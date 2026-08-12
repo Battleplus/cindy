@@ -6,22 +6,22 @@ import { describe, expect, it } from 'vitest';
 const source = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'NewMakerDraftRoute.tsx'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 const sessionViewSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'CCAgentSessionView.tsx'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 const pendingHandoffSource = readFileSync(
   resolve(__dirname, '..', 'state', 'pendingFirstMessage.ts'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 const remoteCollabHandoffSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'remoteCollabHandoff.ts'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 describe('NewMakerDraftRoute Orca worker create order', () => {
   it('delegates worker creation to enableOrca and defers tab reveal until the new route is current', () => {

@@ -73,14 +73,18 @@ describe('resolveDesktopPiProjectIdentity', () => {
     fs.symlinkSync(project.first, alias);
 
     const identity = await resolveDesktopPiProjectIdentity(alias);
+    const platform = process.platform === 'win32' ? 'win32' : 'posix';
 
     expect(identity).toMatchObject({
       workingDir: path.resolve(alias),
-      canonicalWorkingDir: fs.realpathSync(project.first),
-      canonicalRepoRoot: fs.realpathSync(project.repo),
+      canonicalWorkingDir: await fs.promises.realpath(project.first),
+      canonicalRepoRoot: await fs.promises.realpath(project.repo),
       repoRootStatus: 'resolved',
-      platform: 'posix',
-      canonicalPathEncoding: 'utf8-lossless',
+      platform,
+      canonicalPathEncoding: platform === 'win32' ? 'utf16-lossless' : 'utf8-lossless',
+      ...(platform === 'win32'
+        ? { windowsCaseComparison: 'ordinal-insensitive' }
+        : {}),
     });
   });
 
@@ -149,11 +153,16 @@ describe('scanContainedDesktopPiProjectSkills', () => {
     const evidence = await scanContainedDesktopPiProjectSkills(identity);
 
     expect(evidence?.map((item) => item.discoveredPath)).toEqual(
-      project.skills.map((skill) => fs.realpathSync(skill))
+      [
+        path.join(identity.canonicalWorkingDir!, '.pi', 'skills', 'pi-skill'),
+        path.join(identity.canonicalWorkingDir!, '.agents', 'skills', 'local-skill'),
+        path.join(identity.canonicalRepoRoot!, '.agents', 'skills', 'repo-skill'),
+      ]
         .sort((left, right) => left.localeCompare(right)),
     );
-    expect(evidence?.every((item) => item.canonicalPath === fs.realpathSync(item.discoveredPath)))
-      .toBe(true);
+    expect(evidence?.map((item) => item.canonicalPath)).toEqual(
+      await Promise.all(evidence!.map((item) => fs.promises.realpath(item.discoveredPath))),
+    );
   });
 
   it('fails closed when a skill or a skill source symlink escapes the repository', async () => {
@@ -193,11 +202,15 @@ describe('resolveDesktopPiProjectTrustInput', () => {
       sessionId: 'runtime-one',
       workingDir: project.first,
     });
+    const identity = snapshot!.identity;
+    const expectedProjectKey = `${identity.canonicalRepoRoot}\0${identity.canonicalWorkingDir}`;
 
     expect(snapshot?.approval).toMatchObject({
       status: 'approved',
       scope: 'working-dir',
-      scopeKey: `${fs.realpathSync(project.repo)}\0${fs.realpathSync(project.first)}`,
+      scopeKey: identity.windowsCaseComparison === 'ordinal-insensitive'
+        ? expectedProjectKey.toLowerCase()
+        : expectedProjectKey,
     });
     expect(snapshot?.approval?.revision).toMatch(/^auto-skills-v1:[a-f0-9]{64}$/);
     expect(snapshot?.discovered.skills).toEqual(
@@ -234,11 +247,13 @@ describe('resolveDesktopPiProjectTrustInput', () => {
     expect(scanProjectSkills).toHaveBeenCalledTimes(6);
     expect(first?.approval?.revision).not.toBe(second?.approval?.revision);
     expect(restarted?.approval?.revision).not.toBe(first?.approval?.revision);
-    expect(restarted?.discovered.skills).toContain(fs.realpathSync(added));
+    expect(restarted?.discovered.skills).toContain(
+      path.join(restarted.identity.canonicalWorkingDir!, '.pi', 'skills', path.basename(added)),
+    );
     expect(second?.discovered.skills).toEqual([
-      fs.realpathSync(project.skills[2]),
-      fs.realpathSync(secondSkill),
-    ]);
+      path.join(second!.identity.canonicalRepoRoot!, '.agents', 'skills', 'repo-skill'),
+      path.join(second!.identity.canonicalWorkingDir!, '.pi', 'skills', path.basename(secondSkill)),
+    ].sort((left, right) => left.localeCompare(right)));
   });
 
   it('fails closed for remote sessions and scan failures', async () => {
