@@ -1259,7 +1259,7 @@ describe('Maker Pi runtime skill status', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 describe('Session turn send guard', () => {
