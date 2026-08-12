@@ -14,6 +14,7 @@ import {
   reconcilePiRuntimeCommandForDispatch,
   reconcilePiRuntimeCommandForDispatchWithRetry,
   resolvePendingPiProjectSkillForDispatch,
+  rollbackUnclaimedPiProjectSkillSession,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
 
@@ -565,6 +566,41 @@ describe('resolvePendingPiProjectSkillForDispatch', () => {
       retryDelaysMs: [],
     })).resolves.toBeNull();
   });
+});
+
+describe('rollbackUnclaimedPiProjectSkillSession', () => {
+  it('closes the runtime before durable deletion and only then hides local state', async () => {
+    const order: string[] = [];
+    await rollbackUnclaimedPiProjectSkillSession({
+      sessionId: 'session-1',
+      closeRuntime: async () => { order.push('close'); },
+      markDeleted: async () => { order.push('delete'); },
+      patchDeleted: () => { order.push('patch'); },
+      purgeRuntimeState: () => { order.push('purge'); },
+    });
+    expect(order).toEqual(['close', 'delete', 'patch', 'purge']);
+  });
+
+  it.each(['close', 'delete'] as const)(
+    'keeps the session visible when %s rollback fails',
+    async (failure) => {
+      const patchDeleted = vi.fn();
+      const purgeRuntimeState = vi.fn();
+      await expect(rollbackUnclaimedPiProjectSkillSession({
+        sessionId: 'session-1',
+        closeRuntime: async () => {
+          if (failure === 'close') throw new Error('close failed');
+        },
+        markDeleted: async () => {
+          if (failure === 'delete') throw new Error('delete failed');
+        },
+        patchDeleted,
+        purgeRuntimeState,
+      })).rejects.toThrow(`${failure} failed`);
+      expect(patchDeleted).not.toHaveBeenCalled();
+      expect(purgeRuntimeState).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('isSameProjectSkillAcrossRoots', () => {

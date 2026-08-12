@@ -3381,6 +3381,7 @@ export function CCAgentSessionView({
               pending.agentReferences?.length ||
               pending.pastedTextRanges?.length ||
               pending.slashCommandRanges !== undefined ||
+              pending.agentSkillInvocation !== undefined ||
               slashDispatch.agentSkillInvocation !== undefined
               ? {
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
@@ -3394,8 +3395,11 @@ export function CCAgentSessionView({
                   ...(pending.slashCommandRanges !== undefined
                     ? { slashCommandRanges: pending.slashCommandRanges }
                     : {}),
-                  ...(slashDispatch.agentSkillInvocation
-                    ? { agentSkillInvocation: slashDispatch.agentSkillInvocation }
+                  ...(pending.agentSkillInvocation ?? slashDispatch.agentSkillInvocation
+                    ? {
+                        agentSkillInvocation:
+                          pending.agentSkillInvocation ?? slashDispatch.agentSkillInvocation,
+                      }
                     : {}),
                 }
               : undefined,

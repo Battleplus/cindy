@@ -493,6 +493,24 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
 }
 
 /**
+ * A draft Pi Skill session is not user-owned until its exact runtime receipt
+ * exists. Roll it back durably and in order; never hide a session locally when
+ * Main or the database failed to release it.
+ */
+export async function rollbackUnclaimedPiProjectSkillSession(params: {
+  sessionId: string;
+  closeRuntime: () => Promise<void>;
+  markDeleted: () => Promise<void>;
+  patchDeleted: () => void;
+  purgeRuntimeState: () => void;
+}): Promise<void> {
+  await params.closeRuntime();
+  await params.markDeleted();
+  params.patchDeleted();
+  params.purgeRuntimeState();
+}
+
+/**
  * Dispatch context —— 调用方(handleSend)透传 session 上下文给 main。
  * desktop 命令的 execute 拿到这些信息决定怎么响应。
  */

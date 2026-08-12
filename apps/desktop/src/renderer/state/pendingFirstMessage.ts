@@ -19,6 +19,7 @@
 import type { AttachedFile, MentionedResource } from '@/lib/fileTypes';
 import type { PastedTextRange, SlashCommandRange } from '@/lib/imageRef';
 import type { AgentInputReference } from '@cindy/maker-shared/agent-input-projection';
+import type { AgentInputQueuedMessage } from '../../shared/agentInputQueue';
 
 /**
  * device-link 草稿开了协同时,把「开协同」这件事一起交接给 SessionView(issue #1170)。
@@ -45,6 +46,8 @@ export interface PendingPayload {
   agentReferences?: AgentInputReference[];
   pastedTextRanges?: PastedTextRange[];
   slashCommandRanges?: SlashCommandRange[];
+  /** Exact loaded Pi Skill receipt; Main revalidates it against the live runtime. */
+  agentSkillInvocation?: AgentInputQueuedMessage['agentSkillInvocation'];
   /** 非空 = 发首轮之前先在被控端开协同(见 PendingRemoteCollab)。 */
   remoteCollab?: PendingRemoteCollab;
   /** 调试用——createPending 时刻,过期清理时可参考(目前未做 GC,实际场景 navigate 立即消费)。 */

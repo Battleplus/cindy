@@ -56,6 +56,7 @@ interface ProjectSkillScanDeps {
   lstat: (candidate: string) => Promise<FsLstatLike>;
   stat: (candidate: string) => Promise<FsStatLike>;
   realpath: (candidate: string) => Promise<string>;
+  resolveWindowsCaseComparison?: (candidate: string) => Promise<WindowsCaseComparison>;
 }
 
 function losslessPosixPath(value: string): boolean {
@@ -160,34 +161,63 @@ async function nearestGitRoot(
 }
 
 function swapAsciiCase(value: string): string | null {
-  const drivePrefixLength = /^[A-Za-z]:[\\/]/.test(value) ? 2 : 0;
-  for (let index = value.length - 1; index >= drivePrefixLength; index -= 1) {
-    const character = value[index];
-    if (!/[A-Za-z]/.test(character)) continue;
-    const swapped = character === character.toLowerCase()
-      ? character.toUpperCase()
-      : character.toLowerCase();
-    return `${value.slice(0, index)}${swapped}${value.slice(index + 1)}`;
-  }
-  return null;
+  if (!/[A-Za-z]/.test(value)) return null;
+  return value === value.toLowerCase() ? value.toUpperCase() : value.toLowerCase();
 }
 
 async function detectWindowsCaseComparison(
   canonicalWorkingDir: string,
+  dependencies: {
+    readdir: (candidate: string) => Promise<Array<{ name: string }>>;
+    lstat: (candidate: string) => Promise<{ dev?: number | bigint; ino?: number | bigint }>;
+  } = {
+    readdir: (candidate) => fsp.readdir(candidate, { withFileTypes: true }),
+    lstat: (candidate) => fsp.lstat(candidate),
+  },
 ): Promise<WindowsCaseComparison> {
-  const alternate = swapAsciiCase(canonicalWorkingDir);
-  if (!alternate) return 'unavailable';
+  // Windows case sensitivity is a per-directory property. Changing the
+  // spelling of workingDir itself probes its parent, not the lookup semantics
+  // used for Skill children. Probe one existing child without mutating the
+  // project; an empty/non-ASCII-only directory cannot provide this proof.
   try {
-    const [original, probe] = await Promise.all([
-      fsp.stat(canonicalWorkingDir),
-      fsp.stat(alternate),
-    ]);
-    return original.dev === probe.dev && original.ino === probe.ino
-      ? 'ordinal-insensitive'
-      : 'case-sensitive';
+    const entries = await dependencies.readdir(canonicalWorkingDir);
+    const foldedNames = new Set<string>();
+    for (const entry of entries) {
+      const folded = entry.name.replace(/[A-Z]/g, (character) => character.toLowerCase());
+      if (foldedNames.has(folded)) return 'case-sensitive';
+      foldedNames.add(folded);
+    }
+    for (const entry of entries) {
+      const alternateName = swapAsciiCase(entry.name);
+      if (!alternateName || alternateName === entry.name) continue;
+      const originalPath = path.win32.join(canonicalWorkingDir, entry.name);
+      const alternatePath = path.win32.join(canonicalWorkingDir, alternateName);
+      try {
+        const [original, probe] = await Promise.all([
+          dependencies.lstat(originalPath),
+          dependencies.lstat(alternatePath),
+        ]);
+        if (
+          original.dev === undefined
+          || original.ino === undefined
+          || original.ino === 0
+          || original.ino === 0n
+          || probe.dev === undefined
+          || probe.ino === undefined
+          || probe.ino === 0
+          || probe.ino === 0n
+        ) return 'unavailable';
+        return original.dev === probe.dev && original.ino === probe.ino
+          ? 'ordinal-insensitive'
+          : 'case-sensitive';
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === 'ENOENT' || code === 'ENOTDIR' ? 'case-sensitive' : 'unavailable';
+      }
+    }
+    return 'unavailable';
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === 'ENOENT' || code === 'ENOTDIR' ? 'case-sensitive' : 'unavailable';
+    return 'unavailable';
   }
 }
 
@@ -297,6 +327,7 @@ async function scanOneProjectSkillRoot(
   identity: PiProjectIdentityResolution,
   sourceRoot: string,
   dependencies: ProjectSkillScanDeps,
+  checkedWindowsDirectories: Map<string, boolean>,
 ): Promise<PiProjectCanonicalPathEvidence[] | null> {
   const rootEntry = await lstatOrNull(sourceRoot, dependencies.lstat);
   if (!rootEntry) return [];
@@ -305,6 +336,12 @@ async function scanOneProjectSkillRoot(
   if (!rootStat.isDirectory()) return null;
   const canonicalSourceRoot = await dependencies.realpath(sourceRoot);
   if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalSourceRoot)) return null;
+  if (!await windowsDirectoryChainMatchesIdentity(
+    identity,
+    canonicalSourceRoot,
+    dependencies,
+    checkedWindowsDirectories,
+  )) return null;
   const entries = await dependencies.readdir(sourceRoot);
   const result: PiProjectCanonicalPathEvidence[] = [];
 
@@ -314,6 +351,12 @@ async function scanOneProjectSkillRoot(
     const folder = pathFor(identity).join(sourceRoot, entry.name);
     const canonicalFolder = await dependencies.realpath(folder);
     if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalFolder)) return null;
+    if (!await windowsDirectoryChainMatchesIdentity(
+      identity,
+      canonicalFolder,
+      dependencies,
+      checkedWindowsDirectories,
+    )) return null;
     const folderStat = await statOrNull(folder, dependencies.stat);
     if (!folderStat?.isDirectory()) return null;
 
@@ -339,7 +382,37 @@ const defaultScanDeps = (): ProjectSkillScanDeps => ({
   lstat: (candidate) => fsp.lstat(candidate),
   stat: (candidate) => fsp.stat(candidate),
   realpath: (candidate) => fsp.realpath(candidate),
+  resolveWindowsCaseComparison: detectWindowsCaseComparison,
 });
+
+async function windowsDirectoryChainMatchesIdentity(
+  identity: PiProjectIdentityResolution,
+  canonicalDirectory: string,
+  dependencies: ProjectSkillScanDeps,
+  checked: Map<string, boolean> = new Map<string, boolean>(),
+): Promise<boolean> {
+  if (identity.platform !== 'win32') return true;
+  const expected = identity.windowsCaseComparison;
+  const resolve = dependencies.resolveWindowsCaseComparison;
+  const repoRoot = identity.canonicalRepoRoot;
+  if (!repoRoot || !expected || !resolve) return false;
+  let current = canonicalDirectory;
+  for (let depth = 0; depth < 1024; depth += 1) {
+    const comparison = comparisonPath(identity, current);
+    if (!comparison || !canonicalPathIsWithin(identity, repoRoot, current)) return false;
+    let matches = checked.get(comparison);
+    if (matches === undefined) {
+      matches = await resolve(current) === expected;
+      checked.set(comparison, matches);
+    }
+    if (!matches) return false;
+    if (canonicalPathsEqual(identity, current, repoRoot)) return true;
+    const parent = path.win32.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+  return false;
+}
 
 export async function scanContainedDesktopPiProjectSkills(
   identity: PiProjectIdentityResolution,
@@ -350,8 +423,20 @@ export async function scanContainedDesktopPiProjectSkills(
   try {
     const evidence: PiProjectCanonicalPathEvidence[] = [];
     const canonicalPaths = new Set<string>();
+    const checkedWindowsDirectories = new Map<string, boolean>();
+    if (!await windowsDirectoryChainMatchesIdentity(
+      identity,
+      identity.canonicalWorkingDir!,
+      dependencies,
+      checkedWindowsDirectories,
+    )) return null;
     for (const root of roots) {
-      const scanned = await scanOneProjectSkillRoot(identity, root, dependencies);
+      const scanned = await scanOneProjectSkillRoot(
+        identity,
+        root,
+        dependencies,
+        checkedWindowsDirectories,
+      );
       if (!scanned) return null;
       for (const item of scanned) {
         const comparison = comparisonPath(identity, item.canonicalPath);
@@ -453,6 +538,8 @@ export const __testing = {
   canonicalPathIsWithin,
   canonicalPathsEqual,
   comparisonPath,
+  detectWindowsCaseComparison,
   nearestGitRoot,
   projectSkillSourceRoots,
+  windowsDirectoryChainMatchesIdentity,
 };

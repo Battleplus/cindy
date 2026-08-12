@@ -123,6 +123,7 @@ import { buildCreateOptsForCurrentSession, makerChatStore } from '@/lib/makerCha
 import {
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
   resolvePendingPiProjectSkillForDispatch,
+  rollbackUnclaimedPiProjectSkillSession,
   type AgentSkillInvocation,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
@@ -3645,8 +3646,6 @@ export function NewMakerDraftRoute() {
             toastCreateSessionFailed();
             return;
           }
-          // 计划模式是一次性选择:随本次发送被消耗,草稿勾选同步熄灭。
-          if (effectivePlanMode) patchActivePrefs({ planMode: false });
           // 首条消息经 setPending → SessionView 自动发送,createOpts 读 chat store 的
           // planModeEnabled —— ensureInitialMessages 的行水合是异步的,必须先确定性
           // seed store,否则勾了计划模式的首条消息可能以 planMode:false 发出
@@ -3656,6 +3655,85 @@ export function NewMakerDraftRoute() {
             fastMode: effectiveFastMode,
             planModeEnabled: effectivePlanMode,
           });
+
+          let pendingAgentSkillInvocation: AgentSkillInvocation | undefined;
+          if (persistedAgentKind === 'pi' && opts?.pendingProjectSkillName) {
+            const rollbackUnclaimedSession = async () => {
+              await rollbackUnclaimedPiProjectSkillSession({
+                sessionId: newSession.id,
+                closeRuntime: () => window.electronAPI.maker.closeSession(
+                  newSession.id,
+                  { preserveWorkspace: true },
+                ),
+                markDeleted: () => sessionService.setStatus(
+                  newSession.id,
+                  'deleted',
+                ).then(() => undefined),
+                patchDeleted: () => sessionsStore.patchLocal(
+                  newSession.id,
+                  { status: 'deleted' },
+                ),
+                purgeRuntimeState: () => makerChatStore.purgeSession(newSession.id),
+              });
+            };
+            if (!workingDir || !opts.pendingProjectSkillPath || !opts.pendingProjectSkillRoot) {
+              await rollbackUnclaimedSession();
+              toast.warning(t('commandPalette.projectSkillUnavailableForNewTask'));
+              return;
+            }
+            let resolvedInvocation: AgentSkillInvocation | null;
+            try {
+              resolvedInvocation = await resolvePendingPiProjectSkillForDispatch({
+                sessionId: newSession.id,
+                commandName: opts.pendingProjectSkillName,
+                sourceProjectRoot: opts.pendingProjectSkillRoot,
+                sourceSkillPath: opts.pendingProjectSkillPath,
+                // No worktree rebind occurs on this path. Keep both sides rooted
+                // at the detected repository so ancestor `.agents/skills`
+                // entries remain provable when workingDir is a nested folder.
+                targetProjectRoot: opts.pendingProjectSkillRoot,
+                retryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
+                prepareRuntime: () => window.electronAPI.maker.createSession({
+                  id: newSession.id,
+                  ...buildCreateOptsForCurrentSession(
+                    newSession.id,
+                    model,
+                    effort,
+                    permissionMode,
+                    workingDir,
+                  ),
+                  agentKind: 'pi',
+                  workingDir,
+                }).then(() => undefined),
+                reload: async () => {
+                  const result = await window.electronAPI.maker.listAgentSkills('pi', {
+                    workingDir,
+                    sessionId: newSession.id,
+                    forceReload: true,
+                  });
+                  if (!result.success || !result.skills) return [];
+                  return result.skills.flatMap((skill): UnifiedCommand[] => (
+                    skill.scope === 'user' || skill.scope === 'repo'
+                      ? [{ ...skill, scope: skill.scope }]
+                      : []
+                  ));
+                },
+              });
+            } catch (error) {
+              await rollbackUnclaimedSession();
+              throw error;
+            }
+            if (!resolvedInvocation) {
+              await rollbackUnclaimedSession();
+              toast.warning(t('commandPalette.projectSkillUnavailableForNewTask'));
+              return;
+            }
+            pendingAgentSkillInvocation = resolvedInvocation;
+          }
+
+          // 计划模式是一次性选择:只有首条消息已具备完整交接条件时才消费。
+          // Pi Skill catalog proof 失败会留在 /new，必须保持用户原选择可重试。
+          if (effectivePlanMode) patchActivePrefs({ planMode: false });
 
           // "创建即发送"路径:乐观回写 userSendAt 跳过 projectGrouping 的草稿兜底
           // (userSendAt==null && messages==0 → unclassified),否则新会话会先在
@@ -3707,6 +3785,9 @@ export function NewMakerDraftRoute() {
             ...(opts?.pastedTextRanges?.length ? { pastedTextRanges: opts.pastedTextRanges } : {}),
             ...(opts?.slashCommandRanges !== undefined
               ? { slashCommandRanges: opts.slashCommandRanges }
+              : {}),
+            ...(pendingAgentSkillInvocation
+              ? { agentSkillInvocation: pendingAgentSkillInvocation }
               : {}),
           });
           opts?.onAccepted?.();
@@ -4710,7 +4791,7 @@ export function NewMakerDraftRoute() {
                       && !isDeviceLinkDraft
                     }
                     pendingProjectSkillRoot={
-                      wtEnabled ? (wtBaseRepo ?? undefined) : undefined
+                      wtBaseRepo ?? effectiveWorkingDir ?? undefined
                     }
                     attachmentState={guardedAttachmentState}
                     draftKey={NEW_MAKER_DRAFT_KEY}

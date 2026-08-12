@@ -143,6 +143,70 @@ describe('canonical Windows comparison', () => {
       'C:\\项目',
     )).toBeNull();
   });
+
+  it('probes child lookup semantics instead of the working directory parent', async () => {
+    const lstat = vi.fn(async (candidate: string) => {
+      expect(candidate).toMatch(/^C:\\Repo\\(?:Demo|demo)$/);
+      return { dev: 1, ino: 2 };
+    });
+    await expect(__testing.detectWindowsCaseComparison('C:\\Repo', {
+      readdir: async () => [{ name: 'Demo' }],
+      lstat,
+    })).resolves.toBe('ordinal-insensitive');
+    expect(lstat).toHaveBeenCalledWith('C:\\Repo\\Demo');
+    expect(lstat).toHaveBeenCalledWith('C:\\Repo\\demo');
+    expect(lstat).not.toHaveBeenCalledWith('c:\\Repo');
+  });
+
+  it('detects a case-sensitive directory and fails closed without a child proof', async () => {
+    await expect(__testing.detectWindowsCaseComparison('C:\\Repo', {
+      readdir: async () => [{ name: 'Demo' }, { name: 'demo' }],
+      lstat: async () => ({ dev: 1, ino: 2 }),
+    })).resolves.toBe('case-sensitive');
+
+    await expect(__testing.detectWindowsCaseComparison('C:\\Repo', {
+      readdir: async () => [],
+      lstat: async () => ({ dev: 1, ino: 2 }),
+    })).resolves.toBe('unavailable');
+
+    await expect(__testing.detectWindowsCaseComparison('C:\\Repo', {
+      readdir: async () => [{ name: 'Demo' }],
+      lstat: async () => ({}),
+    })).resolves.toBe('unavailable');
+
+    await expect(__testing.detectWindowsCaseComparison('C:\\Repo', {
+      readdir: async () => [{ name: 'Demo' }],
+      lstat: async () => ({ dev: 0, ino: 0 }),
+    })).resolves.toBe('unavailable');
+  });
+
+  it('fails closed when any participating Windows directory has different comparison semantics', async () => {
+    const resolveWindowsCaseComparison = vi.fn(async (candidate: string) => (
+      candidate === 'C:\\Repo\\packages'
+        ? 'case-sensitive' as const
+        : 'ordinal-insensitive' as const
+    ));
+    const dependencies = {
+      readdir: async () => [],
+      lstat: async () => ({
+        isDirectory: () => true,
+        isFile: () => false,
+        isSymbolicLink: () => false,
+      }),
+      stat: async () => ({ isDirectory: () => true, isFile: () => false }),
+      realpath: async (candidate: string) => candidate,
+      resolveWindowsCaseComparison,
+    };
+
+    await expect(__testing.windowsDirectoryChainMatchesIdentity(
+      insensitiveIdentity,
+      'C:\\Repo\\packages\\app',
+      dependencies,
+    )).resolves.toBe(false);
+    expect(resolveWindowsCaseComparison).toHaveBeenCalledWith('C:\\Repo\\packages\\app');
+    expect(resolveWindowsCaseComparison).toHaveBeenCalledWith('C:\\Repo\\packages');
+    expect(resolveWindowsCaseComparison).not.toHaveBeenCalledWith('C:\\Repo');
+  });
 });
 
 describe('scanContainedDesktopPiProjectSkills', () => {

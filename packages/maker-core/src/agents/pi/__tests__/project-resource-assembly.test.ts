@@ -14,6 +14,7 @@ import {
 import { promises as fsPromises } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 
 import {
   assembleApprovedPiProjectResources,
@@ -333,6 +334,212 @@ describe('Pi approved project resource assembly', () => {
     }
   });
 
+  it('fails the entire snapshot closed when one file exceeds the per-file byte budget', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-file-budget-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved content\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-file-budget', [skillPath]),
+        workingDir,
+      );
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        maxFileBytes: 8,
+        maxTotalBytes: 1024,
+      });
+
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails the entire snapshot closed when the aggregate byte budget is exhausted', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-total-budget-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const first = path.join(workingDir, '.pi', 'skills', 'first');
+    const second = path.join(workingDir, '.pi', 'skills', 'second');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(first, { recursive: true });
+      mkdirSync(second, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(first, 'SKILL.md'), '12345678');
+      writeFileSync(path.join(second, 'SKILL.md'), 'abcdefgh');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-total-budget', [first, second]),
+        workingDir,
+      );
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        maxFileBytes: 8,
+        maxTotalBytes: 15,
+      });
+
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails the snapshot closed when its shared deadline is already exhausted', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-deadline-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-deadline', [skillPath]),
+        workingDir,
+      );
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        deadlineMs: 0,
+      });
+
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a snapshot exactly at both byte budget boundaries', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-budget-edge-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '12345678');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-budget-edge', [skillPath]),
+        workingDir,
+      );
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        maxFileBytes: 8,
+        maxTotalBytes: 8,
+      });
+
+      expect(staged.skillPaths).toEqual([skillPath]);
+      expect(staged.launchSkillPaths).toHaveLength(1);
+      expect(readFileSync(path.join(staged.launchSkillPaths[0]!, 'SKILL.md'), 'utf8'))
+        .toBe('12345678');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an ordinary file injected into the temporary tree before publication', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-injection-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-injection', [skillPath]),
+        workingDir,
+      );
+      const realReaddir = fsPromises.readdir.bind(fsPromises);
+      let injected = false;
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(async (candidate, options) => {
+        if (
+          !injected
+          && String(candidate).includes('.project-resources-')
+          && String(candidate).endsWith(path.join('skills', '0', 'demo'))
+        ) {
+          injected = true;
+          writeFileSync(path.join(String(candidate), 'injected.txt'), 'not fingerprinted\n');
+        }
+        return realReaddir(candidate, options as never) as never;
+      });
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome);
+
+      expect(injected).toBe(true);
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a nested file injected after the baseline staging proof', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-late-injection-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-late-injection', [skillPath]),
+        workingDir,
+      );
+      const realOpendir = fsPromises.opendir.bind(fsPromises);
+      let stagingRootReads = 0;
+      let injected = false;
+      vi.spyOn(fsPromises, 'opendir').mockImplementation(async (candidate, options) => {
+        if (
+          String(candidate).includes('.project-resources-')
+          && path.basename(String(candidate)) === 'skills'
+        ) {
+          stagingRootReads += 1;
+          if (stagingRootReads === 2) {
+            injected = true;
+            writeFileSync(
+              path.join(String(candidate), '0', 'demo', 'late.txt'),
+              'changed after baseline\n',
+            );
+          }
+        }
+        return realOpendir(candidate, options as never);
+      });
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome);
+
+      expect(injected).toBe(true);
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the launch snapshot immutable when the project skill is retargeted before spawn', async () => {
     const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-retarget-')));
     const configHome = path.join(root, 'config-home');
@@ -427,16 +634,21 @@ describe('Pi approved project resource assembly', () => {
         inputForRepoRoot(workingDir, 'rev-dir-churn', [skillPath]),
         workingDir,
       );
-      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const realReaddir = fsPromises.readdir.bind(fsPromises);
+      let skillDirectoryReads = 0;
       let mutated = false;
-      vi.spyOn(fsPromises, 'lstat').mockImplementation(async (candidate, options) => {
-        if (String(candidate) === skillFile && !mutated) {
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(async (candidate, options) => {
+        const children = await realReaddir(candidate, options as never);
+        if (String(candidate) === skillPath) {
+          skillDirectoryReads += 1;
+        }
+        if (String(candidate) === skillPath && skillDirectoryReads === 2 && !mutated) {
           mutated = true;
           writeFileSync(path.join(skillPath, 'late-asset.txt'), 'added after readdir\n');
           const stableChangedTime = new Date('2000-01-01T00:00:00.000Z');
           utimesSync(skillPath, stableChangedTime, stableChangedTime);
         }
-        return realLstat(candidate, options);
+        return children as never;
       });
 
       const staged = await stageApprovedPiProjectResources(assembled, configHome);
@@ -524,6 +736,40 @@ describe('Pi approved project resource assembly', () => {
 
       await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir)).resolves.toBeNull();
       expect(skillOpenCount).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts fingerprinting when a file streams beyond its opened size', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-hash-growth-')));
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    const skillFile = path.join(skillPath, 'SKILL.md');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      writeFileSync(skillFile, '12345678');
+      const realOpen = fsPromises.open.bind(fsPromises);
+      let replacedStream = false;
+      vi.spyOn(fsPromises, 'open').mockImplementation(async (candidate, flags, mode) => {
+        const handle = await realOpen(candidate, flags, mode);
+        if (String(candidate) === skillFile && !replacedStream) {
+          replacedStream = true;
+          handle.createReadStream = (() => Readable.from(['123456789'])) as typeof handle.createReadStream;
+        }
+        return handle;
+      });
+
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        budget: {
+          remainingEntries: 100,
+          deadlineAtMs: Date.now() + 1_000,
+          maxFileBytes: 8,
+        },
+      })).resolves.toBeNull();
+      expect(replacedStream).toBe(true);
     } finally {
       vi.restoreAllMocks();
       rmSync(root, { recursive: true, force: true });

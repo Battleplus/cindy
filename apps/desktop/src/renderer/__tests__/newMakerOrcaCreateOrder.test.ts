@@ -155,7 +155,9 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(pendingBranch).toContain('agentReferences: pending.agentReferences');
     expect(pendingBranch).toContain('pastedTextRanges: pending.pastedTextRanges');
     expect(pendingBranch).toContain('slashCommandRanges: pending.slashCommandRanges');
-    expect(pendingBranch).toContain('agentSkillInvocation: slashDispatch.agentSkillInvocation');
+    expect(pendingBranch).toContain(
+      'pending.agentSkillInvocation ?? slashDispatch.agentSkillInvocation',
+    );
     expect(pendingBranch).toContain('PI_RUNTIME_SKILL_RETRY_DELAYS_MS');
   });
 
@@ -166,7 +168,29 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(source).toContain('!effectiveRemoteHostId');
     expect(source).toContain('!isDeviceLinkDraft');
     expect(source).toContain('pendingProjectSkillRoot={');
-    expect(source).toContain('wtEnabled ? (wtBaseRepo ?? undefined) : undefined');
+    expect(source).toContain('wtBaseRepo ?? effectiveWorkingDir ?? undefined');
+  });
+
+  it('loads a selected project Skill before handing off a normal first message', () => {
+    const normalBranch = source.slice(
+      source.indexOf('const newSession = await createSession({', source.indexOf('const handleSend')),
+      source.indexOf('setPending(newSession.id, {', source.indexOf('const handleSend')),
+    );
+    const resolveSkill = normalBranch.lastIndexOf('resolvePendingPiProjectSkillForDispatch({');
+    const initializeRuntime = normalBranch.lastIndexOf('window.electronAPI.maker.createSession({');
+
+    expect(resolveSkill).toBeGreaterThan(-1);
+    expect(initializeRuntime).toBeGreaterThan(resolveSkill);
+    expect(normalBranch).toContain('sourceProjectRoot: opts.pendingProjectSkillRoot');
+    expect(normalBranch).toContain('targetProjectRoot: opts.pendingProjectSkillRoot');
+    expect(normalBranch).toContain('rollbackUnclaimedPiProjectSkillSession({');
+    expect(normalBranch).toContain('closeRuntime: () => window.electronAPI.maker.closeSession(');
+    expect(normalBranch).toContain('markDeleted: () => sessionService.setStatus(');
+    expect(normalBranch).toContain('purgeRuntimeState: () => makerChatStore.purgeSession');
+    expect(normalBranch.lastIndexOf('patchActivePrefs({ planMode: false })'))
+      .toBeGreaterThan(normalBranch.lastIndexOf('if (!resolvedInvocation)'));
+    expect(normalBranch).toContain('pendingAgentSkillInvocation = resolvedInvocation;');
+    expect(source).toContain('agentSkillInvocation: pendingAgentSkillInvocation');
   });
 
   it('rebinds a selected Pi project Skill to the created worktree before sending', () => {
