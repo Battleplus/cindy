@@ -8243,7 +8243,8 @@
     }
   },
   "commandPalette": {
-    "projectSkillNotLoaded": "目前的 Pi 任務尚未載入此專案 Skill，新任務會自動嘗試載入"
+    "projectSkillNotLoaded": "目前的 Pi 任務尚未載入此專案 Skill，新任務會自動嘗試載入",
+    "projectSkillMissingInWorktree": "新 worktree 中沒有載入所選專案 Skill，第一則訊息已恢復；請確認目標分支包含該 Skill 後重試"
   },
   "skillhub": {
     "home": {

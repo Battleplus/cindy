@@ -224,6 +224,7 @@ import {
   hasAvailableSlashCommand,
   hasUnavailableProjectSkillPreview,
   isSlashCommandUnavailable,
+  isSlashCommandSelectable,
   isSlashCommandRosterReady,
   loadAllCommands,
   nextAvailableSlashCommandIndex,
@@ -397,6 +398,11 @@ interface ChatInputProps {
       pastedTextRanges?: PastedTextRange[];
       /** Exact local display ranges for slash commands confirmed by this composer. */
       slashCommandRanges?: SlashCommandRange[];
+      /** Discovered Pi project Skill selected before the New Maker runtime exists. */
+      pendingProjectSkillName?: string;
+      /** Absolute discovery path and project root used when rebinding into a new worktree. */
+      pendingProjectSkillPath?: string;
+      pendingProjectSkillRoot?: string;
       /**
        * New Maker 会异步创建会话并自己清理草稿，onSend 为保留编辑器
        * 始终返回 false。它在消息真正移交给新会话后调本回调，与
@@ -594,6 +600,10 @@ interface ChatInputProps {
    * 避免弹窗盖住 logo / worktree chips。
    */
   paletteMaxHeight?: number;
+  /** New Maker may select a discovered Pi project Skill that startup will load before send. */
+  allowPendingProjectSkillSelection?: boolean;
+  /** Base repository root used to bind a selected project Skill across worktree creation. */
+  pendingProjectSkillRoot?: string;
   /** Parent-owned drag state for full-page drop zones; mirrors the same hint inside the input card. */
   externalDragOver?: boolean;
   /** Composer drops stop propagation, so parent full-page drag state needs an explicit reset hook. */
@@ -984,6 +994,8 @@ export function ChatInput({
   onProviderDidChange,
   attachmentState,
   paletteMaxHeight,
+  allowPendingProjectSkillSelection = false,
+  pendingProjectSkillRoot,
   externalDragOver = false,
   onComposerDropHandled,
   vendorKey,
@@ -3848,11 +3860,20 @@ export function ChatInput({
   useEffect(() => {
     setSlashFocus((current) => (
       current >= filteredCommands.length
-      || (filteredCommands[current] && isSlashCommandUnavailable(filteredCommands[current]))
-        ? firstAvailableSlashCommandIndex(filteredCommands)
+      || (
+        filteredCommands[current]
+        && !isSlashCommandSelectable(
+          filteredCommands[current],
+          allowPendingProjectSkillSelection,
+        )
+      )
+        ? firstAvailableSlashCommandIndex(
+            filteredCommands,
+            allowPendingProjectSkillSelection,
+          )
         : current
     ));
-  }, [filteredCommands]);
+  }, [allowPendingProjectSkillSelection, filteredCommands]);
   useEffect(() => {
     if (
       atFocus >= filteredAt.length ||
@@ -3960,7 +3981,12 @@ export function ChatInput({
         switch (e.key) {
           case 'ArrowDown':
             if (slashOpen && filteredCommands.length > 0) {
-              setSlashFocus((i) => nextAvailableSlashCommandIndex(filteredCommands, i, 1));
+              setSlashFocus((i) => nextAvailableSlashCommandIndex(
+                filteredCommands,
+                i,
+                1,
+                allowPendingProjectSkillSelection,
+              ));
               return true;
             }
             if (atOpen && filteredAt.length > 0) {
@@ -3970,7 +3996,12 @@ export function ChatInput({
             return false;
           case 'ArrowUp':
             if (slashOpen && filteredCommands.length > 0) {
-              setSlashFocus((i) => nextAvailableSlashCommandIndex(filteredCommands, i, -1));
+              setSlashFocus((i) => nextAvailableSlashCommandIndex(
+                filteredCommands,
+                i,
+                -1,
+                allowPendingProjectSkillSelection,
+              ));
               return true;
             }
             if (atOpen && filteredAt.length > 0) {
@@ -3986,9 +4017,21 @@ export function ChatInput({
                 if (trigger.kind === 'slash') setSuppressedSlashAt(trigger.from);
                 return true;
               }
-              if (isSlashCommandUnavailable(focusedCommand)) {
-                setSlashFocus(firstAvailableSlashCommandIndex(filteredCommands));
-                if (!hasAvailableSlashCommand(filteredCommands) && trigger.kind === 'slash') {
+              if (!isSlashCommandSelectable(
+                focusedCommand,
+                allowPendingProjectSkillSelection,
+              )) {
+                setSlashFocus(firstAvailableSlashCommandIndex(
+                  filteredCommands,
+                  allowPendingProjectSkillSelection,
+                ));
+                if (
+                  !hasAvailableSlashCommand(
+                    filteredCommands,
+                    allowPendingProjectSkillSelection,
+                  )
+                  && trigger.kind === 'slash'
+                ) {
                   setSuppressedSlashAt(trigger.from);
                 }
                 return true;
@@ -4038,7 +4081,7 @@ export function ChatInput({
         editor.isDestroyed ||
         trigger.kind !== 'slash' || composerMutationLockedRef.current ||
         editor.view.composing ||
-        isSlashCommandUnavailable(cmd)
+        !isSlashCommandSelectable(cmd, allowPendingProjectSkillSelection)
       ) {
         return;
       }
@@ -4103,7 +4146,13 @@ export function ChatInput({
         planModeEntry?.onToggle(!planModeEntry.enabled);
       }
     },
-    [editor, planModeCommandAvailable, planModeEntry, trigger],
+    [
+      allowPendingProjectSkillSelection,
+      editor,
+      planModeCommandAvailable,
+      planModeEntry,
+      trigger,
+    ],
   );
 
   const resolveEffectiveAtRange = useCallback((): { from: number; to: number } | null => {
@@ -4382,6 +4431,21 @@ export function ChatInput({
           slashCommandRanges,
           hostCapability: serializedHostCapability,
         } = serializedContent;
+        const leadingSlashName = serializedEditorText.match(/^\/(\S+)/)?.[1]?.toLowerCase();
+        const pendingProjectSkill =
+          allowPendingProjectSkillSelection
+          && leadingSlashName
+          && slashCommandRanges.some((range) => range.start === 0)
+            ? mergedCommands.find((command): command is Extract<
+                UnifiedCommand,
+                { kind: 'agent-skill' }
+              > => (
+                command.kind === 'agent-skill'
+                &&
+                command.name.toLowerCase() === leadingSlashName
+                && isSlashCommandUnavailable(command)
+              ))
+            : undefined;
         let editorText = serializedEditorText;
         let agentReferences = serializedAgentReferences;
         const attachmentsForSend = optimisticallyClearRemoteComposer
@@ -4931,6 +4995,15 @@ export function ChatInput({
               ...(agentReferences.length > 0 ? { agentReferences } : {}),
               ...(pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
               slashCommandRanges,
+              ...(pendingProjectSkill
+                ? {
+                    pendingProjectSkillName: pendingProjectSkill.name,
+                    ...(pendingProjectSkill.path
+                      ? { pendingProjectSkillPath: pendingProjectSkill.path }
+                      : {}),
+                    ...(pendingProjectSkillRoot ? { pendingProjectSkillRoot } : {}),
+                  }
+                : {}),
               ...(usedGhost ? { onAccepted: markRecentPluginUsage } : {}),
               ...(onRemoteOptimisticFailure ? { onRemoteOptimisticFailure } : {}),
               onDeferredAccepted,
@@ -7150,6 +7223,7 @@ export function ChatInput({
               }}
               onTooltipHoverChange={setPaletteTooltipHover}
               maxHeight={paletteMaxHeight}
+              allowPendingProjectSkillSelection={allowPendingProjectSkillSelection}
             />
           )}
 

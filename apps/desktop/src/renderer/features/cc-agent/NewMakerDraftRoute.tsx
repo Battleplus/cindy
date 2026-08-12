@@ -119,7 +119,13 @@ import { emitAutoTitlePreview, emitAutoTitlePreviewCleared } from '@/lib/session
 import { NewGoalDialog } from '@/components/new-chat/NewGoalDialog';
 import { cleanupStagedChatAttachmentFiles } from '@/lib/chatAttachmentStageCleanup';
 import type { GoalLimitValues } from '@/components/new-chat/GoalAdvancedLimits';
-import { makerChatStore } from '@/lib/makerChatStore';
+import { buildCreateOptsForCurrentSession, makerChatStore } from '@/lib/makerChatStore';
+import {
+  PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
+  rebaseInlineRangesAfterSlashCommandRewrite,
+  resolvePendingPiProjectSkillForDispatch,
+  type UnifiedCommand,
+} from '@/lib/slashCommands';
 import { worktreeCreationStore } from '@/lib/worktreeCreationStore';
 import { useRefreshWorktrees } from '@/contexts/WorktreeContext';
 import { crossAgentConvertService } from '@/lib/crossAgentConvertService';
@@ -2878,6 +2884,9 @@ export function NewMakerDraftRoute() {
         agentReferences?: AgentInputReference[];
         pastedTextRanges?: PastedTextRange[];
         slashCommandRanges?: SlashCommandRange[];
+        pendingProjectSkillName?: string;
+        pendingProjectSkillPath?: string;
+        pendingProjectSkillRoot?: string;
         onAccepted?: () => void;
       },
     ): Promise<boolean | undefined> => {
@@ -3493,6 +3502,81 @@ export function NewMakerDraftRoute() {
                 // 才进入 1.6s 平滑期, overlay 从 "空 ChatView" 自然过渡到 "已在
                 // streaming 的 ChatView", 不暴露中间空窗。clear 时机见本 async 块末尾。
 
+                let messageForSend = message;
+                let agentReferencesForSend = opts?.agentReferences;
+                let pastedTextRangesForSend = opts?.pastedTextRanges;
+                let slashCommandRangesForSend = opts?.slashCommandRanges;
+                if (persistedAgentKind === 'pi' && opts?.pendingProjectSkillName) {
+                  if (!opts.pendingProjectSkillPath || !opts.pendingProjectSkillRoot) {
+                    worktreeCreationStore.clear(newSession.id);
+                    restoreFirstMessageDraft();
+                    toast.warning(t('commandPalette.projectSkillMissingInWorktree'));
+                    return;
+                  }
+                  const resolvedMessage = await resolvePendingPiProjectSkillForDispatch({
+                    sessionId: newSession.id,
+                    commandName: opts.pendingProjectSkillName,
+                    message,
+                    sourceProjectRoot: opts.pendingProjectSkillRoot,
+                    sourceSkillPath: opts.pendingProjectSkillPath,
+                    targetProjectRoot: newDir,
+                    retryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
+                    prepareRuntime: () => window.electronAPI.maker.createSession({
+                      id: newSession.id,
+                      ...buildCreateOptsForCurrentSession(
+                        newSession.id,
+                        model,
+                        effort,
+                        permissionMode,
+                        newDir,
+                      ),
+                      agentKind: 'pi',
+                      workingDir: newDir,
+                    }).then(() => undefined),
+                    reload: async () => {
+                      const result = await window.electronAPI.maker.listAgentSkills('pi', {
+                        workingDir: newDir,
+                        sessionId: newSession.id,
+                        forceReload: true,
+                      });
+                      if (!result.success || !result.skills) return [];
+                      return result.skills.flatMap((skill): UnifiedCommand[] => (
+                        skill.scope === 'user' || skill.scope === 'repo'
+                          ? [{ ...skill, scope: skill.scope }]
+                          : []
+                      ));
+                    },
+                  });
+                  if (!resolvedMessage) {
+                    worktreeCreationStore.clear(newSession.id);
+                    restoreFirstMessageDraft();
+                    toast.warning(t('commandPalette.projectSkillMissingInWorktree'));
+                    return;
+                  }
+                  messageForSend = resolvedMessage;
+                  agentReferencesForSend = opts.agentReferences
+                    ? rebaseInlineRangesAfterSlashCommandRewrite(
+                        opts.agentReferences,
+                        message,
+                        resolvedMessage,
+                      )
+                    : undefined;
+                  pastedTextRangesForSend = opts.pastedTextRanges
+                    ? rebaseInlineRangesAfterSlashCommandRewrite(
+                        opts.pastedTextRanges,
+                        message,
+                        resolvedMessage,
+                      )
+                    : undefined;
+                  slashCommandRangesForSend = opts.slashCommandRanges !== undefined
+                    ? rebaseInlineRangesAfterSlashCommandRewrite(
+                        opts.slashCommandRanges,
+                        message,
+                        resolvedMessage,
+                      )
+                    : undefined;
+                }
+
                 if (shouldEnableCollab) {
                   try {
                     const result = await window.electronAPI.maker.enableOrca(
@@ -3524,7 +3608,7 @@ export function NewMakerDraftRoute() {
 
                 const accepted = await makerChatStore.sendMessage(
                   newSession.id,
-                  message,
+                  messageForSend,
                   model,
                   effort,
                   permissionMode,
@@ -3533,14 +3617,14 @@ export function NewMakerDraftRoute() {
                   mentions,
                   {
                     ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
-                    ...(opts?.agentReferences?.length
-                      ? { agentReferences: opts.agentReferences }
+                    ...(agentReferencesForSend?.length
+                      ? { agentReferences: agentReferencesForSend }
                       : {}),
-                    ...(opts?.pastedTextRanges?.length
-                      ? { pastedTextRanges: opts.pastedTextRanges }
+                    ...(pastedTextRangesForSend?.length
+                      ? { pastedTextRanges: pastedTextRangesForSend }
                       : {}),
-                    ...(opts?.slashCommandRanges !== undefined
-                      ? { slashCommandRanges: opts.slashCommandRanges }
+                    ...(slashCommandRangesForSend !== undefined
+                      ? { slashCommandRanges: slashCommandRangesForSend }
                       : {}),
                   },
                 );
@@ -4643,6 +4727,15 @@ export function NewMakerDraftRoute() {
                     }
                     narrowToolbar={isDraftToolbarNarrow}
                     paletteMaxHeight={240}
+                    allowPendingProjectSkillSelection={
+                      persistedAgentKind === 'pi'
+                      && !!effectiveWorkingDir
+                      && !effectiveRemoteHostId
+                      && !isDeviceLinkDraft
+                    }
+                    pendingProjectSkillRoot={
+                      wtEnabled ? (wtBaseRepo ?? undefined) : undefined
+                    }
                     attachmentState={guardedAttachmentState}
                     draftKey={NEW_MAKER_DRAFT_KEY}
                     focusOnStorageKeyChange

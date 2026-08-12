@@ -33,12 +33,32 @@ export function isSlashCommandUnavailable(command: UnifiedCommand): boolean {
     && command.runtimeStatus === 'discovered';
 }
 
-export function hasAvailableSlashCommand(commands: readonly UnifiedCommand[]): boolean {
-  return commands.some((command) => !isSlashCommandUnavailable(command));
+/**
+ * A discovered Pi project Skill is not executable in an existing runtime, but
+ * New Maker may select it before the runtime exists. The delayed first-message
+ * handoff starts Pi, refreshes the catalog until the Skill is loaded, then
+ * rewrites the visible name to Pi's runtime command name before sending.
+ */
+export function isSlashCommandSelectable(
+  command: UnifiedCommand,
+  allowPendingProjectSkillSelection = false,
+): boolean {
+  return !isSlashCommandUnavailable(command) || allowPendingProjectSkillSelection;
+}
+
+export function hasAvailableSlashCommand(
+  commands: readonly UnifiedCommand[],
+  allowPendingProjectSkillSelection = false,
+): boolean {
+  return commands.some((command) => (
+    isSlashCommandSelectable(command, allowPendingProjectSkillSelection)
+  ));
 }
 
 export function slashCommandInvocationName(command: UnifiedCommand): string {
-  return command.kind === 'agent-skill' && command.runtimeCommandName
+  return command.kind === 'agent-skill'
+    && command.runtimeCommandName
+    && !isSlashCommandUnavailable(command)
     ? command.runtimeCommandName
     : command.name;
 }
@@ -89,8 +109,13 @@ export function rebaseInlineRangesAfterSlashCommandRewrite<T extends { start: nu
 }
 
 /** First available command index, or 0 when nothing is available/present. */
-export function firstAvailableSlashCommandIndex(commands: readonly UnifiedCommand[]): number {
-  const index = commands.findIndex((command) => !isSlashCommandUnavailable(command));
+export function firstAvailableSlashCommandIndex(
+  commands: readonly UnifiedCommand[],
+  allowPendingProjectSkillSelection = false,
+): number {
+  const index = commands.findIndex((command) => (
+    isSlashCommandSelectable(command, allowPendingProjectSkillSelection)
+  ));
   return index >= 0 ? index : 0;
 }
 
@@ -99,12 +124,13 @@ export function nextAvailableSlashCommandIndex(
   commands: readonly UnifiedCommand[],
   current: number,
   delta: 1 | -1,
+  allowPendingProjectSkillSelection = false,
 ): number {
   if (commands.length === 0) return current;
   let index = current;
   for (let step = 0; step < commands.length; step++) {
     index = (index + delta + commands.length) % commands.length;
-    if (!isSlashCommandUnavailable(commands[index])) return index;
+    if (isSlashCommandSelectable(commands[index], allowPendingProjectSkillSelection)) return index;
   }
   return current;
 }
@@ -378,6 +404,101 @@ export async function reconcilePiRuntimeCommandForDispatchWithRetry(params: {
     });
   }
   return result;
+}
+
+function normalizeProjectSkillPath(value: string): { path: string; windows: boolean } | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const withoutLongPrefix = trimmed.startsWith('\\\\?\\UNC\\')
+    ? `//${trimmed.slice('\\\\?\\UNC\\'.length)}`
+    : trimmed.startsWith('\\\\?\\')
+      ? trimmed.slice('\\\\?\\'.length)
+      : trimmed;
+  const windows = /^[A-Za-z]:[\\/]/.test(withoutLongPrefix)
+    || withoutLongPrefix.startsWith('\\\\')
+    || withoutLongPrefix.startsWith('//');
+  let normalized = withoutLongPrefix.replace(/\\/g, '/');
+  const prefix = normalized.startsWith('//') ? '//' : '';
+  normalized = prefix + normalized.slice(prefix.length).replace(/\/+/g, '/');
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    if (/^[A-Za-z]:\/$/.test(normalized)) break;
+    normalized = normalized.slice(0, -1);
+  }
+  return { path: windows ? normalized.toLowerCase() : normalized, windows };
+}
+
+function projectRelativeSkillPath(projectRoot: string, skillPath: string): string | null {
+  const root = normalizeProjectSkillPath(projectRoot);
+  const skill = normalizeProjectSkillPath(skillPath);
+  if (!root || !skill || root.windows !== skill.windows) return null;
+  if (skill.path === root.path) return '';
+  const prefix = root.path.endsWith('/') ? root.path : `${root.path}/`;
+  return skill.path.startsWith(prefix) ? skill.path.slice(prefix.length) : null;
+}
+
+export function isSameProjectSkillAcrossRoots(params: {
+  sourceProjectRoot: string;
+  sourceSkillPath: string;
+  targetProjectRoot: string;
+  targetSkillPath: string;
+}): boolean {
+  const sourceRelative = projectRelativeSkillPath(
+    params.sourceProjectRoot,
+    params.sourceSkillPath,
+  );
+  const targetRelative = projectRelativeSkillPath(
+    params.targetProjectRoot,
+    params.targetSkillPath,
+  );
+  return sourceRelative !== null && sourceRelative === targetRelative;
+}
+
+/**
+ * New Maker can select a discovered Pi project Skill before a runtime exists.
+ * Worktree creation changes the physical project root, so that first message
+ * must be rebound against the newly created directory instead of trusting the
+ * palette snapshot from the base repository.
+ */
+export async function resolvePendingPiProjectSkillForDispatch(params: {
+  sessionId: string;
+  commandName: string;
+  message: string;
+  reload: () => Promise<UnifiedCommand[]>;
+  prepareRuntime: () => Promise<void>;
+  sourceProjectRoot: string;
+  sourceSkillPath: string;
+  targetProjectRoot: string;
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number) => Promise<void>;
+}): Promise<string | null> {
+  const retryDelaysMs = params.retryDelaysMs ?? PI_RUNTIME_SKILL_RETRY_DELAYS_MS;
+  const sleep = params.sleep ?? ((delayMs: number) => new Promise<void>(
+    (resolve) => window.setTimeout(resolve, delayMs),
+  ));
+  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate) => (
+    candidate.kind === 'agent-skill'
+    && candidate.name.toLowerCase() === params.commandName.toLowerCase()
+    && candidate.scope === 'repo'
+    && candidate.runtimeStatus === 'loaded'
+    && !!candidate.path
+    && isSameProjectSkillAcrossRoots({
+      sourceProjectRoot: params.sourceProjectRoot,
+      sourceSkillPath: params.sourceSkillPath,
+      targetProjectRoot: params.targetProjectRoot,
+      targetSkillPath: candidate.path,
+    })
+  ));
+
+  await params.prepareRuntime();
+  let commands = await params.reload();
+  let command = findLoadedTarget(commands);
+  for (const delayMs of retryDelaysMs) {
+    if (command) break;
+    await sleep(delayMs);
+    commands = await params.reload();
+    command = findLoadedTarget(commands);
+  }
+  return command ? rewriteAgentSkillInvocationForDispatch(params.message, command) : null;
 }
 
 /**

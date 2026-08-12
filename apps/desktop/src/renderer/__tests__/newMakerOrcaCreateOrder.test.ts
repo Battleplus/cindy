@@ -165,6 +165,34 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(pendingBranch).toContain('PI_RUNTIME_SKILL_RETRY_DELAYS_MS');
   });
 
+  it('lets only a new local Pi project select a discovered Skill before startup loads it', () => {
+    expect(source).toContain('allowPendingProjectSkillSelection={');
+    expect(source).toContain("persistedAgentKind === 'pi'");
+    expect(source).toContain('!!effectiveWorkingDir');
+    expect(source).toContain('!effectiveRemoteHostId');
+    expect(source).toContain('!isDeviceLinkDraft');
+    expect(source).toContain('pendingProjectSkillRoot={');
+    expect(source).toContain('wtEnabled ? (wtBaseRepo ?? undefined) : undefined');
+  });
+
+  it('rebinds a selected Pi project Skill to the created worktree before sending', () => {
+    const worktreeBranch = source.slice(
+      source.indexOf('if (!isRemoteProjectDraft && wt.enabled && wt.baseRepo)'),
+      source.indexOf('// 普通路径:', source.indexOf('if (!isRemoteProjectDraft && wt.enabled && wt.baseRepo)')),
+    );
+    const resolveSkill = worktreeBranch.indexOf('resolvePendingPiProjectSkillForDispatch({');
+    const send = worktreeBranch.indexOf('makerChatStore.sendMessage(');
+
+    expect(resolveSkill).toBeGreaterThan(-1);
+    expect(resolveSkill).toBeLessThan(send);
+    expect(worktreeBranch).toContain('sourceProjectRoot: opts.pendingProjectSkillRoot');
+    expect(worktreeBranch).toContain('sourceSkillPath: opts.pendingProjectSkillPath');
+    expect(worktreeBranch).toContain('targetProjectRoot: newDir');
+    expect(worktreeBranch).toContain("toast.warning(t('commandPalette.projectSkillMissingInWorktree'))");
+    expect(worktreeBranch).toContain('restoreFirstMessageDraft();');
+    expect(worktreeBranch).toContain('messageForSend');
+  });
+
   it('reconciles Pi skill aliases after the user selects a working directory', () => {
     const workingDirHandler = sessionViewSource
       .slice(
