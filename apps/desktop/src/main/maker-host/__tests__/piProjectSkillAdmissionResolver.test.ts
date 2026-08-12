@@ -214,7 +214,10 @@ describe('resolveDesktopPiProjectTrustInput', () => {
     });
     expect(snapshot?.approval?.revision).toMatch(/^auto-skills-v1:[a-f0-9]{64}$/);
     expect(snapshot?.discovered.skills).toEqual(
-      project.skills.map((skill) => fs.realpathSync(skill))
+      project.skills.map((skill) => path.join(
+        identity.canonicalRepoRoot!,
+        path.relative(project.repo, skill),
+      ))
         .sort((left, right) => left.localeCompare(right)),
     );
     expect(snapshot?.discovered).toMatchObject({ settings: [], packages: [], extensions: [] });
@@ -245,10 +248,11 @@ describe('resolveDesktopPiProjectTrustInput', () => {
     );
 
     expect(scanProjectSkills).toHaveBeenCalledTimes(6);
+    expect(restarted).not.toBeNull();
     expect(first?.approval?.revision).not.toBe(second?.approval?.revision);
     expect(restarted?.approval?.revision).not.toBe(first?.approval?.revision);
     expect(restarted?.discovered.skills).toContain(
-      path.join(restarted.identity.canonicalWorkingDir!, '.pi', 'skills', path.basename(added)),
+      path.join(restarted!.identity.canonicalWorkingDir!, '.pi', 'skills', path.basename(added)),
     );
     expect(second?.discovered.skills).toEqual([
       path.join(second!.identity.canonicalRepoRoot!, '.agents', 'skills', 'repo-skill'),

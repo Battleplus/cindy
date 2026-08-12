@@ -125,6 +125,7 @@ describe('Pi project skill availability', () => {
   it('keeps the palette label and records the Pi runtime command separately', () => {
     const loaded = skill({
       name: 'demo',
+      path: '/repo/.pi/skills/demo',
       scope: 'repo',
       runtimeStatus: 'loaded',
       runtimeCommandName: 'skill:demo',
@@ -134,6 +135,8 @@ describe('Pi project skill availability', () => {
     expect(agentSkillInvocationForDispatch('/demo arg', loaded)).toEqual({
       name: 'demo',
       runtimeCommandName: 'skill:demo',
+      scope: 'repo',
+      sourcePath: '/repo/.pi/skills/demo',
     });
     expect(agentSkillInvocationForDispatch('/demo', skill({
       name: 'demo',
@@ -439,7 +442,12 @@ describe('resolvePendingPiProjectSkillForDispatch', () => {
       prepareRuntime,
       reload: async () => [{ ...loaded, path: '/repo/.cindy-worktrees/demo/.pi/skills/demo' }],
       retryDelaysMs: [],
-    })).resolves.toEqual({ name: 'demo', runtimeCommandName: 'skill:demo' });
+    })).resolves.toEqual({
+      name: 'demo',
+      runtimeCommandName: 'skill:demo',
+      scope: 'repo',
+      sourcePath: '/repo/.cindy-worktrees/demo/.pi/skills/demo',
+    });
     expect(prepareRuntime).toHaveBeenCalledOnce();
   });
 
@@ -480,7 +488,12 @@ describe('resolvePendingPiProjectSkillForDispatch', () => {
       },
       retryDelaysMs: [10],
       sleep: async (delayMs) => { sleeps.push(delayMs); },
-    })).resolves.toEqual({ name: 'demo', runtimeCommandName: 'skill:demo' });
+    })).resolves.toEqual({
+      name: 'demo',
+      runtimeCommandName: 'skill:demo',
+      scope: 'repo',
+      sourcePath: '/repo/.cindy-worktrees/demo/.pi/skills/demo',
+    });
     expect(sleeps).toEqual([10]);
   });
 
@@ -526,7 +539,12 @@ describe('resolvePendingPiProjectSkillForDispatch', () => {
         }),
       ],
       retryDelaysMs: [],
-    })).resolves.toEqual({ name: 'demo', runtimeCommandName: 'skill:project-demo' });
+    })).resolves.toEqual({
+      name: 'demo',
+      runtimeCommandName: 'skill:project-demo',
+      scope: 'repo',
+      sourcePath: '/repo/.cindy-worktrees/demo/.pi/skills/demo',
+    });
   });
 
   it('rejects a same-name project Skill at a different relative path', async () => {
@@ -559,19 +577,34 @@ describe('isSameProjectSkillAcrossRoots', () => {
     })).toBe(true);
   });
 
-  it('matches Windows drive and UNC paths case-insensitively', () => {
+  it('matches Windows paths only when their project-relative spelling is exact', () => {
     expect(isSameProjectSkillAcrossRoots({
       sourceProjectRoot: 'C:\\Repo',
-      sourceSkillPath: 'c:\\repo\\.pi\\skills\\Demo',
+      sourceSkillPath: 'C:\\Repo\\.pi\\skills\\Demo',
       targetProjectRoot: 'D:\\Worktrees\\Task',
-      targetSkillPath: 'd:\\worktrees\\task\\.PI\\SKILLS\\demo',
+      targetSkillPath: 'D:\\Worktrees\\Task\\.pi\\skills\\Demo',
     })).toBe(true);
     expect(isSameProjectSkillAcrossRoots({
       sourceProjectRoot: '\\\\server\\share\\Repo',
-      sourceSkillPath: '\\\\SERVER\\SHARE\\repo\\.agents\\skills\\demo',
+      sourceSkillPath: '\\\\server\\share\\Repo\\.agents\\skills\\demo',
       targetProjectRoot: '\\\\server\\share\\worktrees\\task',
-      targetSkillPath: '\\\\SERVER\\SHARE\\WORKTREES\\TASK\\.AGENTS\\SKILLS\\DEMO',
+      targetSkillPath: '\\\\server\\share\\worktrees\\task\\.agents\\skills\\demo',
     })).toBe(true);
+    expect(isSameProjectSkillAcrossRoots({
+      sourceProjectRoot: 'C:\\Repo',
+      sourceSkillPath: 'C:\\Repo\\.pi\\skills\\Demo',
+      targetProjectRoot: 'D:\\Worktrees\\Task',
+      targetSkillPath: 'D:\\Worktrees\\Task\\.pi\\skills\\demo',
+    })).toBe(false);
+  });
+
+  it('does not erase meaningful trailing spaces from Windows Skill paths', () => {
+    expect(isSameProjectSkillAcrossRoots({
+      sourceProjectRoot: 'C:\\Repo',
+      sourceSkillPath: 'C:\\Repo\\.pi\\skills\\Demo ',
+      targetProjectRoot: 'D:\\Worktrees\\Task',
+      targetSkillPath: 'D:\\Worktrees\\Task\\.pi\\skills\\Demo',
+    })).toBe(false);
   });
 
   it('rejects paths outside either project root', () => {

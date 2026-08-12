@@ -58,6 +58,8 @@ export function hasAvailableSlashCommand(
 export interface AgentSkillInvocation {
   name: string;
   runtimeCommandName: string;
+  scope: NonNullable<Extract<UnifiedCommand, { kind: 'agent-skill' }>['scope']>;
+  sourcePath?: string;
 }
 
 /** Resolve an available Skill alias without changing its user-visible text. */
@@ -69,13 +71,20 @@ export function agentSkillInvocationForDispatch(
     !command
     || command.kind !== 'agent-skill'
     || !command.runtimeCommandName
+    || !command.scope
+    || !command.path
     || isSlashCommandUnavailable(command)
   ) {
     return undefined;
   }
   const match = message.match(/^\/(\S+)([\s\S]*)$/);
   if (!match || match[1].toLowerCase() !== command.name.toLowerCase()) return undefined;
-  return { name: command.name, runtimeCommandName: command.runtimeCommandName };
+  return {
+    name: command.name,
+    runtimeCommandName: command.runtimeCommandName,
+    scope: command.scope,
+    sourcePath: command.path,
+  };
 }
 
 /** First available command index, or 0 when nothing is available/present. */
@@ -377,13 +386,12 @@ export async function reconcilePiRuntimeCommandForDispatchWithRetry(params: {
 }
 
 function normalizeProjectSkillPath(value: string): { path: string; windows: boolean } | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const withoutLongPrefix = trimmed.startsWith('\\\\?\\UNC\\')
-    ? `//${trimmed.slice('\\\\?\\UNC\\'.length)}`
-    : trimmed.startsWith('\\\\?\\')
-      ? trimmed.slice('\\\\?\\'.length)
-      : trimmed;
+  if (!value || value.includes('\0')) return null;
+  const withoutLongPrefix = value.startsWith('\\\\?\\UNC\\')
+    ? `//${value.slice('\\\\?\\UNC\\'.length)}`
+    : value.startsWith('\\\\?\\')
+      ? value.slice('\\\\?\\'.length)
+      : value;
   const windows = /^[A-Za-z]:[\\/]/.test(withoutLongPrefix)
     || withoutLongPrefix.startsWith('\\\\')
     || withoutLongPrefix.startsWith('//');
@@ -394,7 +402,10 @@ function normalizeProjectSkillPath(value: string): { path: string; windows: bool
     if (/^[A-Za-z]:\/$/.test(normalized)) break;
     normalized = normalized.slice(0, -1);
   }
-  return { path: windows ? normalized.toLowerCase() : normalized, windows };
+  // No host comparison identity reaches this renderer-only worktree helper.
+  // Preserve case so Windows case-sensitive directories fail closed instead
+  // of binding a different Skill that differs only by case.
+  return { path: normalized, windows };
 }
 
 function projectRelativeSkillPath(projectRoot: string, skillPath: string): string | null {
@@ -444,10 +455,12 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
   const sleep = params.sleep ?? ((delayMs: number) => new Promise<void>(
     (resolve) => window.setTimeout(resolve, delayMs),
   ));
-  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate): candidate is Extract<
-    UnifiedCommand,
-    { kind: 'agent-skill' }
-  > => (
+  type LoadedProjectSkill = Extract<UnifiedCommand, { kind: 'agent-skill' }> & {
+    scope: 'repo';
+    path: string;
+    runtimeCommandName: string;
+  };
+  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate): candidate is LoadedProjectSkill => (
     candidate.kind === 'agent-skill'
     && candidate.name.toLowerCase() === params.commandName.toLowerCase()
     && candidate.scope === 'repo'
@@ -471,7 +484,12 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
     command = findLoadedTarget(commands);
   }
   if (!command?.runtimeCommandName) return null;
-  return { name: command.name, runtimeCommandName: command.runtimeCommandName };
+  return {
+    name: command.name,
+    runtimeCommandName: command.runtimeCommandName,
+    scope: command.scope,
+    sourcePath: command.path,
+  };
 }
 
 /**

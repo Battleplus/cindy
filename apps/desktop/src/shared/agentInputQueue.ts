@@ -194,11 +194,16 @@ export interface AgentInputQueuedMessage {
    * `/name`，让输入框、排队行与历史消息共用同一套 Slash 胶囊坐标；只有
    * {@link buildMakerUserMessage} 在真正构造 Agent 输入时将它改写为
    * `/${runtimeCommandName}`。这不是批准能力，也不能让未装配的 Skill 变为可用；
-   * Renderer 只会在 Main 返回的当前 Pi runtime catalog 命中后写入该映射。
+   * Renderer 只会在 Main 返回的当前 Pi runtime catalog 命中后写入该路由声明；
+   * Main 在每次实际 dispatch 前仍会用当前 runtime provenance 重新验证。
    */
   agentSkillInvocation?: {
     name: string;
     runtimeCommandName: string;
+    /** Scanner scope captured with the catalog hit; missing legacy values fail closed. */
+    scope?: 'global' | 'project' | 'user' | 'repo' | 'system' | 'admin';
+    /** Exact scanner source used to bind repo-scoped Skills to runtime provenance. */
+    sourcePath?: string;
   };
   /**
    * Host-owned receipt for the first acceptance boundary.  The controlled
@@ -535,7 +540,7 @@ export function updateQueuedMessageText(
     persistedContent: nextPersisted,
     chatMessage: nextChatMessage,
   };
-  // 队列纯文本编辑若只改参数，仍应保持已核验的 runtime 映射；一旦首个 token
+  // 队列纯文本编辑若只改参数，仍可保持原 runtime 路由声明；一旦首个 token
   // 改名或被移除就 fail closed，绝不能让旧 Skill 身份附着到另一条正文上。
   if (
     entry.agentSkillInvocation

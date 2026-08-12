@@ -101,7 +101,7 @@ async function persistQueuedUserMessage(
 ): Promise<void> {
   const persist = sendOpts.persistUserMessage;
   if (!persist) return;
-  (persist as { onPersisting?: () => void }).onPersisting?.();
+  await (persist as { onPersisting?: () => void | Promise<void> }).onPersisting?.();
   try {
     await mocks.createMessage(
       sessionId,
@@ -242,6 +242,9 @@ function createHarness(opts?: {
 
   let hasPendingCredentialSwitch: (() => boolean) | null = null;
   let screenUserMessage: NonNullable<AgentInputCoordinatorDeps['screenUserMessage']> | null = null;
+  let validateAgentSkillInvocation: NonNullable<
+    AgentInputCoordinatorDeps['validateAgentSkillInvocation']
+  > = () => true;
   const onUserMessageBlocked = vi.fn<
     NonNullable<AgentInputCoordinatorDeps['onUserMessageBlocked']>
   >(() => {});
@@ -285,6 +288,8 @@ function createHarness(opts?: {
     hasPendingInteraction: () => pendingInteraction,
     getAgentKind: () => agentKind,
     getSdkSessionId,
+    validateAgentSkillInvocation: (sessionId, item) =>
+      validateAgentSkillInvocation(sessionId, item),
     hasAssistantProgressAfter: (sessionId, userClientId) =>
       hasAssistantProgressAfter
         ? hasAssistantProgressAfter(sessionId, userClientId)
@@ -367,6 +372,11 @@ function createHarness(opts?: {
     onUserMessageRewritten,
     setScreenUserMessage(fn: NonNullable<AgentInputCoordinatorDeps['screenUserMessage']> | null) {
       screenUserMessage = fn;
+    },
+    setValidateAgentSkillInvocation(
+      fn: NonNullable<AgentInputCoordinatorDeps['validateAgentSkillInvocation']>,
+    ) {
+      validateAgentSkillInvocation = fn;
     },
     setHasAssistantProgressAfter(
       fn: ((sessionId: string, userClientId: string) => Promise<boolean>) | null,
@@ -4786,6 +4796,7 @@ describe('AgentInputCoordinator steer transaction', () => {
       sid,
       { type: 'user', content: 'second' },
       expect.objectContaining({ messageUuid: expect.any(String) }),
+      expect.objectContaining({ clientId: second.clientId }),
     );
     expect(h.sendToAgent).toHaveBeenCalledTimes(1);
     expect(latestProjection(h.projections).pendingQueue).toHaveLength(0);
@@ -4888,6 +4899,44 @@ describe('AgentInputCoordinator steer transaction', () => {
     expect(projection.pendingQueue).toEqual([]);
     expect(projection.error).toBeNull();
     expect(projection.recovery).toBeNull();
+  });
+
+  it('fails closed and preserves a Pi Skill steer when runtime validation throws', async () => {
+    const h = createHarness();
+    h.setAgentKind('pi');
+    const sid = 'steer-stale-pi-skill';
+    const first = makeItem('q-1', 'first');
+    const second = makeItem('q-2', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    });
+    h.setValidateAgentSkillInvocation(() => {
+      throw new Error('scanner unavailable');
+    });
+
+    h.coordinator.enqueue(sid, first);
+    await flush();
+    h.coordinator.enqueue(sid, second);
+    await flush();
+
+    await expect(h.coordinator.steer(sid, second, { removeFromQueue: true })).resolves.toBe(false);
+    await flush();
+
+    const projection = latestProjection(h.projections);
+    expect(h.steerToAgent).not.toHaveBeenCalled();
+    expect(mocks.createMessage).toHaveBeenCalledTimes(1);
+    expect(projection.pendingQueue.map((item) => item.clientId)).toEqual(['q-2']);
+    expect(projection.recovery).toEqual({ kind: 'queue-head', clientId: 'q-2' });
+    expect(projection.error).toContain('Skill is not loaded from the selected source');
   });
 
   it('preserves a capability-rejected steer when the original active turn errors concurrently', async () => {
@@ -5002,6 +5051,7 @@ describe('AgentInputCoordinator steer transaction', () => {
       sid,
       { type: 'user', content: 'rewritten text' },
       expect.objectContaining({ messageUuid: expect.any(String) }),
+      expect.objectContaining({ clientId: second.clientId }),
     );
     expect(h.onUserMessageRewritten).toHaveBeenCalledWith(
       sid,
@@ -5229,6 +5279,7 @@ describe('AgentInputCoordinator steer transaction', () => {
       sid,
       { type: 'user', content: 'second' },
       expect.objectContaining({ messageUuid: expect.any(String) }),
+      expect.objectContaining({ clientId: second.clientId }),
     );
     expect(latestProjection(h.projections).pendingQueue).toHaveLength(0);
     expect(mocks.createMessage).toHaveBeenNthCalledWith(
@@ -6086,6 +6137,50 @@ describe('AgentInputCoordinator crash-recovery queue snapshots (issue #761)', ()
     await flush();
     expect(h.sendToAgent).toHaveBeenCalledTimes(1);
     expect(h.sendToAgent.mock.calls[0]?.[1]).toEqual({ type: 'user', content: 'first' });
+  });
+
+  it('keeps a restored Pi Skill at the queue head when the current runtime rejects its receipt', async () => {
+    const h = createHarness();
+    const sid = 'snapshot-stale-pi-skill';
+    const restored = makeItem('r-skill', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    });
+    h.setLoadQueueSnapshot(async () => [restored]);
+    const validate = vi.fn<NonNullable<AgentInputCoordinatorDeps['validateAgentSkillInvocation']>>(
+      () => { throw new Error('scanner unavailable'); },
+    );
+    h.setValidateAgentSkillInvocation(validate);
+
+    await h.coordinator.ensureQueueRestored(sid);
+    h.coordinator.resume(sid);
+    await flush();
+
+    const projection = latestProjection(h.projections);
+    expect(mocks.createMessage).not.toHaveBeenCalled();
+    expect(projection.pendingQueue.map((queued) => queued.clientId)).toEqual(['r-skill']);
+    expect(projection.recovery).toEqual({ kind: 'queue-head', clientId: 'r-skill' });
+    expect(projection.error).toContain('Skill is not loaded from the selected source');
+    expect(validate).toHaveBeenCalledTimes(1);
+
+    validate.mockImplementation(() => true);
+    await h.coordinator.retryLastError(sid);
+    await flush();
+    expect(mocks.createMessage).toHaveBeenCalledTimes(1);
+    expect(h.sendToAgent.mock.calls.at(-1)?.[1]).toEqual({
+      type: 'user',
+      content: '/skill:demo inspect',
+    });
+    expect(validate).toHaveBeenCalledTimes(3);
   });
 
   it('releases a crash-restored paused queue on explicit user input (resumeRestorePausedQueue)', async () => {

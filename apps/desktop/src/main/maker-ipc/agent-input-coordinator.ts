@@ -61,6 +61,10 @@ import {
   RECOVERY_CHECKPOINT_MARKER,
   type RecoveryContextSnapshot,
 } from './recoveryCoordinator.js';
+import {
+  isStalePiSkillInvocationError,
+  stalePiSkillInvocationError,
+} from './piSkillInvocationValidation.js';
 
 const log = createLogger('maker-input-coordinator');
 const SESSION_RUNNING_RETRY_DELAY_MS = 250;
@@ -214,7 +218,7 @@ export interface AgentInputSendOpts {
      */
     origin?: AgentInputQueuedMessage['origin'];
     shouldBroadcast?: () => boolean;
-    onPersisting?: () => void;
+    onPersisting?: () => void | Promise<void>;
     onPersisted?: () => void | Promise<void>;
     onPersistFailed?: () => void;
   };
@@ -251,6 +255,7 @@ export interface AgentInputCoordinatorDeps {
     sessionId: string,
     message: AgentInputMakerMessage,
     sendOpts: AgentInputSendOpts,
+    item: AgentInputQueuedMessage,
   ) => Promise<void>;
   abortSession: (sessionId: string) => Promise<void>;
   isTurnRunning: (sessionId: string) => boolean;
@@ -268,6 +273,11 @@ export interface AgentInputCoordinatorDeps {
   hasPendingInteraction: (sessionId: string) => boolean;
   getAgentKind: (sessionId: string) => AgentInputCreateOpts['agentKind'] | null;
   getSdkSessionId: (sessionId: string) => Promise<string | undefined>;
+  /** Final host check against the exact live Pi runtime; false blocks dispatch. */
+  validateAgentSkillInvocation?: (
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+  ) => boolean | Promise<boolean>;
   /** Read a bounded, durable progress snapshot before a retry is re-enqueued. */
   getRecoveryContextSnapshot?: (
     sessionId: string,
@@ -863,6 +873,21 @@ export class AgentInputCoordinator {
   private readonly autoResumeDispatchAttempts = new Map<string, number>();
 
   constructor(private readonly deps: AgentInputCoordinatorDeps) {}
+
+  private async assertAgentSkillInvocationCurrent(
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+  ): Promise<void> {
+    if (!item.agentSkillInvocation) return;
+    try {
+      if (await this.deps.validateAgentSkillInvocation?.(sessionId, item) !== true) {
+        throw stalePiSkillInvocationError();
+      }
+    } catch (error) {
+      if (isStalePiSkillInvocationError(error)) throw error;
+      throw stalePiSkillInvocationError();
+    }
+  }
 
   /**
    * 媒体回收器活引用取证(recycler.ts 的内存队列暂存区):序列化所有会话在
@@ -1781,15 +1806,21 @@ export class AgentInputCoordinator {
         item.persistedContent,
         referenceContexts,
       );
-      await this.deps.steerToAgent(sessionId, buildMakerUserMessage(item, referenceContexts), {
-        messageUuid,
-        userName: item.userName,
-        signal: AbortSignal.any([inputBoundarySignal, steerAbort.signal]),
-        expectedClearBoundaryMs: steerClearBoundaryMs,
-        expectedInputGeneration: steerGeneration,
-        // 同 drain:steer 投递也在入队时的 async context 之外。
-        ...(item.fromMobileClient ? { fromMobileClient: true } : {}),
-      });
+      await this.assertAgentSkillInvocationCurrent(sessionId, item);
+      await this.deps.steerToAgent(
+        sessionId,
+        buildMakerUserMessage(item, referenceContexts),
+        {
+          messageUuid,
+          userName: item.userName,
+          signal: AbortSignal.any([inputBoundarySignal, steerAbort.signal]),
+          expectedClearBoundaryMs: steerClearBoundaryMs,
+          expectedInputGeneration: steerGeneration,
+          // 同 drain:steer 投递也在入队时的 async context 之外。
+          ...(item.fromMobileClient ? { fromMobileClient: true } : {}),
+        },
+        item,
+      );
     } catch (err) {
       this.clearSteerAbortController(sessionId, item.clientId);
       const latest = this.getState(sessionId);
@@ -1846,7 +1877,7 @@ export class AgentInputCoordinator {
         // 恢复到队首并留下 typed recovery；用户切换到视觉模型后可原样重试。与 ack
         // 超时不同，这里不暂停队列，因为不存在重复投递风险。marker 已被 Stop/clear
         // 清掉时不会进本分支，因此不会把显式丢弃的消息复活。
-        if (isPiImageInputUnsupportedError(err)) {
+        if (isPiImageInputUnsupportedError(err) || isStalePiSkillInvocationError(err)) {
           this.movePreparedItemToQueueFront(latest, item, true);
           this.movePendingCompactWaitClientIdToFront(latest, item.clientId);
           latest.recovery = { kind: 'queue-head', clientId: item.clientId };
@@ -3247,7 +3278,8 @@ export class AgentInputCoordinator {
             ...(head.recoveryCheckpoint ? { recoveryCheckpoint: head.recoveryCheckpoint } : {}),
             ...(head.origin ? { origin: head.origin } : {}),
             shouldBroadcast: () => this.isTurnGenerationCurrent(sessionId, active),
-            onPersisting: () => {
+            onPersisting: async () => {
+              await this.assertAgentSkillInvocationCurrent(sessionId, head);
               this.notifyUserMessagePersisting(sessionId, head);
               if (this.isTurnGenerationCurrent(sessionId, active)) {
                 active.persisting = true;
@@ -3283,6 +3315,10 @@ export class AgentInputCoordinator {
                   '[SEND_CANCELLED_BEFORE_DISPATCH] User turn was cancelled before vendor dispatch',
                 );
               }
+              // Host hooks above may await long-running work. Rebind to the
+              // exact current Pi runtime immediately before the transaction
+              // returns to its synchronous vendor-dispatch fence.
+              await this.assertAgentSkillInvocationCurrent(sessionId, head);
               active.dispatchLifecycle = 'sending';
             },
             onPersistFailed: () => {
