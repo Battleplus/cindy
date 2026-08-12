@@ -142,7 +142,7 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     );
   });
 
-  it('rebases delayed-create inline metadata after rewriting a Pi skill alias', () => {
+  it('keeps delayed-create display metadata while carrying the Pi runtime mapping separately', () => {
     const pendingBranch = sessionViewSource
       .slice(
         sessionViewSource.indexOf('const pending = consumePending(sessionId);'),
@@ -150,18 +150,12 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
       )
       .replace(/\r\n/g, '\n');
 
-    expect(pendingBranch).toContain(
-      'rebaseInlineRangesAfterSlashCommandRewrite(\n              pending.agentReferences,',
-    );
-    expect(pendingBranch).toContain(
-      'rebaseInlineRangesAfterSlashCommandRewrite(\n              pending.pastedTextRanges,',
-    );
-    expect(pendingBranch).toMatch(
-      /rebaseInlineRangesAfterSlashCommandRewrite\(\s*\n\s*pending\.slashCommandRanges,/,
-    );
-    expect(pendingBranch).toContain('agentReferences: pendingAgentReferences');
-    expect(pendingBranch).toContain('pastedTextRanges: pendingPastedTextRanges');
-    expect(pendingBranch).toContain('slashCommandRanges: pendingSlashCommandRanges');
+    expect(pendingBranch).not.toContain('rebaseInlineRangesAfterSlashCommandRewrite');
+    expect(pendingBranch).toContain('pending.text,');
+    expect(pendingBranch).toContain('agentReferences: pending.agentReferences');
+    expect(pendingBranch).toContain('pastedTextRanges: pending.pastedTextRanges');
+    expect(pendingBranch).toContain('slashCommandRanges: pending.slashCommandRanges');
+    expect(pendingBranch).toContain('agentSkillInvocation: slashDispatch.agentSkillInvocation');
     expect(pendingBranch).toContain('PI_RUNTIME_SKILL_RETRY_DELAYS_MS');
   });
 
@@ -190,7 +184,11 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(worktreeBranch).toContain('targetProjectRoot: newDir');
     expect(worktreeBranch).toContain("toast.warning(t('commandPalette.projectSkillMissingInWorktree'))");
     expect(worktreeBranch).toContain('restoreFirstMessageDraft();');
-    expect(worktreeBranch).toContain('messageForSend');
+    expect(worktreeBranch).toContain('const resolvedInvocation =');
+    expect(worktreeBranch).toContain('agentSkillInvocation = resolvedInvocation;');
+    expect(worktreeBranch).toContain('newSession.id,\n                  message,');
+    expect(worktreeBranch).toContain('agentSkillInvocation }');
+    expect(worktreeBranch).not.toContain('messageForSend');
   });
 
   it('reconciles Pi skill aliases after the user selects a working directory', () => {
@@ -207,23 +205,24 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(workingDirHandler).toContain('preparePiRuntime: async () =>');
     expect(workingDirHandler).toContain("'maker:create-session'");
     expect(workingDirHandler).toContain('window.electronAPI.maker.createSession(createOpts)');
+    expect(workingDirHandler).not.toContain('rebaseInlineRangesAfterSlashCommandRewrite');
+    expect(workingDirHandler).toContain('pending.message,');
+    expect(workingDirHandler).toContain('agentReferences: pending.agentReferences');
+    expect(workingDirHandler).toContain('pastedTextRanges: pending.pastedTextRanges');
+    expect(workingDirHandler).toContain('slashCommandRanges: pending.slashCommandRanges');
     expect(workingDirHandler).toContain(
-      'rebaseInlineRangesAfterSlashCommandRewrite(\n                pending.agentReferences,',
+      'agentSkillInvocation: slashDispatch.agentSkillInvocation',
     );
-    expect(workingDirHandler).toContain(
-      'rebaseInlineRangesAfterSlashCommandRewrite(\n                pending.pastedTextRanges,',
-    );
-    expect(workingDirHandler).toMatch(
-      /rebaseInlineRangesAfterSlashCommandRewrite\(\s*\n\s*pending\.slashCommandRanges,/,
-    );
-    expect(workingDirHandler).toContain('slashDispatch.message,');
   });
 
   it('uses bounded Pi runtime reconciliation for ordinary sends and steering', () => {
     const slashDispatchBranch = sessionViewSource
       .slice(
-        sessionViewSource.indexOf('const originalMessage = message;'),
-        sessionViewSource.indexOf('if (slashDispatch.handled) return slashDispatch.accepted;'),
+        sessionViewSource.indexOf('// ── Slash command dispatch (palette refactor) ──'),
+        sessionViewSource.indexOf(
+          'if (slashDispatch.handled) return slashDispatch.accepted;',
+          sessionViewSource.indexOf('// ── Slash command dispatch (palette refactor) ──'),
+        ),
       )
       .replace(/\r\n/g, '\n');
 

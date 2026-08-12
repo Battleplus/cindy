@@ -229,7 +229,6 @@ import {
   loadAllCommands,
   nextAvailableSlashCommandIndex,
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
-  slashCommandInvocationName,
   type SlashCommandRosterState,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
@@ -4136,7 +4135,7 @@ export function ChatInput({
               editor.schema,
               from,
               runEnd,
-              slashCommandInvocationName(cmd),
+              cmd.name,
             );
           }
           return true;

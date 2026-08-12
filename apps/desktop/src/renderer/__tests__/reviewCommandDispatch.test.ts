@@ -17,8 +17,8 @@ describe('/review command dispatch', () => {
     expect(dispatchSource).toContain('serializeAttachedFiles(files)');
     expect(dispatchSource).toContain('.startReview({');
     expect(dispatchSource).toContain('await window.electronAPI.maker.startReview({');
-    expect(dispatchSource).toContain('return { handled: true, accepted: true, message }');
-    expect(dispatchSource).toContain('return { handled: true, accepted: false, message }');
+    expect(dispatchSource).toContain('return { handled: true, accepted: true }');
+    expect(dispatchSource).toContain('return { handled: true, accepted: false }');
     expect(sessionViewSource).toContain('if (slashDispatch.handled) return slashDispatch.accepted');
     expect(dispatchSource.indexOf('.startReview({')).toBeLessThan(
       dispatchSource.indexOf('void dispatchCommand(hit'),

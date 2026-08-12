@@ -37,7 +37,7 @@ export function isSlashCommandUnavailable(command: UnifiedCommand): boolean {
  * A discovered Pi project Skill is not executable in an existing runtime, but
  * New Maker may select it before the runtime exists. The delayed first-message
  * handoff starts Pi, refreshes the catalog until the Skill is loaded, then
- * rewrites the visible name to Pi's runtime command name before sending.
+ * records Pi's runtime command name separately for the send boundary.
  */
 export function isSlashCommandSelectable(
   command: UnifiedCommand,
@@ -55,57 +55,27 @@ export function hasAvailableSlashCommand(
   ));
 }
 
-export function slashCommandInvocationName(command: UnifiedCommand): string {
-  return command.kind === 'agent-skill'
-    && command.runtimeCommandName
-    && !isSlashCommandUnavailable(command)
-    ? command.runtimeCommandName
-    : command.name;
+export interface AgentSkillInvocation {
+  name: string;
+  runtimeCommandName: string;
 }
 
-/**
- * Palette selection already inserts runtimeCommandName. Apply the same mapping
- * to a matching command that the user typed or pasted directly before send.
- */
-export function rewriteAgentSkillInvocationForDispatch(
+/** Resolve an available Skill alias without changing its user-visible text. */
+export function agentSkillInvocationForDispatch(
   message: string,
   command: UnifiedCommand | undefined,
-): string {
+): AgentSkillInvocation | undefined {
   if (
-    !command ||
-    command.kind !== 'agent-skill' ||
-    !command.runtimeCommandName ||
-    isSlashCommandUnavailable(command)
+    !command
+    || command.kind !== 'agent-skill'
+    || !command.runtimeCommandName
+    || isSlashCommandUnavailable(command)
   ) {
-    return message;
+    return undefined;
   }
   const match = message.match(/^\/(\S+)([\s\S]*)$/);
-  if (!match || match[1].toLowerCase() !== command.name.toLowerCase()) return message;
-  return `/${command.runtimeCommandName}${match[2]}`;
-}
-
-/**
- * Rebase persisted/render-only inline ranges after the leading slash-command
- * token grows or shrinks during runtime alias rewriting.
- */
-export function rebaseInlineRangesAfterSlashCommandRewrite<T extends { start: number; end: number }>(
-  ranges: readonly T[],
-  originalMessage: string,
-  rewrittenMessage: string,
-): T[] {
-  if (originalMessage === rewrittenMessage) return [...ranges];
-  const originalCommand = originalMessage.match(/^\/\S+/)?.[0];
-  const rewrittenCommand = rewrittenMessage.match(/^\/\S+/)?.[0];
-  if (!originalCommand || !rewrittenCommand) return [...ranges];
-
-  const boundary = originalCommand.length;
-  const delta = rewrittenCommand.length - boundary;
-  if (delta === 0) return [...ranges];
-  return ranges.map((range) => ({
-    ...range,
-    start: range.start >= boundary ? range.start + delta : range.start,
-    end: range.end >= boundary ? range.end + delta : range.end,
-  }));
+  if (!match || match[1].toLowerCase() !== command.name.toLowerCase()) return undefined;
+  return { name: command.name, runtimeCommandName: command.runtimeCommandName };
 }
 
 /** First available command index, or 0 when nothing is available/present. */
@@ -462,7 +432,6 @@ export function isSameProjectSkillAcrossRoots(params: {
 export async function resolvePendingPiProjectSkillForDispatch(params: {
   sessionId: string;
   commandName: string;
-  message: string;
   reload: () => Promise<UnifiedCommand[]>;
   prepareRuntime: () => Promise<void>;
   sourceProjectRoot: string;
@@ -470,12 +439,15 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
   targetProjectRoot: string;
   retryDelaysMs?: readonly number[];
   sleep?: (delayMs: number) => Promise<void>;
-}): Promise<string | null> {
+}): Promise<AgentSkillInvocation | null> {
   const retryDelaysMs = params.retryDelaysMs ?? PI_RUNTIME_SKILL_RETRY_DELAYS_MS;
   const sleep = params.sleep ?? ((delayMs: number) => new Promise<void>(
     (resolve) => window.setTimeout(resolve, delayMs),
   ));
-  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate) => (
+  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate): candidate is Extract<
+    UnifiedCommand,
+    { kind: 'agent-skill' }
+  > => (
     candidate.kind === 'agent-skill'
     && candidate.name.toLowerCase() === params.commandName.toLowerCase()
     && candidate.scope === 'repo'
@@ -498,7 +470,8 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
     commands = await params.reload();
     command = findLoadedTarget(commands);
   }
-  return command ? rewriteAgentSkillInvocationForDispatch(params.message, command) : null;
+  if (!command?.runtimeCommandName) return null;
+  return { name: command.name, runtimeCommandName: command.runtimeCommandName };
 }
 
 /**

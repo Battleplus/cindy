@@ -122,8 +122,8 @@ import type { GoalLimitValues } from '@/components/new-chat/GoalAdvancedLimits';
 import { buildCreateOptsForCurrentSession, makerChatStore } from '@/lib/makerChatStore';
 import {
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
-  rebaseInlineRangesAfterSlashCommandRewrite,
   resolvePendingPiProjectSkillForDispatch,
+  type AgentSkillInvocation,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
 import { worktreeCreationStore } from '@/lib/worktreeCreationStore';
@@ -3502,10 +3502,7 @@ export function NewMakerDraftRoute() {
                 // 才进入 1.6s 平滑期, overlay 从 "空 ChatView" 自然过渡到 "已在
                 // streaming 的 ChatView", 不暴露中间空窗。clear 时机见本 async 块末尾。
 
-                let messageForSend = message;
-                let agentReferencesForSend = opts?.agentReferences;
-                let pastedTextRangesForSend = opts?.pastedTextRanges;
-                let slashCommandRangesForSend = opts?.slashCommandRanges;
+                let agentSkillInvocation: AgentSkillInvocation | undefined;
                 if (persistedAgentKind === 'pi' && opts?.pendingProjectSkillName) {
                   if (!opts.pendingProjectSkillPath || !opts.pendingProjectSkillRoot) {
                     worktreeCreationStore.clear(newSession.id);
@@ -3513,10 +3510,9 @@ export function NewMakerDraftRoute() {
                     toast.warning(t('commandPalette.projectSkillMissingInWorktree'));
                     return;
                   }
-                  const resolvedMessage = await resolvePendingPiProjectSkillForDispatch({
+                  const resolvedInvocation = await resolvePendingPiProjectSkillForDispatch({
                     sessionId: newSession.id,
                     commandName: opts.pendingProjectSkillName,
-                    message,
                     sourceProjectRoot: opts.pendingProjectSkillRoot,
                     sourceSkillPath: opts.pendingProjectSkillPath,
                     targetProjectRoot: newDir,
@@ -3547,34 +3543,13 @@ export function NewMakerDraftRoute() {
                       ));
                     },
                   });
-                  if (!resolvedMessage) {
+                  if (!resolvedInvocation) {
                     worktreeCreationStore.clear(newSession.id);
                     restoreFirstMessageDraft();
                     toast.warning(t('commandPalette.projectSkillMissingInWorktree'));
                     return;
                   }
-                  messageForSend = resolvedMessage;
-                  agentReferencesForSend = opts.agentReferences
-                    ? rebaseInlineRangesAfterSlashCommandRewrite(
-                        opts.agentReferences,
-                        message,
-                        resolvedMessage,
-                      )
-                    : undefined;
-                  pastedTextRangesForSend = opts.pastedTextRanges
-                    ? rebaseInlineRangesAfterSlashCommandRewrite(
-                        opts.pastedTextRanges,
-                        message,
-                        resolvedMessage,
-                      )
-                    : undefined;
-                  slashCommandRangesForSend = opts.slashCommandRanges !== undefined
-                    ? rebaseInlineRangesAfterSlashCommandRewrite(
-                        opts.slashCommandRanges,
-                        message,
-                        resolvedMessage,
-                      )
-                    : undefined;
+                  agentSkillInvocation = resolvedInvocation;
                 }
 
                 if (shouldEnableCollab) {
@@ -3608,7 +3583,7 @@ export function NewMakerDraftRoute() {
 
                 const accepted = await makerChatStore.sendMessage(
                   newSession.id,
-                  messageForSend,
+                  message,
                   model,
                   effort,
                   permissionMode,
@@ -3617,15 +3592,16 @@ export function NewMakerDraftRoute() {
                   mentions,
                   {
                     ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
-                    ...(agentReferencesForSend?.length
-                      ? { agentReferences: agentReferencesForSend }
+                    ...(opts?.agentReferences?.length
+                      ? { agentReferences: opts.agentReferences }
                       : {}),
-                    ...(pastedTextRangesForSend?.length
-                      ? { pastedTextRanges: pastedTextRangesForSend }
+                    ...(opts?.pastedTextRanges?.length
+                      ? { pastedTextRanges: opts.pastedTextRanges }
                       : {}),
-                    ...(slashCommandRangesForSend !== undefined
-                      ? { slashCommandRanges: slashCommandRangesForSend }
+                    ...(opts?.slashCommandRanges !== undefined
+                      ? { slashCommandRanges: opts.slashCommandRanges }
                       : {}),
+                    ...(agentSkillInvocation ? { agentSkillInvocation } : {}),
                   },
                 );
                 if (accepted) opts?.onAccepted?.();
