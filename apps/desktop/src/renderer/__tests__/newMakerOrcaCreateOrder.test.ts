@@ -165,10 +165,13 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(source).toContain('allowPendingProjectSkillSelection={');
     expect(source).toContain("persistedAgentKind === 'pi'");
     expect(source).toContain('!!effectiveWorkingDir');
+    expect(source).toContain('!!projectRepoRoot');
     expect(source).toContain('!effectiveRemoteHostId');
     expect(source).toContain('!isDeviceLinkDraft');
     expect(source).toContain('pendingProjectSkillRoot={');
-    expect(source).toContain('wtBaseRepo ?? effectiveWorkingDir ?? undefined');
+    expect(source).toContain('projectRepoRoot ?? undefined');
+    expect(source).not.toContain('wtBaseRepo ?? effectiveWorkingDir ?? undefined');
+    expect(source).toContain('onProjectRepoRootChange={handleProjectRepoRootChange}');
   });
 
   it('loads a selected project Skill before handing off a normal first message', () => {

@@ -680,6 +680,7 @@ export function NewMakerDraftRoute() {
   const [wtName, setWtName] = useState('');
   const [wtSourceBranch, setWtSourceBranch] = useState('');
   const [wtBaseRepo, setWtBaseRepo] = useState<string | null>(null);
+  const [projectRepoRoot, setProjectRepoRoot] = useState<string | null>(null);
   const [wtSupportsRecoveryKeyDiscard, setWtSupportsRecoveryKeyDiscard] = useState<boolean | null>(
     null,
   );
@@ -2041,6 +2042,7 @@ export function NewMakerDraftRoute() {
         wtBranchPreferenceErrorRef.current = false;
         setWtBranchPreferenceError(false);
         setWtBaseRepo(null);
+        setProjectRepoRoot(null);
         setWtSourceBranch('');
         setWtSupportsRecoveryKeyDiscard(null);
         setWtConfirmedIneligible(null);
@@ -2825,6 +2827,9 @@ export function NewMakerDraftRoute() {
     setWtSourceBranch('');
     setWtBaseRepo(baseRepo);
   }, [effectiveDeviceLinkDeviceId, wtBaseRepo]);
+  const handleProjectRepoRootChange = useCallback((repoRoot: string | null) => {
+    setProjectRepoRoot(repoRoot);
+  }, []);
   const handleWtRecoveryKeyDiscardSupportChange = useCallback((supported: boolean | null) => {
     setWtSupportsRecoveryKeyDiscard(supported);
   }, []);
@@ -4667,6 +4672,7 @@ export function NewMakerDraftRoute() {
                   sourceBranch={wtSourceBranch}
                   onSourceBranchChange={handleWtSourceBranchChange}
                   onBaseRepoChange={handleWtBaseRepoChange}
+                  onProjectRepoRootChange={handleProjectRepoRootChange}
                   onRecoveryKeyDiscardSupportChange={handleWtRecoveryKeyDiscardSupportChange}
                   onConfirmedIneligibleChange={handleWtConfirmedIneligibleChange}
                   onSuggestedNameChange={handleWtNameChange}
@@ -4787,11 +4793,12 @@ export function NewMakerDraftRoute() {
                     allowPendingProjectSkillSelection={
                       persistedAgentKind === 'pi'
                       && !!effectiveWorkingDir
+                      && !!projectRepoRoot
                       && !effectiveRemoteHostId
                       && !isDeviceLinkDraft
                     }
                     pendingProjectSkillRoot={
-                      wtBaseRepo ?? effectiveWorkingDir ?? undefined
+                      projectRepoRoot ?? undefined
                     }
                     attachmentState={guardedAttachmentState}
                     draftKey={NEW_MAKER_DRAFT_KEY}
