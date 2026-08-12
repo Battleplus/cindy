@@ -207,6 +207,33 @@ describe('canonical Windows comparison', () => {
     expect(resolveWindowsCaseComparison).toHaveBeenCalledWith('C:\\Repo\\packages');
     expect(resolveWindowsCaseComparison).not.toHaveBeenCalledWith('C:\\Repo');
   });
+
+  it('fails closed when the repo root lookup differs from its own child semantics', async () => {
+    const resolveWindowsCaseComparison = vi.fn(async (candidate: string) => (
+      candidate === 'C:\\'
+        ? 'case-sensitive' as const
+        : 'ordinal-insensitive' as const
+    ));
+    const dependencies = {
+      readdir: async () => [],
+      lstat: async () => ({
+        isDirectory: () => true,
+        isFile: () => false,
+        isSymbolicLink: () => false,
+      }),
+      stat: async () => ({ isDirectory: () => true, isFile: () => false }),
+      realpath: async (candidate: string) => candidate,
+      resolveWindowsCaseComparison,
+    };
+
+    await expect(__testing.windowsDirectoryChainMatchesIdentity(
+      insensitiveIdentity,
+      'C:\\Repo\\packages\\app',
+      dependencies,
+    )).resolves.toBe(false);
+    expect(resolveWindowsCaseComparison).toHaveBeenCalledWith('C:\\Repo');
+    expect(resolveWindowsCaseComparison).toHaveBeenCalledWith('C:\\');
+  });
 });
 
 describe('scanContainedDesktopPiProjectSkills', () => {

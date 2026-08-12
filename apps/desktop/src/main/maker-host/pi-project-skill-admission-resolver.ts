@@ -406,7 +406,22 @@ async function windowsDirectoryChainMatchesIdentity(
       checked.set(comparison, matches);
     }
     if (!matches) return false;
-    if (canonicalPathsEqual(identity, current, repoRoot)) return true;
+    if (canonicalPathsEqual(identity, current, repoRoot)) {
+      // The lookup semantics for the repoRoot path component belong to its
+      // parent. Without this proof an insensitive repo directory inside a
+      // sensitive parent could fold a distinct sibling (Repo vs repo) into
+      // the admitted boundary. A volume/share root has no parent component.
+      const boundaryParent = path.win32.dirname(current);
+      if (boundaryParent === current) return true;
+      const parentComparison = comparisonPath(identity, boundaryParent);
+      if (!parentComparison) return false;
+      let parentMatches = checked.get(parentComparison);
+      if (parentMatches === undefined) {
+        parentMatches = await resolve(boundaryParent) === expected;
+        checked.set(parentComparison, parentMatches);
+      }
+      return parentMatches;
+    }
     const parent = path.win32.dirname(current);
     if (parent === current) return false;
     current = parent;

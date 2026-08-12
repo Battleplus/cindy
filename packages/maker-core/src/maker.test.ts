@@ -1172,6 +1172,94 @@ describe('Maker Pi runtime skill status', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('keeps an admitted project skill loaded beyond the old palette entry budget', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'maker-pi-large-skill-')));
+    const repoRoot = path.join(root, 'repo');
+    const sourcePath = path.join(repoRoot, '.pi', 'skills', 'large');
+    const runtimePath = path.join(root, 'runtime', 'skills', 'large');
+    try {
+      mkdirSync(path.join(sourcePath, 'assets'), { recursive: true });
+      writeFileSync(path.join(sourcePath, 'SKILL.md'), '# large admitted skill\n');
+      // 1,050 assets plus the root, assets directory, and SKILL.md exceed the
+      // old 2,048 shared budget once the stable fingerprint walks twice, while
+      // remaining far below the 10,000-entry launch admission ceiling.
+      for (let index = 0; index < 1_050; index += 1) {
+        writeFileSync(path.join(sourcePath, 'assets', `${index}.txt`), '');
+      }
+      const sourceFingerprint = await fingerprintPiProjectSkillEntrypoint(sourcePath, repoRoot);
+      expect(sourceFingerprint).not.toBeNull();
+
+      const agent = createAgent(async (opts) => {
+        const handle = createHandle({ id: `pi-${opts.sessionId}`, agentKind: 'pi' });
+        handle.getRuntimeCapabilities = () => ({
+          sessionId: opts.sessionId,
+          capturedAt: '2026-08-12T00:00:00.000Z',
+          generation: 1,
+          status: 'loaded',
+          source: 'pi:get_commands',
+          projectResources: {
+            status: 'approved',
+            reason: 'runtime-skills-confirmed',
+            approvalRevision: 'rev-large-skill',
+            requestedSkillCount: 1,
+            loadedSkillCount: 1,
+            loadedSkills: [{
+              sourcePath,
+              runtimePath,
+              commandName: 'skill:large',
+              snapshotDigest: sourceFingerprint!.contentDigest,
+              sourceFingerprint: sourceFingerprint!.sourceStateDigest,
+              canonicalRepoRoot: repoRoot,
+            }],
+          },
+          commands: [{
+            name: 'skill:large',
+            source: 'skill',
+            sourceInfo: {
+              source: 'local',
+              scope: 'temporary',
+              baseDir: runtimePath,
+              path: path.join(runtimePath, 'SKILL.md'),
+            },
+          }],
+        });
+        return handle;
+      }, 'pi');
+      agent.listAgentSkills = vi.fn(async () => ({
+        skills: [{
+          kind: 'agent-skill' as const,
+          name: 'large',
+          source: 'skill' as const,
+          scope: 'repo' as const,
+          path: sourcePath,
+          runtimeStatus: 'discovered' as const,
+        }],
+      }));
+      const maker = new Maker({
+        agents: { pi: agent },
+        storage: createStorage(),
+        logger: createLogger(),
+      });
+      await maker.createSession({
+        id: 'large-skill',
+        agentKind: 'pi',
+        workingDir: repoRoot,
+        model: 'm',
+      });
+
+      const result = await maker.listAgentSkills('pi', {
+        workingDir: repoRoot,
+        sessionId: 'large-skill',
+      });
+      expect(result.skills[0]).toMatchObject({
+        runtimeStatus: 'loaded',
+        runtimeCommandName: 'skill:large',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Session turn send guard', () => {

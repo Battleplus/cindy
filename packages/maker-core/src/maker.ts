@@ -36,7 +36,12 @@ import type {
 } from './types/customizations.js';
 import type { PiRuntimeCapabilityManifest } from './types/pi-runtime-capabilities.js';
 import { piExplicitSkillRuntimePath } from './agents/pi/skill-runtime-provenance.js';
-import { fingerprintPiProjectSkillEntrypoint } from './agents/pi/project-resource-assembly.js';
+import {
+  fingerprintPiProjectSkillEntrypoint,
+  MAX_PI_PROJECT_SKILL_FINGERPRINT_ENTRIES,
+  MAX_PI_PROJECT_SKILL_SNAPSHOT_FILE_BYTES,
+  PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS,
+} from './agents/pi/project-resource-assembly.js';
 import { Session, generateSessionId } from './session.js';
 import type {
   AgentSessionHandle,
@@ -162,8 +167,15 @@ function canonicalPiRuntimePath(value: string): string {
   }
 }
 
-const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS = 250;
-const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET = 2_048;
+// Admission permits 10,000 entries across the complete project Skill set.
+// Palette freshness deliberately fingerprints every tree twice to reject a
+// concurrent mutation, so its shared accounting must cover two complete
+// passes of every tree admitted at launch. Use the same deadline as launch;
+// otherwise a valid large Skill can start but can never become selectable.
+const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS =
+  PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS;
+const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET =
+  MAX_PI_PROJECT_SKILL_FINGERPRINT_ENTRIES * 2;
 
 async function fingerprintPiProjectSkillForPalette(
   sourcePath: string,
@@ -196,6 +208,7 @@ async function mergePiRuntimeSkillStatuses(
   const fingerprintBudget = {
     remainingEntries: PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET,
     deadlineAtMs: Date.now() + PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS,
+    maxFileBytes: MAX_PI_PROJECT_SKILL_SNAPSHOT_FILE_BYTES,
   };
   for (const skill of manifest.projectResources?.loadedSkills ?? []) {
     const canonicalSourcePath = canonicalPiRuntimePath(skill.sourcePath);
