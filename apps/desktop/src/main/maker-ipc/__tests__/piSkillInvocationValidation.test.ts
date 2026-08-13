@@ -102,7 +102,11 @@ describe('Pi Skill invocation validation', () => {
       commands: [{
         name: 'skill:demo',
         source: 'skill',
-        sourceInfo: { scope: 'user', source: 'auto', baseDir: '/home/user/.agents' },
+        sourceInfo: {
+          scope: 'user',
+          source: 'auto',
+          baseDir: '/home/user/.agents',
+        },
       }],
     });
     expect(isCurrentPiSkillInvocation(userItem, userManifest, userSkills)).toBe(true);
@@ -110,6 +114,44 @@ describe('Pi Skill invocation validation', () => {
       userItem,
       userManifest,
       skills({ scope: 'user', path: '/home/user/.agents/skills/other' }),
+    )).toBe(false);
+
+    expect(isCurrentPiSkillInvocation(
+      userItem,
+      manifest({
+        commands: [{
+          name: 'skill:demo',
+          source: 'skill',
+          sourceInfo: {
+            scope: 'user',
+            source: 'auto',
+            baseDir: '/other/.agents',
+            path: '/other/.agents/skills/demo',
+          },
+        }],
+      }),
+      [...userSkills, ...skills({
+        scope: 'user',
+        path: '/other/.agents/skills/demo',
+        runtimeStatus: undefined,
+      })],
+    )).toBe(false);
+
+    expect(isCurrentPiSkillInvocation(
+      userItem,
+      manifest({
+        commands: [{
+          name: 'skill:demo',
+          source: 'skill',
+          sourceInfo: {
+            scope: 'user',
+            source: 'auto',
+            baseDir: '/home/user/.agents',
+            path: '/other/.agents/skills/demo/SKILL.md',
+          },
+        }],
+      }),
+      userSkills,
     )).toBe(false);
   });
 

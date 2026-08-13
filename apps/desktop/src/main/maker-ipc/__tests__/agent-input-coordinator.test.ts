@@ -204,6 +204,9 @@ function createHarness(opts?: {
   const onUserMessagePersistenceFailed = vi.fn<
     NonNullable<AgentInputCoordinatorDeps['onUserMessagePersistenceFailed']>
   >(() => {});
+  const rewindPersistedUndispatchedUserMessage = vi.fn<
+    NonNullable<AgentInputCoordinatorDeps['rewindPersistedUndispatchedUserMessage']>
+  >(async () => true);
   const onAcceptedQueuedMessage = vi.fn<
     NonNullable<AgentInputCoordinatorDeps['onAcceptedQueuedMessage']>
   >(() => {});
@@ -302,6 +305,7 @@ function createHarness(opts?: {
     onUserMessagePersisting,
     onUserMessagePersisted,
     onUserMessagePersistenceFailed,
+    rewindPersistedUndispatchedUserMessage,
     onAcceptedQueuedMessage,
     onDispatchedUserTurn,
     onResumableTurnError,
@@ -338,6 +342,7 @@ function createHarness(opts?: {
     onUserMessagePersisting,
     onUserMessagePersisted,
     onUserMessagePersistenceFailed,
+    rewindPersistedUndispatchedUserMessage,
     onAcceptedQueuedMessage,
     onDispatchedUserTurn,
     onResumableTurnError,
@@ -6181,6 +6186,249 @@ describe('AgentInputCoordinator crash-recovery queue snapshots (issue #761)', ()
       content: '/skill:demo inspect',
     });
     expect(validate).toHaveBeenCalledTimes(3);
+  });
+
+  it('rewinds a persisted Pi Skill row and restores a fresh queue identity when final proof expires', async () => {
+    const h = createHarness();
+    const sid = 'persisted-pi-skill-final-proof-stale';
+    const original = makeItem('pi-skill-original', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    });
+    let validationCount = 0;
+    h.setValidateAgentSkillInvocation(() => {
+      validationCount += 1;
+      return validationCount === 1;
+    });
+
+    h.coordinator.enqueue(sid, original);
+    await flush();
+    await vi.waitFor(() => {
+      expect(latestProjection(h.projections).pendingQueue).toHaveLength(1);
+    });
+
+    let projection = latestProjection(h.projections);
+    expect(mocks.createMessage).toHaveBeenCalledTimes(1);
+    expect(h.rewindPersistedUndispatchedUserMessage).toHaveBeenCalledWith(
+      sid,
+      'pi-skill-original',
+    );
+    expect(h.onUndispatchedUserTurn).toHaveBeenCalledWith(
+      sid,
+      expect.objectContaining({ clientId: 'pi-skill-original' }),
+      'failed',
+    );
+    expect(h.sendToAgent).toHaveBeenCalledTimes(1);
+    expect(projection.pendingQueue).toHaveLength(1);
+    const restored = projection.pendingQueue[0]!;
+    expect(restored.clientId).not.toBe('pi-skill-original');
+    expect(restored.chatMessage.clientId).toBe(restored.clientId);
+    expect(restored.agentSkillInvocation).toEqual(original.agentSkillInvocation);
+    expect(restored.supersedesUserClientId).toBe('pi-skill-original');
+    expect(projection.recovery).toEqual({ kind: 'queue-head', clientId: restored.clientId });
+    const recoverySnapshotIndex = h.persistQueueSnapshot.mock.calls.findIndex((call) =>
+      call[1].some((queued) => queued.clientId === restored.clientId),
+    );
+    expect(recoverySnapshotIndex).toBeGreaterThanOrEqual(0);
+    expect(h.persistQueueSnapshot.mock.invocationCallOrder[recoverySnapshotIndex]!)
+      .toBeLessThan(h.rewindPersistedUndispatchedUserMessage.mock.invocationCallOrder[0]!);
+
+    h.setValidateAgentSkillInvocation(() => true);
+    await h.coordinator.retryLastError(sid);
+    await flush();
+
+    projection = latestProjection(h.projections);
+    expect(mocks.createMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.createMessage.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+      clientId: restored.clientId,
+    }));
+    expect(h.sendToAgent).toHaveBeenCalledTimes(2);
+    expect(projection.recovery).toBeNull();
+  });
+
+  it('keeps the crash-durable fresh Pi Skill queue head when persisted-row rewind fails', async () => {
+    const h = createHarness();
+    const sid = 'persisted-pi-skill-rewind-failed';
+    const item = makeItem('pi-skill-persisted', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    });
+    let validationCount = 0;
+    h.setValidateAgentSkillInvocation(() => {
+      validationCount += 1;
+      return validationCount === 1;
+    });
+    h.rewindPersistedUndispatchedUserMessage.mockResolvedValueOnce(false);
+
+    h.coordinator.enqueue(sid, item);
+    await flush();
+    await vi.waitFor(() => {
+      expect(latestProjection(h.projections).pendingQueue).toHaveLength(1);
+    });
+
+    const projection = latestProjection(h.projections);
+    expect(projection.pendingQueue).toHaveLength(1);
+    expect(projection.pendingQueue[0]?.clientId).not.toBe(item.clientId);
+    expect(projection.pendingQueue[0]?.supersedesUserClientId).toBe(item.clientId);
+    expect(projection.recovery).toEqual({
+      kind: 'queue-head',
+      clientId: projection.pendingQueue[0]?.clientId,
+    });
+    expect(h.onUndispatchedUserTurn).toHaveBeenCalledWith(
+      sid,
+      expect.objectContaining({ clientId: 'pi-skill-persisted' }),
+      'failed',
+    );
+    expect(h.sendToAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps persisted recovery semantics when the fresh Pi Skill snapshot cannot commit', async () => {
+    const h = createHarness();
+    const sid = 'persisted-pi-skill-snapshot-failed';
+    const item = makeItem('pi-skill-snapshot-old', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    });
+    let validationCount = 0;
+    h.setValidateAgentSkillInvocation(() => {
+      validationCount += 1;
+      return validationCount === 1;
+    });
+    h.persistQueueSnapshot.mockImplementation((_sessionId, items) => {
+      if (items.some((queued) => queued.supersedesUserClientId === item.clientId)) {
+        return Promise.reject(new Error('snapshot unavailable'));
+      }
+    });
+
+    h.coordinator.enqueue(sid, item);
+    await flush();
+
+    const projection = latestProjection(h.projections);
+    expect(h.rewindPersistedUndispatchedUserMessage).not.toHaveBeenCalled();
+    expect(projection.pendingQueue).toEqual([]);
+    expect(projection.recovery).toEqual({ kind: 'active-turn', item });
+  });
+
+  it('restores the fresh Pi Skill identity if the process exits before old-row rewind', async () => {
+    const first = createHarness();
+    const sid = 'persisted-pi-skill-crash-handoff';
+    const rewindStarted = deferred<void>();
+    const finishRewind = deferred<void>();
+    let validationCount = 0;
+    first.setValidateAgentSkillInvocation(() => {
+      validationCount += 1;
+      return validationCount === 1;
+    });
+    first.rewindPersistedUndispatchedUserMessage.mockImplementationOnce(async () => {
+      rewindStarted.resolve();
+      await finishRewind.promise;
+      return true;
+    });
+    first.coordinator.enqueue(sid, makeItem('pi-skill-crash-old', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    }));
+    await rewindStarted.promise;
+
+    const durableItems = structuredClone(
+      first.persistQueueSnapshot.mock.calls.at(-1)?.[1] ?? [],
+    );
+    expect(durableItems).toHaveLength(1);
+    expect(durableItems[0]?.clientId).not.toBe('pi-skill-crash-old');
+    expect(durableItems[0]?.supersedesUserClientId).toBe('pi-skill-crash-old');
+
+    const restarted = createHarness();
+    restarted.setLoadQueueSnapshot(async () => durableItems);
+    restarted.setGetPersistedClientIds(async () => new Set(['pi-skill-crash-old']));
+    await restarted.coordinator.ensureQueueRestored(sid);
+    const restoredItems = latestProjection(restarted.projections).pendingQueue;
+    expect(restoredItems).toHaveLength(1);
+    expect(restoredItems[0]).toEqual(expect.objectContaining({
+      clientId: durableItems[0]?.clientId,
+      supersedesUserClientId: 'pi-skill-crash-old',
+      agentSkillInvocation: durableItems[0]?.agentSkillInvocation,
+    }));
+
+    first.coordinator.clearSession(sid);
+    finishRewind.resolve();
+    await flush();
+  });
+
+  it('does not revive a stale Pi Skill queue head when clear wins during persisted-row rewind', async () => {
+    const h = createHarness();
+    const sid = 'persisted-pi-skill-rewind-clear-race';
+    const rewindStarted = deferred<void>();
+    const finishRewind = deferred<void>();
+    let validationCount = 0;
+    h.setValidateAgentSkillInvocation(() => {
+      validationCount += 1;
+      return validationCount === 1;
+    });
+    h.rewindPersistedUndispatchedUserMessage.mockImplementationOnce(async () => {
+      rewindStarted.resolve();
+      await finishRewind.promise;
+      return true;
+    });
+
+    h.coordinator.enqueue(sid, makeItem('pi-skill-clear-race', '/demo inspect', {
+      agentSkillInvocation: {
+        name: 'demo',
+        runtimeCommandName: 'skill:demo',
+        scope: 'repo',
+        sourcePath: '/repo/.pi/skills/demo',
+      },
+      createOpts: {
+        agentKind: 'pi',
+        workingDir: '/repo',
+        model: 'pi-model',
+      },
+    }));
+    await rewindStarted.promise;
+
+    h.coordinator.clearSession(sid);
+    finishRewind.resolve();
+    await flush();
+
+    const projection = latestProjection(h.projections);
+    expect(projection.pendingQueue).toEqual([]);
+    expect(projection.recovery).toBeNull();
+    expect(h.sendToAgent).toHaveBeenCalledTimes(1);
   });
 
   it('releases a crash-restored paused queue on explicit user input (resumeRestorePausedQueue)', async () => {

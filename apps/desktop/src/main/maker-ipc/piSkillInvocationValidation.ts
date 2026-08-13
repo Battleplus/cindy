@@ -1,9 +1,53 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import type {
   AgentSkillCommand,
   PiRuntimeCapabilityManifest,
 } from '@cindy/maker-core';
 
 import type { AgentInputQueuedMessage } from '../../shared/agentInputQueue.js';
+
+function canonicalLocalPath(value: unknown): string | null {
+  if (typeof value !== 'string' || !value || value.includes('\0') || !path.isAbsolute(value)) {
+    return null;
+  }
+  const resolved = path.resolve(value);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    // Runtime provenance can describe a path that disappeared after capture.
+    // Keep the fallback case-sensitive so uncertainty produces false negatives,
+    // never a case-folded match on a case-sensitive Windows directory.
+    return resolved;
+  }
+}
+
+function runtimeUserSkillMatchesSource(
+  sourcePath: string,
+  command: PiRuntimeCapabilityManifest['commands'][number],
+): boolean {
+  const selected = canonicalLocalPath(sourcePath);
+  const baseDir = canonicalLocalPath(command.sourceInfo.baseDir);
+  if (
+    !selected
+    || !baseDir
+    || command.sourceInfo.scope !== 'user'
+    || command.sourceInfo.source !== 'auto'
+  ) return false;
+
+  const selectedName = path.basename(selected);
+  const derivedFromBase = canonicalLocalPath(path.join(baseDir, 'skills', selectedName));
+  if (derivedFromBase !== selected) return false;
+
+  if (command.sourceInfo.path === undefined) return true;
+  const runtimePath = canonicalLocalPath(command.sourceInfo.path);
+  if (!runtimePath) return false;
+  const runtimeSkillDir = path.basename(runtimePath) === 'SKILL.md'
+    ? canonicalLocalPath(path.dirname(runtimePath))
+    : runtimePath;
+  return runtimeSkillDir === selected;
+}
 
 /**
  * Revalidate renderer-provided Pi Skill routing against this exact runtime.
@@ -23,6 +67,7 @@ export function isCurrentPiSkillInvocation(
   if (!invocation.sourcePath || (invocation.scope !== 'repo' && invocation.scope !== 'user')) {
     return false;
   }
+  const invocationSourcePath = invocation.sourcePath;
   const currentMatches = currentSkills.filter((skill) => (
     skill.name === invocation.name
     && skill.scope === invocation.scope
@@ -42,7 +87,7 @@ export function isCurrentPiSkillInvocation(
   const runtimeMatches = manifest.commands.filter((command) => (
     command.name === invocation.runtimeCommandName
     && command.source === 'skill'
-    && command.sourceInfo.scope === 'user'
+    && runtimeUserSkillMatchesSource(invocationSourcePath, command)
   ));
   return runtimeMatches.length === 1;
 }

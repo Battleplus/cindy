@@ -291,6 +291,11 @@ export interface AgentInputCoordinatorDeps {
   createUserMessage?: typeof createDbMessage;
   /** Hide a user row that was written after `/clear` won the persistence race. */
   rewindPersistedUserMessageAfterClear?: (sessionId: string, clientId: string) => Promise<void>;
+  /** Hide a persisted Pi Skill row whose final runtime proof failed before vendor dispatch. */
+  rewindPersistedUndispatchedUserMessage?: (
+    sessionId: string,
+    clientId: string,
+  ) => Promise<boolean>;
   /**
    * interrupted-turn-resume:判断某条已派发 user 消息之后 agent 是否已产出内容
    * (assistant / tool_use / thinking 持久化行)。retryLastError 用它决定语义:
@@ -2982,6 +2987,21 @@ export class AgentInputCoordinator {
     }
   }
 
+  /**
+   * Persist the current recovery shape before retiring its only durable user
+   * row. Unlike the normal fire-and-forget snapshot path, this boundary must
+   * complete so a crash cannot lose both copies of the user's input.
+   */
+  private async persistQueueSnapshotBoundary(sessionId: string): Promise<void> {
+    const persist = this.deps.persistQueueSnapshot;
+    const state = this.states.get(sessionId);
+    if (!persist || !state) throw new Error('durable queue snapshot is unavailable');
+    const items = this.computeQueueSnapshotItems(state);
+    const json = JSON.stringify(items);
+    await persist(sessionId, items);
+    this.lastQueueSnapshotJson.set(sessionId, json);
+  }
+
   private toProjection(sessionId: string, state: SessionInputState): AgentInputProjection {
     const pendingQueue = state.pendingQueue.map((item) => this.toProjectedItem(item));
     const recovery: AgentInputRecovery =
@@ -3158,11 +3178,12 @@ export class AgentInputCoordinator {
       await this.dispatchCompact(sessionId, compact, reason);
       return;
     }
-    const head = this.getDrainableHead(sessionId, state);
-    if (!head) {
+    const drainableHead = this.getDrainableHead(sessionId, state);
+    if (!drainableHead) {
       this.scheduleExternalTurnRetryIfNeeded(sessionId, state, `drain-blocked:${reason}`);
       return;
     }
+    let head: AgentInputQueuedMessage = drainableHead;
     state.pendingQueue = state.pendingQueue.slice(1);
     this.removePendingCompactWaitClientId(state, head.clientId);
     if (!state.stickyError) {
@@ -3318,7 +3339,61 @@ export class AgentInputCoordinator {
               // Host hooks above may await long-running work. Rebind to the
               // exact current Pi runtime immediately before the transaction
               // returns to its synchronous vendor-dispatch fence.
-              await this.assertAgentSkillInvocationCurrent(sessionId, head);
+              try {
+                await this.assertAgentSkillInvocationCurrent(sessionId, head);
+              } catch (error) {
+                if (!isStalePiSkillInvocationError(error)) throw error;
+                const persistedHead = head;
+                const rewind = this.deps.rewindPersistedUndispatchedUserMessage;
+                if (!rewind) throw error;
+                const retryClientId = crypto.randomUUID();
+                head = {
+                  ...persistedHead,
+                  clientId: retryClientId,
+                  // If the process exits after the fresh snapshot commits but
+                  // before the old row is rewound, a later successful retry
+                  // still hides that never-dispatched durable row.
+                  supersedesUserClientId: persistedHead.clientId,
+                  chatMessage: {
+                    ...persistedHead.chatMessage,
+                    clientId: retryClientId,
+                    createdAt: new Date().toISOString(),
+                  },
+                };
+                active.item = head;
+                active.persisted = false;
+                active.persisting = false;
+                try {
+                  await this.persistQueueSnapshotBoundary(sessionId);
+                } catch (snapshotError) {
+                  head = persistedHead;
+                  active.item = persistedHead;
+                  active.persisted = true;
+                  log.warn('persist stale Pi Skill recovery before rewind failed', {
+                    sessionId,
+                    clientId: persistedHead.clientId,
+                    error: errorMessage(snapshotError),
+                  });
+                  throw error;
+                }
+                if (!this.isActiveTurnCurrent(sessionId, active)) throw error;
+                try {
+                  if (await rewind(sessionId, persistedHead.clientId) !== true) {
+                    throw new Error('persisted user row was not rewound');
+                  }
+                } catch (rewindError) {
+                  // The fresh queue identity is already crash-durable and is
+                  // linked to supersede this row after a successful retry.
+                  log.warn('rewind stale Pi Skill user row before dispatch deferred', {
+                    sessionId,
+                    clientId: persistedHead.clientId,
+                    error: errorMessage(rewindError),
+                  });
+                }
+                if (!this.isActiveTurnCurrent(sessionId, active)) throw error;
+                this.notifyUndispatchedUserTurn(sessionId, persistedHead, 'failed');
+                throw error;
+              }
               active.dispatchLifecycle = 'sending';
             },
             onPersistFailed: () => {

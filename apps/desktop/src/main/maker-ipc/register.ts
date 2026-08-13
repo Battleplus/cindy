@@ -10846,6 +10846,20 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       enqueueDurableWrite(`user-rewind:${sessionId}:${clientId}`, () =>
         rewindPersistedUserMessageAfterClear(sessionId, clientId),
       ),
+    rewindPersistedUndispatchedUserMessage: (sessionId, clientId) =>
+      enqueueDurableWrite(`user-rewind:${sessionId}:${clientId}`, async () => {
+        await rewindPersistedUserMessageAfterClear(sessionId, clientId);
+        const [row] = await getDbClient().drizzle
+          .select({ rewindAt: messages.rewindAt })
+          .from(messages)
+          .where(and(
+            eq(messages.sessionId, sessionId),
+            eq(messages.clientId, clientId),
+            eq(messages.role, 'user'),
+          ))
+          .limit(1);
+        return row?.rewindAt != null;
+      }),
     resolveSessionReferences,
     // interrupted-turn-resume:retry 续跑判定走 DB 持久化行(见 dep 注释)。
     // 先 drain 持久化写队列:terminal error 到达时 flushAssistantBlock 只是把
