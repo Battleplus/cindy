@@ -126,6 +126,14 @@ export async function scanPiCustomizations(opts: ListCustomizationsOptions): Pro
   }
 
   const result = scanCustomizationSources(buildPiSources(opts.workingDirs ?? []), null);
+  // The host-owned project admission and Pi resource assembly contract accepts
+  // only the canonical `SKILL.md` entrypoint. Keep the shared scanner's legacy
+  // lowercase fallback for user/global and other agents, but never advertise a
+  // repo Skill that a new Pi runtime must reject later.
+  result.items = result.items.filter((item) => (
+    item.scope !== 'repo'
+    || (typeof item.mdPath === 'string' && path.basename(item.mdPath) === 'SKILL.md')
+  ));
   result.items = dedupePiItems(result.items);
   result.items.sort((a, b) => {
     if (a.scope !== b.scope) return a.scope.localeCompare(b.scope);

@@ -32,6 +32,18 @@ function canCreateSymlink(kind: 'dir' | 'file'): boolean {
 const canLinkDirectory = canCreateSymlink('dir');
 const canLinkFile = canCreateSymlink('file');
 
+function canDistinguishEntrypointCase(): boolean {
+  const probe = mkdtempSync(path.join(tmpdir(), 'pi-customization-case-probe-'));
+  try {
+    writeFileSync(path.join(probe, 'skill.md'), 'probe');
+    return !fs.existsSync(path.join(probe, 'SKILL.md'));
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+const caseSensitiveEntrypoints = canDistinguishEntrypointCase();
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -251,6 +263,33 @@ describe('scanPiCustomizations', () => {
     expect(duplicates.map((item) => canonical(item.absolutePath))).toEqual(
       [canonical(first), canonical(second)].sort(),
     );
+  });
+
+  it.skipIf(!caseSensitiveEntrypoints)('does not advertise a project skill with only lowercase skill.md', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    const skillDir = path.join(repo, '.pi', 'skills', 'lowercase');
+    mkdirSync(path.join(repo, '.git'), { recursive: true });
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(path.join(skillDir, 'skill.md'), '# lowercase entrypoint\n');
+
+    const result = await scanPiCustomizations({ workingDirs: [repo] });
+
+    expect(projectItems(result)).toEqual([]);
+    expect(result.errors).toEqual([]);
+  });
+
+  it.skipIf(!caseSensitiveEntrypoints)('prefers canonical SKILL.md when both entrypoint spellings exist', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    const skillDir = writeSkill(repo, path.join('.pi', 'skills'), 'both');
+    writeFileSync(path.join(skillDir, 'skill.md'), '# lowercase fallback\n');
+
+    const result = await scanPiCustomizations({ workingDirs: [repo] });
+    const found = projectItems(result).find((item) => item.name === 'both');
+
+    expect(found?.mdPath).toBe(path.join(canonical(skillDir), 'SKILL.md'));
+    expect(found?.description).toBe('both description');
   });
 
   it.skipIf(!canLinkDirectory)('rejects project skill folders that resolve outside the repository', async () => {

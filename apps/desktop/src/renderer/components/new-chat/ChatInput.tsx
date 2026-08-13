@@ -216,6 +216,7 @@ import { Selection, TextSelection } from '@tiptap/pm/state';
 import * as sessionService from '@/lib/sessionService';
 import { getModelById } from '@/lib/modelDefinitions';
 import {
+  ambiguousPendingProjectSkillName,
   beginSlashCommandRosterLoad,
   EMPTY_SLASH_COMMANDS,
   failSlashCommandRosterLoad,
@@ -4431,6 +4432,14 @@ export function ChatInput({
           hostCapability: serializedHostCapability,
         } = serializedContent;
         const leadingSlashName = serializedEditorText.match(/^\/(\S+)/)?.[1]?.toLowerCase();
+        if (ambiguousPendingProjectSkillName(
+          serializedEditorText,
+          mergedCommands,
+          allowPendingProjectSkillSelection,
+        )) {
+          toast.warning(t('commandPalette.projectSkillUnavailableForNewTask'));
+          return;
+        }
         const pendingProjectSkill =
           allowPendingProjectSkillSelection
           && leadingSlashName

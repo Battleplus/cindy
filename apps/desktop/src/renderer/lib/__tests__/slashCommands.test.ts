@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   agentSkillInvocationForDispatch,
+  ambiguousPendingProjectSkillName,
   filterSlashCommands,
   firstAvailableSlashCommandIndex,
   hasAvailableSlashCommand,
@@ -121,6 +122,66 @@ describe('Pi project skill availability', () => {
     expect(isSlashCommandSelectable(discovered, true)).toBe(true);
     expect(firstAvailableSlashCommandIndex([discovered], true)).toBe(0);
     expect(hasAvailableSlashCommand([discovered], true)).toBe(true);
+  });
+
+  it('hides ambiguous same-name project skills instead of binding an arbitrary path', () => {
+    const first = skill({
+      name: 'demo',
+      path: '/repo/.pi/skills/demo',
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+    const second = skill({
+      name: 'Demo',
+      path: '/repo/.agents/skills/demo',
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+
+    const merged = mergeCommands([], [], [first, second]);
+
+    expect(merged).toEqual([]);
+    expect(hasAvailableSlashCommand(merged, true)).toBe(false);
+    expect(hasUnavailableProjectSkillPreview(merged)).toBe(true);
+    expect(ambiguousPendingProjectSkillName('/DEMO run', merged, true)).toBe('demo');
+    expect(ambiguousPendingProjectSkillName('/demo run', merged, false)).toBeUndefined();
+  });
+
+  it('deduplicates repeated discovery of the same project skill path', () => {
+    const discovered = skill({
+      name: 'demo',
+      path: '/repo/.pi/skills/demo',
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+
+    const merged = mergeCommands([], [], [discovered, { ...discovered, name: 'Demo' }]);
+
+    expect(merged).toEqual([discovered]);
+    expect(hasAvailableSlashCommand(merged, true)).toBe(true);
+    expect(ambiguousPendingProjectSkillName('/demo', merged, true)).toBeUndefined();
+  });
+
+  it('keeps an explicit executable owner when same-name project previews are ambiguous', () => {
+    const discovered = (name: string, path: string) => skill({
+      name,
+      path,
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+    const desktop: UnifiedCommand = { kind: 'desktop', name: 'demo', description: '' };
+
+    const merged = mergeCommands(
+      [desktop],
+      [],
+      [
+        discovered('demo', '/repo/.pi/skills/demo'),
+        discovered('Demo', '/repo/.agents/skills/demo'),
+      ],
+    );
+
+    expect(merged).toEqual([desktop]);
+    expect(ambiguousPendingProjectSkillName('/demo', merged, true)).toBeUndefined();
   });
 
   it('keeps the palette label and records the Pi runtime command separately', () => {

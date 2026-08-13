@@ -22,6 +22,7 @@ import { createLogger } from '@/lib/logger';
 
 const log = createLogger('SlashCommands');
 const shadowedUnavailableSkillsByCommands = new WeakMap<UnifiedCommand[], Set<string>>();
+const ambiguousUnavailableSkillsByCommands = new WeakMap<UnifiedCommand[], Set<string>>();
 
 export type { UnifiedCommand } from '@cindy/maker-core';
 
@@ -184,7 +185,23 @@ export function mergeCommands(
   const result: UnifiedCommand[] = [];
   const shadowedUnavailableSkills = new Set<string>();
   const availableSkills = agentSkill.filter((command) => !isSlashCommandUnavailable(command));
-  const unavailableSkills = agentSkill.filter(isSlashCommandUnavailable);
+  const unavailableSkills = agentSkill.filter((command): command is Extract<
+    UnifiedCommand,
+    { kind: 'agent-skill' }
+  > => isSlashCommandUnavailable(command));
+  const unavailableProjectSkillPaths = new Map<string, Set<string>>();
+  for (const command of unavailableSkills) {
+    const normalizedName = command.name.toLowerCase();
+    const paths = unavailableProjectSkillPaths.get(normalizedName) ?? new Set<string>();
+    paths.add(command.path ?? '');
+    unavailableProjectSkillPaths.set(normalizedName, paths);
+  }
+  const ambiguousUnavailableSkills = new Set(
+    [...unavailableProjectSkillPaths]
+      .filter(([, paths]) => paths.size > 1 || paths.has(''))
+      .map(([name]) => name),
+  );
+  for (const name of ambiguousUnavailableSkills) shadowedUnavailableSkills.add(name);
   const tiers: UnifiedCommand[][] = [
     availableSkills.sort((a, b) => a.name.localeCompare(b.name)),
     [...desktop].sort((a, b) => a.name.localeCompare(b.name)),
@@ -193,22 +210,47 @@ export function mergeCommands(
   ];
   for (const tier of tiers) {
     for (const cmd of tier) {
-      if (seen.has(cmd.name)) {
+      const normalizedName = cmd.name.toLowerCase();
+      if (isSlashCommandUnavailable(cmd) && ambiguousUnavailableSkills.has(normalizedName)) {
+        continue;
+      }
+      if (seen.has(normalizedName)) {
         if (isSlashCommandUnavailable(cmd)) {
-          shadowedUnavailableSkills.add(cmd.name.toLowerCase());
+          shadowedUnavailableSkills.add(normalizedName);
         } else {
           log.warn(`Slash command "/${cmd.name}" already provided by higher-priority tier; skipping ${cmd.kind}.`);
         }
         continue;
       }
-      seen.add(cmd.name);
+      seen.add(normalizedName);
       result.push(cmd);
     }
   }
   if (shadowedUnavailableSkills.size > 0) {
     shadowedUnavailableSkillsByCommands.set(result, shadowedUnavailableSkills);
   }
+  const unresolvedAmbiguousSkills = new Set(
+    [...ambiguousUnavailableSkills].filter((name) => (
+      !result.some((command) => command.name.toLowerCase() === name)
+    )),
+  );
+  if (unresolvedAmbiguousSkills.size > 0) {
+    ambiguousUnavailableSkillsByCommands.set(result, unresolvedAmbiguousSkills);
+  }
   return result;
+}
+
+/** Reject a typed project Skill alias whose source path cannot be selected uniquely. */
+export function ambiguousPendingProjectSkillName(
+  message: string,
+  commands: UnifiedCommand[],
+  allowPendingProjectSkillSelection = false,
+): string | undefined {
+  if (!allowPendingProjectSkillSelection) return undefined;
+  const name = message.match(/^\/(\S+)/)?.[1]?.toLowerCase();
+  return name && ambiguousUnavailableSkillsByCommands.get(commands)?.has(name)
+    ? name
+    : undefined;
 }
 
 function hasShadowedUnavailableSkill(
