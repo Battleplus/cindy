@@ -8,6 +8,7 @@ import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from '
 import type { FileHandle } from 'node:fs/promises';
 
 import type {
+  PiProjectPathComparisonIdentity,
   PiProjectTrustDecision,
   PiProjectTrustInputSnapshot,
   PiProjectTrustStatus,
@@ -32,6 +33,8 @@ export interface PiProjectResourceAssemblyDiagnostic {
 
 export interface PiProjectResourceAssemblySnapshot {
   readonly decision: PiProjectTrustDecision | null;
+  /** Host-proven comparison semantics used for every source-tree containment check. */
+  readonly pathComparisonIdentity: PiProjectPathComparisonIdentity | null;
   /** Canonical project paths represented by the host approval snapshot. */
   readonly skillPaths: readonly string[];
   /** Per-session immutable copies that are safe to pass to Pi. */
@@ -59,6 +62,7 @@ export function unavailablePiProjectResourceAssembly(
 ): PiProjectResourceAssemblySnapshot {
   return Object.freeze({
     decision: null,
+    pathComparisonIdentity: null,
     skillPaths: Object.freeze([]),
     launchSkillPaths: Object.freeze([]),
     launchSkillDigests: Object.freeze([]),
@@ -212,8 +216,19 @@ export async function assembleApprovedPiProjectResources(
   }
 
   const frozenSkillPaths = Object.freeze([...skillPaths]);
+  const pathComparisonIdentity: PiProjectPathComparisonIdentity | null =
+    input.identity.platform === 'posix'
+      ? Object.freeze({ platform: 'posix' })
+      : input.identity.windowsCaseComparison === 'ordinal-insensitive'
+        || input.identity.windowsCaseComparison === 'case-sensitive'
+        ? Object.freeze({
+            platform: 'win32',
+            windowsCaseComparison: input.identity.windowsCaseComparison,
+          })
+        : null;
   return Object.freeze({
     decision,
+    pathComparisonIdentity,
     skillPaths: frozenSkillPaths,
     launchSkillPaths: Object.freeze([]),
     launchSkillDigests: Object.freeze([]),
@@ -227,9 +242,19 @@ export async function assembleApprovedPiProjectResources(
   });
 }
 
-function localPathIsWithin(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+function localPathIsWithin(
+  root: string,
+  candidate: string,
+  identity: PiProjectPathComparisonIdentity,
+): boolean {
+  return piCanonicalPathIsWithin(identity, root, candidate);
+}
+
+/** Staging paths are host-owned; literal case comparison is conservative on Windows. */
+function strictLocalPathComparisonIdentity(): PiProjectPathComparisonIdentity {
+  return process.platform === 'win32'
+    ? { platform: 'win32', windowsCaseComparison: 'case-sensitive' }
+    : { platform: 'posix' };
 }
 
 function sameFileIdentity(
@@ -312,6 +337,7 @@ export interface PiProjectSkillFingerprintBudget {
 async function fingerprintSkillEntrypointOnce(
   rootPath: string,
   canonicalRepoRoot: string,
+  pathComparisonIdentity: PiProjectPathComparisonIdentity,
   sharedBudget?: PiProjectSkillFingerprintBudget,
 ): Promise<string> {
   const skillPath = path.join(rootPath, 'SKILL.md');
@@ -326,8 +352,8 @@ async function fingerprintSkillEntrypointOnce(
   if (
     !rootEntry.isDirectory()
     || !skillTargetEntry.isFile()
-    || !localPathIsWithin(canonicalRepoRoot, canonicalRoot)
-    || !localPathIsWithin(canonicalRepoRoot, canonicalSkill)
+    || !localPathIsWithin(canonicalRepoRoot, canonicalRoot, pathComparisonIdentity)
+    || !localPathIsWithin(canonicalRepoRoot, canonicalSkill, pathComparisonIdentity)
   ) {
     throw new Error('approved skill entrypoint escaped its repository');
   }
@@ -374,8 +400,8 @@ async function fingerprintSkillEntrypointOnce(
       || !sameEntrySnapshot(skillTargetEntry, skillTargetEntryAfterRead)
       || !sameEntrySnapshot(openedEntry, openedAfterRead)
       || !sameFileIdentity(openedEntry, skillTargetEntryAfterRead)
-      || path.relative(canonicalRootAfterRead, canonicalRoot) !== ''
-      || path.relative(canonicalSkillAfterRead, canonicalSkill) !== ''
+      || !piCanonicalPathsEqual(pathComparisonIdentity, canonicalRootAfterRead, canonicalRoot)
+      || !piCanonicalPathsEqual(pathComparisonIdentity, canonicalSkillAfterRead, canonicalSkill)
     ) {
       throw new Error('approved skill entrypoint changed while fingerprinting');
     }
@@ -410,6 +436,7 @@ function assertSnapshotBudgetAvailable(budget: PiProjectSkillSnapshotBudget): vo
 async function preflightSkillSnapshotEntry(
   entryPath: string,
   canonicalRepoRoot: string,
+  pathComparisonIdentity: PiProjectPathComparisonIdentity,
   budget: PiProjectSkillSnapshotBudget,
   activeDirectories: Set<string>,
 ): Promise<void> {
@@ -418,13 +445,14 @@ async function preflightSkillSnapshotEntry(
     fs.lstat(entryPath),
     fs.realpath(entryPath),
   ]);
-  if (!localPathIsWithin(canonicalRepoRoot, canonicalEntry)) {
+  if (!localPathIsWithin(canonicalRepoRoot, canonicalEntry, pathComparisonIdentity)) {
     throw new Error('approved skill snapshot entry escaped its repository');
   }
   if (entry.isSymbolicLink()) {
     await preflightSkillSnapshotEntry(
       canonicalEntry,
       canonicalRepoRoot,
+      pathComparisonIdentity,
       budget,
       activeDirectories,
     );
@@ -444,6 +472,7 @@ async function preflightSkillSnapshotEntry(
         await preflightSkillSnapshotEntry(
           path.join(entryPath, child.name),
           canonicalRepoRoot,
+          pathComparisonIdentity,
           budget,
           activeDirectories,
         );
@@ -468,6 +497,7 @@ function updateFingerprintValue(hash: ReturnType<typeof createHash>, value: unkn
 async function fingerprintSkillTreeStateOnce(
   rootPath: string,
   canonicalRepoRoot: string,
+  pathComparisonIdentity: PiProjectPathComparisonIdentity,
   sharedBudget?: PiProjectSkillFingerprintBudget,
 ): Promise<string> {
   const hash = createHash('sha256');
@@ -491,7 +521,7 @@ async function fingerprintSkillTreeStateOnce(
       fs.stat(entryPath),
     ]);
     if (
-      !localPathIsWithin(canonicalRepoRoot, canonicalEntry)
+      !localPathIsWithin(canonicalRepoRoot, canonicalEntry, pathComparisonIdentity)
       || (!targetEntry.isDirectory() && !targetEntry.isFile())
     ) {
       throw new Error('approved skill tree contains an escaped or special entry');
@@ -565,7 +595,7 @@ async function fingerprintSkillTreeStateOnce(
     if (
       !sameEntrySnapshot(linkEntry, linkEntryAfter)
       || !sameEntrySnapshot(targetEntry, targetEntryAfter)
-      || path.resolve(canonicalEntryAfter) !== path.resolve(canonicalEntry)
+      || !piCanonicalPathsEqual(pathComparisonIdentity, canonicalEntryAfter, canonicalEntry)
     ) {
       throw new Error('approved skill tree changed while fingerprinting');
     }
@@ -579,33 +609,43 @@ async function fingerprintSkillTreeStateOnce(
 export async function fingerprintPiProjectSkillEntrypoint(
   rootPath: string,
   canonicalRepoRoot: string,
-  options: { budget?: PiProjectSkillFingerprintBudget } = {},
+  options: {
+    budget?: PiProjectSkillFingerprintBudget;
+    pathComparisonIdentity?: PiProjectPathComparisonIdentity;
+  } = {},
 ): Promise<PiProjectSkillEntrypointFingerprint | null> {
   try {
     if (options.budget && Date.now() >= options.budget.deadlineAtMs) return null;
+    const pathComparisonIdentity = options.pathComparisonIdentity
+      ?? (process.platform === 'win32' ? null : strictLocalPathComparisonIdentity());
+    if (!pathComparisonIdentity) return null;
     const [canonicalRoot, canonicalBoundary] = await Promise.all([
       fs.realpath(rootPath),
       fs.realpath(canonicalRepoRoot),
     ]);
-    if (!localPathIsWithin(canonicalBoundary, canonicalRoot)) return null;
+    if (!localPathIsWithin(canonicalBoundary, canonicalRoot, pathComparisonIdentity)) return null;
     const firstContentDigest = await fingerprintSkillEntrypointOnce(
       rootPath,
       canonicalBoundary,
+      pathComparisonIdentity,
       options.budget,
     );
     const firstSourceStateDigest = await fingerprintSkillTreeStateOnce(
       rootPath,
       canonicalBoundary,
+      pathComparisonIdentity,
       options.budget,
     );
     const secondContentDigest = await fingerprintSkillEntrypointOnce(
       rootPath,
       canonicalBoundary,
+      pathComparisonIdentity,
       options.budget,
     );
     const secondSourceStateDigest = await fingerprintSkillTreeStateOnce(
       rootPath,
       canonicalBoundary,
+      pathComparisonIdentity,
       options.budget,
     );
     return firstContentDigest === secondContentDigest
@@ -624,6 +664,7 @@ async function materializeSkillEntry(
   sourcePath: string,
   targetPath: string,
   canonicalRepoRoot: string,
+  pathComparisonIdentity: PiProjectPathComparisonIdentity,
   activeDirectories: Set<string>,
   budget: PiProjectSkillSnapshotBudget,
 ): Promise<void> {
@@ -632,7 +673,7 @@ async function materializeSkillEntry(
     fs.lstat(sourcePath),
     fs.realpath(sourcePath),
   ]);
-  if (!localPathIsWithin(canonicalRepoRoot, canonicalSource)) {
+  if (!localPathIsWithin(canonicalRepoRoot, canonicalSource, pathComparisonIdentity)) {
     throw new Error('approved skill entry escaped its repository');
   }
 
@@ -641,6 +682,7 @@ async function materializeSkillEntry(
       canonicalSource,
       targetPath,
       canonicalRepoRoot,
+      pathComparisonIdentity,
       activeDirectories,
       budget,
     );
@@ -659,6 +701,7 @@ async function materializeSkillEntry(
           path.join(sourcePath, child.name),
           path.join(targetPath, child.name),
           canonicalRepoRoot,
+          pathComparisonIdentity,
           activeDirectories,
           budget,
         );
@@ -668,7 +711,7 @@ async function materializeSkillEntry(
         fs.lstat(sourcePath),
       ]);
       if (
-        path.relative(canonicalAfterCopy, canonicalSource) !== ''
+        !piCanonicalPathsEqual(pathComparisonIdentity, canonicalAfterCopy, canonicalSource)
         || !entryAfterCopy.isDirectory()
         || !sameEntrySnapshot(entry, entryAfterCopy)
       ) {
@@ -733,7 +776,7 @@ async function materializeSkillEntry(
     if (
       !sameEntrySnapshot(openedEntry, openedAfterCopy)
       || !sameFileIdentity(openedEntry, sourcePathAfterCopy)
-      || path.relative(sourceAfterCopy, canonicalSource) !== ''
+      || !piCanonicalPathsEqual(pathComparisonIdentity, sourceAfterCopy, canonicalSource)
       || !targetAfterCopy.isFile()
     ) {
       throw new Error('approved skill file changed while snapshotting');
@@ -843,7 +886,8 @@ export async function stageApprovedPiProjectResources(
 ): Promise<PiProjectResourceAssemblySnapshot> {
   if (assembly.skillPaths.length === 0) return assembly;
   const canonicalRepoRoot = assembly.decision?.canonicalRepoRoot;
-  if (!canonicalRepoRoot) {
+  const pathComparisonIdentity = assembly.pathComparisonIdentity;
+  if (!canonicalRepoRoot || !pathComparisonIdentity) {
     return Object.freeze({
       ...assembly,
       skillPaths: Object.freeze([]),
@@ -884,6 +928,7 @@ export async function stageApprovedPiProjectResources(
       await preflightSkillSnapshotEntry(
         sourcePath,
         canonicalRepoRoot,
+        pathComparisonIdentity,
         preflightBudget,
         new Set<string>(),
       );
@@ -917,15 +962,19 @@ export async function stageApprovedPiProjectResources(
       ]);
       if (
         !sourceRootBeforeCopy.isDirectory()
-        || path.resolve(canonicalSourceBeforeCopy) !== path.resolve(sourcePath)
-        || !localPathIsWithin(canonicalRepoRoot, canonicalSourceBeforeCopy)
+        || !piCanonicalPathsEqual(pathComparisonIdentity, canonicalSourceBeforeCopy, sourcePath)
+        || !localPathIsWithin(
+          canonicalRepoRoot,
+          canonicalSourceBeforeCopy,
+          pathComparisonIdentity,
+        )
       ) {
         throw new Error('approved skill root changed before snapshotting');
       }
       const sourceFingerprintBeforeCopy = await fingerprintPiProjectSkillEntrypoint(
         sourcePath,
         canonicalRepoRoot,
-        { budget: fingerprintBudget() },
+        { budget: fingerprintBudget(), pathComparisonIdentity },
       );
       if (!sourceFingerprintBeforeCopy) {
         throw new Error('approved skill source fingerprint failed before snapshotting');
@@ -934,6 +983,7 @@ export async function stageApprovedPiProjectResources(
         sourcePath,
         targetPath,
         canonicalRepoRoot,
+        pathComparisonIdentity,
         new Set<string>(),
         copyBudget,
       );
@@ -941,15 +991,20 @@ export async function stageApprovedPiProjectResources(
         fs.realpath(sourcePath),
         fs.lstat(path.join(targetPath, 'SKILL.md')),
       ]);
-      if (path.resolve(canonicalSourceAfterCopy) !== path.resolve(sourcePath) || !skillEntrypoint.isFile()) {
+      if (
+        !piCanonicalPathsEqual(pathComparisonIdentity, canonicalSourceAfterCopy, sourcePath)
+        || !skillEntrypoint.isFile()
+      ) {
         throw new Error('approved skill changed before snapshot publication');
       }
       const [launchFingerprint, sourceFingerprint] = await Promise.all([
         fingerprintPiProjectSkillEntrypoint(targetPath, targetPath, {
           budget: fingerprintBudget(),
+          pathComparisonIdentity: strictLocalPathComparisonIdentity(),
         }),
         fingerprintPiProjectSkillEntrypoint(sourcePath, canonicalRepoRoot, {
           budget: fingerprintBudget(),
+          pathComparisonIdentity,
         }),
       ]);
       const [sourceRootAfterFingerprint, canonicalSourceAfterFingerprint] = await Promise.all([
@@ -963,7 +1018,11 @@ export async function stageApprovedPiProjectResources(
         || sourceFingerprintBeforeCopy.contentDigest !== sourceFingerprint.contentDigest
         || sourceFingerprintBeforeCopy.sourceStateDigest !== sourceFingerprint.sourceStateDigest
         || !sameEntrySnapshot(sourceRootBeforeCopy, sourceRootAfterFingerprint)
-        || path.resolve(canonicalSourceAfterFingerprint) !== path.resolve(canonicalSourceBeforeCopy)
+        || !piCanonicalPathsEqual(
+          pathComparisonIdentity,
+          canonicalSourceAfterFingerprint,
+          canonicalSourceBeforeCopy,
+        )
       ) {
         throw new Error('approved skill snapshot fingerprint failed');
       }
@@ -1002,12 +1061,14 @@ export async function stageApprovedPiProjectResources(
     const baselineStagingFingerprint = await fingerprintSkillTreeStateOnce(
       temporarySkillsRoot,
       canonicalTemporarySkillsRoot,
+      strictLocalPathComparisonIdentity(),
       fingerprintBudget(),
     );
     for (const [index, relativePath] of relativeLaunchPaths.entries()) {
       const targetPath = path.join(temporaryRoot, relativePath);
       const finalFingerprint = await fingerprintPiProjectSkillEntrypoint(targetPath, targetPath, {
         budget: fingerprintBudget(),
+        pathComparisonIdentity: strictLocalPathComparisonIdentity(),
       });
       const expectedFingerprint = launchSnapshotFingerprints[index];
       if (
@@ -1020,6 +1081,7 @@ export async function stageApprovedPiProjectResources(
     const finalStagingFingerprint = await fingerprintSkillTreeStateOnce(
       temporarySkillsRoot,
       canonicalTemporarySkillsRoot,
+      strictLocalPathComparisonIdentity(),
       fingerprintBudget(),
     );
     if (
@@ -1096,7 +1158,9 @@ export function reconcilePiProjectResourceRuntime(
     const snapshotDigest = assembly.launchSkillDigests[index];
     const sourceFingerprint = assembly.launchSkillSourceFingerprints[index];
     const canonicalRepoRoot = assembly.decision?.canonicalRepoRoot;
-    return commandName && sourcePath && snapshotDigest && sourceFingerprint && canonicalRepoRoot
+    const pathComparisonIdentity = assembly.pathComparisonIdentity;
+    return commandName && sourcePath && snapshotDigest && sourceFingerprint
+      && canonicalRepoRoot && pathComparisonIdentity
       ? [{
           sourcePath,
           runtimePath,
@@ -1104,6 +1168,7 @@ export function reconcilePiProjectResourceRuntime(
           snapshotDigest,
           sourceFingerprint,
           canonicalRepoRoot,
+          pathComparisonIdentity,
         }]
       : [];
   });

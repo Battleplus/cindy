@@ -35,6 +35,7 @@ import type {
   ListCustomizationsResult,
 } from './types/customizations.js';
 import type { PiRuntimeCapabilityManifest } from './types/pi-runtime-capabilities.js';
+import type { PiProjectPathComparisonIdentity } from './types/pi-project-trust.js';
 import { piExplicitSkillRuntimePath } from './agents/pi/skill-runtime-provenance.js';
 import {
   fingerprintPiProjectSkillEntrypoint,
@@ -177,9 +178,26 @@ const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS =
 const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET =
   MAX_PI_PROJECT_SKILL_FINGERPRINT_ENTRIES * 2;
 
+function runtimePathComparisonIdentity(value: unknown): PiProjectPathComparisonIdentity | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as { platform?: unknown; windowsCaseComparison?: unknown };
+  if (candidate.platform === 'posix') {
+    return candidate.windowsCaseComparison === undefined ? { platform: 'posix' } : null;
+  }
+  return candidate.platform === 'win32'
+    && (candidate.windowsCaseComparison === 'ordinal-insensitive'
+      || candidate.windowsCaseComparison === 'case-sensitive')
+    ? {
+        platform: 'win32',
+        windowsCaseComparison: candidate.windowsCaseComparison,
+      }
+    : null;
+}
+
 async function fingerprintPiProjectSkillForPalette(
   sourcePath: string,
   canonicalRepoRoot: string,
+  pathComparisonIdentity: PiProjectPathComparisonIdentity,
   budget: { remainingEntries: number; deadlineAtMs: number },
 ): ReturnType<typeof fingerprintPiProjectSkillEntrypoint> {
   const remainingMs = budget.deadlineAtMs - Date.now();
@@ -187,7 +205,10 @@ async function fingerprintPiProjectSkillForPalette(
   let timeout: number | NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      fingerprintPiProjectSkillEntrypoint(sourcePath, canonicalRepoRoot, { budget }),
+      fingerprintPiProjectSkillEntrypoint(sourcePath, canonicalRepoRoot, {
+        budget,
+        pathComparisonIdentity,
+      }),
       new Promise<null>((resolve) => {
         timeout = setNodeTimeout(() => resolve(null), remainingMs);
       }),
@@ -212,13 +233,20 @@ async function mergePiRuntimeSkillStatuses(
   };
   for (const skill of manifest.projectResources?.loadedSkills ?? []) {
     const canonicalSourcePath = canonicalPiRuntimePath(skill.sourcePath);
-    if (!skill.snapshotDigest || !skill.sourceFingerprint || !skill.canonicalRepoRoot) {
+    const pathComparisonIdentity = runtimePathComparisonIdentity(skill.pathComparisonIdentity);
+    if (
+      !skill.snapshotDigest
+      || !skill.sourceFingerprint
+      || !skill.canonicalRepoRoot
+      || !pathComparisonIdentity
+    ) {
       changedProjectSkills.set(canonicalSourcePath, skill.sourcePath);
       continue;
     }
     const currentFingerprint = await fingerprintPiProjectSkillForPalette(
       skill.sourcePath,
       skill.canonicalRepoRoot,
+      pathComparisonIdentity,
       fingerprintBudget,
     );
     if (

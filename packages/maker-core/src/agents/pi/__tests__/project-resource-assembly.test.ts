@@ -113,6 +113,10 @@ const available = {
   findNearestGitRoot: async (workingDir: string) => workingDir.split('/').slice(0, 3).join('/'),
 };
 
+const nativePathComparisonIdentity = process.platform === 'win32'
+  ? { platform: 'win32' as const, windowsCaseComparison: 'ordinal-insensitive' as const }
+  : { platform: 'posix' as const };
+
 describe('Pi approved project resource assembly', () => {
   it('freezes only explicitly eligible project skill paths', async () => {
     const workingDir = '/repo-a/packages/app';
@@ -162,6 +166,7 @@ describe('Pi approved project resource assembly', () => {
   it('diagnoses a missing authority without manufacturing trust input', () => {
     expect(unavailablePiProjectResourceAssembly('approval-resolver-unavailable')).toEqual({
       decision: null,
+      pathComparisonIdentity: null,
       skillPaths: [],
       launchSkillPaths: [],
       launchSkillDigests: [],
@@ -320,7 +325,9 @@ describe('Pi approved project resource assembly', () => {
         .toBe('# approved snapshot\n');
       expect(readFileSync(path.join(staged.launchSkillPaths[0]!, 'assets', 'fixture.txt'), 'utf8'))
         .toBe('snapshot asset\n');
-      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir))
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      }))
         .resolves.toMatchObject({
           contentDigest: staged.launchSkillDigests[0],
           sourceStateDigest: staged.launchSkillSourceFingerprints[0],
@@ -330,6 +337,182 @@ describe('Pi approved project resource assembly', () => {
         .toBe(nonBlockingFlag);
     } finally {
       vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a case-only sibling before recursive Windows fingerprint I/O', async () => {
+    const skillPath = String.raw`C:\Repo\.pi\skills\demo`;
+    const repoRoot = String.raw`C:\Repo`;
+    const escapedRealpath = String.raw`C:\repo\outside\demo`;
+    const realRealpath = fsPromises.realpath.bind(fsPromises);
+    const lstatSpy = vi.spyOn(fsPromises, 'lstat');
+    vi.spyOn(fsPromises, 'realpath').mockImplementation(async (candidate, options) => {
+      if (String(candidate) === skillPath) return escapedRealpath as never;
+      if (String(candidate) === repoRoot) return repoRoot as never;
+      return realRealpath(candidate, options as never) as never;
+    });
+    try {
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, repoRoot, {
+        pathComparisonIdentity: {
+          platform: 'win32',
+          windowsCaseComparison: 'case-sensitive',
+        },
+      })).resolves.toBeNull();
+      expect(lstatSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('rejects a case-only Windows realpath retarget during fingerprinting', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-case-retarget-')));
+    const repoRoot = path.join(root, 'repo');
+    const skillPath = path.join(repoRoot, '.pi', 'skills', 'demo');
+    const skillFile = path.join(skillPath, 'SKILL.md');
+    const canonicalRepoRoot = String.raw`C:\Repo`;
+    const canonicalSkillPath = String.raw`C:\Repo\.pi\skills\demo`;
+    const canonicalSkillFile = String.raw`C:\Repo\.pi\skills\demo\SKILL.md`;
+    const retargetedSkillPath = String.raw`C:\repo\.pi\skills\demo`;
+    const retargetedSkillFile = String.raw`C:\repo\.pi\skills\demo\SKILL.md`;
+    try {
+      mkdirSync(skillPath, { recursive: true });
+      writeFileSync(skillFile, '# approved\n');
+      const realRealpath = fsPromises.realpath.bind(fsPromises);
+      const realOpen = fsPromises.open.bind(fsPromises);
+      let skillRootReads = 0;
+      let skillFileReads = 0;
+      vi.spyOn(fsPromises, 'open').mockImplementation(async (candidate, flags, mode) =>
+        realOpen(
+          String(candidate) === canonicalSkillFile || String(candidate) === retargetedSkillFile
+            ? skillFile
+            : candidate,
+          flags,
+          mode,
+        ));
+      vi.spyOn(fsPromises, 'realpath').mockImplementation(async (candidate, options) => {
+        const value = String(candidate);
+        if (value === repoRoot) return canonicalRepoRoot as never;
+        if (value === skillPath) {
+          skillRootReads += 1;
+          return (skillRootReads < 3 ? canonicalSkillPath : retargetedSkillPath) as never;
+        }
+        if (value === skillFile) {
+          skillFileReads += 1;
+          return (skillFileReads < 2 ? canonicalSkillFile : retargetedSkillFile) as never;
+        }
+        return realRealpath(candidate, options as never) as never;
+      });
+
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, repoRoot, {
+        pathComparisonIdentity: {
+          platform: 'win32',
+          windowsCaseComparison: 'case-sensitive',
+        },
+      })).resolves.toBeNull();
+      expect(skillRootReads).toBe(3);
+      expect(skillFileReads).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a nested symlink into a case-only Windows sibling during recursive fingerprinting', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-case-link-')));
+    const repoRoot = path.join(root, 'repo');
+    const skillPath = path.join(repoRoot, '.pi', 'skills', 'demo');
+    const skillFile = path.join(skillPath, 'SKILL.md');
+    const outsideDir = path.join(root, 'outside');
+    const nestedLink = path.join(skillPath, 'outside');
+    const canonicalRepoRoot = String.raw`C:\Repo`;
+    const canonicalSkillPath = String.raw`C:\Repo\.pi\skills\demo`;
+    const canonicalSkillFile = String.raw`C:\Repo\.pi\skills\demo\SKILL.md`;
+    try {
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(outsideDir, { recursive: true });
+      writeFileSync(skillFile, '# approved\n');
+      writeFileSync(path.join(outsideDir, 'outside.txt'), 'outside\n');
+      symlinkSync(outsideDir, nestedLink, process.platform === 'win32' ? 'junction' : 'dir');
+      const realRealpath = fsPromises.realpath.bind(fsPromises);
+      const realOpen = fsPromises.open.bind(fsPromises);
+      let nestedRealpathReads = 0;
+      vi.spyOn(fsPromises, 'open').mockImplementation(async (candidate, flags, mode) =>
+        realOpen(String(candidate) === canonicalSkillFile ? skillFile : candidate, flags, mode));
+      vi.spyOn(fsPromises, 'realpath').mockImplementation(async (candidate, options) => {
+        const value = String(candidate);
+        if (value === repoRoot) return canonicalRepoRoot as never;
+        if (value === skillPath) return canonicalSkillPath as never;
+        if (value === skillFile) return canonicalSkillFile as never;
+        if (value === nestedLink || value.startsWith(`${nestedLink}${path.sep}`)) {
+          nestedRealpathReads += 1;
+          const suffix = value.slice(nestedLink.length).split(path.sep).join('\\');
+          return `${String.raw`C:\repo\outside`}${suffix}` as never;
+        }
+        return realRealpath(candidate, options as never) as never;
+      });
+
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, repoRoot, {
+        pathComparisonIdentity: {
+          platform: 'win32',
+          windowsCaseComparison: 'case-sensitive',
+        },
+      })).resolves.toBeNull();
+      expect(nestedRealpathReads).toBeGreaterThan(0);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes unusable Windows comparison evidence to no staging identity', async () => {
+    const workingDir = String.raw`C:\Repo`;
+    const input: PiProjectTrustInputSnapshot = {
+      identity: {
+        workingDir,
+        canonicalWorkingDir: workingDir,
+        canonicalRepoRoot: workingDir,
+        repoRootStatus: 'resolved',
+        platform: 'win32',
+        canonicalPathEncoding: 'utf16-lossless',
+        windowsCaseComparison: 'unavailable',
+      },
+      approval: null,
+      discovered: { skills: [], settings: [], packages: [], extensions: [] },
+    };
+
+    const assembled = await assembleApprovedPiProjectResources(input, workingDir);
+
+    expect(assembled.pathComparisonIdentity).toBeNull();
+    expect(assembled.skillPaths).toEqual([]);
+    expect(assembled.diagnostic.reason).toBe('project-identity-unavailable');
+  });
+
+  it('fails snapshot staging closed without host path comparison identity', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-identity-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-missing-identity', [skillPath]),
+        workingDir,
+      );
+
+      const staged = await stageApprovedPiProjectResources({
+        ...assembled,
+        pathComparisonIdentity: null,
+      }, configHome);
+
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -734,7 +917,9 @@ describe('Pi approved project resource assembly', () => {
         return realOpen(candidate, flags, mode);
       });
 
-      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir)).resolves.toBeNull();
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      })).resolves.toBeNull();
       expect(skillOpenCount).toBe(2);
     } finally {
       vi.restoreAllMocks();
@@ -763,6 +948,7 @@ describe('Pi approved project resource assembly', () => {
       });
 
       await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
         budget: {
           remainingEntries: 100,
           deadlineAtMs: Date.now() + 1_000,
@@ -786,10 +972,14 @@ describe('Pi approved project resource assembly', () => {
       mkdirSync(path.dirname(assetPath), { recursive: true });
       writeFileSync(path.join(skillPath, 'SKILL.md'), '# unchanged entrypoint\n');
       writeFileSync(assetPath, 'asset-one\n');
-      const before = await fingerprintPiProjectSkillEntrypoint(skillPath, workingDir);
+      const before = await fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      });
 
       writeFileSync(assetPath, 'asset-two\n');
-      const after = await fingerprintPiProjectSkillEntrypoint(skillPath, workingDir);
+      const after = await fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      });
 
       expect(before?.contentDigest).toBe(after?.contentDigest);
       expect(before?.sourceStateDigest).not.toBe(after?.sourceStateDigest);
@@ -809,9 +999,11 @@ describe('Pi approved project resource assembly', () => {
       writeFileSync(path.join(skillPath, 'assets', 'fixture.txt'), 'asset\n');
 
       await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
         budget: { remainingEntries: 1, deadlineAtMs: Number.POSITIVE_INFINITY },
       })).resolves.toBeNull();
       await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
         budget: { remainingEntries: 10, deadlineAtMs: Date.now() - 1 },
       })).resolves.toBeNull();
     } finally {
@@ -967,6 +1159,7 @@ describe('Pi approved project resource assembly', () => {
         snapshotDigest: 'snapshot-digest',
         sourceFingerprint: 'source-fingerprint',
         canonicalRepoRoot: assembly.decision?.canonicalRepoRoot,
+        pathComparisonIdentity: assembly.pathComparisonIdentity,
       }],
     });
 

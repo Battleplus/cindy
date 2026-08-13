@@ -22,6 +22,10 @@ import type { AgentKind, PermissionMode } from './types/common.js';
 import type { AgentEvent } from './types/events.js';
 import { fingerprintPiProjectSkillEntrypoint } from './agents/pi/project-resource-assembly.js';
 
+const nativePathComparisonIdentity = process.platform === 'win32'
+  ? { platform: 'win32' as const, windowsCaseComparison: 'ordinal-insensitive' as const }
+  : { platform: 'posix' as const };
+
 /** A generator that never completes — simulates a live session handle. */
 async function* neverEndingIterator(): AsyncGenerator<AgentEvent> {
   await new Promise<never>(() => {}); // never resolves
@@ -1075,11 +1079,16 @@ describe('Maker Pi runtime skill status', () => {
     try {
       writeSkill(sourcePath, '# approved\n', 'approved asset\n');
       writeSkill(runtimePath, '# approved\n', 'approved asset\n');
-      const snapshotFingerprint = await fingerprintPiProjectSkillEntrypoint(runtimePath, runtimePath);
-      const sourceFingerprint = await fingerprintPiProjectSkillEntrypoint(sourcePath, repoRoot);
+      const snapshotFingerprint = await fingerprintPiProjectSkillEntrypoint(runtimePath, runtimePath, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      });
+      const sourceFingerprint = await fingerprintPiProjectSkillEntrypoint(sourcePath, repoRoot, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      });
       expect(snapshotFingerprint?.contentDigest).toMatch(/^[a-f0-9]{64}$/);
       expect(sourceFingerprint?.sourceStateDigest).toMatch(/^[a-f0-9]{64}$/);
 
+      let runtimePathComparisonIdentity: unknown = nativePathComparisonIdentity;
       const agent = createAgent(async (opts) => {
         const handle = createHandle({ id: `pi-${opts.sessionId}`, agentKind: 'pi' });
         handle.getRuntimeCapabilities = () => ({
@@ -1101,6 +1110,7 @@ describe('Maker Pi runtime skill status', () => {
               snapshotDigest: snapshotFingerprint!.contentDigest,
               sourceFingerprint: sourceFingerprint!.sourceStateDigest,
               canonicalRepoRoot: repoRoot,
+              pathComparisonIdentity: runtimePathComparisonIdentity as never,
             }],
           },
           commands: [{
@@ -1143,6 +1153,26 @@ describe('Maker Pi runtime skill status', () => {
         sessionId: 'source-snapshot',
       });
       expect(initial.skills[0]).toMatchObject({ runtimeStatus: 'loaded' });
+
+      runtimePathComparisonIdentity = undefined;
+      const missingIdentity = await maker.listAgentSkills('pi', {
+        workingDir: repoRoot,
+        sessionId: 'source-snapshot',
+      });
+      expect(missingIdentity.skills[0]).toMatchObject({ runtimeStatus: 'discovered' });
+      expect(missingIdentity.errors).toContainEqual(expect.objectContaining({ path: sourcePath }));
+
+      runtimePathComparisonIdentity = {
+        platform: 'win32',
+        windowsCaseComparison: 'unavailable',
+      };
+      const invalidIdentity = await maker.listAgentSkills('pi', {
+        workingDir: repoRoot,
+        sessionId: 'source-snapshot',
+      });
+      expect(invalidIdentity.skills[0]).toMatchObject({ runtimeStatus: 'discovered' });
+      expect(invalidIdentity.errors).toContainEqual(expect.objectContaining({ path: sourcePath }));
+      runtimePathComparisonIdentity = nativePathComparisonIdentity;
 
       writeFileSync(path.join(sourcePath, 'assets', 'fixture.txt'), 'changed! asset\n');
       const changedAsset = await maker.listAgentSkills('pi', {
@@ -1187,7 +1217,9 @@ describe('Maker Pi runtime skill status', () => {
       for (let index = 0; index < 1_050; index += 1) {
         writeFileSync(path.join(sourcePath, 'assets', `${index}.txt`), '');
       }
-      const sourceFingerprint = await fingerprintPiProjectSkillEntrypoint(sourcePath, repoRoot);
+      const sourceFingerprint = await fingerprintPiProjectSkillEntrypoint(sourcePath, repoRoot, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+      });
       expect(sourceFingerprint).not.toBeNull();
 
       const agent = createAgent(async (opts) => {
@@ -1211,6 +1243,7 @@ describe('Maker Pi runtime skill status', () => {
               snapshotDigest: sourceFingerprint!.contentDigest,
               sourceFingerprint: sourceFingerprint!.sourceStateDigest,
               canonicalRepoRoot: repoRoot,
+              pathComparisonIdentity: nativePathComparisonIdentity,
             }],
           },
           commands: [{
