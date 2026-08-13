@@ -25,6 +25,7 @@ vi.mock('@cindy/maker-core', () => ({
 
 import {
   __testing,
+  MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
   resolveDesktopPiProjectIdentity,
   resolveDesktopPiProjectTrustInput,
   scanContainedDesktopPiProjectSkills,
@@ -237,6 +238,39 @@ describe('canonical Windows comparison', () => {
 });
 
 describe('scanContainedDesktopPiProjectSkills', () => {
+  it('rejects an oversized discovery directory before probing its children', async () => {
+    const project = makeProject();
+    const identity = (await resolveDesktopPiProjectIdentity(project.first))!;
+    const targetRoot = path.join(identity.canonicalWorkingDir!, '.pi', 'skills');
+    const stat = vi.fn(async (candidate: string) => fs.promises.stat(candidate));
+    const lstat = vi.fn(async (candidate: string) => fs.promises.lstat(candidate));
+    const realpath = vi.fn(async (candidate: string) => fs.promises.realpath(candidate));
+    const openDirectory = vi.fn(async (candidate: string) => {
+      if (candidate !== targetRoot) return fs.promises.opendir(candidate);
+      return (async function* oversizedEntries() {
+        for (let index = 0; index <= MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES; index += 1) {
+          yield {
+            name: `skill-${index}`,
+            isDirectory: (): boolean => true,
+            isSymbolicLink: (): boolean => false,
+          };
+        }
+      }());
+    });
+
+    expect(await scanContainedDesktopPiProjectSkills(identity, {
+      readdir: async () => [],
+      openDirectory,
+      stat,
+      lstat,
+      realpath,
+    })).toBeNull();
+    expect(openDirectory).toHaveBeenCalledWith(targetRoot);
+    expect(realpath).toHaveBeenCalledTimes(1);
+    expect(stat).toHaveBeenCalledTimes(1);
+    expect(lstat).toHaveBeenCalledTimes(1);
+  });
+
   it('finds only directory-form Pi skills from workingDir through the repo root', async () => {
     const project = makeProject();
     const identity = (await resolveDesktopPiProjectIdentity(project.first))!;

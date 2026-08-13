@@ -53,10 +53,87 @@ export interface PiProjectSkillAdmissionResolverDeps {
 
 interface ProjectSkillScanDeps {
   readdir: (candidate: string) => Promise<FsDirentLike[]>;
+  /** Production uses this bounded streaming reader; readdir remains a test seam. */
+  openDirectory?: (candidate: string) => Promise<AsyncIterable<FsDirentLike>>;
   lstat: (candidate: string) => Promise<FsLstatLike>;
   stat: (candidate: string) => Promise<FsStatLike>;
   realpath: (candidate: string) => Promise<string>;
   resolveWindowsCaseComparison?: (candidate: string) => Promise<WindowsCaseComparison>;
+}
+
+export const MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES = 10_000;
+export const PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS = 30_000;
+
+interface ProjectSkillDiscoveryBudget {
+  remainingEntries: number;
+  readonly deadlineAtMs: number;
+}
+
+function assertProjectSkillDiscoveryBudget(budget: ProjectSkillDiscoveryBudget): void {
+  if (Date.now() >= budget.deadlineAtMs) {
+    throw new Error('project skill discovery deadline expired');
+  }
+  if (budget.remainingEntries <= 0) {
+    throw new Error('project skill discovery entry budget exhausted');
+  }
+}
+
+async function awaitProjectSkillDiscoveryStep<T>(
+  operation: Promise<T>,
+  budget: ProjectSkillDiscoveryBudget,
+): Promise<T> {
+  const remainingMs = budget.deadlineAtMs - Date.now();
+  if (remainingMs <= 0) throw new Error('project skill discovery deadline expired');
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('project skill discovery deadline expired')),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function readProjectSkillDirectory(
+  candidate: string,
+  dependencies: ProjectSkillScanDeps,
+  budget: ProjectSkillDiscoveryBudget,
+): Promise<FsDirentLike[]> {
+  const entries: FsDirentLike[] = [];
+  if (dependencies.openDirectory) {
+    const directory = await awaitProjectSkillDiscoveryStep(
+      dependencies.openDirectory(candidate),
+      budget,
+    );
+    const iterator = directory[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const result = await awaitProjectSkillDiscoveryStep(iterator.next(), budget);
+        if (result.done) break;
+        assertProjectSkillDiscoveryBudget(budget);
+        budget.remainingEntries -= 1;
+        entries.push(result.value);
+      }
+    } finally {
+      await iterator.return?.();
+    }
+    return entries;
+  }
+
+  // Compatibility seam for focused tests that inject only readdir. The host
+  // default never takes this path, so production discovery remains streaming.
+  const listed = await awaitProjectSkillDiscoveryStep(dependencies.readdir(candidate), budget);
+  if (Date.now() >= budget.deadlineAtMs || listed.length > budget.remainingEntries) {
+    throw new Error('project skill discovery budget exhausted');
+  }
+  budget.remainingEntries -= listed.length;
+  return listed;
 }
 
 function losslessPosixPath(value: string): boolean {
@@ -328,7 +405,9 @@ async function scanOneProjectSkillRoot(
   sourceRoot: string,
   dependencies: ProjectSkillScanDeps,
   checkedWindowsDirectories: Map<string, boolean>,
+  budget: ProjectSkillDiscoveryBudget,
 ): Promise<PiProjectCanonicalPathEvidence[] | null> {
+  assertProjectSkillDiscoveryBudget(budget);
   const rootEntry = await lstatOrNull(sourceRoot, dependencies.lstat);
   if (!rootEntry) return [];
   const rootStat = await statOrNull(sourceRoot, dependencies.stat);
@@ -342,13 +421,14 @@ async function scanOneProjectSkillRoot(
     dependencies,
     checkedWindowsDirectories,
   )) return null;
-  const entries = await dependencies.readdir(sourceRoot);
+  const entries = await readProjectSkillDirectory(sourceRoot, dependencies, budget);
   const result: PiProjectCanonicalPathEvidence[] = [];
 
   for (const entry of entries) {
     if (entry.name.startsWith('.') || /\.bak\.\d+$/.test(entry.name)) continue;
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const folder = pathFor(identity).join(sourceRoot, entry.name);
+    assertProjectSkillDiscoveryBudget(budget);
     const canonicalFolder = await dependencies.realpath(folder);
     if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalFolder)) return null;
     if (!await windowsDirectoryChainMatchesIdentity(
@@ -379,6 +459,7 @@ function pathFor(identity: PiProjectIdentityResolution): PathApi {
 
 const defaultScanDeps = (): ProjectSkillScanDeps => ({
   readdir: (candidate) => fsp.readdir(candidate, { withFileTypes: true }),
+  openDirectory: async (candidate) => fsp.opendir(candidate),
   lstat: (candidate) => fsp.lstat(candidate),
   stat: (candidate) => fsp.stat(candidate),
   realpath: (candidate) => fsp.realpath(candidate),
@@ -439,6 +520,10 @@ export async function scanContainedDesktopPiProjectSkills(
     const evidence: PiProjectCanonicalPathEvidence[] = [];
     const canonicalPaths = new Set<string>();
     const checkedWindowsDirectories = new Map<string, boolean>();
+    const budget: ProjectSkillDiscoveryBudget = {
+      remainingEntries: MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
+      deadlineAtMs: Date.now() + PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS,
+    };
     if (!await windowsDirectoryChainMatchesIdentity(
       identity,
       identity.canonicalWorkingDir!,
@@ -451,6 +536,7 @@ export async function scanContainedDesktopPiProjectSkills(
         root,
         dependencies,
         checkedWindowsDirectories,
+        budget,
       );
       if (!scanned) return null;
       for (const item of scanned) {
