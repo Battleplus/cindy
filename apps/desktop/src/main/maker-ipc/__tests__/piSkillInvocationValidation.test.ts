@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterAll, describe, expect, it } from 'vitest';
 import type {
   AgentSkillCommand,
   PiRuntimeCapabilityManifest,
@@ -11,7 +15,16 @@ import {
   isStalePiSkillInvocationError,
 } from '../piSkillInvocationValidation.js';
 
-const sourcePath = '/repo/.pi/skills/demo';
+const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-pi-skill-validation-'));
+const sourcePath = path.join(repoRoot, '.pi', 'skills', 'demo');
+const localPathComparisonIdentity = process.platform === 'win32'
+  ? ({ platform: 'win32', windowsCaseComparison: 'case-sensitive' } as const)
+  : ({ platform: 'posix' } as const);
+fs.mkdirSync(sourcePath, { recursive: true });
+
+afterAll(() => {
+  fs.rmSync(repoRoot, { recursive: true, force: true });
+});
 
 function item(
   patch: Partial<NonNullable<AgentInputQueuedMessage['agentSkillInvocation']>> = {},
@@ -60,6 +73,8 @@ function manifest(
         sourcePath,
         runtimePath: '/snapshot/demo',
         commandName: 'skill:demo',
+        canonicalRepoRoot: repoRoot,
+        pathComparisonIdentity: localPathComparisonIdentity,
       }],
     },
     ...patch,
@@ -84,6 +99,65 @@ describe('Pi Skill invocation validation', () => {
     expect(isCurrentPiSkillInvocation(item(), manifest(), skills())).toBe(true);
   });
 
+  it('accepts a loaded project Skill receipt through its stable in-repo symlink', () => {
+    const physicalSource = path.join(repoRoot, '.pi', 'skills', 'physical-demo');
+    const otherSource = path.join(repoRoot, '.pi', 'skills', 'other-demo');
+    const linkedSource = path.join(repoRoot, '.pi', 'skills', 'linked-demo');
+    try {
+      fs.mkdirSync(physicalSource);
+      fs.mkdirSync(otherSource);
+      fs.symlinkSync(
+        physicalSource,
+        linkedSource,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+
+      expect(isCurrentPiSkillInvocation(
+        item({ sourcePath: linkedSource }),
+        manifest({
+          projectResources: {
+            ...manifest().projectResources!,
+            loadedSkills: [{
+              sourcePath: physicalSource,
+              runtimePath: '/snapshot/demo',
+              commandName: 'skill:demo',
+              canonicalRepoRoot: repoRoot,
+              pathComparisonIdentity: localPathComparisonIdentity,
+            }],
+          },
+        }),
+        skills({ path: linkedSource }),
+      )).toBe(true);
+
+      fs.unlinkSync(linkedSource);
+      fs.symlinkSync(
+        otherSource,
+        linkedSource,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      expect(isCurrentPiSkillInvocation(
+        item({ sourcePath: linkedSource }),
+        manifest({
+          projectResources: {
+            ...manifest().projectResources!,
+            loadedSkills: [{
+              sourcePath: physicalSource,
+              runtimePath: '/snapshot/demo',
+              commandName: 'skill:demo',
+              canonicalRepoRoot: repoRoot,
+              pathComparisonIdentity: localPathComparisonIdentity,
+            }],
+          },
+        }),
+        skills({ path: linkedSource }),
+      )).toBe(false);
+    } finally {
+      fs.rmSync(linkedSource, { recursive: true, force: true });
+      fs.rmSync(physicalSource, { recursive: true, force: true });
+      fs.rmSync(otherSource, { recursive: true, force: true });
+    }
+  });
+
   it('rejects legacy, stale, renamed, changed, and ambiguous project receipts', () => {
     expect(isCurrentPiSkillInvocation(item({ scope: undefined }), manifest(), skills())).toBe(false);
     expect(isCurrentPiSkillInvocation(item({ sourcePath: undefined }), manifest(), skills())).toBe(false);
@@ -92,6 +166,49 @@ describe('Pi Skill invocation validation', () => {
     expect(isCurrentPiSkillInvocation(item(), manifest(), skills({ runtimeStatus: 'discovered' }))).toBe(false);
     expect(isCurrentPiSkillInvocation(item(), manifest({ projectResources: undefined }), skills())).toBe(false);
     expect(isCurrentPiSkillInvocation(item(), manifest(), [...skills(), ...skills()])).toBe(false);
+    expect(isCurrentPiSkillInvocation(item(), manifest({
+      projectResources: {
+        ...manifest().projectResources!,
+        loadedSkills: [{
+          sourcePath,
+          runtimePath: '/snapshot/demo',
+          commandName: 'skill:demo',
+          canonicalRepoRoot: repoRoot,
+        }],
+      },
+    }), skills())).toBe(false);
+    expect(isCurrentPiSkillInvocation(item(), manifest({
+      projectResources: {
+        ...manifest().projectResources!,
+        loadedSkills: [{
+          sourcePath,
+          runtimePath: '/snapshot/demo',
+          commandName: 'skill:demo',
+          canonicalRepoRoot: repoRoot,
+          pathComparisonIdentity: {
+            platform: 'invalid',
+          } as never,
+        }],
+      },
+    }), skills())).toBe(false);
+
+    const unrelatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-pi-skill-other-repo-'));
+    try {
+      expect(isCurrentPiSkillInvocation(item(), manifest({
+        projectResources: {
+          ...manifest().projectResources!,
+          loadedSkills: [{
+            sourcePath,
+            runtimePath: '/snapshot/demo',
+            commandName: 'skill:demo',
+            canonicalRepoRoot: unrelatedRoot,
+            pathComparisonIdentity: localPathComparisonIdentity,
+          }],
+        },
+      }), skills())).toBe(false);
+    } finally {
+      fs.rmSync(unrelatedRoot, { recursive: true, force: true });
+    }
   });
 
   it('requires exact current user Skill source provenance too', () => {

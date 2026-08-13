@@ -5,6 +5,10 @@ import type {
   AgentSkillCommand,
   PiRuntimeCapabilityManifest,
 } from '@cindy/maker-core';
+import {
+  piCanonicalPathIsWithin,
+  piCanonicalPathsEqual,
+} from '@cindy/maker-core';
 
 import type { AgentInputQueuedMessage } from '../../shared/agentInputQueue.js';
 
@@ -21,6 +25,36 @@ function canonicalLocalPath(value: unknown): string | null {
     // never a case-folded match on a case-sensitive Windows directory.
     return resolved;
   }
+}
+
+function existingPhysicalPath(value: unknown): string | null {
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.includes('\0')
+    || !path.isAbsolute(value)
+  ) return null;
+  try {
+    return fs.realpathSync.native(path.resolve(value));
+  } catch {
+    return null;
+  }
+}
+
+function runtimeProjectSkillMatchesSource(
+  sourcePath: string,
+  skill: NonNullable<NonNullable<
+    PiRuntimeCapabilityManifest['projectResources']
+  >['loadedSkills']>[number],
+): boolean {
+  const selected = existingPhysicalPath(sourcePath);
+  const loadedSource = existingPhysicalPath(skill.sourcePath);
+  const repoRoot = existingPhysicalPath(skill.canonicalRepoRoot);
+  const identity = skill.pathComparisonIdentity;
+  if (!selected || !loadedSource || !repoRoot || !identity) return false;
+  return piCanonicalPathIsWithin(identity, repoRoot, selected)
+    && piCanonicalPathIsWithin(identity, repoRoot, loadedSource)
+    && piCanonicalPathsEqual(identity, selected, loadedSource);
 }
 
 function runtimeUserSkillMatchesSource(
@@ -80,7 +114,7 @@ export function isCurrentPiSkillInvocation(
   if (invocation.scope === 'repo') {
     const loadedMatches = manifest.projectResources?.loadedSkills?.filter((skill) => (
       skill.commandName === invocation.runtimeCommandName
-      && skill.sourcePath === invocation.sourcePath
+      && runtimeProjectSkillMatchesSource(invocationSourcePath, skill)
     )) ?? [];
     return loadedMatches.length === 1;
   }
