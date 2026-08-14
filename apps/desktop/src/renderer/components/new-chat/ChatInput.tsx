@@ -229,6 +229,7 @@ import {
   isSlashCommandRosterReady,
   loadAllCommands,
   nextAvailableSlashCommandIndex,
+  pendingProjectSkillForMessage,
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
   type SlashCommandRosterState,
   type UnifiedCommand,
@@ -4431,7 +4432,6 @@ export function ChatInput({
           slashCommandRanges,
           hostCapability: serializedHostCapability,
         } = serializedContent;
-        const leadingSlashName = serializedEditorText.match(/^\/(\S+)/)?.[1]?.toLowerCase();
         if (ambiguousPendingProjectSkillName(
           serializedEditorText,
           mergedCommands,
@@ -4440,20 +4440,11 @@ export function ChatInput({
           toast.warning(t('commandPalette.projectSkillUnavailableForNewTask'));
           return;
         }
-        const pendingProjectSkill =
-          allowPendingProjectSkillSelection
-          && leadingSlashName
-          && slashCommandRanges.some((range) => range.start === 0)
-            ? mergedCommands.find((command): command is Extract<
-                UnifiedCommand,
-                { kind: 'agent-skill' }
-              > => (
-                command.kind === 'agent-skill'
-                &&
-                command.name.toLowerCase() === leadingSlashName
-                && isSlashCommandUnavailable(command)
-              ))
-            : undefined;
+        const pendingProjectSkill = pendingProjectSkillForMessage(
+          serializedEditorText,
+          mergedCommands,
+          allowPendingProjectSkillSelection,
+        );
         let editorText = serializedEditorText;
         let agentReferences = serializedAgentReferences;
         const attachmentsForSend = optimisticallyClearRemoteComposer

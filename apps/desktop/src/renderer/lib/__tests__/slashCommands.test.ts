@@ -12,6 +12,7 @@ import {
   isSameProjectSkillAcrossRoots,
   mergeCommands,
   nextAvailableSlashCommandIndex,
+  pendingProjectSkillForMessage,
   reconcilePiRuntimeCommandForDispatch,
   reconcilePiRuntimeCommandForDispatchWithRetry,
   resolvePendingPiProjectSkillForDispatch,
@@ -160,6 +161,51 @@ describe('Pi project skill availability', () => {
     expect(merged).toEqual([discovered]);
     expect(hasAvailableSlashCommand(merged, true)).toBe(true);
     expect(ambiguousPendingProjectSkillName('/demo', merged, true)).toBeUndefined();
+  });
+
+  it('binds a uniquely typed project Skill alias to its exact discovery path', () => {
+    const discovered = skill({
+      name: 'demo',
+      path: '/repo/.pi/skills/demo',
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+    const merged = mergeCommands([], [], [discovered]);
+
+    expect(pendingProjectSkillForMessage('/DEMO run this', merged, true)).toEqual(discovered);
+    expect(pendingProjectSkillForMessage('/demo', merged, false)).toBeUndefined();
+  });
+
+  it('fails closed instead of choosing a typed ambiguous project Skill path', () => {
+    const merged = mergeCommands([], [], [
+      skill({
+        name: 'demo',
+        path: '/repo/.pi/skills/demo',
+        scope: 'repo',
+        runtimeStatus: 'discovered',
+      }),
+      skill({
+        name: 'Demo',
+        path: '/repo/.agents/skills/demo',
+        scope: 'repo',
+        runtimeStatus: 'discovered',
+      }),
+    ]);
+
+    expect(pendingProjectSkillForMessage('/demo', merged, true)).toBeUndefined();
+  });
+
+  it('does not turn a typed executable same-name command into a pending project Skill', () => {
+    const discovered = skill({
+      name: 'help',
+      path: '/repo/.pi/skills/help',
+      scope: 'repo',
+      runtimeStatus: 'discovered',
+    });
+    const desktop: UnifiedCommand = { kind: 'desktop', name: 'help', description: 'Help' };
+    const merged = mergeCommands([desktop], [], [discovered]);
+
+    expect(pendingProjectSkillForMessage('/help', merged, true)).toBeUndefined();
   });
 
   it('keeps an explicit executable owner when same-name project previews are ambiguous', () => {

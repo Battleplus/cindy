@@ -433,14 +433,80 @@ function assertSnapshotBudgetAvailable(budget: PiProjectSkillSnapshotBudget): vo
   budget.remainingEntries -= 1;
 }
 
+async function awaitSnapshotBudgetStep<T>(
+  operation: Promise<T>,
+  budget: PiProjectSkillSnapshotBudget,
+): Promise<T> {
+  const remainingMs = budget.deadlineAtMs - Date.now();
+  if (remainingMs <= 0) throw new Error('approved skill snapshot deadline expired');
+  if (!Number.isFinite(remainingMs)) return operation;
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setNodeTimeout(
+      () => reject(new Error('approved skill snapshot deadline expired')),
+      remainingMs,
+    );
+    operation.then(
+      (value) => {
+        clearNodeTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        clearNodeTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function visitSnapshotDirectoryEntries(
+  entryPath: string,
+  budget: PiProjectSkillSnapshotBudget,
+  visit: (childName: string) => Promise<void>,
+): Promise<void> {
+  if (typeof fs.opendir === 'function') {
+    const directory = await awaitSnapshotBudgetStep(fs.opendir(entryPath), budget);
+    const iterator = directory[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const result = await awaitSnapshotBudgetStep(iterator.next(), budget);
+        if (result.done) break;
+        // Charge the shared budget before any child lstat/realpath work. A
+        // hostile directory therefore cannot make preflight materialize or
+        // probe an unbounded child list before failing closed.
+        assertSnapshotBudgetAvailable(budget);
+        await visit(result.value.name);
+      }
+    } finally {
+      await iterator.return?.();
+    }
+    return;
+  }
+
+  // Compatibility seam for focused tests/runtimes without opendir. Production
+  // uses the streaming path above; the fallback still has a deadline and
+  // rejects the whole listing before probing any child when it exceeds budget.
+  const children = await awaitSnapshotBudgetStep(
+    fs.readdir(entryPath, { withFileTypes: true }),
+    budget,
+  );
+  if (Date.now() >= budget.deadlineAtMs || children.length > budget.remainingEntries) {
+    throw new Error('approved skill snapshot entry budget exhausted');
+  }
+  for (const child of children) {
+    assertSnapshotBudgetAvailable(budget);
+    await visit(child.name);
+  }
+}
+
 async function preflightSkillSnapshotEntry(
   entryPath: string,
   canonicalRepoRoot: string,
   pathComparisonIdentity: PiProjectPathComparisonIdentity,
   budget: PiProjectSkillSnapshotBudget,
   activeDirectories: Set<string>,
+  entryAlreadyCounted = false,
 ): Promise<void> {
-  assertSnapshotBudgetAvailable(budget);
+  if (!entryAlreadyCounted) assertSnapshotBudgetAvailable(budget);
   const [entry, canonicalEntry] = await Promise.all([
     fs.lstat(entryPath),
     fs.realpath(entryPath),
@@ -464,19 +530,16 @@ async function preflightSkillSnapshotEntry(
     }
     activeDirectories.add(canonicalEntry);
     try {
-      const children = await fs.readdir(entryPath, { withFileTypes: true });
-      if (Date.now() >= budget.deadlineAtMs) {
-        throw new Error('approved skill snapshot deadline expired');
-      }
-      for (const child of children) {
+      await visitSnapshotDirectoryEntries(entryPath, budget, async (childName) => {
         await preflightSkillSnapshotEntry(
-          path.join(entryPath, child.name),
+          path.join(entryPath, childName),
           canonicalRepoRoot,
           pathComparisonIdentity,
           budget,
           activeDirectories,
+          true,
         );
-      }
+      });
     } finally {
       activeDirectories.delete(canonicalEntry);
     }

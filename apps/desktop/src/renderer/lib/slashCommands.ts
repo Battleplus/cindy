@@ -253,6 +253,30 @@ export function ambiguousPendingProjectSkillName(
     : undefined;
 }
 
+type PendingProjectSkillCommand = Extract<UnifiedCommand, { kind: 'agent-skill' }> & {
+  path: string;
+};
+
+/** Resolve a typed or palette-inserted project Skill alias to one exact discovery path. */
+export function pendingProjectSkillForMessage(
+  message: string,
+  commands: UnifiedCommand[],
+  allowPendingProjectSkillSelection = false,
+): PendingProjectSkillCommand | undefined {
+  if (!allowPendingProjectSkillSelection) return undefined;
+  const name = message.match(/^\/(\S+)/)?.[1]?.toLowerCase();
+  if (!name || ambiguousPendingProjectSkillName(message, commands, true)) return undefined;
+  const matches = commands.filter((command): command is PendingProjectSkillCommand => (
+    command.kind === 'agent-skill'
+    && isSlashCommandUnavailable(command)
+    && command.name.toLowerCase() === name
+    && typeof command.path === 'string'
+    && command.path.length > 0
+  ));
+  const sourcePaths = new Set(matches.map((command) => command.path));
+  return sourcePaths.size === 1 ? matches[0] : undefined;
+}
+
 function hasShadowedUnavailableSkill(
   commands: UnifiedCommand[],
   commandName: string,
