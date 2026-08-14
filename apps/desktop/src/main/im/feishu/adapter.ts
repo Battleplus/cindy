@@ -9,6 +9,8 @@
  *   - ack emoji: REACTION_PROCESSING
  *   - 群 lane(senderId = `g/{chatId}[/{threadId}]`, @cindy/im feishu/codec.ts):
  *     群主流 @ 入站即开话题(每话题一个会话, 群 lane 仅开话题失败的降级路径);
+ *     群里新建的会话一律用渠道设置「群聊新建任务权限档」(sessions.permissionModeFor,
+ *     `/ctr` 新建走 cardActionHandler 读同一设置);
  *     群轮次挂「非只读即确认」策略 + 触发时按页回翻群历史(50/页, 最多 5 页,
  *     模型相关性早停 + 注入扫描), 图片/文件下载后进上下文, 统一防注入包裹
  *     (见 ./groupContext.ts)。
@@ -19,9 +21,16 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { app } from 'electron';
-import { decodeFeishuLaneUserId, type FeishuIM, type FeishuLane } from '@cindy/im';
+import {
+  decodeFeishuLaneUserId,
+  encodeFeishuLaneUserId,
+  type FeishuIM,
+  type FeishuLane,
+} from '@cindy/im';
 
 import type { ImChannelAdapter, ImOrchestratorConfig } from '../shared/types';
+import { bindingStore } from '../binding';
+import { readImDefaultSettings } from '../defaultSettingsStore';
 import { claimLegacyImPath, ownerScopedImUserDataPath } from '../ownerScopedStorage';
 import { createLogger } from '../../logger';
 import { buildFeishuGroupContext, sanitizeDisplayText } from './groupContext';
@@ -211,10 +220,45 @@ function takeMainFlowContextLane(topicLaneUserId: string): FeishuLane | undefine
   return entry.lane;
 }
 
+/**
+ * 群主流消息的 /ctr 接管路由裁决(transport lane 覆写钩子的 host 侧实现)。
+ *
+ * 本群存在且仅存在一个「话题 lane 的活跃接管」时, 群主流消息直接落进该
+ * 接管话题 —— 不再开新话题, 会话状态进 /ctr 接管的 desktop session, 回复
+ * 也回接管话题(见 wsClient 钩子注释)。多个接管并存时歧义, 回落默认
+ * 开话题行为; slash 命令(如 /ctr 本身)恒回落, 让控制流照常拿新话题 lane。
+ * binding 可能刚被收回(detach 与消息并发) — 确认存活才接管路由。
+ *
+ * 回复锚点用 attach 时记录的 /ctr 控制卡 messageId(attachCardIds, 恒在
+ * 接管话题内) —— 群主流的触发消息不是话题内消息, 拿它当锚点会让回复
+ * 落进群主流(outbound 的 fail-closed 不变量, review P1)。
+ */
+export function resolveGroupTakeoverLane(args: {
+  chatId: string;
+  botAppId: string;
+  text: string;
+}): { laneUserId: string; replyAnchorMessageId?: string } | null {
+  if (args.text.trimStart().startsWith('/')) return null;
+  const candidates = bindingStore
+    .listIdentities('feishu', args.botAppId)
+    .map((id) => decodeFeishuLaneUserId(id.userId))
+    .filter((l): l is FeishuLane => l !== null && l.chatId === args.chatId && l.threadId !== '');
+  if (candidates.length !== 1) return null;
+  const lane = candidates[0];
+  if (!lane) return null;
+  const laneUserId = encodeFeishuLaneUserId(lane.chatId, lane.threadId);
+  const identity = { channel: 'feishu', botContextId: args.botAppId, userId: laneUserId };
+  if (!bindingStore.get(identity)) return null;
+  const anchor = bindingStore.getAttachCardMessageId(identity);
+  return anchor ? { laneUserId, replyAnchorMessageId: anchor } : { laneUserId };
+}
+
 export function buildFeishuAdapter(
   feishuIm: FeishuIM,
   config: ImOrchestratorConfig,
 ): ImChannelAdapter {
+  // 群主流消息的 /ctr 接管路由: 接管存在时消息落进接管话题, 不再开新话题。
+  feishuIm.setGroupMainFlowLaneOverride(resolveGroupTakeoverLane);
   const isLark = () => feishuIm.getService() === 'lark';
   const conversationPrefix = () => (isLark() ? '[Lark·DM] ' : '[飞书·DM] ');
   const groupPrefix = (threadId: string) =>
@@ -260,6 +304,25 @@ export function buildFeishuAdapter(
         feishuBotAppId: botAppId,
         feishuOpenId: userId,
       }),
+      /**
+       * 群/话题里新建的会话一律用渠道设置「群聊新建任务权限档」, 不吃上面那条
+       * 面向私聊的 `permissionMode`。
+       *
+       * 覆盖到的建会话路径(都经 sessionRepo.prepareNewSession):
+       *   - 群主流 @bot 开新话题 → 话题 lane 首条消息建行(turnRunner)
+       *   - 群里 `/new` 重开上下文(slashCommands → resetSessionToDefaults)
+       *   - 群主流降级 lane(开话题失败时)建行
+       * `/ctr` 新建接管会话不走这里(它建的是 desktop 会话, 见
+       * cardActionHandler), 那边读的是同一个设置项。
+       *
+       * DM(userId 是 open_id, decode 得 null)返回 null = 不覆写, 私聊照旧。
+       * 群那档比私聊那档**宽**时同样覆写 —— 这是用户在设置里对群的显式选择,
+       * 「群里的事只看这一行」是产品裁决(不看用户是否手动改过该下拉框)。
+       */
+      permissionModeFor: (userId) =>
+        decodeFeishuLaneUserId(userId) === null
+          ? null
+          : readImDefaultSettings('feishu').groupPermissionMode,
       // 群/话题 lane 建行后异步拉群名把标题升级为 [飞书·群] {群名} /
       // [飞书·话题] {群名}; 拉不到(无「获取群基本信息」权限)保持后缀回落。
       // 只对新建行生效(sessionRepo 侧保证), 复活行保留自己的历史标题。
