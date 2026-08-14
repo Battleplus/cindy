@@ -730,8 +730,9 @@ async function materializeSkillEntry(
   pathComparisonIdentity: PiProjectPathComparisonIdentity,
   activeDirectories: Set<string>,
   budget: PiProjectSkillSnapshotBudget,
+  entryAlreadyCounted = false,
 ): Promise<void> {
-  assertSnapshotBudgetAvailable(budget);
+  if (!entryAlreadyCounted) assertSnapshotBudgetAvailable(budget);
   const [entry, canonicalSource] = await Promise.all([
     fs.lstat(sourcePath),
     fs.realpath(sourcePath),
@@ -758,17 +759,17 @@ async function materializeSkillEntry(
     activeDirectories.add(canonicalSource);
     try {
       await fs.mkdir(targetPath, { recursive: false });
-      const children = await fs.readdir(sourcePath, { withFileTypes: true });
-      for (const child of children) {
+      await visitSnapshotDirectoryEntries(sourcePath, budget, async (childName) => {
         await materializeSkillEntry(
-          path.join(sourcePath, child.name),
-          path.join(targetPath, child.name),
+          path.join(sourcePath, childName),
+          path.join(targetPath, childName),
           canonicalRepoRoot,
           pathComparisonIdentity,
           activeDirectories,
           budget,
+          true,
         );
-      }
+      });
       const [canonicalAfterCopy, entryAfterCopy] = await Promise.all([
         fs.realpath(sourcePath),
         fs.lstat(sourcePath),

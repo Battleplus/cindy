@@ -652,6 +652,91 @@ describe('Pi approved project resource assembly', () => {
     }
   });
 
+  it('streams source directories during materialization without readdir', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-copy-stream-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(path.join(skillPath, 'assets'), { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      writeFileSync(path.join(skillPath, 'assets', 'fixture.txt'), 'asset\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-copy-stream', [skillPath]),
+        workingDir,
+      );
+      const realReaddir = fsPromises.readdir.bind(fsPromises);
+      let sourceReaddirCount = 0;
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(async (candidate, options) => {
+        if (String(candidate) === skillPath) sourceReaddirCount += 1;
+        return realReaddir(candidate, options as never) as never;
+      });
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome);
+
+      expect(staged.launchSkillPaths).toHaveLength(1);
+      expect(sourceReaddirCount).toBe(0);
+      expect(readFileSync(path.join(staged.launchSkillPaths[0]!, 'assets', 'fixture.txt'), 'utf8'))
+        .toBe('asset\n');
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds each streamed materialization directory read by the shared deadline', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-copy-deadline-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-copy-deadline', [skillPath]),
+        workingDir,
+      );
+      const realOpendir = fsPromises.opendir.bind(fsPromises);
+      const close = vi.fn(async () => ({ done: true as const, value: undefined }));
+      let sourceDirectoryReads = 0;
+      vi.spyOn(fsPromises, 'opendir').mockImplementation(async (candidate, options) => {
+        if (String(candidate) !== skillPath) {
+          return realOpendir(candidate, options as never);
+        }
+        sourceDirectoryReads += 1;
+        if (sourceDirectoryReads !== 4) {
+          return realOpendir(candidate, options as never);
+        }
+        const iterator = {
+          next: () => new Promise<IteratorResult<{ name: string }>>(() => {}),
+          return: close,
+          [Symbol.asyncIterator]() { return this; },
+        };
+        return {
+          [Symbol.asyncIterator]: () => iterator,
+        } as never;
+      });
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        deadlineMs: 25,
+      });
+
+      expect(sourceDirectoryReads).toBe(4);
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      expect(close).toHaveBeenCalledOnce();
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an oversized streamed directory before probing the over-budget child', async () => {
     const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-stream-budget-')));
     const configHome = path.join(root, 'config-home');
