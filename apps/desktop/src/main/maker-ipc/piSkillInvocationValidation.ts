@@ -52,11 +52,6 @@ async function awaitValidationStep<T>(
   }
 }
 
-function isValidationTimeout(error: unknown): boolean {
-  return !!error && typeof error === 'object'
-    && (error as { code?: unknown }).code === PI_SKILL_INVOCATION_VALIDATION_TIMEOUT;
-}
-
 async function canonicalLocalPath(
   value: unknown,
   dependencies: PiSkillInvocationValidationDeps,
@@ -68,12 +63,8 @@ async function canonicalLocalPath(
   const resolved = path.resolve(value);
   try {
     return await awaitValidationStep(() => dependencies.realpath(resolved), deadlineAtMs);
-  } catch (error) {
-    if (isValidationTimeout(error)) return null;
-    // Runtime provenance can describe a path that disappeared after capture.
-    // Keep the fallback case-sensitive so uncertainty produces false negatives,
-    // never a case-folded match on a case-sensitive Windows directory.
-    return resolved;
+  } catch {
+    return null;
   }
 }
 

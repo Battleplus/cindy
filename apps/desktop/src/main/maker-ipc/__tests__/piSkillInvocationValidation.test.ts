@@ -212,7 +212,9 @@ describe('Pi Skill invocation validation', () => {
   });
 
   it('requires exact current user Skill source provenance too', async () => {
-    const userSource = '/home/user/.agents/skills/demo';
+    const userBaseDir = path.join(repoRoot, 'user-skill-provenance', '.agents');
+    const userSource = path.join(userBaseDir, 'skills', 'demo');
+    fs.mkdirSync(userSource, { recursive: true });
     const userItem = item({ scope: 'user', sourcePath: userSource });
     const userSkills = skills({ scope: 'user', path: userSource, runtimeStatus: undefined });
     const userManifest = manifest({
@@ -222,7 +224,7 @@ describe('Pi Skill invocation validation', () => {
         sourceInfo: {
           scope: 'user',
           source: 'auto',
-          baseDir: '/home/user/.agents',
+          baseDir: userBaseDir,
         },
       }],
     });
@@ -270,6 +272,29 @@ describe('Pi Skill invocation validation', () => {
       }),
       userSkills,
     )).toBe(false);
+  });
+
+  it('rejects a user Skill whose physical source disappeared after scanning', async () => {
+    const userBaseDir = path.join(repoRoot, 'deleted-user-skill', '.agents');
+    const userSource = path.join(userBaseDir, 'skills', 'demo');
+    fs.mkdirSync(userSource, { recursive: true });
+    const userItem = item({ scope: 'user', sourcePath: userSource });
+    const userSkills = skills({ scope: 'user', path: userSource, runtimeStatus: undefined });
+    const userManifest = manifest({
+      commands: [{
+        name: 'skill:demo',
+        source: 'skill',
+        sourceInfo: {
+          scope: 'user',
+          source: 'auto',
+          baseDir: userBaseDir,
+        },
+      }],
+    });
+
+    fs.rmSync(userSource, { recursive: true, force: true });
+
+    expect(await isCurrentPiSkillInvocation(userItem, userManifest, userSkills)).toBe(false);
   });
 
   it('fails closed when repo or user source canonicalization exceeds the deadline', async () => {
