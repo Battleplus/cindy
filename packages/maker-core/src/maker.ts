@@ -16,7 +16,7 @@
  */
 
 import { DEFAULT_DRAFT_SESSION_TITLE } from '@cindy/maker-shared/session-title';
-import fs from 'node:fs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from 'node:timers';
 
@@ -171,14 +171,6 @@ function capabilitiesForSession(
   };
 }
 
-function canonicalPiRuntimePath(value: string): string {
-  try {
-    return fs.realpathSync(value);
-  } catch {
-    return path.resolve(value);
-  }
-}
-
 // Admission permits 10,000 entries across the complete project Skill set.
 // Palette freshness deliberately fingerprints every tree twice to reject a
 // concurrent mutation, so its shared accounting must cover two complete
@@ -188,6 +180,34 @@ const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS =
   PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS;
 const PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET =
   MAX_PI_PROJECT_SKILL_FINGERPRINT_ENTRIES * 2;
+const PI_SKILL_CATALOG_TIMEOUT = 'PI_SKILL_CATALOG_TIMEOUT';
+
+function piSkillCatalogTimeoutError(): Error & { code: string } {
+  return Object.assign(new Error('Pi skill catalog validation deadline expired'), {
+    code: PI_SKILL_CATALOG_TIMEOUT,
+  });
+}
+
+function isPiSkillCatalogTimeout(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === PI_SKILL_CATALOG_TIMEOUT;
+}
+
+async function canonicalPiRuntimePath(value: string, deadlineAtMs: number): Promise<string> {
+  const remainingMs = deadlineAtMs - Date.now();
+  if (remainingMs <= 0) throw piSkillCatalogTimeoutError();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fs.realpath(value).catch(() => path.resolve(value)),
+      new Promise<string>((_, reject) => {
+        timeout = setTimeout(() => reject(piSkillCatalogTimeoutError()), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 function runtimePathComparisonIdentity(value: unknown): PiProjectPathComparisonIdentity | null {
   if (!value || typeof value !== 'object') return null;
@@ -232,6 +252,7 @@ async function fingerprintPiProjectSkillForPalette(
 async function mergePiRuntimeSkillStatuses(
   result: ListAgentSkillsResult,
   manifest: PiRuntimeCapabilityManifest | undefined,
+  deadlineAtMs = Date.now() + PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS,
 ): Promise<ListAgentSkillsResult> {
   if (manifest?.status !== 'loaded') return result;
   const loadedExplicitSkills = new Map<string, string>();
@@ -239,11 +260,11 @@ async function mergePiRuntimeSkillStatuses(
   const changedProjectSkills = new Map<string, string>();
   const fingerprintBudget = {
     remainingEntries: PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET,
-    deadlineAtMs: Date.now() + PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS,
+    deadlineAtMs,
     maxFileBytes: MAX_PI_PROJECT_SKILL_SNAPSHOT_FILE_BYTES,
   };
   for (const skill of manifest.projectResources?.loadedSkills ?? []) {
-    const canonicalSourcePath = canonicalPiRuntimePath(skill.sourcePath);
+    const canonicalSourcePath = await canonicalPiRuntimePath(skill.sourcePath, deadlineAtMs);
     const pathComparisonIdentity = runtimePathComparisonIdentity(skill.pathComparisonIdentity);
     if (
       !skill.snapshotDigest
@@ -275,7 +296,7 @@ async function mergePiRuntimeSkillStatuses(
     const skillName = command.name.slice('skill:'.length);
     if (command.sourceInfo.scope === 'project' && typeof baseDir === 'string') {
       loadedLegacyProjectSkills.set(
-        [skillName, canonicalPiRuntimePath(baseDir)].join('\0'),
+        [skillName, await canonicalPiRuntimePath(baseDir, deadlineAtMs)].join('\0'),
         command.name,
       );
       continue;
@@ -287,7 +308,10 @@ async function mergePiRuntimeSkillStatuses(
     // their containing folder names.
     const explicitPath = piExplicitSkillRuntimePath(command);
     if (explicitPath) {
-      loadedExplicitSkills.set(canonicalPiRuntimePath(explicitPath), command.name);
+      loadedExplicitSkills.set(
+        await canonicalPiRuntimePath(explicitPath, deadlineAtMs),
+        command.name,
+      );
     }
   }
   if (
@@ -299,24 +323,32 @@ async function mergePiRuntimeSkillStatuses(
     path: skillPath,
     message: 'Project skill changed after this Pi session started; restart the session to load the current version.',
   }));
-  return {
-    ...result,
-    skills: result.skills.map((skill) => {
-      let runtimeCommandName: string | undefined;
-      if (skill.scope === 'repo' && skill.path) {
-        const canonicalSkillPath = canonicalPiRuntimePath(skill.path);
-        if (!changedProjectSkills.has(canonicalSkillPath)) {
-          runtimeCommandName = loadedExplicitSkills.get(canonicalSkillPath)
-            ?? [skill.path, path.dirname(path.dirname(skill.path))]
-              .map(canonicalPiRuntimePath)
-              .map((skillPath) => loadedLegacyProjectSkills.get([skill.name, skillPath].join('\0')))
-              .find((commandName) => commandName !== undefined);
+  const skills: ListAgentSkillsResult['skills'] = [];
+  for (const skill of result.skills) {
+    let runtimeCommandName: string | undefined;
+    if (skill.scope === 'repo' && skill.path) {
+      const canonicalSkillPath = await canonicalPiRuntimePath(skill.path, deadlineAtMs);
+      if (!changedProjectSkills.has(canonicalSkillPath)) {
+        runtimeCommandName = loadedExplicitSkills.get(canonicalSkillPath);
+        if (!runtimeCommandName) {
+          for (const candidate of [skill.path, path.dirname(path.dirname(skill.path))]) {
+            const canonicalCandidate = await canonicalPiRuntimePath(candidate, deadlineAtMs);
+            runtimeCommandName = loadedLegacyProjectSkills.get([
+              skill.name,
+              canonicalCandidate,
+            ].join('\0'));
+            if (runtimeCommandName) break;
+          }
         }
       }
-      return runtimeCommandName
-        ? { ...skill, runtimeStatus: 'loaded' as const, runtimeCommandName }
-        : skill;
-    }),
+    }
+    skills.push(runtimeCommandName
+      ? { ...skill, runtimeStatus: 'loaded' as const, runtimeCommandName }
+      : skill);
+  }
+  return {
+    ...result,
+    skills,
     ...(changedSkillErrors.length > 0
       ? { errors: [...(result.errors ?? []), ...changedSkillErrors] }
       : {}),
@@ -1006,11 +1038,30 @@ export class Maker {
     if (
       session?.agentKind !== 'pi'
       || !opts.workingDir
-      || canonicalPiRuntimePath(opts.workingDir) !== canonicalPiRuntimePath(session.workDir)
     ) {
       return result;
     }
-    return mergePiRuntimeSkillStatuses(result, session.getRuntimeCapabilities());
+    const deadlineAtMs = Date.now() + PI_PROJECT_SKILL_PALETTE_FINGERPRINT_TIMEOUT_MS;
+    try {
+      if (
+        await canonicalPiRuntimePath(opts.workingDir, deadlineAtMs)
+        !== await canonicalPiRuntimePath(session.workDir, deadlineAtMs)
+      ) return result;
+      return await mergePiRuntimeSkillStatuses(
+        result,
+        session.getRuntimeCapabilities(),
+        deadlineAtMs,
+      );
+    } catch (error) {
+      if (!isPiSkillCatalogTimeout(error)) throw error;
+      return {
+        ...result,
+        errors: [
+          ...(result.errors ?? []),
+          { message: error instanceof Error ? error.message : String(error) },
+        ],
+      };
+    }
   }
 
   /** ChatInput `@` palette entries, routed by agent kind. */

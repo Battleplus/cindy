@@ -10812,6 +10812,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       workingDir: item.createOpts.workingDir,
       forceReload: true,
     });
+    if (currentSkills.errors?.length) return false;
     if (
       maker.getSession(sessionId) !== session
       || session.getRuntimeCapabilities() !== manifest

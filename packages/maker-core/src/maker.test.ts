@@ -6,6 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -20,7 +21,10 @@ import {
 import type { SessionMeta, SessionStorage } from './interfaces/session-storage.js';
 import type { AgentKind, PermissionMode } from './types/common.js';
 import type { AgentEvent } from './types/events.js';
-import { fingerprintPiProjectSkillEntrypoint } from './agents/pi/project-resource-assembly.js';
+import {
+  fingerprintPiProjectSkillEntrypoint,
+  PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS,
+} from './agents/pi/project-resource-assembly.js';
 
 const nativePathComparisonIdentity = process.platform === 'win32'
   ? { platform: 'win32' as const, windowsCaseComparison: 'ordinal-insensitive' as const }
@@ -959,6 +963,54 @@ describe('Maker session capabilities', () => {
 });
 
 describe('Maker Pi runtime skill status', () => {
+  it('fails closed when runtime path canonicalization exceeds its deadline', async () => {
+    const workingDir = '/hung/repo';
+    const agent = createAgent(async () => createHandle({ id: 'pi-timeout', agentKind: 'pi' }), 'pi');
+    agent.listAgentSkills = vi.fn(async () => ({
+      skills: [{
+        kind: 'agent-skill' as const,
+        name: 'demo',
+        source: 'skill' as const,
+        scope: 'repo' as const,
+        path: `${workingDir}/.pi/skills/demo`,
+        runtimeStatus: 'discovered' as const,
+      }],
+    }));
+    const maker = new Maker({
+      agents: { pi: agent },
+      storage: createStorage(),
+      logger: createLogger(),
+    });
+    await maker.createSession({
+      id: 'runtime-path-timeout',
+      agentKind: 'pi',
+      workingDir,
+      model: 'm',
+    });
+    const realpath = vi.spyOn(fsPromises, 'realpath').mockImplementation(async (candidate) => {
+      if (String(candidate) === workingDir) return await new Promise<string>(() => {});
+      return String(candidate);
+    });
+
+    vi.useFakeTimers();
+    try {
+      const pending = maker.listAgentSkills('pi', {
+        sessionId: 'runtime-path-timeout',
+        workingDir,
+      });
+      await vi.advanceTimersByTimeAsync(PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS);
+
+      await expect(pending).resolves.toMatchObject({
+        skills: [{ name: 'demo', runtimeStatus: 'discovered' }],
+        errors: [{ message: 'Pi skill catalog validation deadline expired' }],
+      });
+      expect(realpath).toHaveBeenCalledWith(workingDir);
+    } finally {
+      vi.useRealTimers();
+      realpath.mockRestore();
+    }
+  });
+
   it('fails partial project mappings closed without leaking them across live sessions', async () => {
     const agent = createAgent(async (opts) => {
       const handle = createHandle({ id: `pi-${opts.sessionId}`, agentKind: 'pi' });

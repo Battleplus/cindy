@@ -4,7 +4,11 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { isCustomizationPathInside } from '../../shared/customization-scanner.js';
-import { buildPiSources, scanPiCustomizations } from '../customization-scanner.js';
+import {
+  MAX_PI_CUSTOMIZATION_SCAN_ENTRIES,
+  piUserSkillRoot,
+  scanPiCustomizations,
+} from '../customization-scanner.js';
 
 const { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } = fs;
 
@@ -77,6 +81,74 @@ function projectItems(result: Awaited<ReturnType<typeof scanPiCustomizations>>) 
 }
 
 describe('scanPiCustomizations', () => {
+  it('fails closed on its deadline when an async filesystem probe hangs', async () => {
+    const root = tempRoot();
+    const cwd = path.join(root, 'repo');
+    mkdirSync(cwd, { recursive: true });
+    const blockedStat = vi.fn(() => new Promise<fs.Stats>(() => {}));
+
+    vi.useFakeTimers();
+    try {
+      const pending = scanPiCustomizations(
+        { workingDirs: [cwd] },
+        { stat: blockedStat, deadlineMs: 10 },
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(pending).resolves.toMatchObject({
+        items: [],
+        errors: [{ message: 'Pi customization scan deadline expired' }],
+      });
+      expect(blockedStat).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed at the shared entry budget before probing discovered children', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    const lexicalSkillRoot = path.join(repo, '.pi', 'skills');
+    mkdirSync(path.join(repo, '.git'), { recursive: true });
+    mkdirSync(lexicalSkillRoot, { recursive: true });
+    const skillRoot = canonical(lexicalSkillRoot);
+    const originalStat = fs.promises.stat;
+    const stat = vi.fn((candidate: string) => {
+      if (candidate === piUserSkillRoot()) {
+        return Promise.reject(Object.assign(new Error('missing user root'), { code: 'ENOENT' }));
+      }
+      return originalStat(candidate) as Promise<fs.Stats>;
+    });
+    let index = 0;
+    const read = vi.fn(async () => {
+      if (index > MAX_PI_CUSTOMIZATION_SCAN_ENTRIES) return null;
+      index += 1;
+      return {
+        name: `entry-${index}`,
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+      } as fs.Dirent;
+    });
+    const close = vi.fn(async () => {});
+    const openDirectory = vi.fn(async (candidate: string) => {
+      if (candidate !== skillRoot) return fs.promises.opendir(candidate);
+      return { read, close } as unknown as fs.Dir;
+    });
+
+    const result = await scanPiCustomizations(
+      { workingDirs: [repo] },
+      { stat, openDirectory },
+    );
+
+    expect(result).toEqual({
+      items: [],
+      errors: [{ message: 'Pi customization scan entry budget exceeded' }],
+    });
+    expect(read).toHaveBeenCalledTimes(MAX_PI_CUSTOMIZATION_SCAN_ENTRIES + 1);
+    expect(close).toHaveBeenCalledOnce();
+    expect(stat.mock.calls.some(([candidate]) => String(candidate).includes('entry-'))).toBe(false);
+  });
+
   it('uses Windows path semantics for drive and UNC containment', () => {
     expect(isCustomizationPathInside(
       'C:\\Repo',
@@ -101,12 +173,8 @@ describe('scanPiCustomizations', () => {
   });
 
   it('keeps only the shared user skill root', () => {
-    const userSources = buildPiSources([]).filter((source) => source.scope === 'user');
-
-    expect(userSources.map((source) => source.dir)).toEqual([
-      path.join(homedir(), '.agents', 'skills'),
-    ]);
-    expect(userSources.some((source) => source.dir.includes(path.join('.pi', 'agent')))).toBe(false);
+    expect(piUserSkillRoot()).toBe(path.join(homedir(), '.agents', 'skills'));
+    expect(piUserSkillRoot()).not.toContain(path.join('.pi', 'agent'));
   });
 
   it('discovers .pi/skills and .agents/skills through the nearest Git root', async () => {
@@ -176,24 +244,26 @@ describe('scanPiCustomizations', () => {
     mkdirSync(cwd, { recursive: true });
     const canonicalRepo = canonical(repo);
     const canonicalCwd = canonical(cwd);
-    const originalStatSync = fs.statSync;
-    const statSyncSpy = vi.spyOn(fs, 'statSync').mockImplementation((candidate, options) => {
+    const originalStat = fs.promises.stat;
+    const stat = vi.fn(async (candidate: string) => {
       if (String(candidate) === path.join(canonicalRepo, '.git')) {
         throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       }
-      return originalStatSync(candidate, options as never);
+      return originalStat(candidate) as Promise<fs.Stats>;
     });
 
-    const projectDirs = buildPiSources([cwd])
-      .filter((source) => source.scope === 'repo')
-      .map((source) => source.dir);
+    writeSkill(cwd, path.join('.pi', 'skills'), 'cwd-pi');
+    writeSkill(cwd, path.join('.agents', 'skills'), 'cwd-agents');
+    writeSkill(repo, path.join('.agents', 'skills'), 'repo-agents');
+    writeSkill(root, path.join('.agents', 'skills'), 'above-repo');
+    const result = await scanPiCustomizations({ workingDirs: [cwd] }, { stat });
+    const projectDirs = projectItems(result).map((item) => path.dirname(item.absolutePath));
 
-    expect(projectDirs).toEqual([
+    expect(projectDirs.sort()).toEqual([
       path.join(canonicalCwd, '.pi', 'skills'),
       path.join(canonicalCwd, '.agents', 'skills'),
       path.join(canonicalRepo, '.agents', 'skills'),
-    ]);
-    statSyncSpy.mockRestore();
+    ].sort());
   });
 
   it('scans only the working directory .agents path outside Git repositories', async () => {

@@ -8,60 +8,194 @@
  */
 
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import type {
   AgentCustomization,
+  AgentCustomizationFile,
   ListCustomizationsOptions,
   ListCustomizationsResult,
 } from '../../types/customizations.js';
-import { scanCustomizationSources, type SourceDef } from '../shared/customization-scanner.js';
+import {
+  isCustomizationPathInside,
+  parseFrontmatter,
+  type SourceDef,
+} from '../shared/customization-scanner.js';
 
-function canonicalDirectory(dir: string): string {
-  const resolved = path.resolve(dir);
-  if (!fs.existsSync(resolved)) return resolved;
+export const PI_CUSTOMIZATION_SCAN_DEADLINE_MS = 30_000;
+export const MAX_PI_CUSTOMIZATION_SCAN_ENTRIES = 10_000;
+const MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES = 16 * 1024 * 1024;
+const PI_CUSTOMIZATION_SCAN_TIMEOUT = 'PI_CUSTOMIZATION_SCAN_TIMEOUT';
+const PI_CUSTOMIZATION_SCAN_BUDGET = 'PI_CUSTOMIZATION_SCAN_BUDGET';
+
+/** Injectable async filesystem surface used to test fail-closed scan budgets. */
+export interface PiCustomizationScanDeps {
+  stat: (candidate: string) => Promise<fs.Stats>;
+  realpath: (candidate: string) => Promise<string>;
+  openDirectory: (candidate: string) => Promise<fs.Dir>;
+  readFile: (candidate: string, encoding: BufferEncoding) => Promise<string>;
+  deadlineMs: number;
+}
+
+const defaultScanDeps: PiCustomizationScanDeps = {
+  stat: (candidate) => fsp.stat(candidate),
+  realpath: (candidate) => fsp.realpath(candidate),
+  openDirectory: (candidate) => fsp.opendir(candidate),
+  readFile: (candidate, encoding) => fsp.readFile(candidate, encoding),
+  deadlineMs: PI_CUSTOMIZATION_SCAN_DEADLINE_MS,
+};
+
+interface PiCustomizationScanBudget {
+  remainingEntries: number;
+  readonly deadlineAtMs: number;
+}
+
+function scanTimeoutError(): Error & { code: string } {
+  return Object.assign(new Error('Pi customization scan deadline expired'), {
+    code: PI_CUSTOMIZATION_SCAN_TIMEOUT,
+  });
+}
+
+function isScanTimeout(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === PI_CUSTOMIZATION_SCAN_TIMEOUT;
+}
+
+function scanBudgetError(): Error & { code: string } {
+  return Object.assign(new Error('Pi customization scan entry budget exceeded'), {
+    code: PI_CUSTOMIZATION_SCAN_BUDGET,
+  });
+}
+
+function isScanFatal(error: unknown): boolean {
+  if (isScanTimeout(error)) return true;
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === PI_CUSTOMIZATION_SCAN_BUDGET;
+}
+
+async function awaitScanStep<T>(
+  operation: () => Promise<T>,
+  budget: PiCustomizationScanBudget,
+): Promise<T> {
+  const remainingMs = budget.deadlineAtMs - Date.now();
+  if (remainingMs <= 0) throw scanTimeoutError();
+  let timeout: NodeJS.Timeout | undefined;
   try {
-    return fs.realpathSync(resolved);
-  } catch {
+    return await Promise.race([
+      operation(),
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(scanTimeoutError()), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function consumeScanEntry(budget: PiCustomizationScanBudget): void {
+  budget.remainingEntries -= 1;
+  if (budget.remainingEntries < 0) {
+    throw scanBudgetError();
+  }
+}
+
+function filesystemErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object'
+    && typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code
+    : undefined;
+}
+
+async function readDirectoryEntries(
+  dir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<fs.Dirent[]> {
+  const handle = await awaitScanStep(() => dependencies.openDirectory(dir), budget);
+  const entries: fs.Dirent[] = [];
+  try {
+    while (true) {
+      const entry = await awaitScanStep(() => handle.read(), budget);
+      if (!entry) break;
+      consumeScanEntry(budget);
+      entries.push(entry);
+    }
+  } finally {
+    void handle.close().catch(() => {});
+  }
+  return entries;
+}
+
+async function canonicalDirectoryAsync(
+  dir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<string> {
+  const resolved = path.resolve(dir);
+  try {
+    return await awaitScanStep(() => dependencies.realpath(resolved), budget);
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
     return resolved;
   }
 }
 
-function isExistingDirectory(dir: string): boolean {
+async function isExistingDirectoryAsync(
+  dir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<boolean> {
   try {
-    return fs.statSync(dir).isDirectory();
-  } catch {
+    return (await awaitScanStep(() => dependencies.stat(dir), budget)).isDirectory();
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
     return false;
   }
 }
 
-function hasGitMarker(dir: string): boolean {
+async function hasGitMarkerAsync(
+  dir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<boolean> {
   try {
-    const marker = fs.statSync(path.join(dir, '.git'));
+    const marker = await awaitScanStep(
+      () => dependencies.stat(path.join(dir, '.git')),
+      budget,
+    );
     return marker.isDirectory() || marker.isFile();
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    if (isScanFatal(error)) throw error;
+    const code = filesystemErrorCode(error);
     return code !== 'ENOENT' && code !== 'ENOTDIR';
   }
 }
 
-function findNearestGitRoot(workingDir: string): string | null {
-  let current = canonicalDirectory(workingDir);
+async function findNearestGitRootAsync(
+  workingDir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<string | null> {
+  let current = await canonicalDirectoryAsync(workingDir, dependencies, budget);
   while (true) {
-    if (hasGitMarker(current)) return current;
+    if (await hasGitMarkerAsync(current, dependencies, budget)) return current;
     const parent = path.dirname(current);
     if (parent === current) return null;
     current = parent;
   }
 }
 
-function agentSkillAncestors(workingDir: string): string[] {
-  const start = canonicalDirectory(workingDir);
-  const repoRoot = findNearestGitRoot(start);
+async function agentSkillAncestorsAsync(
+  workingDir: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<string[]> {
+  const start = await canonicalDirectoryAsync(workingDir, dependencies, budget);
+  const repoRoot = await findNearestGitRootAsync(start, dependencies, budget);
   const result: string[] = [];
   let current = start;
-
   while (true) {
     result.push(current);
     if (!repoRoot || current === repoRoot) break;
@@ -72,23 +206,32 @@ function agentSkillAncestors(workingDir: string): string[] {
   return result;
 }
 
-export function buildPiSources(workingDirs: string[]): SourceDef[] {
+export function piUserSkillRoot(): string {
+  return path.join(os.homedir(), '.agents', 'skills');
+}
+
+async function buildPiSourcesAsync(
+  workingDirs: string[],
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<SourceDef[]> {
   const sources: SourceDef[] = [
-    { engine: 'pi', kind: 'skill', scope: 'user', dir: path.join(os.homedir(), '.agents', 'skills') },
+    { engine: 'pi', kind: 'skill', scope: 'user', dir: piUserSkillRoot() },
   ];
   const seen = new Set<string>();
 
   for (const input of workingDirs) {
-    if (!input || !path.isAbsolute(input) || !isExistingDirectory(input)) continue;
-    // Scan through the physical directory so Git-boundary discovery is stable,
-    // but preserve the caller's lexical root for project ownership. Two project
-    // entries may intentionally refer to the same checkout through different
-    // symlink paths and must remain distinguishable to SkillHub.
+    if (
+      !input
+      || !path.isAbsolute(input)
+      || !await isExistingDirectoryAsync(input, dependencies, budget)
+    ) continue;
     const workingDir = path.resolve(input);
-    const scanRoot = canonicalDirectory(input);
-    const projectBoundary = findNearestGitRoot(scanRoot) ?? scanRoot;
-    const addProjectSource = (dir: string): void => {
-      const key = `${workingDir}\0${canonicalDirectory(dir)}`;
+    const scanRoot = await canonicalDirectoryAsync(input, dependencies, budget);
+    const projectBoundary = await findNearestGitRootAsync(scanRoot, dependencies, budget)
+      ?? scanRoot;
+    const addProjectSource = async (dir: string): Promise<void> => {
+      const key = `${workingDir}\0${await canonicalDirectoryAsync(dir, dependencies, budget)}`;
       if (seen.has(key)) return;
       seen.add(key);
       sources.push({
@@ -102,43 +245,247 @@ export function buildPiSources(workingDirs: string[]): SourceDef[] {
       });
     };
 
-    addProjectSource(path.join(scanRoot, '.pi', 'skills'));
-    for (const ancestor of agentSkillAncestors(scanRoot)) {
-      addProjectSource(path.join(ancestor, '.agents', 'skills'));
+    await addProjectSource(path.join(scanRoot, '.pi', 'skills'));
+    for (const ancestor of await agentSkillAncestorsAsync(scanRoot, dependencies, budget)) {
+      await addProjectSource(path.join(ancestor, '.agents', 'skills'));
     }
   }
   return sources;
 }
 
-function dedupePiItems(items: AgentCustomization[]): AgentCustomization[] {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const key = [item.scope, item.workingDir ?? '', canonicalDirectory(item.absolutePath)].join('\0');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+async function readChildKindAsync(
+  parent: string,
+  entry: fs.Dirent,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<AgentCustomizationFile['kind']> {
+  if (entry.isDirectory()) return 'dir';
+  if (!entry.isSymbolicLink()) return 'file';
+  try {
+    return (await awaitScanStep(
+      () => dependencies.stat(path.join(parent, entry.name)),
+      budget,
+    )).isDirectory()
+      ? 'dir'
+      : 'file';
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    return 'file';
+  }
 }
 
-export async function scanPiCustomizations(opts: ListCustomizationsOptions): Promise<ListCustomizationsResult> {
+async function readFolderSkillAsync(
+  source: SourceDef,
+  folder: string,
+  mdPath: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<AgentCustomization> {
+  let description: string | undefined;
+  let frontmatter: Record<string, unknown> | undefined;
+  let parseError: string | undefined;
+  try {
+    const mdStat = await awaitScanStep(() => dependencies.stat(mdPath), budget);
+    if (!mdStat.isFile() || mdStat.size > MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES) {
+      throw new Error('Pi Skill entrypoint is not a bounded file');
+    }
+    const raw = await awaitScanStep(() => dependencies.readFile(mdPath, 'utf8'), budget);
+    ({ description, frontmatter, parseError } = parseFrontmatter(raw));
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    parseError = error instanceof Error ? error.message : String(error);
+  }
+
+  let files: AgentCustomizationFile[] = [];
+  try {
+    const entries = await readDirectoryEntries(folder, dependencies, budget);
+    for (const entry of entries) {
+      files.push({
+        name: entry.name,
+        kind: await readChildKindAsync(folder, entry, dependencies, budget),
+      });
+    }
+    files.sort((left, right) => {
+      if (left.name === 'SKILL.md') return -1;
+      if (right.name === 'SKILL.md') return 1;
+      if (left.kind !== right.kind) return left.kind === 'dir' ? -1 : 1;
+      return left.name.localeCompare(right.name);
+    });
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    // File previews remain best-effort, matching the legacy shared scanner.
+  }
+
+  return {
+    engine: source.engine,
+    kind: source.kind,
+    scope: source.scope,
+    name: path.basename(folder),
+    description,
+    absolutePath: folder,
+    mdPath,
+    files,
+    frontmatter,
+    parseError,
+    ...(source.workingDir ? { workingDir: source.workingDir } : {}),
+    ...(source.runtimeStatus ? { runtimeStatus: source.runtimeStatus } : {}),
+  };
+}
+
+async function realPathInsideAsync(
+  parentRealPath: string,
+  candidate: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<boolean> {
+  try {
+    return isCustomizationPathInside(
+      parentRealPath,
+      await awaitScanStep(() => dependencies.realpath(candidate), budget),
+    );
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    return false;
+  }
+}
+
+async function statFileIfPresent(
+  candidate: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<boolean> {
+  try {
+    return (await awaitScanStep(() => dependencies.stat(candidate), budget)).isFile();
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    return false;
+  }
+}
+
+async function scanOneSourceAsync(
+  source: SourceDef,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<{ items: AgentCustomization[]; errors: Array<{ path?: string; message: string }> }> {
+  const errors: Array<{ path?: string; message: string }> = [];
+  try {
+    let sourceStat: fs.Stats;
+    try {
+      sourceStat = await awaitScanStep(() => dependencies.stat(source.dir), budget);
+    } catch (error) {
+      if (isScanFatal(error)) throw error;
+      const code = filesystemErrorCode(error);
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { items: [], errors };
+      throw error;
+    }
+    if (!sourceStat.isDirectory()) return { items: [], errors };
+
+    let containmentRoot: string | null = null;
+    if (source.skillContainWithin) {
+      containmentRoot = await awaitScanStep(
+        () => dependencies.realpath(source.skillContainWithin!),
+        budget,
+      );
+      if (!await realPathInsideAsync(containmentRoot, source.dir, dependencies, budget)) {
+        return { items: [], errors };
+      }
+    }
+
+    const entries = await readDirectoryEntries(source.dir, dependencies, budget);
+    const items: AgentCustomization[] = [];
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || /\.bak\.\d+$/.test(entry.name)) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const folder = path.join(source.dir, entry.name);
+      const canonicalMd = path.join(folder, 'SKILL.md');
+      let actualMd = canonicalMd;
+      if (!await statFileIfPresent(canonicalMd, dependencies, budget)) {
+        if (source.scope === 'repo') continue;
+        const lowerMd = path.join(folder, 'skill.md');
+        if (!await statFileIfPresent(lowerMd, dependencies, budget)) continue;
+        actualMd = lowerMd;
+      }
+      if (
+        containmentRoot
+        && (
+          !await realPathInsideAsync(containmentRoot, folder, dependencies, budget)
+          || !await realPathInsideAsync(containmentRoot, actualMd, dependencies, budget)
+        )
+      ) continue;
+      items.push(await readFolderSkillAsync(
+        source,
+        folder,
+        actualMd,
+        dependencies,
+        budget,
+      ));
+    }
+    return { items, errors };
+  } catch (error) {
+    if (isScanFatal(error)) throw error;
+    errors.push({
+      path: source.dir,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { items: [], errors };
+  }
+}
+
+async function dedupePiItemsAsync(
+  items: AgentCustomization[],
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<AgentCustomization[]> {
+  const seen = new Set<string>();
+  const result: AgentCustomization[] = [];
+  for (const item of items) {
+    const key = [
+      item.scope,
+      item.workingDir ?? '',
+      await canonicalDirectoryAsync(item.absolutePath, dependencies, budget),
+    ].join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+export async function scanPiCustomizations(
+  opts: ListCustomizationsOptions,
+  overrides: Partial<PiCustomizationScanDeps> = {},
+): Promise<ListCustomizationsResult> {
   if (opts.kinds && opts.kinds.length > 0 && !opts.kinds.includes('skill')) {
     return { items: [], errors: [] };
   }
-
-  const result = scanCustomizationSources(buildPiSources(opts.workingDirs ?? []), null);
-  // The host-owned project admission and Pi resource assembly contract accepts
-  // only the canonical `SKILL.md` entrypoint. Keep the shared scanner's legacy
-  // lowercase fallback for user/global and other agents, but never advertise a
-  // repo Skill that a new Pi runtime must reject later.
-  result.items = result.items.filter((item) => (
-    item.scope !== 'repo'
-    || (typeof item.mdPath === 'string' && path.basename(item.mdPath) === 'SKILL.md')
-  ));
-  result.items = dedupePiItems(result.items);
-  result.items.sort((a, b) => {
-    if (a.scope !== b.scope) return a.scope.localeCompare(b.scope);
-    if (a.name !== b.name) return a.name.localeCompare(b.name);
-    return a.absolutePath.localeCompare(b.absolutePath);
-  });
-  return result;
+  const dependencies: PiCustomizationScanDeps = { ...defaultScanDeps, ...overrides };
+  const deadlineMs = Number.isSafeInteger(dependencies.deadlineMs) && dependencies.deadlineMs >= 0
+    ? dependencies.deadlineMs
+    : 0;
+  const budget: PiCustomizationScanBudget = {
+    remainingEntries: MAX_PI_CUSTOMIZATION_SCAN_ENTRIES,
+    deadlineAtMs: Date.now() + deadlineMs,
+  };
+  try {
+    const sources = await buildPiSourcesAsync(opts.workingDirs ?? [], dependencies, budget);
+    const items: AgentCustomization[] = [];
+    const errors: Array<{ path?: string; message: string }> = [];
+    for (const source of sources) {
+      const scanned = await scanOneSourceAsync(source, dependencies, budget);
+      items.push(...scanned.items);
+      errors.push(...scanned.errors);
+    }
+    const deduped = await dedupePiItemsAsync(items, dependencies, budget);
+    deduped.sort((left, right) => {
+      if (left.scope !== right.scope) return left.scope.localeCompare(right.scope);
+      if (left.name !== right.name) return left.name.localeCompare(right.name);
+      return left.absolutePath.localeCompare(right.absolutePath);
+    });
+    return { items: deduped, errors };
+  } catch (error) {
+    return {
+      items: [],
+      errors: [{ message: error instanceof Error ? error.message : String(error) }],
+    };
+  }
 }
