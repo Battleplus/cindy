@@ -703,7 +703,9 @@ describe('Pi approved project resource assembly', () => {
       });
 
       const staged = await stageApprovedPiProjectResources(assembled, configHome, {
-        deadlineMs: 10,
+        // Leave enough time for Windows metadata probes to reach the streamed
+        // directory read that this test deliberately leaves pending.
+        deadlineMs: 1_000,
       });
 
       expect(staged.skillPaths).toEqual([]);

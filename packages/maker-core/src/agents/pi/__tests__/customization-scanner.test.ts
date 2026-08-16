@@ -70,7 +70,7 @@ function writeSkill(root: string, relativeDir: string, name: string): string {
 
 function canonical(value: string): string {
   try {
-    return realpathSync(value);
+    return realpathSync.native(value);
   } catch {
     return path.resolve(value);
   }
