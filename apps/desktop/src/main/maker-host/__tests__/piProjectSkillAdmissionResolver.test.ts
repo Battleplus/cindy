@@ -444,6 +444,54 @@ describe('resolveDesktopPiProjectTrustInput', () => {
     )).toBeNull();
   });
 
+  it('shares one deadline across identity resolution and both stability scans', async () => {
+    const project = makeProject();
+    const identity = (await resolveDesktopPiProjectIdentity(project.first))!;
+    const evidence = (await scanContainedDesktopPiProjectSkills(identity))!;
+    const deadlines: number[] = [];
+    const resolveIdentity = vi.fn(async (_workingDir: string, deadlineAtMs?: number) => {
+      deadlines.push(deadlineAtMs!);
+      return identity;
+    });
+    const scanProjectSkills = vi.fn(async (
+      _identity: typeof identity,
+      deadlineAtMs?: number,
+    ) => {
+      deadlines.push(deadlineAtMs!);
+      return evidence;
+    });
+
+    expect(await resolveDesktopPiProjectTrustInput(
+      { workingDir: project.first },
+      { resolveIdentity, scanProjectSkills },
+    )).not.toBeNull();
+    expect(deadlines).toHaveLength(4);
+    expect(new Set(deadlines).size).toBe(1);
+  });
+
+  it('fails closed when outer identity resolution exceeds the shared deadline', async () => {
+    const project = makeProject();
+    const resolveIdentity = vi.fn(() => (
+      new Promise<Awaited<ReturnType<typeof resolveDesktopPiProjectIdentity>>>(() => {})
+    ));
+    const scanProjectSkills = vi.fn(async () => []);
+
+    vi.useFakeTimers();
+    try {
+      const pending = resolveDesktopPiProjectTrustInput(
+        { workingDir: project.first },
+        { resolveIdentity, scanProjectSkills },
+      );
+      await vi.advanceTimersByTimeAsync(PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS);
+
+      await expect(pending).resolves.toBeNull();
+      expect(resolveIdentity).toHaveBeenCalledOnce();
+      expect(scanProjectSkills).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('invalidates if the repo identity or complete skill directory set changes mid-resolution', async () => {
     const project = makeProject();
     const firstIdentity = (await resolveDesktopPiProjectIdentity(project.first))!;

@@ -1,4 +1,4 @@
-import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import type {
@@ -12,14 +12,64 @@ import {
 
 import type { AgentInputQueuedMessage } from '../../shared/agentInputQueue.js';
 
-function canonicalLocalPath(value: unknown): string | null {
+export const PI_SKILL_INVOCATION_VALIDATION_DEADLINE_MS = 30_000;
+
+export interface PiSkillInvocationValidationDeps {
+  realpath: (candidate: string) => Promise<string>;
+  deadlineMs?: number;
+}
+
+const defaultValidationDeps: PiSkillInvocationValidationDeps = {
+  realpath: (candidate) => fsp.realpath(candidate),
+};
+
+const PI_SKILL_INVOCATION_VALIDATION_TIMEOUT = 'PI_SKILL_INVOCATION_VALIDATION_TIMEOUT';
+
+async function awaitValidationStep<T>(
+  operation: () => Promise<T>,
+  deadlineAtMs: number,
+): Promise<T> {
+  const remainingMs = deadlineAtMs - Date.now();
+  if (remainingMs <= 0) {
+    throw Object.assign(new Error('Pi Skill invocation validation deadline expired'), {
+      code: PI_SKILL_INVOCATION_VALIDATION_TIMEOUT,
+    });
+  }
+  const pending = operation();
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(Object.assign(
+          new Error('Pi Skill invocation validation deadline expired'),
+          { code: PI_SKILL_INVOCATION_VALIDATION_TIMEOUT },
+        )), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isValidationTimeout(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === PI_SKILL_INVOCATION_VALIDATION_TIMEOUT;
+}
+
+async function canonicalLocalPath(
+  value: unknown,
+  dependencies: PiSkillInvocationValidationDeps,
+  deadlineAtMs: number,
+): Promise<string | null> {
   if (typeof value !== 'string' || !value || value.includes('\0') || !path.isAbsolute(value)) {
     return null;
   }
   const resolved = path.resolve(value);
   try {
-    return fs.realpathSync.native(resolved);
-  } catch {
+    return await awaitValidationStep(() => dependencies.realpath(resolved), deadlineAtMs);
+  } catch (error) {
+    if (isValidationTimeout(error)) return null;
     // Runtime provenance can describe a path that disappeared after capture.
     // Keep the fallback case-sensitive so uncertainty produces false negatives,
     // never a case-folded match on a case-sensitive Windows directory.
@@ -27,7 +77,11 @@ function canonicalLocalPath(value: unknown): string | null {
   }
 }
 
-function existingPhysicalPath(value: unknown): string | null {
+async function existingPhysicalPath(
+  value: unknown,
+  dependencies: PiSkillInvocationValidationDeps,
+  deadlineAtMs: number,
+): Promise<string | null> {
   if (
     typeof value !== 'string'
     || !value
@@ -35,21 +89,28 @@ function existingPhysicalPath(value: unknown): string | null {
     || !path.isAbsolute(value)
   ) return null;
   try {
-    return fs.realpathSync.native(path.resolve(value));
+    return await awaitValidationStep(
+      () => dependencies.realpath(path.resolve(value)),
+      deadlineAtMs,
+    );
   } catch {
     return null;
   }
 }
 
-function runtimeProjectSkillMatchesSource(
+async function runtimeProjectSkillMatchesSource(
   sourcePath: string,
   skill: NonNullable<NonNullable<
     PiRuntimeCapabilityManifest['projectResources']
   >['loadedSkills']>[number],
-): boolean {
-  const selected = existingPhysicalPath(sourcePath);
-  const loadedSource = existingPhysicalPath(skill.sourcePath);
-  const repoRoot = existingPhysicalPath(skill.canonicalRepoRoot);
+  dependencies: PiSkillInvocationValidationDeps,
+  deadlineAtMs: number,
+): Promise<boolean> {
+  const [selected, loadedSource, repoRoot] = await Promise.all([
+    existingPhysicalPath(sourcePath, dependencies, deadlineAtMs),
+    existingPhysicalPath(skill.sourcePath, dependencies, deadlineAtMs),
+    existingPhysicalPath(skill.canonicalRepoRoot, dependencies, deadlineAtMs),
+  ]);
   const identity = skill.pathComparisonIdentity;
   if (!selected || !loadedSource || !repoRoot || !identity) return false;
   return piCanonicalPathIsWithin(identity, repoRoot, selected)
@@ -57,12 +118,16 @@ function runtimeProjectSkillMatchesSource(
     && piCanonicalPathsEqual(identity, selected, loadedSource);
 }
 
-function runtimeUserSkillMatchesSource(
+async function runtimeUserSkillMatchesSource(
   sourcePath: string,
   command: PiRuntimeCapabilityManifest['commands'][number],
-): boolean {
-  const selected = canonicalLocalPath(sourcePath);
-  const baseDir = canonicalLocalPath(command.sourceInfo.baseDir);
+  dependencies: PiSkillInvocationValidationDeps,
+  deadlineAtMs: number,
+): Promise<boolean> {
+  const [selected, baseDir] = await Promise.all([
+    canonicalLocalPath(sourcePath, dependencies, deadlineAtMs),
+    canonicalLocalPath(command.sourceInfo.baseDir, dependencies, deadlineAtMs),
+  ]);
   if (
     !selected
     || !baseDir
@@ -71,14 +136,22 @@ function runtimeUserSkillMatchesSource(
   ) return false;
 
   const selectedName = path.basename(selected);
-  const derivedFromBase = canonicalLocalPath(path.join(baseDir, 'skills', selectedName));
+  const derivedFromBase = await canonicalLocalPath(
+    path.join(baseDir, 'skills', selectedName),
+    dependencies,
+    deadlineAtMs,
+  );
   if (derivedFromBase !== selected) return false;
 
   if (command.sourceInfo.path === undefined) return true;
-  const runtimePath = canonicalLocalPath(command.sourceInfo.path);
+  const runtimePath = await canonicalLocalPath(
+    command.sourceInfo.path,
+    dependencies,
+    deadlineAtMs,
+  );
   if (!runtimePath) return false;
   const runtimeSkillDir = path.basename(runtimePath) === 'SKILL.md'
-    ? canonicalLocalPath(path.dirname(runtimePath))
+    ? await canonicalLocalPath(path.dirname(runtimePath), dependencies, deadlineAtMs)
     : runtimePath;
   return runtimeSkillDir === selected;
 }
@@ -87,11 +160,12 @@ function runtimeUserSkillMatchesSource(
  * Revalidate renderer-provided Pi Skill routing against this exact runtime.
  * Discovery and persisted queue data are never sufficient authority.
  */
-export function isCurrentPiSkillInvocation(
+export async function isCurrentPiSkillInvocation(
   item: Pick<AgentInputQueuedMessage, 'agentSkillInvocation' | 'createOpts'>,
   manifest: PiRuntimeCapabilityManifest | undefined,
   currentSkills: readonly AgentSkillCommand[],
-): boolean {
+  dependencies: PiSkillInvocationValidationDeps = defaultValidationDeps,
+): Promise<boolean> {
   const invocation = item.agentSkillInvocation;
   if (!invocation) return true;
   if (item.createOpts.agentKind !== 'pi' || manifest?.status !== 'loaded') return false;
@@ -110,20 +184,42 @@ export function isCurrentPiSkillInvocation(
     && (invocation.scope !== 'repo' || skill.runtimeStatus === 'loaded')
   ));
   if (currentMatches.length !== 1) return false;
+  const deadlineMs = dependencies.deadlineMs ?? PI_SKILL_INVOCATION_VALIDATION_DEADLINE_MS;
+  const deadlineAtMs = Number.isSafeInteger(deadlineMs) && deadlineMs >= 0
+    ? Date.now() + deadlineMs
+    : Date.now();
 
   if (invocation.scope === 'repo') {
-    const loadedMatches = manifest.projectResources?.loadedSkills?.filter((skill) => (
-      skill.commandName === invocation.runtimeCommandName
-      && runtimeProjectSkillMatchesSource(invocationSourcePath, skill)
-    )) ?? [];
-    return loadedMatches.length === 1;
+    let loadedMatches = 0;
+    for (const skill of manifest.projectResources?.loadedSkills ?? []) {
+      if (
+        skill.commandName === invocation.runtimeCommandName
+        && await runtimeProjectSkillMatchesSource(
+          invocationSourcePath,
+          skill,
+          dependencies,
+          deadlineAtMs,
+        )
+      ) loadedMatches += 1;
+      if (loadedMatches > 1) return false;
+    }
+    return loadedMatches === 1;
   }
-  const runtimeMatches = manifest.commands.filter((command) => (
-    command.name === invocation.runtimeCommandName
-    && command.source === 'skill'
-    && runtimeUserSkillMatchesSource(invocationSourcePath, command)
-  ));
-  return runtimeMatches.length === 1;
+  let runtimeMatches = 0;
+  for (const command of manifest.commands) {
+    if (
+      command.name === invocation.runtimeCommandName
+      && command.source === 'skill'
+      && await runtimeUserSkillMatchesSource(
+        invocationSourcePath,
+        command,
+        dependencies,
+        deadlineAtMs,
+      )
+    ) runtimeMatches += 1;
+    if (runtimeMatches > 1) return false;
+  }
+  return runtimeMatches === 1;
 }
 
 export function stalePiSkillInvocationError(): Error & { code: string } {

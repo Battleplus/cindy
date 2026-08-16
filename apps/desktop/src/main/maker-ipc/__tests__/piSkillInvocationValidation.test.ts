@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import type {
   AgentSkillCommand,
   PiRuntimeCapabilityManifest,
@@ -95,11 +95,11 @@ function skills(patch: Partial<AgentSkillCommand> = {}): AgentSkillCommand[] {
 }
 
 describe('Pi Skill invocation validation', () => {
-  it('accepts one exact current project Skill provenance match', () => {
-    expect(isCurrentPiSkillInvocation(item(), manifest(), skills())).toBe(true);
+  it('accepts one exact current project Skill provenance match', async () => {
+    expect(await isCurrentPiSkillInvocation(item(), manifest(), skills())).toBe(true);
   });
 
-  it('accepts a loaded project Skill receipt through its stable in-repo symlink', () => {
+  it('accepts a loaded project Skill receipt through its stable in-repo symlink', async () => {
     const physicalSource = path.join(repoRoot, '.pi', 'skills', 'physical-demo');
     const otherSource = path.join(repoRoot, '.pi', 'skills', 'other-demo');
     const linkedSource = path.join(repoRoot, '.pi', 'skills', 'linked-demo');
@@ -112,7 +112,7 @@ describe('Pi Skill invocation validation', () => {
         process.platform === 'win32' ? 'junction' : 'dir',
       );
 
-      expect(isCurrentPiSkillInvocation(
+      expect(await isCurrentPiSkillInvocation(
         item({ sourcePath: linkedSource }),
         manifest({
           projectResources: {
@@ -135,7 +135,7 @@ describe('Pi Skill invocation validation', () => {
         linkedSource,
         process.platform === 'win32' ? 'junction' : 'dir',
       );
-      expect(isCurrentPiSkillInvocation(
+      expect(await isCurrentPiSkillInvocation(
         item({ sourcePath: linkedSource }),
         manifest({
           projectResources: {
@@ -158,15 +158,15 @@ describe('Pi Skill invocation validation', () => {
     }
   });
 
-  it('rejects legacy, stale, renamed, changed, and ambiguous project receipts', () => {
-    expect(isCurrentPiSkillInvocation(item({ scope: undefined }), manifest(), skills())).toBe(false);
-    expect(isCurrentPiSkillInvocation(item({ sourcePath: undefined }), manifest(), skills())).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest({ status: 'unknown' }), skills())).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest(), skills({ path: '/repo/.pi/skills/other' }))).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest(), skills({ runtimeStatus: 'discovered' }))).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest({ projectResources: undefined }), skills())).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest(), [...skills(), ...skills()])).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest({
+  it('rejects legacy, stale, renamed, changed, and ambiguous project receipts', async () => {
+    expect(await isCurrentPiSkillInvocation(item({ scope: undefined }), manifest(), skills())).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item({ sourcePath: undefined }), manifest(), skills())).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest({ status: 'unknown' }), skills())).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest(), skills({ path: '/repo/.pi/skills/other' }))).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest(), skills({ runtimeStatus: 'discovered' }))).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest({ projectResources: undefined }), skills())).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest(), [...skills(), ...skills()])).toBe(false);
+    expect(await isCurrentPiSkillInvocation(item(), manifest({
       projectResources: {
         ...manifest().projectResources!,
         loadedSkills: [{
@@ -177,7 +177,7 @@ describe('Pi Skill invocation validation', () => {
         }],
       },
     }), skills())).toBe(false);
-    expect(isCurrentPiSkillInvocation(item(), manifest({
+    expect(await isCurrentPiSkillInvocation(item(), manifest({
       projectResources: {
         ...manifest().projectResources!,
         loadedSkills: [{
@@ -194,7 +194,7 @@ describe('Pi Skill invocation validation', () => {
 
     const unrelatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-pi-skill-other-repo-'));
     try {
-      expect(isCurrentPiSkillInvocation(item(), manifest({
+      expect(await isCurrentPiSkillInvocation(item(), manifest({
         projectResources: {
           ...manifest().projectResources!,
           loadedSkills: [{
@@ -211,7 +211,7 @@ describe('Pi Skill invocation validation', () => {
     }
   });
 
-  it('requires exact current user Skill source provenance too', () => {
+  it('requires exact current user Skill source provenance too', async () => {
     const userSource = '/home/user/.agents/skills/demo';
     const userItem = item({ scope: 'user', sourcePath: userSource });
     const userSkills = skills({ scope: 'user', path: userSource, runtimeStatus: undefined });
@@ -226,14 +226,14 @@ describe('Pi Skill invocation validation', () => {
         },
       }],
     });
-    expect(isCurrentPiSkillInvocation(userItem, userManifest, userSkills)).toBe(true);
-    expect(isCurrentPiSkillInvocation(
+    expect(await isCurrentPiSkillInvocation(userItem, userManifest, userSkills)).toBe(true);
+    expect(await isCurrentPiSkillInvocation(
       userItem,
       userManifest,
       skills({ scope: 'user', path: '/home/user/.agents/skills/other' }),
     )).toBe(false);
 
-    expect(isCurrentPiSkillInvocation(
+    expect(await isCurrentPiSkillInvocation(
       userItem,
       manifest({
         commands: [{
@@ -254,7 +254,7 @@ describe('Pi Skill invocation validation', () => {
       })],
     )).toBe(false);
 
-    expect(isCurrentPiSkillInvocation(
+    expect(await isCurrentPiSkillInvocation(
       userItem,
       manifest({
         commands: [{
@@ -270,6 +270,46 @@ describe('Pi Skill invocation validation', () => {
       }),
       userSkills,
     )).toBe(false);
+  });
+
+  it('fails closed when repo or user source canonicalization exceeds the deadline', async () => {
+    const blockedRealpath = vi.fn(() => new Promise<string>(() => {}));
+    const dependencies = { realpath: blockedRealpath, deadlineMs: 10 };
+
+    vi.useFakeTimers();
+    try {
+      const repoValidation = isCurrentPiSkillInvocation(
+        item(),
+        manifest(),
+        skills(),
+        dependencies,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(repoValidation).resolves.toBe(false);
+
+      const userSource = '/home/user/.agents/skills/demo';
+      const userValidation = isCurrentPiSkillInvocation(
+        item({ scope: 'user', sourcePath: userSource }),
+        manifest({
+          commands: [{
+            name: 'skill:demo',
+            source: 'skill',
+            sourceInfo: {
+              scope: 'user',
+              source: 'auto',
+              baseDir: '/home/user/.agents',
+            },
+          }],
+        }),
+        skills({ scope: 'user', path: userSource, runtimeStatus: undefined }),
+        dependencies,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(userValidation).resolves.toBe(false);
+      expect(blockedRealpath).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects a replacement Session after the final async runtime proof', async () => {

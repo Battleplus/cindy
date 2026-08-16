@@ -45,9 +45,11 @@ export interface DesktopPiProjectIdentityDeps {
 export interface PiProjectSkillAdmissionResolverDeps {
   resolveIdentity: (
     workingDir: string,
+    deadlineAtMs?: number,
   ) => Promise<PiProjectIdentityResolution | null>;
   scanProjectSkills: (
     identity: PiProjectIdentityResolution,
+    deadlineAtMs?: number,
   ) => Promise<PiProjectCanonicalPathEvidence[] | null>;
 }
 
@@ -315,18 +317,41 @@ function defaultIdentityDeps(): DesktopPiProjectIdentityDeps {
 
 export async function resolveDesktopPiProjectIdentity(
   workingDir: string,
-  dependencies: DesktopPiProjectIdentityDeps = defaultIdentityDeps(),
+  dependenciesOrDeadline: DesktopPiProjectIdentityDeps | number = defaultIdentityDeps(),
+  suppliedDeadlineAtMs?: number,
 ): Promise<PiProjectIdentityResolution | null> {
+  const dependencies = typeof dependenciesOrDeadline === 'number'
+    ? defaultIdentityDeps()
+    : dependenciesOrDeadline;
+  const deadlineAtMs = typeof dependenciesOrDeadline === 'number'
+    ? dependenciesOrDeadline
+    : suppliedDeadlineAtMs ?? Date.now() + PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS;
   if (!workingDir || workingDir.includes('\0')) return null;
   const pathApi = dependencies.platform === 'win32' ? path.win32 : path.posix;
   if (!pathApi.isAbsolute(workingDir)) return null;
   const requestedWorkingDir = pathApi.resolve(workingDir);
+  const budget: ProjectSkillDiscoveryBudget = {
+    remainingEntries: MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
+    deadlineAtMs,
+  };
   try {
-    if (!(await dependencies.stat(requestedWorkingDir)).isDirectory()) return null;
-    const canonicalWorkingDir = await dependencies.realpath(requestedWorkingDir);
-    const lexicalRepoRoot = await nearestGitRoot(canonicalWorkingDir, dependencies.stat, pathApi);
+    if (!(await awaitProjectSkillDiscoveryStep(
+      () => dependencies.stat(requestedWorkingDir),
+      budget,
+    )).isDirectory()) return null;
+    const canonicalWorkingDir = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.realpath(requestedWorkingDir),
+      budget,
+    );
+    const lexicalRepoRoot = await awaitProjectSkillDiscoveryStep(
+      () => nearestGitRoot(canonicalWorkingDir, dependencies.stat, pathApi),
+      budget,
+    );
     if (!lexicalRepoRoot) return null;
-    const canonicalRepoRoot = await dependencies.realpath(lexicalRepoRoot);
+    const canonicalRepoRoot = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.realpath(lexicalRepoRoot),
+      budget,
+    );
     let identity: PiProjectIdentityResolution;
     if (dependencies.platform === 'posix') {
       if (!losslessPosixPath(canonicalWorkingDir) || !losslessPosixPath(canonicalRepoRoot)) return null;
@@ -340,9 +365,12 @@ export async function resolveDesktopPiProjectIdentity(
       };
     } else {
       if (!losslessUtf16Path(canonicalWorkingDir) || !losslessUtf16Path(canonicalRepoRoot)) return null;
-      const windowsCaseComparison = await dependencies.resolveWindowsCaseComparison?.(
-        canonicalWorkingDir,
-      ) ?? 'unavailable';
+      const windowsCaseComparison = dependencies.resolveWindowsCaseComparison
+        ? await awaitProjectSkillDiscoveryStep(
+            () => dependencies.resolveWindowsCaseComparison!(canonicalWorkingDir),
+            budget,
+          )
+        : 'unavailable';
       if (windowsCaseComparison === 'unavailable') return null;
       identity = {
         workingDir: requestedWorkingDir,
@@ -539,8 +567,15 @@ async function windowsDirectoryChainMatchesIdentity(
 
 export async function scanContainedDesktopPiProjectSkills(
   identity: PiProjectIdentityResolution,
-  dependencies: ProjectSkillScanDeps = defaultScanDeps(),
+  dependenciesOrDeadline: ProjectSkillScanDeps | number = defaultScanDeps(),
+  suppliedDeadlineAtMs?: number,
 ): Promise<PiProjectCanonicalPathEvidence[] | null> {
+  const dependencies = typeof dependenciesOrDeadline === 'number'
+    ? defaultScanDeps()
+    : dependenciesOrDeadline;
+  const deadlineAtMs = typeof dependenciesOrDeadline === 'number'
+    ? dependenciesOrDeadline
+    : suppliedDeadlineAtMs ?? Date.now() + PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS;
   const roots = projectSkillSourceRoots(identity);
   if (!roots) return null;
   try {
@@ -549,7 +584,7 @@ export async function scanContainedDesktopPiProjectSkills(
     const checkedWindowsDirectories = new Map<string, boolean>();
     const budget: ProjectSkillDiscoveryBudget = {
       remainingEntries: MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
-      deadlineAtMs: Date.now() + PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS,
+      deadlineAtMs,
     };
     if (!await windowsDirectoryChainMatchesIdentity(
       identity,
@@ -582,8 +617,16 @@ export async function scanContainedDesktopPiProjectSkills(
 }
 
 const defaultResolverDeps = (): PiProjectSkillAdmissionResolverDeps => ({
-  resolveIdentity: resolveDesktopPiProjectIdentity,
-  scanProjectSkills: scanContainedDesktopPiProjectSkills,
+  resolveIdentity: (workingDir, deadlineAtMs) => resolveDesktopPiProjectIdentity(
+    workingDir,
+    defaultIdentityDeps(),
+    deadlineAtMs,
+  ),
+  scanProjectSkills: (identity, deadlineAtMs) => scanContainedDesktopPiProjectSkills(
+    identity,
+    defaultScanDeps(),
+    deadlineAtMs,
+  ),
 });
 
 function admissionRevision(
@@ -629,37 +672,60 @@ export async function resolveDesktopPiProjectTrustInput(
   dependencies: PiProjectSkillAdmissionResolverDeps = defaultResolverDeps(),
 ): Promise<PiProjectTrustInputSnapshot | null> {
   if (context.remoteHostId) return null;
-  const identity = await dependencies.resolveIdentity(context.workingDir);
-  const projectKey = identity && piProjectKey(identity);
-  if (!identity || !projectKey) return null;
-  const evidence = await dependencies.scanProjectSkills(identity);
-  if (!evidence) return null;
-
-  const reboundIdentity = await dependencies.resolveIdentity(context.workingDir);
-  if (!reboundIdentity || !sameProjectIdentity(identity, reboundIdentity)) return null;
-  const reboundEvidence = await dependencies.scanProjectSkills(reboundIdentity);
-  if (!reboundEvidence || !sameEvidence(identity, evidence, reboundEvidence)) return null;
-
-  const frozenEvidence = Object.freeze(
-    evidence.map((item) => Object.freeze({ ...item })),
-  );
-  const snapshot: PiProjectTrustInputSnapshot = {
-    identity: Object.freeze({ ...identity }),
-    approval: Object.freeze({
-      status: 'approved',
-      scope: 'working-dir',
-      scopeKey: projectKey,
-      revision: admissionRevision(projectKey, frozenEvidence),
-    }),
-    discovered: Object.freeze({
-      skills: Object.freeze(evidence.map((item) => item.discoveredPath)),
-      canonicalSkillEvidence: frozenEvidence,
-      settings: Object.freeze([]),
-      packages: Object.freeze([]),
-      extensions: Object.freeze([]),
-    }),
+  const deadlineAtMs = Date.now() + PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS;
+  const budget: ProjectSkillDiscoveryBudget = {
+    remainingEntries: MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
+    deadlineAtMs,
   };
-  return Object.freeze(snapshot);
+  let identity: PiProjectIdentityResolution | null;
+  let evidence: PiProjectCanonicalPathEvidence[] | null;
+  try {
+    identity = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.resolveIdentity(context.workingDir, deadlineAtMs),
+      budget,
+    );
+    const projectKey = identity && piProjectKey(identity);
+    if (!identity || !projectKey) return null;
+    evidence = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.scanProjectSkills(identity!, deadlineAtMs),
+      budget,
+    );
+    if (!evidence) return null;
+
+    const reboundIdentity = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.resolveIdentity(context.workingDir, deadlineAtMs),
+      budget,
+    );
+    if (!reboundIdentity || !sameProjectIdentity(identity, reboundIdentity)) return null;
+    const reboundEvidence = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.scanProjectSkills(reboundIdentity, deadlineAtMs),
+      budget,
+    );
+    if (!reboundEvidence || !sameEvidence(identity, evidence, reboundEvidence)) return null;
+
+    const frozenEvidence = Object.freeze(
+      evidence.map((item) => Object.freeze({ ...item })),
+    );
+    const snapshot: PiProjectTrustInputSnapshot = {
+      identity: Object.freeze({ ...identity }),
+      approval: Object.freeze({
+        status: 'approved',
+        scope: 'working-dir',
+        scopeKey: projectKey,
+        revision: admissionRevision(projectKey, frozenEvidence),
+      }),
+      discovered: Object.freeze({
+        skills: Object.freeze(evidence.map((item) => item.discoveredPath)),
+        canonicalSkillEvidence: frozenEvidence,
+        settings: Object.freeze([]),
+        packages: Object.freeze([]),
+        extensions: Object.freeze([]),
+      }),
+    };
+    return Object.freeze(snapshot);
+  } catch {
+    return null;
+  }
 }
 
 export const __testing = {

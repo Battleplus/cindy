@@ -10816,7 +10816,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       maker.getSession(sessionId) !== session
       || session.getRuntimeCapabilities() !== manifest
     ) return false;
-    return isCurrentPiSkillInvocation(item, manifest, currentSkills.skills);
+    return await isCurrentPiSkillInvocation(item, manifest, currentSkills.skills);
   };
 
   const inputCoordinator: AgentInputCoordinator = new AgentInputCoordinator({
