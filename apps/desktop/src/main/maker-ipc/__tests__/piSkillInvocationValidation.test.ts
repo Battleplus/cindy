@@ -274,6 +274,42 @@ describe('Pi Skill invocation validation', () => {
     )).toBe(false);
   });
 
+  it('accepts a user Skill symlink whose selected name differs from its target', async () => {
+    const userBaseDir = path.join(repoRoot, 'linked-user-skill', '.agents');
+    const sharedSource = path.join(repoRoot, 'linked-user-skill-target', 'physical-name');
+    const linkedSource = path.join(userBaseDir, 'skills', 'demo');
+    try {
+      fs.mkdirSync(sharedSource, { recursive: true });
+      fs.mkdirSync(path.dirname(linkedSource), { recursive: true });
+      fs.writeFileSync(path.join(sharedSource, 'SKILL.md'), '# linked user skill\n');
+      fs.symlinkSync(
+        sharedSource,
+        linkedSource,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+
+      expect(await isCurrentPiSkillInvocation(
+        item({ scope: 'user', sourcePath: linkedSource }),
+        manifest({
+          commands: [{
+            name: 'skill:demo',
+            source: 'skill',
+            sourceInfo: {
+              scope: 'user',
+              source: 'auto',
+              baseDir: userBaseDir,
+              path: path.join(sharedSource, 'SKILL.md'),
+            },
+          }],
+        }),
+        skills({ scope: 'user', path: linkedSource, runtimeStatus: undefined }),
+      )).toBe(true);
+    } finally {
+      fs.rmSync(linkedSource, { recursive: true, force: true });
+      fs.rmSync(sharedSource, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a user Skill whose physical source disappeared after scanning', async () => {
     const userBaseDir = path.join(repoRoot, 'deleted-user-skill', '.agents');
     const userSource = path.join(userBaseDir, 'skills', 'demo');

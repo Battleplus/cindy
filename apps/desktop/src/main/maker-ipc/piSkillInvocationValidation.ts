@@ -126,7 +126,10 @@ async function runtimeUserSkillMatchesSource(
     || command.sourceInfo.source !== 'auto'
   ) return false;
 
-  const selectedName = path.basename(selected);
+  // Preserve the selected entry name under ~/.agents/skills. Its canonical
+  // target may have a different basename when the Skill is installed through
+  // a symlink (for example, demo -> /shared/my-skill).
+  const selectedName = path.basename(path.resolve(sourcePath));
   const derivedFromBase = await canonicalLocalPath(
     path.join(baseDir, 'skills', selectedName),
     dependencies,
