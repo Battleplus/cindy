@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -147,6 +148,141 @@ describe('scanPiCustomizations', () => {
     expect(read).toHaveBeenCalledTimes(MAX_PI_CUSTOMIZATION_SCAN_ENTRIES + 1);
     expect(close).toHaveBeenCalledOnce();
     expect(stat.mock.calls.some(([candidate]) => String(candidate).includes('entry-'))).toBe(false);
+  });
+
+  it('stops streaming a growing project SKILL.md at the byte budget', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    mkdirSync(path.join(repo, '.git'), { recursive: true });
+    const skillDir = writeSkill(repo, path.join('.pi', 'skills'), 'growing');
+    const mdPath = path.join(canonical(skillDir), 'SKILL.md');
+    const mdStat = await fs.promises.stat(mdPath);
+    const next = vi.fn(async () => ({
+      done: false as const,
+      value: Buffer.alloc(4 * 1024 * 1024),
+    }));
+    const finish = vi.fn(async () => ({ done: true as const, value: undefined }));
+    const close = vi.fn(async () => {});
+    const handle = {
+      stat: vi.fn(async () => mdStat),
+      createReadStream: vi.fn(() => ({
+        [Symbol.asyncIterator]: () => ({ next, return: finish }),
+      })),
+      close,
+    } as unknown as FileHandle;
+
+    const result = await scanPiCustomizations(
+      { workingDirs: [repo] },
+      {
+        openFile: (candidate) => candidate === mdPath
+          ? Promise.resolve(handle)
+          : fs.promises.open(candidate, 'r'),
+      },
+    );
+
+    expect(result).toEqual({
+      items: [],
+      errors: [{ message: 'Pi Skill entrypoint exceeded the byte budget' }],
+    });
+    expect(next).toHaveBeenCalledTimes(5);
+    expect(finish).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('aborts a hanging project SKILL.md stream at the shared deadline', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    mkdirSync(path.join(repo, '.git'), { recursive: true });
+    const skillDir = writeSkill(repo, path.join('.pi', 'skills'), 'hanging');
+    const mdPath = path.join(canonical(skillDir), 'SKILL.md');
+    const mdStat = await fs.promises.stat(mdPath);
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    const next = vi.fn(() => {
+      markReadStarted();
+      return new Promise<IteratorResult<Buffer>>(() => {});
+    });
+    const finish = vi.fn(async () => ({ done: true as const, value: undefined }));
+    const close = vi.fn(async () => {});
+    let aborted = false;
+    const handle = {
+      stat: vi.fn(async () => mdStat),
+      createReadStream: vi.fn((options: { signal?: AbortSignal }) => {
+        options.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        return {
+          [Symbol.asyncIterator]: () => ({ next, return: finish }),
+        };
+      }),
+      close,
+    } as unknown as FileHandle;
+
+    vi.useFakeTimers();
+    try {
+      const pending = scanPiCustomizations(
+        { workingDirs: [repo] },
+        {
+          openFile: (candidate) => candidate === mdPath
+            ? Promise.resolve(handle)
+            : fs.promises.open(candidate, 'r'),
+          deadlineMs: 1_000,
+        },
+      );
+      await readStarted;
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(pending).resolves.toEqual({
+        items: [],
+        errors: [{ message: 'Pi customization scan deadline expired' }],
+      });
+      expect(aborted).toBe(true);
+      expect(finish).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a project SKILL.md whose open-file identity changes while reading', async () => {
+    const root = tempRoot();
+    const repo = path.join(root, 'repo');
+    mkdirSync(path.join(repo, '.git'), { recursive: true });
+    const skillDir = writeSkill(repo, path.join('.pi', 'skills'), 'replaced');
+    const mdPath = path.join(canonical(skillDir), 'SKILL.md');
+    const mdStat = await fs.promises.stat(mdPath);
+    const changedStat = {
+      ...mdStat,
+      mtimeMs: mdStat.mtimeMs + 1,
+      isFile: () => true,
+    } as fs.Stats;
+    const stats = [mdStat, changedStat];
+    const iterator = [Buffer.from('# safe\n')][Symbol.iterator]();
+    const close = vi.fn(async () => {});
+    const handle = {
+      stat: vi.fn(async () => stats.shift() ?? changedStat),
+      createReadStream: vi.fn(() => ({
+        [Symbol.asyncIterator]: () => iterator,
+      })),
+      close,
+    } as unknown as FileHandle;
+
+    const result = await scanPiCustomizations(
+      { workingDirs: [repo] },
+      {
+        openFile: (candidate) => candidate === mdPath
+          ? Promise.resolve(handle)
+          : fs.promises.open(candidate, 'r'),
+      },
+    );
+
+    expect(result).toEqual({
+      items: [],
+      errors: [{ message: 'Pi Skill entrypoint changed while reading' }],
+    });
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it('uses Windows path semantics for drive and UNC containment', () => {

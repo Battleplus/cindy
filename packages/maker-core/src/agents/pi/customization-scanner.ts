@@ -9,6 +9,7 @@
 
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -29,13 +30,14 @@ export const MAX_PI_CUSTOMIZATION_SCAN_ENTRIES = 10_000;
 const MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES = 16 * 1024 * 1024;
 const PI_CUSTOMIZATION_SCAN_TIMEOUT = 'PI_CUSTOMIZATION_SCAN_TIMEOUT';
 const PI_CUSTOMIZATION_SCAN_BUDGET = 'PI_CUSTOMIZATION_SCAN_BUDGET';
+const PI_CUSTOMIZATION_SCAN_UNSAFE_FILE = 'PI_CUSTOMIZATION_SCAN_UNSAFE_FILE';
 
 /** Injectable async filesystem surface used to test fail-closed scan budgets. */
 export interface PiCustomizationScanDeps {
   stat: (candidate: string) => Promise<fs.Stats>;
   realpath: (candidate: string) => Promise<string>;
   openDirectory: (candidate: string) => Promise<fs.Dir>;
-  readFile: (candidate: string, encoding: BufferEncoding) => Promise<string>;
+  openFile: (candidate: string) => Promise<FileHandle>;
   deadlineMs: number;
 }
 
@@ -43,7 +45,7 @@ const defaultScanDeps: PiCustomizationScanDeps = {
   stat: (candidate) => fsp.stat(candidate),
   realpath: (candidate) => fsp.realpath(candidate),
   openDirectory: (candidate) => fsp.opendir(candidate),
-  readFile: (candidate, encoding) => fsp.readFile(candidate, encoding),
+  openFile: (candidate) => fsp.open(candidate, 'r'),
   deadlineMs: PI_CUSTOMIZATION_SCAN_DEADLINE_MS,
 };
 
@@ -69,10 +71,21 @@ function scanBudgetError(): Error & { code: string } {
   });
 }
 
+function unsafeSkillFileError(message: string): Error & { code: string } {
+  return Object.assign(new Error(message), {
+    code: PI_CUSTOMIZATION_SCAN_UNSAFE_FILE,
+  });
+}
+
 function isScanFatal(error: unknown): boolean {
   if (isScanTimeout(error)) return true;
   return !!error && typeof error === 'object'
     && (error as { code?: unknown }).code === PI_CUSTOMIZATION_SCAN_BUDGET;
+}
+
+function isUnsafeSkillFile(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === PI_CUSTOMIZATION_SCAN_UNSAFE_FILE;
 }
 
 async function awaitScanStep<T>(
@@ -106,6 +119,82 @@ function filesystemErrorCode(error: unknown): string | undefined {
     && typeof (error as { code?: unknown }).code === 'string'
     ? (error as { code: string }).code
     : undefined;
+}
+
+function sameFileSnapshot(first: fs.Stats, second: fs.Stats): boolean {
+  return first.isFile()
+    && second.isFile()
+    && first.ino !== 0
+    && second.ino !== 0
+    && first.dev === second.dev
+    && first.ino === second.ino
+    && first.size === second.size
+    && first.mtimeMs === second.mtimeMs
+    && first.ctimeMs === second.ctimeMs;
+}
+
+async function readBoundedSkillFile(
+  mdPath: string,
+  dependencies: PiCustomizationScanDeps,
+  budget: PiCustomizationScanBudget,
+): Promise<string> {
+  const pathBefore = await awaitScanStep(() => dependencies.stat(mdPath), budget);
+  if (!pathBefore.isFile() || pathBefore.size > MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES) {
+    throw unsafeSkillFileError('Pi Skill entrypoint is not a bounded file');
+  }
+
+  const handle = await awaitScanStep(() => dependencies.openFile(mdPath), budget);
+  let iterator: AsyncIterator<unknown> | undefined;
+  let stream: fs.ReadStream | undefined;
+  const controller = new AbortController();
+  try {
+    const handleBefore = await awaitScanStep(() => handle.stat(), budget);
+    if (!sameFileSnapshot(pathBefore, handleBefore)) {
+      throw unsafeSkillFileError('Pi Skill entrypoint changed before reading');
+    }
+
+    const chunks: Buffer[] = [];
+    let byteLength = 0;
+    stream = handle.createReadStream({
+      start: 0,
+      autoClose: false,
+      highWaterMark: 64 * 1024,
+      signal: controller.signal,
+    });
+    iterator = stream[Symbol.asyncIterator]();
+    while (true) {
+      const result = await awaitScanStep(() => iterator!.next(), budget);
+      if (result.done) break;
+      if (!Buffer.isBuffer(result.value)) {
+        throw unsafeSkillFileError('Pi Skill entrypoint returned a non-binary chunk');
+      }
+      const chunk = result.value;
+      byteLength += chunk.byteLength;
+      if (byteLength > MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES) {
+        throw unsafeSkillFileError('Pi Skill entrypoint exceeded the byte budget');
+      }
+      chunks.push(chunk);
+    }
+
+    const [handleAfter, pathAfter] = await Promise.all([
+      awaitScanStep(() => handle.stat(), budget),
+      awaitScanStep(() => dependencies.stat(mdPath), budget),
+    ]);
+    if (
+      !sameFileSnapshot(handleBefore, handleAfter)
+      || !sameFileSnapshot(handleBefore, pathAfter)
+    ) {
+      throw unsafeSkillFileError('Pi Skill entrypoint changed while reading');
+    }
+    return Buffer.concat(chunks, byteLength).toString('utf8');
+  } finally {
+    controller.abort();
+    stream?.destroy?.();
+    if (iterator?.return) {
+      void Promise.resolve().then(() => iterator!.return!()).catch(() => {});
+    }
+    void Promise.resolve().then(() => handle.close()).catch(() => {});
+  }
 }
 
 async function readDirectoryEntries(
@@ -285,18 +374,16 @@ async function readFolderSkillAsync(
   let frontmatter: Record<string, unknown> | undefined;
   let parseError: string | undefined;
   try {
-    const mdStat = await awaitScanStep(() => dependencies.stat(mdPath), budget);
-    if (!mdStat.isFile() || mdStat.size > MAX_PI_CUSTOMIZATION_SKILL_MD_BYTES) {
-      throw new Error('Pi Skill entrypoint is not a bounded file');
-    }
-    const raw = await awaitScanStep(() => dependencies.readFile(mdPath, 'utf8'), budget);
+    const raw = await readBoundedSkillFile(mdPath, dependencies, budget);
     ({ description, frontmatter, parseError } = parseFrontmatter(raw));
   } catch (error) {
-    if (isScanFatal(error)) throw error;
+    if (isScanFatal(error) || (source.scope === 'repo' && isUnsafeSkillFile(error))) {
+      throw error;
+    }
     parseError = error instanceof Error ? error.message : String(error);
   }
 
-  let files: AgentCustomizationFile[] = [];
+  const files: AgentCustomizationFile[] = [];
   try {
     const entries = await readDirectoryEntries(folder, dependencies, budget);
     for (const entry of entries) {
@@ -422,7 +509,7 @@ async function scanOneSourceAsync(
     }
     return { items, errors };
   } catch (error) {
-    if (isScanFatal(error)) throw error;
+    if (isScanFatal(error) || isUnsafeSkillFile(error)) throw error;
     errors.push({
       path: source.dir,
       message: error instanceof Error ? error.message : String(error),
