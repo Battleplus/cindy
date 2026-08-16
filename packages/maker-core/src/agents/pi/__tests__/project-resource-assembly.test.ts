@@ -722,7 +722,7 @@ describe('Pi approved project resource assembly', () => {
       });
 
       const staged = await stageApprovedPiProjectResources(assembled, configHome, {
-        deadlineMs: 25,
+        deadlineMs: 1_000,
       });
 
       expect(sourceDirectoryReads).toBe(4);

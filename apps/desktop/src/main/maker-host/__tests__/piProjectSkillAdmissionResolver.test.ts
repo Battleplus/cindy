@@ -264,6 +264,9 @@ describe('scanContainedDesktopPiProjectSkills', () => {
       stat,
       lstat,
       realpath,
+      resolveWindowsCaseComparison: async () => (
+        identity.windowsCaseComparison ?? 'unavailable'
+      ),
     })).toBeNull();
     expect(openDirectory).toHaveBeenCalledWith(targetRoot);
     expect(realpath).toHaveBeenCalledTimes(1);
