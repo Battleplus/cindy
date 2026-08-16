@@ -559,6 +559,47 @@ export async function resolvePendingPiProjectSkillForDispatch(params: {
 }
 
 /**
+ * A New Maker worktree sends its first turn directly, before SessionView can
+ * reconcile aliases. Bind a selected user Skill to the exact path that the
+ * newly started Pi session re-discovers; a same-name Skill from another
+ * directory is not an acceptable replacement. Main remains the final loaded
+ * provenance authority when the receipt reaches the dispatch fence.
+ */
+export async function resolvePendingPiUserSkillForDispatch(params: {
+  message: string;
+  pendingInvocation: AgentSkillInvocation;
+  reload: () => Promise<UnifiedCommand[]>;
+  prepareRuntime: () => Promise<void>;
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number) => Promise<void>;
+}): Promise<AgentSkillInvocation | null> {
+  if (
+    params.pendingInvocation.scope !== 'user'
+    || !params.pendingInvocation.sourcePath
+  ) return null;
+  const retryDelaysMs = params.retryDelaysMs ?? PI_RUNTIME_SKILL_RETRY_DELAYS_MS;
+  const sleep = params.sleep ?? ((delayMs: number) => new Promise<void>(
+    (resolve) => window.setTimeout(resolve, delayMs),
+  ));
+  const findLoadedTarget = (commands: UnifiedCommand[]) => commands.find((candidate) => (
+    candidate.kind === 'agent-skill'
+    && candidate.scope === 'user'
+    && candidate.name.toLowerCase() === params.pendingInvocation.name.toLowerCase()
+    && candidate.path === params.pendingInvocation.sourcePath
+    && !!candidate.runtimeCommandName
+  ));
+
+  await params.prepareRuntime();
+  let command = findLoadedTarget(await params.reload());
+  for (const delayMs of retryDelaysMs) {
+    if (command) break;
+    await sleep(delayMs);
+    command = findLoadedTarget(await params.reload());
+  }
+  return agentSkillInvocationForDispatch(params.message, command) ?? null;
+}
+
+/**
  * A draft Pi Skill session is not user-owned until its exact runtime receipt
  * exists. Roll it back durably and in order; never hide a session locally when
  * Main or the database failed to release it.

@@ -16,6 +16,7 @@ import {
   reconcilePiRuntimeCommandForDispatch,
   reconcilePiRuntimeCommandForDispatchWithRetry,
   resolvePendingPiProjectSkillForDispatch,
+  resolvePendingPiUserSkillForDispatch,
   rollbackUnclaimedPiProjectSkillSession,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
@@ -667,6 +668,74 @@ describe('resolvePendingPiProjectSkillForDispatch', () => {
         name: 'demo',
         path: '/repo/.cindy-worktrees/demo/.agents/skills/demo',
         scope: 'repo',
+        runtimeStatus: 'loaded',
+        runtimeCommandName: 'skill:demo',
+      })],
+      retryDelaysMs: [],
+    })).resolves.toBeNull();
+  });
+});
+
+describe('resolvePendingPiUserSkillForDispatch', () => {
+  it('waits for the exact selected user Skill path in the new runtime', async () => {
+    const prepareRuntime = vi.fn(async () => undefined);
+    const sleep = vi.fn(async () => undefined);
+    const reload = vi.fn()
+      .mockResolvedValueOnce([
+        skill({
+          name: 'demo',
+          scope: 'user',
+          path: '/home/user/.agents/skills/other-demo',
+          runtimeStatus: 'loaded',
+          runtimeCommandName: 'skill:demo',
+        }),
+      ])
+      .mockResolvedValueOnce([
+        skill({
+          name: 'Demo',
+          scope: 'user',
+          path: '/home/user/.agents/skills/demo',
+          runtimeCommandName: 'skill:frontmatter-demo',
+        }),
+      ]);
+
+    await expect(resolvePendingPiUserSkillForDispatch({
+      message: '/demo run this',
+      pendingInvocation: {
+        name: 'demo',
+        scope: 'user',
+        sourcePath: '/home/user/.agents/skills/demo',
+        runtimeCommandName: 'skill:demo',
+      },
+      prepareRuntime,
+      reload,
+      retryDelaysMs: [0],
+      sleep,
+    })).resolves.toEqual({
+      name: 'Demo',
+      scope: 'user',
+      sourcePath: '/home/user/.agents/skills/demo',
+      runtimeCommandName: 'skill:frontmatter-demo',
+    });
+    expect(prepareRuntime).toHaveBeenCalledOnce();
+    expect(reload).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when only a same-name user Skill from another path is loaded', async () => {
+    await expect(resolvePendingPiUserSkillForDispatch({
+      message: '/demo',
+      pendingInvocation: {
+        name: 'demo',
+        scope: 'user',
+        sourcePath: '/home/user/.agents/skills/demo',
+        runtimeCommandName: 'skill:demo',
+      },
+      prepareRuntime: async () => undefined,
+      reload: async () => [skill({
+        name: 'demo',
+        scope: 'user',
+        path: '/other/.agents/skills/demo',
         runtimeStatus: 'loaded',
         runtimeCommandName: 'skill:demo',
       })],

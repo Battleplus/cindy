@@ -8,6 +8,11 @@ const source = readFileSync(
   'utf8',
 ).replace(/\r\n/g, '\n');
 
+const chatInputSource = readFileSync(
+  resolve(__dirname, '..', 'components', 'new-chat', 'ChatInput.tsx'),
+  'utf8',
+).replace(/\r\n/g, '\n');
+
 const sessionViewSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'CCAgentSessionView.tsx'),
   'utf8',
@@ -216,6 +221,28 @@ describe('NewMakerDraftRoute Orca worker create order', () => {
     expect(worktreeBranch).toContain('newSession.id,\n                  message,');
     expect(worktreeBranch).toContain('agentSkillInvocation }');
     expect(worktreeBranch).not.toContain('messageForSend');
+  });
+
+  it('binds a selected Pi user Skill to the worktree runtime before direct send', () => {
+    const worktreeBranch = source.slice(
+      source.indexOf('if (!isRemoteProjectDraft && wt.enabled && wt.baseRepo)'),
+      source.indexOf('// 普通路径:', source.indexOf('if (!isRemoteProjectDraft && wt.enabled && wt.baseRepo)')),
+    );
+    const resolveSkill = worktreeBranch.indexOf('resolvePendingPiUserSkillForDispatch({');
+    const send = worktreeBranch.indexOf('makerChatStore.sendMessage(');
+
+    expect(chatInputSource).toContain('pendingAgentSkillInvocation?: AgentSkillInvocation;');
+    expect(chatInputSource).toContain('agentSkillInvocationForDispatch(');
+    expect(chatInputSource).toContain('pendingAgentSkillInvocation }');
+    expect(resolveSkill).toBeGreaterThan(-1);
+    expect(resolveSkill).toBeLessThan(send);
+    expect(worktreeBranch).toContain("opts?.pendingAgentSkillInvocation?.scope === 'user'");
+    expect(worktreeBranch).toContain('pendingInvocation: opts.pendingAgentSkillInvocation');
+    expect(worktreeBranch).toContain('prepareRuntime: preparePiRuntimeForWorktree');
+    expect(worktreeBranch).toContain('reload: reloadPiSkillsForWorktree');
+    expect(worktreeBranch).toContain("toast.warning(t('commandPalette.skillUnavailableForNewTask'))");
+    expect(worktreeBranch).toContain('restoreFirstMessageDraft();');
+    expect(worktreeBranch).toContain('agentSkillInvocation = resolvedInvocation;');
   });
 
   it('reconciles Pi skill aliases after the user selects a working directory', () => {

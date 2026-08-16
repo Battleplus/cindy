@@ -343,11 +343,11 @@ async function fingerprintSkillEntrypointOnce(
   const skillPath = path.join(rootPath, 'SKILL.md');
   const [rootEntry, canonicalRoot, skillLinkEntry, canonicalSkill, skillTargetEntry] =
     await Promise.all([
-      fs.lstat(rootPath),
-      fs.realpath(rootPath),
-      fs.lstat(skillPath),
-      fs.realpath(skillPath),
-      fs.stat(skillPath),
+      awaitFingerprintBudgetStep(() => fs.lstat(rootPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(rootPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.lstat(skillPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(skillPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.stat(skillPath), sharedBudget),
     ]);
   if (
     !rootEntry.isDirectory()
@@ -358,15 +358,18 @@ async function fingerprintSkillEntrypointOnce(
     throw new Error('approved skill entrypoint escaped its repository');
   }
 
-  const handle = await fs.open(
-    canonicalSkill,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+  const handle = await awaitFingerprintBudgetStep(
+    () => fs.open(
+      canonicalSkill,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    ),
+    sharedBudget,
   );
   try {
     if (sharedBudget && Date.now() >= sharedBudget.deadlineAtMs) {
       throw new Error('approved skill fingerprint deadline expired');
     }
-    const openedEntry = await handle.stat();
+    const openedEntry = await awaitFingerprintBudgetStep(() => handle.stat(), sharedBudget);
     if (!openedEntry.isFile() || !sameFileIdentity(skillTargetEntry, openedEntry)) {
       throw new Error('approved skill entrypoint changed before fingerprinting');
     }
@@ -387,12 +390,12 @@ async function fingerprintSkillEntrypointOnce(
       skillTargetEntryAfterRead,
       openedAfterRead,
     ] = await Promise.all([
-      fs.lstat(rootPath),
-      fs.realpath(rootPath),
-      fs.lstat(skillPath),
-      fs.realpath(skillPath),
-      fs.stat(skillPath),
-      handle.stat(),
+      awaitFingerprintBudgetStep(() => fs.lstat(rootPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(rootPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.lstat(skillPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(skillPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.stat(skillPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => handle.stat(), sharedBudget),
     ]);
     if (
       !sameEntrySnapshot(rootEntry, rootEntryAfterRead)
@@ -407,7 +410,15 @@ async function fingerprintSkillEntrypointOnce(
     }
     return contentDigest;
   } finally {
-    await handle.close();
+    if (sharedBudget) {
+      await settleDeadlineBoundCleanup(
+        () => handle.close(),
+        sharedBudget.deadlineAtMs,
+        'approved skill fingerprint deadline expired',
+      );
+    } else {
+      await handle.close();
+    }
   }
 }
 
@@ -433,19 +444,21 @@ function assertSnapshotBudgetAvailable(budget: PiProjectSkillSnapshotBudget): vo
   budget.remainingEntries -= 1;
 }
 
-async function awaitSnapshotBudgetStep<T>(
-  operation: Promise<T>,
-  budget: PiProjectSkillSnapshotBudget,
+async function awaitDeadlineStep<T>(
+  operation: () => Promise<T>,
+  deadlineAtMs: number,
+  errorMessage: string,
 ): Promise<T> {
-  const remainingMs = budget.deadlineAtMs - Date.now();
-  if (remainingMs <= 0) throw new Error('approved skill snapshot deadline expired');
-  if (!Number.isFinite(remainingMs)) return operation;
+  const remainingMs = deadlineAtMs - Date.now();
+  if (remainingMs <= 0) throw new Error(errorMessage);
+  if (!Number.isFinite(remainingMs)) return operation();
+  const pending = operation();
   return new Promise<T>((resolve, reject) => {
     const timeout = setNodeTimeout(
-      () => reject(new Error('approved skill snapshot deadline expired')),
+      () => reject(new Error(errorMessage)),
       remainingMs,
     );
-    operation.then(
+    pending.then(
       (value) => {
         clearNodeTimeout(timeout);
         resolve(value);
@@ -458,17 +471,59 @@ async function awaitSnapshotBudgetStep<T>(
   });
 }
 
+function awaitSnapshotBudgetStep<T>(
+  operation: () => Promise<T>,
+  budget: PiProjectSkillSnapshotBudget,
+): Promise<T> {
+  return awaitDeadlineStep(
+    operation,
+    budget.deadlineAtMs,
+    'approved skill snapshot deadline expired',
+  );
+}
+
+function awaitFingerprintBudgetStep<T>(
+  operation: () => Promise<T>,
+  budget?: PiProjectSkillFingerprintBudget,
+): Promise<T> {
+  return budget
+    ? awaitDeadlineStep(
+        operation,
+        budget.deadlineAtMs,
+        'approved skill fingerprint deadline expired',
+      )
+    : operation();
+}
+
+async function settleDeadlineBoundCleanup(
+  operation: () => Promise<unknown>,
+  deadlineAtMs: number,
+  errorMessage: string,
+): Promise<void> {
+  const pending = operation();
+  if (Date.now() >= deadlineAtMs) {
+    void pending.catch(() => undefined);
+    return;
+  }
+  try {
+    await awaitDeadlineStep(() => pending, deadlineAtMs, errorMessage);
+  } catch (error) {
+    if (Date.now() >= deadlineAtMs) return;
+    throw error;
+  }
+}
+
 async function visitSnapshotDirectoryEntries(
   entryPath: string,
   budget: PiProjectSkillSnapshotBudget,
   visit: (childName: string) => Promise<void>,
 ): Promise<void> {
   if (typeof fs.opendir === 'function') {
-    const directory = await awaitSnapshotBudgetStep(fs.opendir(entryPath), budget);
+    const directory = await awaitSnapshotBudgetStep(() => fs.opendir(entryPath), budget);
     const iterator = directory[Symbol.asyncIterator]();
     try {
       while (true) {
-        const result = await awaitSnapshotBudgetStep(iterator.next(), budget);
+        const result = await awaitSnapshotBudgetStep(() => iterator.next(), budget);
         if (result.done) break;
         // Charge the shared budget before any child lstat/realpath work. A
         // hostile directory therefore cannot make preflight materialize or
@@ -477,7 +532,13 @@ async function visitSnapshotDirectoryEntries(
         await visit(result.value.name);
       }
     } finally {
-      await iterator.return?.();
+      if (iterator.return) {
+        await settleDeadlineBoundCleanup(
+          () => iterator.return!().then(() => undefined),
+          budget.deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        );
+      }
     }
     return;
   }
@@ -486,7 +547,7 @@ async function visitSnapshotDirectoryEntries(
   // uses the streaming path above; the fallback still has a deadline and
   // rejects the whole listing before probing any child when it exceeds budget.
   const children = await awaitSnapshotBudgetStep(
-    fs.readdir(entryPath, { withFileTypes: true }),
+    () => fs.readdir(entryPath, { withFileTypes: true }),
     budget,
   );
   if (Date.now() >= budget.deadlineAtMs || children.length > budget.remainingEntries) {
@@ -508,8 +569,8 @@ async function preflightSkillSnapshotEntry(
 ): Promise<void> {
   if (!entryAlreadyCounted) assertSnapshotBudgetAvailable(budget);
   const [entry, canonicalEntry] = await Promise.all([
-    fs.lstat(entryPath),
-    fs.realpath(entryPath),
+    awaitSnapshotBudgetStep(() => fs.lstat(entryPath), budget),
+    awaitSnapshotBudgetStep(() => fs.realpath(entryPath), budget),
   ]);
   if (!localPathIsWithin(canonicalRepoRoot, canonicalEntry, pathComparisonIdentity)) {
     throw new Error('approved skill snapshot entry escaped its repository');
@@ -579,9 +640,9 @@ async function fingerprintSkillTreeStateOnce(
       throw new Error('approved skill tree exceeds the fingerprint entry budget');
     }
     const [linkEntry, canonicalEntry, targetEntry] = await Promise.all([
-      fs.lstat(entryPath),
-      fs.realpath(entryPath),
-      fs.stat(entryPath),
+      awaitFingerprintBudgetStep(() => fs.lstat(entryPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(entryPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.stat(entryPath), sharedBudget),
     ]);
     if (
       !localPathIsWithin(canonicalRepoRoot, canonicalEntry, pathComparisonIdentity)
@@ -619,13 +680,19 @@ async function fingerprintSkillTreeStateOnce(
           sharedBudget?.remainingEntries ?? Number.POSITIVE_INFINITY,
         );
         const childNames: string[] = [];
-        const directory = await fs.opendir(entryPath);
+        const directory = await awaitFingerprintBudgetStep(
+          () => fs.opendir(entryPath),
+          sharedBudget,
+        );
         try {
           while (true) {
             if (sharedBudget && Date.now() >= sharedBudget.deadlineAtMs) {
               throw new Error('approved skill tree exceeded the shared fingerprint deadline');
             }
-            const child = await directory.read();
+            const child = await awaitFingerprintBudgetStep(
+              () => directory.read(),
+              sharedBudget,
+            );
             if (!child) break;
             if (childNames.length >= remainingEntryBudget) {
               throw new Error('approved skill tree exceeds the fingerprint entry budget');
@@ -633,7 +700,15 @@ async function fingerprintSkillTreeStateOnce(
             childNames.push(child.name);
           }
         } finally {
-          await directory.close().catch(() => undefined);
+          if (sharedBudget) {
+            await settleDeadlineBoundCleanup(
+              () => directory.close().catch(() => undefined),
+              sharedBudget.deadlineAtMs,
+              'approved skill fingerprint deadline expired',
+            );
+          } else {
+            await directory.close().catch(() => undefined);
+          }
         }
         if (sharedBudget && Date.now() >= sharedBudget.deadlineAtMs) {
           throw new Error('approved skill tree exceeded the shared fingerprint deadline');
@@ -651,9 +726,9 @@ async function fingerprintSkillTreeStateOnce(
     }
 
     const [linkEntryAfter, canonicalEntryAfter, targetEntryAfter] = await Promise.all([
-      fs.lstat(entryPath),
-      fs.realpath(entryPath),
-      fs.stat(entryPath),
+      awaitFingerprintBudgetStep(() => fs.lstat(entryPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.realpath(entryPath), sharedBudget),
+      awaitFingerprintBudgetStep(() => fs.stat(entryPath), sharedBudget),
     ]);
     if (
       !sameEntrySnapshot(linkEntry, linkEntryAfter)
@@ -683,8 +758,8 @@ export async function fingerprintPiProjectSkillEntrypoint(
       ?? (process.platform === 'win32' ? null : strictLocalPathComparisonIdentity());
     if (!pathComparisonIdentity) return null;
     const [canonicalRoot, canonicalBoundary] = await Promise.all([
-      fs.realpath(rootPath),
-      fs.realpath(canonicalRepoRoot),
+      awaitFingerprintBudgetStep(() => fs.realpath(rootPath), options.budget),
+      awaitFingerprintBudgetStep(() => fs.realpath(canonicalRepoRoot), options.budget),
     ]);
     if (!localPathIsWithin(canonicalBoundary, canonicalRoot, pathComparisonIdentity)) return null;
     const firstContentDigest = await fingerprintSkillEntrypointOnce(
@@ -734,8 +809,8 @@ async function materializeSkillEntry(
 ): Promise<void> {
   if (!entryAlreadyCounted) assertSnapshotBudgetAvailable(budget);
   const [entry, canonicalSource] = await Promise.all([
-    fs.lstat(sourcePath),
-    fs.realpath(sourcePath),
+    awaitSnapshotBudgetStep(() => fs.lstat(sourcePath), budget),
+    awaitSnapshotBudgetStep(() => fs.realpath(sourcePath), budget),
   ]);
   if (!localPathIsWithin(canonicalRepoRoot, canonicalSource, pathComparisonIdentity)) {
     throw new Error('approved skill entry escaped its repository');
@@ -758,7 +833,10 @@ async function materializeSkillEntry(
     }
     activeDirectories.add(canonicalSource);
     try {
-      await fs.mkdir(targetPath, { recursive: false });
+      await awaitSnapshotBudgetStep(
+        () => fs.mkdir(targetPath, { recursive: false }).then(() => undefined),
+        budget,
+      );
       await visitSnapshotDirectoryEntries(sourcePath, budget, async (childName) => {
         await materializeSkillEntry(
           path.join(sourcePath, childName),
@@ -771,8 +849,8 @@ async function materializeSkillEntry(
         );
       });
       const [canonicalAfterCopy, entryAfterCopy] = await Promise.all([
-        fs.realpath(sourcePath),
-        fs.lstat(sourcePath),
+        awaitSnapshotBudgetStep(() => fs.realpath(sourcePath), budget),
+        awaitSnapshotBudgetStep(() => fs.lstat(sourcePath), budget),
       ]);
       if (
         !piCanonicalPathsEqual(pathComparisonIdentity, canonicalAfterCopy, canonicalSource)
@@ -788,12 +866,15 @@ async function materializeSkillEntry(
   }
   if (!entry.isFile()) throw new Error('approved skill contains a special file');
 
-  const sourceHandle = await fs.open(
-    sourcePath,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+  const sourceHandle = await awaitSnapshotBudgetStep(
+    () => fs.open(
+      sourcePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    ),
+    budget,
   );
   try {
-    const openedEntry = await sourceHandle.stat();
+    const openedEntry = await awaitSnapshotBudgetStep(() => sourceHandle.stat(), budget);
     if (!openedEntry.isFile() || !sameFileIdentity(entry, openedEntry)) {
       throw new Error('approved skill file changed before snapshot read');
     }
@@ -832,10 +913,10 @@ async function materializeSkillEntry(
     }
     const [openedAfterCopy, sourcePathAfterCopy, sourceAfterCopy, targetAfterCopy] =
       await Promise.all([
-        sourceHandle.stat(),
-        fs.lstat(sourcePath),
-        fs.realpath(sourcePath),
-        fs.lstat(targetPath),
+        awaitSnapshotBudgetStep(() => sourceHandle.stat(), budget),
+        awaitSnapshotBudgetStep(() => fs.lstat(sourcePath), budget),
+        awaitSnapshotBudgetStep(() => fs.realpath(sourcePath), budget),
+        awaitSnapshotBudgetStep(() => fs.lstat(targetPath), budget),
       ]);
     if (
       !sameEntrySnapshot(openedEntry, openedAfterCopy)
@@ -845,9 +926,12 @@ async function materializeSkillEntry(
     ) {
       throw new Error('approved skill file changed while snapshotting');
     }
-    const targetHandle = await fs.open(
-      targetPath,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    const targetHandle = await awaitSnapshotBudgetStep(
+      () => fs.open(
+        targetPath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+      ),
+      budget,
     );
     try {
       const [sourceDigest, targetDigest] = await Promise.all([
@@ -863,8 +947,8 @@ async function materializeSkillEntry(
         }),
       ]);
       const [sourceAfterStableRead, targetAfterStableRead] = await Promise.all([
-        sourceHandle.stat(),
-        targetHandle.stat(),
+        awaitSnapshotBudgetStep(() => sourceHandle.stat(), budget),
+        awaitSnapshotBudgetStep(() => targetHandle.stat(), budget),
       ]);
       if (
         sourceDigest !== targetDigest
@@ -875,11 +959,22 @@ async function materializeSkillEntry(
         throw new Error('approved skill file content changed while snapshotting');
       }
     } finally {
-      await targetHandle.close();
+      await settleDeadlineBoundCleanup(
+        () => targetHandle.close(),
+        budget.deadlineAtMs,
+        'approved skill snapshot deadline expired',
+      );
     }
-    await fs.chmod(targetPath, openedEntry.mode & 0o777);
+    await awaitSnapshotBudgetStep(
+      () => fs.chmod(targetPath, openedEntry.mode & 0o777),
+      budget,
+    );
   } finally {
-    await sourceHandle.close();
+    await settleDeadlineBoundCleanup(
+      () => sourceHandle.close(),
+      budget.deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
   }
 }
 
@@ -888,13 +983,16 @@ async function auditMaterializedTree(
   budget: PiProjectSkillSnapshotBudget,
 ): Promise<void> {
   assertSnapshotBudgetAvailable(budget);
-  const entries = await fs.readdir(root, { withFileTypes: true });
+  const entries = await awaitSnapshotBudgetStep(
+    () => fs.readdir(root, { withFileTypes: true }),
+    budget,
+  );
   for (const entry of entries) {
     if (Date.now() >= budget.deadlineAtMs) {
       throw new Error('approved skill snapshot deadline expired');
     }
     const entryPath = path.join(root, entry.name);
-    const stats = await fs.lstat(entryPath);
+    const stats = await awaitSnapshotBudgetStep(() => fs.lstat(entryPath), budget);
     if (stats.isSymbolicLink()) throw new Error('skill snapshot contains a symbolic link');
     if (stats.isDirectory()) {
       await auditMaterializedTree(entryPath, budget);
@@ -916,7 +1014,11 @@ async function assertMaterializedSkillLayout(
   deadlineAtMs: number,
 ): Promise<void> {
   const expectedIndexes = relativeLaunchPaths.map((_entry, index) => String(index));
-  const indexes = await fs.readdir(temporarySkillsRoot);
+  const indexes = await awaitDeadlineStep(
+    () => fs.readdir(temporarySkillsRoot),
+    deadlineAtMs,
+    'approved skill snapshot deadline expired',
+  );
   const actualIndexes = new Set(indexes);
   if (
     Date.now() >= deadlineAtMs
@@ -925,7 +1027,11 @@ async function assertMaterializedSkillLayout(
   ) throw new Error('approved skill snapshot layout changed');
   for (const [index, relativePath] of relativeLaunchPaths.entries()) {
     const expectedName = path.basename(relativePath);
-    const entries = await fs.readdir(path.join(temporarySkillsRoot, String(index)));
+    const entries = await awaitDeadlineStep(
+      () => fs.readdir(path.join(temporarySkillsRoot, String(index))),
+      deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
     if (
       Date.now() >= deadlineAtMs
       || entries.length !== 1
@@ -1008,9 +1114,17 @@ export async function stageApprovedPiProjectResources(
       deadlineAtMs,
       maxFileBytes,
     });
-    temporaryRoot = await fs.mkdtemp(path.join(configHome, '.project-resources-'));
+    temporaryRoot = await awaitDeadlineStep(
+      () => fs.mkdtemp(path.join(configHome, '.project-resources-')),
+      deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
     const temporarySkillsRoot = path.join(temporaryRoot, 'skills');
-    await fs.mkdir(temporarySkillsRoot);
+    await awaitDeadlineStep(
+      () => fs.mkdir(temporarySkillsRoot).then(() => undefined),
+      deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
     const relativeLaunchPaths: string[] = [];
     const launchSkillDigests: string[] = [];
     const launchSkillSourceFingerprints: string[] = [];
@@ -1019,10 +1133,22 @@ export async function stageApprovedPiProjectResources(
       const skillName = path.basename(sourcePath);
       const relativePath = path.join('skills', String(index), skillName);
       const targetPath = path.join(temporaryRoot, relativePath);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await awaitDeadlineStep(
+        () => fs.mkdir(path.dirname(targetPath), { recursive: true }).then(() => undefined),
+        deadlineAtMs,
+        'approved skill snapshot deadline expired',
+      );
       const [sourceRootBeforeCopy, canonicalSourceBeforeCopy] = await Promise.all([
-        fs.lstat(sourcePath),
-        fs.realpath(sourcePath),
+        awaitDeadlineStep(
+          () => fs.lstat(sourcePath),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
+        awaitDeadlineStep(
+          () => fs.realpath(sourcePath),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
       ]);
       if (
         !sourceRootBeforeCopy.isDirectory()
@@ -1052,8 +1178,16 @@ export async function stageApprovedPiProjectResources(
         copyBudget,
       );
       const [canonicalSourceAfterCopy, skillEntrypoint] = await Promise.all([
-        fs.realpath(sourcePath),
-        fs.lstat(path.join(targetPath, 'SKILL.md')),
+        awaitDeadlineStep(
+          () => fs.realpath(sourcePath),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
+        awaitDeadlineStep(
+          () => fs.lstat(path.join(targetPath, 'SKILL.md')),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
       ]);
       if (
         !piCanonicalPathsEqual(pathComparisonIdentity, canonicalSourceAfterCopy, sourcePath)
@@ -1072,8 +1206,16 @@ export async function stageApprovedPiProjectResources(
         }),
       ]);
       const [sourceRootAfterFingerprint, canonicalSourceAfterFingerprint] = await Promise.all([
-        fs.lstat(sourcePath),
-        fs.realpath(sourcePath),
+        awaitDeadlineStep(
+          () => fs.lstat(sourcePath),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
+        awaitDeadlineStep(
+          () => fs.realpath(sourcePath),
+          deadlineAtMs,
+          'approved skill snapshot deadline expired',
+        ),
       ]);
       if (
         !launchFingerprint
@@ -1121,7 +1263,11 @@ export async function stageApprovedPiProjectResources(
     // fingerprints. A change before a Skill proof is rejected against its
     // stored launch fingerprint; a change after it is rejected by the closing
     // whole-tree pass. Nothing that can inspect the tree awaits after it.
-    const canonicalTemporarySkillsRoot = await fs.realpath(temporarySkillsRoot);
+    const canonicalTemporarySkillsRoot = await awaitDeadlineStep(
+      () => fs.realpath(temporarySkillsRoot),
+      deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
     const baselineStagingFingerprint = await fingerprintSkillTreeStateOnce(
       temporarySkillsRoot,
       canonicalTemporarySkillsRoot,
@@ -1156,7 +1302,11 @@ export async function stageApprovedPiProjectResources(
     }
 
     const publishedRoot = path.join(configHome, 'project-resources');
-    await fs.rename(temporaryRoot, publishedRoot);
+    await awaitDeadlineStep(
+      () => fs.rename(temporaryRoot!, publishedRoot),
+      deadlineAtMs,
+      'approved skill snapshot deadline expired',
+    );
     temporaryRoot = null;
     const launchSkillPaths = Object.freeze(relativeLaunchPaths.map((relativePath) =>
       path.join(publishedRoot, relativePath)));
@@ -1172,7 +1322,12 @@ export async function stageApprovedPiProjectResources(
     });
   } catch {
     if (temporaryRoot) {
-      await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+      const cleanupDeadlineAtMs = Date.now() + 1_000;
+      await awaitDeadlineStep(
+        () => fs.rm(temporaryRoot!, { recursive: true, force: true }),
+        cleanupDeadlineAtMs,
+        'approved skill snapshot cleanup deadline expired',
+      ).catch(() => undefined);
     }
     return Object.freeze({
       ...assembly,

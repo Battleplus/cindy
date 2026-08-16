@@ -216,6 +216,7 @@ import { Selection, TextSelection } from '@tiptap/pm/state';
 import * as sessionService from '@/lib/sessionService';
 import { getModelById } from '@/lib/modelDefinitions';
 import {
+  agentSkillInvocationForDispatch,
   ambiguousPendingProjectSkillName,
   beginSlashCommandRosterLoad,
   EMPTY_SLASH_COMMANDS,
@@ -231,6 +232,7 @@ import {
   nextAvailableSlashCommandIndex,
   pendingProjectSkillForMessage,
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
+  type AgentSkillInvocation,
   type SlashCommandRosterState,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
@@ -400,6 +402,8 @@ interface ChatInputProps {
       pastedTextRanges?: PastedTextRange[];
       /** Exact local display ranges for slash commands confirmed by this composer. */
       slashCommandRanges?: SlashCommandRange[];
+      /** Palette identity awaiting proof from a newly created Pi runtime. */
+      pendingAgentSkillInvocation?: AgentSkillInvocation;
       /** Discovered Pi project Skill selected before the New Maker runtime exists. */
       pendingProjectSkillName?: string;
       /** Absolute discovery path and project root used when rebinding into a new worktree. */
@@ -4446,6 +4450,13 @@ export function ChatInput({
           mergedCommands,
           allowPendingProjectSkillSelection,
         );
+        const slashCommandName = serializedEditorText.match(/^\/(\S+)/)?.[1]?.toLowerCase();
+        const pendingAgentSkillInvocation = agentSkillInvocationForDispatch(
+          serializedEditorText,
+          slashCommandName
+            ? mergedCommands.find((command) => command.name.toLowerCase() === slashCommandName)
+            : undefined,
+        );
         let editorText = serializedEditorText;
         let agentReferences = serializedAgentReferences;
         const attachmentsForSend = optimisticallyClearRemoteComposer
@@ -4995,6 +5006,7 @@ export function ChatInput({
               ...(agentReferences.length > 0 ? { agentReferences } : {}),
               ...(pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
               slashCommandRanges,
+              ...(pendingAgentSkillInvocation ? { pendingAgentSkillInvocation } : {}),
               ...(pendingProjectSkill
                 ? {
                     pendingProjectSkillName: pendingProjectSkill.name,

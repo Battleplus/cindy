@@ -122,6 +122,7 @@ import { buildCreateOptsForCurrentSession, makerChatStore } from '@/lib/makerCha
 import {
   PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
   resolvePendingPiProjectSkillForDispatch,
+  resolvePendingPiUserSkillForDispatch,
   rollbackUnclaimedPiProjectSkillSession,
   type AgentSkillInvocation,
   type UnifiedCommand,
@@ -2902,6 +2903,7 @@ export function NewMakerDraftRoute() {
         agentReferences?: AgentInputReference[];
         pastedTextRanges?: PastedTextRange[];
         slashCommandRanges?: SlashCommandRange[];
+        pendingAgentSkillInvocation?: AgentSkillInvocation;
         pendingProjectSkillName?: string;
         pendingProjectSkillPath?: string;
         pendingProjectSkillRoot?: string;
@@ -3522,6 +3524,31 @@ export function NewMakerDraftRoute() {
                 // 才进入 1.6s 平滑期, overlay 从 "空 ChatView" 自然过渡到 "已在
                 // streaming 的 ChatView", 不暴露中间空窗。clear 时机见本 async 块末尾。
 
+                const preparePiRuntimeForWorktree = () => window.electronAPI.maker.createSession({
+                  id: newSession.id,
+                  ...buildCreateOptsForCurrentSession(
+                    newSession.id,
+                    model,
+                    effort,
+                    permissionMode,
+                    newDir,
+                  ),
+                  agentKind: 'pi',
+                  workingDir: newDir,
+                }).then(() => undefined);
+                const reloadPiSkillsForWorktree = async () => {
+                  const result = await window.electronAPI.maker.listAgentSkills('pi', {
+                    workingDir: newDir,
+                    sessionId: newSession.id,
+                    forceReload: true,
+                  });
+                  if (!result.success || !result.skills) return [];
+                  return result.skills.flatMap((skill): UnifiedCommand[] => (
+                    skill.scope === 'user' || skill.scope === 'repo'
+                      ? [{ ...skill, scope: skill.scope }]
+                      : []
+                  ));
+                };
                 let agentSkillInvocation: AgentSkillInvocation | undefined;
                 if (persistedAgentKind === 'pi' && opts?.pendingProjectSkillName) {
                   if (!opts.pendingProjectSkillPath || !opts.pendingProjectSkillRoot) {
@@ -3537,36 +3564,31 @@ export function NewMakerDraftRoute() {
                     sourceSkillPath: opts.pendingProjectSkillPath,
                     targetProjectRoot: newDir,
                     retryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
-                    prepareRuntime: () => window.electronAPI.maker.createSession({
-                      id: newSession.id,
-                      ...buildCreateOptsForCurrentSession(
-                        newSession.id,
-                        model,
-                        effort,
-                        permissionMode,
-                        newDir,
-                      ),
-                      agentKind: 'pi',
-                      workingDir: newDir,
-                    }).then(() => undefined),
-                    reload: async () => {
-                      const result = await window.electronAPI.maker.listAgentSkills('pi', {
-                        workingDir: newDir,
-                        sessionId: newSession.id,
-                        forceReload: true,
-                      });
-                      if (!result.success || !result.skills) return [];
-                      return result.skills.flatMap((skill): UnifiedCommand[] => (
-                        skill.scope === 'user' || skill.scope === 'repo'
-                          ? [{ ...skill, scope: skill.scope }]
-                          : []
-                      ));
-                    },
+                    prepareRuntime: preparePiRuntimeForWorktree,
+                    reload: reloadPiSkillsForWorktree,
                   });
                   if (!resolvedInvocation) {
                     worktreeCreationStore.clear(newSession.id);
                     restoreFirstMessageDraft();
                     toast.warning(t('commandPalette.projectSkillMissingInWorktree'));
+                    return;
+                  }
+                  agentSkillInvocation = resolvedInvocation;
+                } else if (
+                  persistedAgentKind === 'pi'
+                  && opts?.pendingAgentSkillInvocation?.scope === 'user'
+                ) {
+                  const resolvedInvocation = await resolvePendingPiUserSkillForDispatch({
+                    message,
+                    pendingInvocation: opts.pendingAgentSkillInvocation,
+                    prepareRuntime: preparePiRuntimeForWorktree,
+                    reload: reloadPiSkillsForWorktree,
+                    retryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
+                  });
+                  if (!resolvedInvocation) {
+                    worktreeCreationStore.clear(newSession.id);
+                    restoreFirstMessageDraft();
+                    toast.warning(t('commandPalette.skillUnavailableForNewTask'));
                     return;
                   }
                   agentSkillInvocation = resolvedInvocation;

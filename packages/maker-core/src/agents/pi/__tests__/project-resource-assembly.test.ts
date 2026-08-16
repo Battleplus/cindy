@@ -652,6 +652,43 @@ describe('Pi approved project resource assembly', () => {
     }
   });
 
+  it('bounds preflight metadata probes by the shared snapshot deadline', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-metadata-deadline-')));
+    const configHome = path.join(root, 'config-home');
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      mkdirSync(configHome, { recursive: true });
+      writeFileSync(path.join(skillPath, 'SKILL.md'), '# approved\n');
+      const assembled = await assembleApprovedPiProjectResources(
+        inputForRepoRoot(workingDir, 'rev-metadata-deadline', [skillPath]),
+        workingDir,
+      );
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const blockedProbe = vi.fn(() => new Promise<never>(() => {}));
+      vi.spyOn(fsPromises, 'lstat').mockImplementation((candidate, options) => (
+        String(candidate) === skillPath
+          ? blockedProbe()
+          : realLstat(candidate, options)
+      ));
+
+      const staged = await stageApprovedPiProjectResources(assembled, configHome, {
+        deadlineMs: 10,
+      });
+
+      expect(blockedProbe).toHaveBeenCalledOnce();
+      expect(staged.skillPaths).toEqual([]);
+      expect(staged.launchSkillPaths).toEqual([]);
+      expect(staged.diagnostic.reason).toBe('approved-skill-snapshot-failed');
+      await expect(fsPromises.readdir(configHome)).resolves.toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('streams source directories during materialization without readdir', async () => {
     const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-copy-stream-')));
     const configHome = path.join(root, 'config-home');
@@ -1211,6 +1248,34 @@ describe('Pi approved project resource assembly', () => {
         budget: { remainingEntries: 10, deadlineAtMs: Date.now() - 1 },
       })).resolves.toBeNull();
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds fingerprint metadata probes by the shared deadline', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'pi-project-resource-fingerprint-deadline-')));
+    const workingDir = path.join(root, 'repo');
+    const skillPath = path.join(workingDir, '.pi', 'skills', 'demo');
+    const skillFile = path.join(skillPath, 'SKILL.md');
+    try {
+      mkdirSync(path.join(workingDir, '.git'), { recursive: true });
+      mkdirSync(skillPath, { recursive: true });
+      writeFileSync(skillFile, '# approved\n');
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const blockedProbe = vi.fn(() => new Promise<never>(() => {}));
+      vi.spyOn(fsPromises, 'stat').mockImplementation((candidate, options) => (
+        String(candidate) === skillFile
+          ? blockedProbe()
+          : realStat(candidate, options)
+      ));
+
+      await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
+        pathComparisonIdentity: nativePathComparisonIdentity,
+        budget: { remainingEntries: 10, deadlineAtMs: Date.now() + 10 },
+      })).resolves.toBeNull();
+      expect(blockedProbe).toHaveBeenCalledOnce();
+    } finally {
+      vi.restoreAllMocks();
       rmSync(root, { recursive: true, force: true });
     }
   });
