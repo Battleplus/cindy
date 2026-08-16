@@ -28,6 +28,7 @@ import type {
   SessionSendResult,
   UserMessage,
 } from '@cindy/maker-core';
+import { storedCustomProviderId } from '@cindy/model-providers';
 import { createId } from '@paralleldrive/cuid2';
 import { redactSensitiveText } from '@cindy/maker-shared/error-redaction';
 import { permissionModeOrAsk } from '@cindy/maker-shared/permission-mode';
@@ -664,7 +665,14 @@ import {
 } from './agentHandoff.js';
 import { hydrateQueuedAgentReferences } from './agentInputReferences.js';
 import { agentHandoffPending } from './agentHandoffPendingSingleton.js';
-import { buildPlanReconcileNote, summarizeOpenPlan } from './planReconcile.js';
+import {
+  clearSealedCodexPlanState,
+  readCodexPlanState,
+} from '../localDb/codexPlanState.js';
+import {
+  buildCompletedPlanGuardNote,
+  buildPlanReconcileNote,
+} from './planReconcile.js';
 import { type MakerSessionCreateOpts, withCreateSessionStderr } from './sessionRequest.js';
 import { persistAndHydrateSessionProvider } from './sessionProviderBootstrap.js';
 import { registerMakerSessionSendHandler } from './sessionSendHandler.js';
@@ -696,13 +704,19 @@ import {
   setSessionProvider,
 } from '../maker-host/session-provider-store.js';
 import { getActiveCatalog, setDiscoveredProviderModels } from '../maker-host/active-catalog.js';
+import { refreshXaiMediaModels } from '../maker-host/model-discovery/xai-media.js';
 import { testProviderConnection } from '../maker-host/provider-diagnostics.js';
 import { fetchProviderModels } from '../maker-host/provider-model-fetch.js';
-import { beginProviderRouteMutation, isUserProviderSession } from '../maker-host/provider-route.js';
+import {
+  beginProviderRouteMutation,
+  isUserProviderSession,
+  setPendingCredentialSwitchReader,
+} from '../maker-host/provider-route.js';
 import {
   getAnthropicModelDiscoveryFailure,
   refreshAnthropicModelsFromHttp,
 } from '../maker-host/model-discovery/anthropic.js';
+import { refreshXaiModelsFromHttp } from '../maker-host/model-discovery/xai.js';
 import { refreshBuiltinProviderModels } from '../maker-host/provider-model-refresh.js';
 import {
   configureProviderModelAutoRefresh,
@@ -3256,11 +3270,6 @@ export function installDesktopInteractionListener(session: {
         planFilePath?: unknown;
       },
     );
-    broadcastToAllWindows(MAKER_PUSH.INTERACTION_REQUEST, {
-      sessionId: session.id,
-      request: req,
-      persistId: interactionPersistId,
-    });
     return new Promise<InteractionDecision>((resolve) => {
       const entry: PendingInteractionEntry = {
         sessionId: session.id,
@@ -3278,7 +3287,14 @@ export function installDesktopInteractionListener(session: {
           dismissRendererInteraction(pending, req.requestId, 'timeout', 'deny');
         }, PERMISSION_INTERACTION_TIMEOUT_MS);
       }
+      // 必须先登记 pending,再广播。否则 renderer / device-link 回得太快会打到
+      // 「no pending resolver」,确认卡看起来没反应,Codex 最终却记成用户拒绝。
       pendingInteractionResolvers.set(req.requestId, entry);
+      broadcastToAllWindows(MAKER_PUSH.INTERACTION_REQUEST, {
+        sessionId: session.id,
+        request: req,
+        persistId: interactionPersistId,
+      });
       handleAgentIslandInteractionAfterBroadcast(
         session as { id: string; agentKind?: unknown; workDir?: unknown; workspaceKind?: unknown },
         req,
@@ -3688,7 +3704,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
           // 新 turn 启动: 上一轮未配对的失败记账交接 id 已无归属, 丢弃防错配。
           pendingFailedTurnAssistantPersistId.delete(session.id);
           // 记录 turn 开始时刻，供 onTurnErrorEvent 判断 error 是否属于 /clear 之前的旧 turn。
-          noteTurnStarted(session.id);
+          noteTurnStarted(session.id, event.turnAttemptToken);
           noteSubagentObservationTurnStarted(session.id);
           // silent-stop 守卫:新 turn 开始 → 清 pendingResume + 记录时刻(陈旧判定)。
           silentStopAutoResumeGuard.noteTurnStarted(session.id);
@@ -3923,6 +3939,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
           eventAgentMeta,
           event.turnScope === 'background' ? 'background' : 'turn',
           event.backgroundTurnStartedAt,
+          event.turnAttemptToken,
         );
       } else if (event.type === 'tool_result') {
         const r = onToolResultEvent(
@@ -5671,9 +5688,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         refreshAnthropic: refreshAnthropicModelsFromHttp,
         refreshOpenAi: () =>
           maker.refreshAgentLocalModels('codex', { credentialMode: 'oauth-bearer' }),
-        refreshXaiCatalog: async () => {
-          await refreshActiveCatalogFromSource();
-        },
+        refreshXai: refreshXaiModelsFromHttp,
+        refreshXaiMedia: refreshXaiMediaModels,
       }),
   });
   options.onProviderModelAutoRefreshConfigured();
@@ -5745,17 +5761,23 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       const provider = getActiveCatalog().providers.find((p) => p.id === providerId);
       const oauth = provider?.auth.oauth;
       if (!provider || !oauth) throw new Error(`provider '${providerId}' has no oauth descriptor`);
+      const storageProviderId =
+        provider.source === 'user' ? storedCustomProviderId(providerId) : providerId;
       let rollbackCredentials: (() => boolean) | undefined;
-      const result = await runGenericOAuthLogin({ id: provider.id, name: provider.name }, oauth, {
-        onProgress: (progress) =>
-          broadcastToAllWindows(MAKER_PUSH.PROVIDER_OAUTH_PROGRESS, {
-            providerId,
-            ...progress,
-          }),
-        onCredentialPersisted: (rollback) => {
-          rollbackCredentials = rollback;
+      const result = await runGenericOAuthLogin(
+        { id: storageProviderId, name: provider.name },
+        oauth,
+        {
+          onProgress: (progress) =>
+            broadcastToAllWindows(MAKER_PUSH.PROVIDER_OAUTH_PROGRESS, {
+              providerId,
+              ...progress,
+            }),
+          onCredentialPersisted: (rollback) => {
+            rollbackCredentials = rollback;
+          },
         },
-      });
+      );
       if (result.ok && isCurrent()) {
         // 授权成功后按 agent 自动发现模型（与内置订阅体验统一,用户不必手填模型）:
         // 发现端点 = 描述符显式声明 ?? 由该 runtime 的 baseUrl 推导（…/v1/models）。
@@ -5776,17 +5798,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             // 去重键含 agent:发现请求头按 wire 分派(cc 带 anthropic-version),同 URL 不同 wire 不能共用响应。
             const key = `${agent}\n${url}`;
             if (!fetched.has(key))
-              fetched.set(key, await discoverGenericOAuthModels(providerId, oauth, url, agent));
+              fetched.set(
+                key,
+                await discoverGenericOAuthModels(storageProviderId, oauth, url, agent),
+              );
             if (!isCurrent()) break;
             const models = fetched.get(key);
             if (!models || models.length === 0) continue;
             if (provider.source === 'user') {
-              const cfg = await getCustomProvider(providerId);
+              const cfg = await getCustomProvider(storageProviderId);
               if (!isCurrent()) break;
               if (cfg) {
                 const nextCfg = mergeDiscoveredModelsIntoConfig(cfg, agent, models);
                 if (nextCfg) {
-                  const applied = await updateCustomProviderIfUnchanged(providerId, cfg, nextCfg);
+                  const applied = await updateCustomProviderIfUnchanged(
+                    storageProviderId,
+                    cfg,
+                    nextCfg,
+                  );
                   if (!isCurrent()) break;
                   if (applied) customChanged = true;
                 }
@@ -5829,12 +5858,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     storeCustomProviderKey,
     removeCustomProviderKey,
     oauthLogout: async (providerId) => {
-      if (!logoutGenericOAuth(providerId)) {
+      if (!logoutGenericOAuth(storedCustomProviderId(providerId))) {
         throw new Error('failed to remove generic OAuth credentials');
       }
     },
-    oauthCancel: (providerId) => cancelGenericOAuthLogin(providerId),
-    removeOAuthCredentials: (providerId) => removeGenericOAuthCredentialsReversibly(providerId),
+    oauthCancel: (providerId) => cancelGenericOAuthLogin(storedCustomProviderId(providerId)),
+    removeOAuthCredentials: (providerId) =>
+      removeGenericOAuthCredentialsReversibly(storedCustomProviderId(providerId)),
   });
 
   // 自定义 MCP 服务器 CRUD —— CRUD 成功后刷新三个 agent 的 mcpProviders 数组
@@ -10118,23 +10148,29 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     reconcileCreateOptsWithDb: reconcileCreateOptsAgainstDb,
     peekPendingHandoff: (sessionId) => agentHandoffPending.peek(sessionId),
     consumePendingHandoff: (sessionId) => agentHandoffPending.consume(sessionId),
-    // 计划对账:未收口的旧计划让 agent 在下一轮顺手交代。读近段历史现算,
-    // 无 pending 状态(清单被更新/清掉后下一轮自然不再注入)。
-    // 窗口 1000 行(交接用 400):计划行被长工具流挤出窗口时 summarize 返回
-    // null → 本轮不注入——降级方向是"少提醒",不会误提醒,可接受;不做全量
-    // 分页回溯,避免每次发送为一个提示扫全历史。
     peekPlanReconcileNote: async (sessionId) => {
-      // 读排在同一条持久化 FIFO 之后:终态章(persistCodexPlanOnDone)与失败印记
-      // 只是 enqueueWrite 入队,不等它们落库就查,会读到未盖章的旧快照 → 给已经
-      // 收口的计划多注入一次对账;反过来,全勾完但失败的计划可能因 turnCompleted:false
-      // 还没写进去而漏掉唯一的收口通道(review P2)。调用方对失败已经 catch 成 null,
-      // 队列被 app-session 边界打断时最多这一轮不注入。
-      const rows = await enqueueDurableWrite(`plan-reconcile-read:${sessionId}`, () =>
-        listMessagesForAgentHandoff(sessionId, 1000),
+      const snapshot = await enqueueDurableWrite(`plan-reconcile-read:${sessionId}`, () =>
+        readCodexPlanState(sessionId),
       );
-      const summary = summarizeOpenPlan(rows);
-      return summary ? buildPlanReconcileNote(summary) : null;
+      if (!snapshot) return null;
+      if (snapshot.state === 'sealed') {
+        return {
+          note: buildCompletedPlanGuardNote(),
+          sealedTurnId: snapshot.turnId,
+        };
+      }
+      const openSteps = snapshot.plan
+        .filter((item) => item.status !== 'completed')
+        .map((item) => item.step);
+      if (openSteps.length === 0 && snapshot.state !== 'interrupted') return null;
+      return {
+        note: buildPlanReconcileNote({ openSteps, totalSteps: snapshot.plan.length }),
+      };
     },
+    consumeSealedPlanReconcileNote: (sessionId, turnId) =>
+      enqueueDurableWrite(`plan-seal-consume:${sessionId}:${turnId}`, () =>
+        clearSealedCodexPlanState(sessionId, turnId),
+      ),
     // 手机客户端说明的开关:被控端盖章的来源判据(本机 renderer / 桌面控制端 / 平台
     // 未知一律 false)。必须在这里现取,不能提前求值缓存——同一个装配好的事务会服务
     // 后续所有 send,来源是逐次调用的属性。
@@ -11373,6 +11409,18 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     logger: log,
   });
   pendingCredentialSwitchHolder = pendingCredentialSwitchService;
+  setPendingCredentialSwitchReader((sessionId) => {
+    const pending = pendingCredentialSwitchService.get(sessionId);
+    return pending
+      ? {
+          model: pending.model,
+          providerId: pending.providerId,
+          ...(pending.previousRoute?.model
+            ? { previousModel: pending.previousRoute.model }
+            : {}),
+        }
+      : undefined;
+  });
 
   // Memory 设置变更撞上 Codex busy 时的延迟软重启登记(见 deferredCodexRestart.ts)。
   // 与 pendingCredentialSwitchService 共用 turn 结束 / 会话关闭边界接线;pending
