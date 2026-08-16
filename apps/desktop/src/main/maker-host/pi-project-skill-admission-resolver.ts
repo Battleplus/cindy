@@ -79,15 +79,16 @@ function assertProjectSkillDiscoveryBudget(budget: ProjectSkillDiscoveryBudget):
 }
 
 async function awaitProjectSkillDiscoveryStep<T>(
-  operation: Promise<T>,
+  operation: () => Promise<T>,
   budget: ProjectSkillDiscoveryBudget,
 ): Promise<T> {
   const remainingMs = budget.deadlineAtMs - Date.now();
   if (remainingMs <= 0) throw new Error('project skill discovery deadline expired');
+  const pending = operation();
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      operation,
+      pending,
       new Promise<T>((_, reject) => {
         timeout = setTimeout(
           () => reject(new Error('project skill discovery deadline expired')),
@@ -108,27 +109,32 @@ async function readProjectSkillDirectory(
   const entries: FsDirentLike[] = [];
   if (dependencies.openDirectory) {
     const directory = await awaitProjectSkillDiscoveryStep(
-      dependencies.openDirectory(candidate),
+      () => dependencies.openDirectory!(candidate),
       budget,
     );
     const iterator = directory[Symbol.asyncIterator]();
     try {
       while (true) {
-        const result = await awaitProjectSkillDiscoveryStep(iterator.next(), budget);
+        const result = await awaitProjectSkillDiscoveryStep(() => iterator.next(), budget);
         if (result.done) break;
         assertProjectSkillDiscoveryBudget(budget);
         budget.remainingEntries -= 1;
         entries.push(result.value);
       }
     } finally {
-      await iterator.return?.();
+      if (iterator.return) {
+        await awaitProjectSkillDiscoveryStep(() => iterator.return!(), budget);
+      }
     }
     return entries;
   }
 
   // Compatibility seam for focused tests that inject only readdir. The host
   // default never takes this path, so production discovery remains streaming.
-  const listed = await awaitProjectSkillDiscoveryStep(dependencies.readdir(candidate), budget);
+  const listed = await awaitProjectSkillDiscoveryStep(
+    () => dependencies.readdir(candidate),
+    budget,
+  );
   if (Date.now() >= budget.deadlineAtMs || listed.length > budget.remainingEntries) {
     throw new Error('project skill discovery budget exhausted');
   }
@@ -377,9 +383,10 @@ function projectSkillSourceRoots(identity: PiProjectIdentityResolution): string[
 async function statOrNull(
   candidate: string,
   stat: ProjectSkillScanDeps['stat'],
+  budget: ProjectSkillDiscoveryBudget,
 ): Promise<FsStatLike | null> {
   try {
-    return await stat(candidate);
+    return await awaitProjectSkillDiscoveryStep(() => stat(candidate), budget);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return null;
@@ -390,9 +397,10 @@ async function statOrNull(
 async function lstatOrNull(
   candidate: string,
   lstat: ProjectSkillScanDeps['lstat'],
+  budget: ProjectSkillDiscoveryBudget,
 ): Promise<FsLstatLike | null> {
   try {
-    return await lstat(candidate);
+    return await awaitProjectSkillDiscoveryStep(() => lstat(candidate), budget);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return null;
@@ -408,18 +416,22 @@ async function scanOneProjectSkillRoot(
   budget: ProjectSkillDiscoveryBudget,
 ): Promise<PiProjectCanonicalPathEvidence[] | null> {
   assertProjectSkillDiscoveryBudget(budget);
-  const rootEntry = await lstatOrNull(sourceRoot, dependencies.lstat);
+  const rootEntry = await lstatOrNull(sourceRoot, dependencies.lstat, budget);
   if (!rootEntry) return [];
-  const rootStat = await statOrNull(sourceRoot, dependencies.stat);
+  const rootStat = await statOrNull(sourceRoot, dependencies.stat, budget);
   if (!rootStat) return null;
   if (!rootStat.isDirectory()) return null;
-  const canonicalSourceRoot = await dependencies.realpath(sourceRoot);
+  const canonicalSourceRoot = await awaitProjectSkillDiscoveryStep(
+    () => dependencies.realpath(sourceRoot),
+    budget,
+  );
   if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalSourceRoot)) return null;
   if (!await windowsDirectoryChainMatchesIdentity(
     identity,
     canonicalSourceRoot,
     dependencies,
     checkedWindowsDirectories,
+    budget,
   )) return null;
   const entries = await readProjectSkillDirectory(sourceRoot, dependencies, budget);
   const result: PiProjectCanonicalPathEvidence[] = [];
@@ -429,27 +441,37 @@ async function scanOneProjectSkillRoot(
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const folder = pathFor(identity).join(sourceRoot, entry.name);
     assertProjectSkillDiscoveryBudget(budget);
-    const canonicalFolder = await dependencies.realpath(folder);
+    const canonicalFolder = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.realpath(folder),
+      budget,
+    );
     if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalFolder)) return null;
     if (!await windowsDirectoryChainMatchesIdentity(
       identity,
       canonicalFolder,
       dependencies,
       checkedWindowsDirectories,
+      budget,
     )) return null;
-    const folderStat = await statOrNull(folder, dependencies.stat);
+    const folderStat = await statOrNull(folder, dependencies.stat, budget);
     if (!folderStat?.isDirectory()) return null;
 
     const upperManifest = pathFor(identity).join(folder, 'SKILL.md');
-    const upperEntry = await lstatOrNull(upperManifest, dependencies.lstat);
+    const upperEntry = await lstatOrNull(upperManifest, dependencies.lstat, budget);
     if (!upperEntry) continue;
-    const upperStat = await statOrNull(upperManifest, dependencies.stat);
+    const upperStat = await statOrNull(upperManifest, dependencies.stat, budget);
     if (!upperStat?.isFile()) return null;
-    const canonicalManifest = await dependencies.realpath(upperManifest);
+    const canonicalManifest = await awaitProjectSkillDiscoveryStep(
+      () => dependencies.realpath(upperManifest),
+      budget,
+    );
     if (!canonicalPathIsWithin(identity, identity.canonicalRepoRoot!, canonicalManifest)) return null;
     result.push({ discoveredPath: folder, canonicalPath: canonicalFolder });
   }
-  const reboundSourceRoot = await dependencies.realpath(sourceRoot);
+  const reboundSourceRoot = await awaitProjectSkillDiscoveryStep(
+    () => dependencies.realpath(sourceRoot),
+    budget,
+  );
   return canonicalPathsEqual(identity, canonicalSourceRoot, reboundSourceRoot) ? result : null;
 }
 
@@ -471,6 +493,7 @@ async function windowsDirectoryChainMatchesIdentity(
   canonicalDirectory: string,
   dependencies: ProjectSkillScanDeps,
   checked: Map<string, boolean> = new Map<string, boolean>(),
+  budget?: ProjectSkillDiscoveryBudget,
 ): Promise<boolean> {
   if (identity.platform !== 'win32') return true;
   const expected = identity.windowsCaseComparison;
@@ -483,7 +506,9 @@ async function windowsDirectoryChainMatchesIdentity(
     if (!comparison || !canonicalPathIsWithin(identity, repoRoot, current)) return false;
     let matches = checked.get(comparison);
     if (matches === undefined) {
-      matches = await resolve(current) === expected;
+      matches = (budget
+        ? await awaitProjectSkillDiscoveryStep(() => resolve(current), budget)
+        : await resolve(current)) === expected;
       checked.set(comparison, matches);
     }
     if (!matches) return false;
@@ -498,7 +523,9 @@ async function windowsDirectoryChainMatchesIdentity(
       if (!parentComparison) return false;
       let parentMatches = checked.get(parentComparison);
       if (parentMatches === undefined) {
-        parentMatches = await resolve(boundaryParent) === expected;
+        parentMatches = (budget
+          ? await awaitProjectSkillDiscoveryStep(() => resolve(boundaryParent), budget)
+          : await resolve(boundaryParent)) === expected;
         checked.set(parentComparison, parentMatches);
       }
       return parentMatches;
@@ -529,6 +556,7 @@ export async function scanContainedDesktopPiProjectSkills(
       identity.canonicalWorkingDir!,
       dependencies,
       checkedWindowsDirectories,
+      budget,
     )) return null;
     for (const root of roots) {
       const scanned = await scanOneProjectSkillRoot(

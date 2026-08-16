@@ -26,6 +26,7 @@ vi.mock('@cindy/maker-core', () => ({
 import {
   __testing,
   MAX_PI_PROJECT_SKILL_DISCOVERY_ENTRIES,
+  PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS,
   resolveDesktopPiProjectIdentity,
   resolveDesktopPiProjectTrustInput,
   scanContainedDesktopPiProjectSkills,
@@ -272,6 +273,45 @@ describe('scanContainedDesktopPiProjectSkills', () => {
     expect(realpath).toHaveBeenCalledTimes(1);
     expect(stat).toHaveBeenCalledTimes(1);
     expect(lstat).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds each candidate path probe by the discovery deadline', async () => {
+    const project = makeProject();
+    const identity = (await resolveDesktopPiProjectIdentity(project.first))!;
+    const blockedSkill = path.join(identity.canonicalWorkingDir!, '.pi', 'skills', 'pi-skill');
+    let markBlockedProbeStarted!: () => void;
+    const blockedProbeStarted = new Promise<void>((resolve) => {
+      markBlockedProbeStarted = resolve;
+    });
+    const blockedProbe = vi.fn(() => {
+      markBlockedProbeStarted();
+      return new Promise<string>(() => {});
+    });
+    const stat = vi.fn(async (candidate: string) => fs.promises.stat(candidate));
+
+    vi.useFakeTimers();
+    try {
+      const pending = scanContainedDesktopPiProjectSkills(identity, {
+        readdir: (candidate) => fs.promises.readdir(candidate, { withFileTypes: true }),
+        lstat: (candidate) => fs.promises.lstat(candidate),
+        stat,
+        realpath: (candidate) => candidate === blockedSkill
+          ? blockedProbe()
+          : fs.promises.realpath(candidate),
+        resolveWindowsCaseComparison: async () => (
+          identity.windowsCaseComparison ?? 'unavailable'
+        ),
+      });
+
+      await blockedProbeStarted;
+      await vi.advanceTimersByTimeAsync(PI_PROJECT_SKILL_DISCOVERY_DEADLINE_MS);
+
+      await expect(pending).resolves.toBeNull();
+      expect(blockedProbe).toHaveBeenCalledOnce();
+      expect(stat).not.toHaveBeenCalledWith(blockedSkill);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('finds only directory-form Pi skills from workingDir through the repo root', async () => {

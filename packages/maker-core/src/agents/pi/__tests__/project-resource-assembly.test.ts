@@ -201,6 +201,71 @@ describe('Pi approved project resource assembly', () => {
     expect(result.decision?.resources.skills).toBe('eligible');
   });
 
+  it('bounds launch path metadata probes before snapshot staging begins', async () => {
+    const workingDir = '/repo-a/packages/app';
+    const skillPath = `${workingDir}/.pi/skills/demo`;
+    const blockedProbe = vi.fn(() => new Promise<never>(() => {}));
+    const result = await assembleApprovedPiProjectResources(
+      inputFor(workingDir, approved(workingDir, 'rev-assembly-deadline')),
+      workingDir,
+      {
+        ...available,
+        stat: (candidate) => candidate === skillPath
+          ? blockedProbe()
+          : available.stat(candidate),
+        deadlineMs: 10,
+      },
+    );
+
+    expect(blockedProbe).toHaveBeenCalledOnce();
+    expect(result.skillPaths).toEqual([]);
+    expect(result.diagnostic.reason).toBe('approved-skill-path-unavailable');
+  });
+
+  it('bounds nearest Git root resolution before snapshot staging begins', async () => {
+    const workingDir = '/repo-a/packages/app';
+    const blockedGitRoot = vi.fn(() => new Promise<string | null>(() => {}));
+    const result = await assembleApprovedPiProjectResources(
+      inputFor(workingDir, approved(workingDir, 'rev-git-root-deadline')),
+      workingDir,
+      {
+        ...available,
+        findNearestGitRoot: blockedGitRoot,
+        deadlineMs: 10,
+      },
+    );
+
+    expect(blockedGitRoot).toHaveBeenCalledOnce();
+    expect(result.skillPaths).toEqual([]);
+    expect(result.diagnostic.reason).toBe('approved-skill-path-unavailable');
+  });
+
+  it('does not reinterpret a timed-out Git marker probe as a valid boundary', async () => {
+    const workingDir = '/repo-a/packages/app';
+    const repoMarker = '/repo-a/.git';
+    const blockedProbe = vi.fn(() => new Promise<never>(() => {}));
+    const stat = vi.fn(async (candidate: string) => {
+      if (candidate === repoMarker) return blockedProbe();
+      if (candidate.endsWith('/.git')) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      }
+      return available.stat(candidate);
+    });
+    const result = await assembleApprovedPiProjectResources(
+      inputFor(workingDir, approved(workingDir, 'rev-git-marker-deadline')),
+      workingDir,
+      {
+        stat,
+        realpath: available.realpath,
+        deadlineMs: 10,
+      },
+    );
+
+    expect(blockedProbe).toHaveBeenCalledOnce();
+    expect(result.skillPaths).toEqual([]);
+    expect(result.diagnostic.reason).toBe('approved-skill-path-unavailable');
+  });
+
   it('diagnoses canonical evidence changes without partially loading the remaining skill', async () => {
     const workingDir = '/repo-a/packages/app';
     const input = inputFor(workingDir, approved(workingDir, 'rev-a'));

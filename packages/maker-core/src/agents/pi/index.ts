@@ -122,6 +122,7 @@ import type { PiRemoteFileOps } from '../base-agent.js';
 import { capturePiRuntimeCapabilityManifest } from './runtime-capabilities.js';
 import {
   assembleApprovedPiProjectResources,
+  PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS,
   reconcilePiProjectResourceRuntime,
   stageApprovedPiProjectResources,
   unavailablePiProjectResourceAssembly,
@@ -1673,13 +1674,21 @@ export class PiAgent extends BaseAgent {
           workingDir: opts.workingDir,
           ...(opts.remoteHostId ? { remoteHostId: opts.remoteHostId } : {}),
         });
+        const projectResourceDeadlineAtMs =
+          Date.now() + PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS;
+        const remainingProjectResourceDeadlineMs = (): number => Math.max(
+          0,
+          projectResourceDeadlineAtMs - Date.now(),
+        );
         projectResourceAssembly = await assembleApprovedPiProjectResources(
           trustInput,
           opts.workingDir,
+          { deadlineMs: remainingProjectResourceDeadlineMs() },
         );
         projectResourceAssembly = await stageApprovedPiProjectResources(
           projectResourceAssembly,
           configHome,
+          { deadlineMs: remainingProjectResourceDeadlineMs() },
         );
       } catch {
         projectResourceAssembly = unavailablePiProjectResourceAssembly(

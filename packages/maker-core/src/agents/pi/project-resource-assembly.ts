@@ -104,6 +104,7 @@ async function validateSkillPathsImmediatelyBeforeLaunch(
     stat: (path: string) => Promise<PiPathStat>,
     pathApi: typeof path.posix | typeof path.win32,
   ) => Promise<string | null>,
+  deadlineAtMs: number,
 ): Promise<
   'available' | 'unavailable' | 'request-mismatch' | 'repo-mismatch' | 'project-changed' | 'skill-changed'
 > {
@@ -112,23 +113,40 @@ async function validateSkillPathsImmediatelyBeforeLaunch(
     const canonicalRepoRoot = identity.canonicalRepoRoot;
     if (!canonicalWorkingDir || !canonicalRepoRoot) return 'unavailable';
     const pathApi = identity.platform === 'win32' ? path.win32 : path.posix;
-    const resolvedRequestedWorkingDir = await realpath(requestedWorkingDir);
+    const boundedStat = (candidate: string): Promise<PiPathStat> => awaitDeadlineStep(
+      () => stat(candidate),
+      deadlineAtMs,
+      'approved skill assembly deadline expired',
+    );
+    const boundedRealpath = (candidate: string): Promise<string> => awaitDeadlineStep(
+      () => realpath(candidate),
+      deadlineAtMs,
+      'approved skill assembly deadline expired',
+    );
+    const resolvedRequestedWorkingDir = await boundedRealpath(requestedWorkingDir);
     const [resolvedWorkingDir, resolvedRepoRoot, currentRepoRoot, entries] =
       await Promise.all([
-        realpath(identity.workingDir),
-        realpath(canonicalRepoRoot),
-        resolveNearestGitRoot(resolvedRequestedWorkingDir, stat, pathApi),
+        boundedRealpath(identity.workingDir),
+        boundedRealpath(canonicalRepoRoot),
+        awaitDeadlineStep(
+          // Bound the resolver as one operation. Passing the raw stat preserves
+          // its existing unreadable-marker semantics without letting an inner
+          // timeout be mistaken for a valid conservative Git boundary.
+          () => resolveNearestGitRoot(resolvedRequestedWorkingDir, stat, pathApi),
+          deadlineAtMs,
+          'approved skill assembly deadline expired',
+        ),
         Promise.all(skillPaths.map(async (skillPath) => {
-          const stats = await stat(skillPath);
-          const resolvedPath = await realpath(skillPath);
+          const stats = await boundedStat(skillPath);
+          const resolvedPath = await boundedRealpath(skillPath);
           if (!stats.isDirectory()) return { skillPath, stats, resolvedPath };
           const skillFile = pathApi.join(skillPath, 'SKILL.md');
           return {
             skillPath,
             stats,
             resolvedPath,
-            skillFileStats: await stat(skillFile),
-            resolvedSkillFile: await realpath(skillFile),
+            skillFileStats: await boundedStat(skillFile),
+            resolvedSkillFile: await boundedRealpath(skillFile),
           };
         })),
       ]);
@@ -176,6 +194,7 @@ export async function assembleApprovedPiProjectResources(
       stat: (path: string) => Promise<PiPathStat>,
       pathApi: typeof path.posix | typeof path.win32,
     ) => Promise<string | null>;
+    deadlineMs?: number;
   } = {},
 ): Promise<PiProjectResourceAssemblySnapshot> {
   if (!input) return unavailablePiProjectResourceAssembly('approval-snapshot-unavailable');
@@ -197,6 +216,10 @@ export async function assembleApprovedPiProjectResources(
   ) {
     reason = 'approved-skills-ineligible';
   } else if (eligibleSkillPaths.length > 0) {
+    const deadlineMs = options.deadlineMs ?? PI_PROJECT_SKILL_SNAPSHOT_DEADLINE_MS;
+    const deadlineAtMs = Number.isSafeInteger(deadlineMs) && deadlineMs >= 0
+      ? Date.now() + deadlineMs
+      : Date.now();
     const pathStatus = await validateSkillPathsImmediatelyBeforeLaunch(
       eligibleSkillPaths,
       options.stat ?? fs.stat,
@@ -204,6 +227,7 @@ export async function assembleApprovedPiProjectResources(
       input.identity,
       requestedWorkingDir,
       options.findNearestGitRoot ?? findNearestGitRoot,
+      deadlineAtMs,
     );
     if (pathStatus !== 'available') {
       if (pathStatus === 'request-mismatch') reason = 'approval-working-dir-mismatch';
