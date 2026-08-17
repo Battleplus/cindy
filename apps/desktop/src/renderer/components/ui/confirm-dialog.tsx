@@ -137,21 +137,27 @@ export function ConfirmDialog({
   return (
     <AlertDialog.Root open={open} onOpenChange={onOpenChange}>
       <AlertDialog.Portal>
-        {/* 窗口拖拽区必须挂在 drag 容器上:Electron 的 no-drag 挖洞只在 drag
-            元素的**后代**上可靠生效,浮层/兄弟节点上的 no-drag 不被计入
-            (实机结论,见 ContentHeader.tsx:155-157 / FileTabsBar.tsx:421-425)。
-            因此用全屏 drag 包装层同时容纳遮罩与弹窗,弹窗作为其后代挖洞:
-            遮罩空白区域保留窗口拖动(避免无边框窗口在单屏边缘打开确认框后
-            无法移回),弹窗内按钮、复选框和滚动区照常交互。 */}
-        <div className="fixed inset-0 z-[10000]" style={{ ...WINDOW_DRAG_STYLE, zIndex }}>
-          <AlertDialog.Overlay
-            className={cn(
-              'absolute inset-0',
-              'bg-neutral-900/40 dark:bg-neutral-950/60',
-              'data-[state=open]:animate-confirm-overlay-in',
-              'data-[state=closed]:animate-confirm-overlay-out',
-            )}
-          />
+        {/* 遮罩即全屏 drag 区:no-drag 挖洞只在 drag 元素自己的**后代**上
+            可靠生效,浮层/兄弟节点上的 no-drag 不被计入(实机结论,见
+            ContentHeader.tsx:155-157 / FileTabsBar.tsx:421-425)。因此弹窗
+            Content 必须是遮罩的 DOM 后代,不能是与 drag 遮罩平级的 Portal
+            兄弟。遮罩空白区域保留窗口拖动(避免无边框窗口在单屏边缘打开
+            确认框后无法移回),弹窗内按钮、复选框和滚动区照常交互。
+
+            生命周期交给 Radix:遮罩自身带 data-state 与 150ms 退场动画,
+            Portal 的 Presence 会等动画播完再卸载;若换成无 Presence 语义的
+            普通包装层,Portal 会在 open 变 false 时立即卸载它,退场动画被
+            切断、弹窗瞬间消失(react-dialog 对 Portal 的每个直接子元素都
+            套一层 Presence)。 */}
+        <AlertDialog.Overlay
+          className={cn(
+            'fixed inset-0 z-[10000]',
+            'bg-neutral-900/40 dark:bg-neutral-950/60',
+            'data-[state=open]:animate-confirm-overlay-in',
+            'data-[state=closed]:animate-confirm-overlay-out',
+          )}
+          style={{ ...WINDOW_DRAG_STYLE, zIndex }}
+        >
           <AlertDialog.Content
             className={cn(
               // 居中不用 transform（-translate-x/y-1/2）：Electron 的 -webkit-app-region
@@ -317,7 +323,7 @@ export function ConfirmDialog({
               )}
             </div>
           </AlertDialog.Content>
-        </div>
+        </AlertDialog.Overlay>
       </AlertDialog.Portal>
     </AlertDialog.Root>
   );
