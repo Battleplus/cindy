@@ -587,12 +587,20 @@ function RootDivider({
 
   // 双击:两侧份额均分(把差值的一半转给少的一侧)—— 右栏旧"双击复位 50/50"
   // 在两块布局下的语义等价推广。在场份额口径:均分的是**画面上**这两块的宽度。
-  // 压缩 chat 的方向同样走接力(计划即时按当前实测现算)。
+  // 压缩 chat 的方向同样走接力(计划即时按当前实测现算),且不得越过 chat 400px 下限。
   const onDoubleClick = () => {
     const total = left.share + right.share;
     const chatEntry = isChatPane(left.node) ? left : isChatPane(right.node) ? right : null;
     const plan = chatEntry ? chatShrinkPlan(chatEntry, chatEntry === left ? right : left) : null;
-    commit(total / 2 - left.share, plan?.relay ?? null);
+    let d = total / 2 - left.share;
+    if (plan) {
+      // 均分 delta 压缩 chat 侧时,夹取到接力计划的可压余量,防止越过 400px 下限。
+      const compressingChat = chatEntry === left ? d < 0 : d > 0;
+      if (compressingChat) {
+        d = chatEntry === left ? Math.max(d, -plan.room) : Math.min(d, plan.room);
+      }
+    }
+    commit(d, plan?.relay ?? null);
   };
 
   return (
