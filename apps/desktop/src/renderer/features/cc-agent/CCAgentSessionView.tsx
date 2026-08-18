@@ -4164,6 +4164,7 @@ export function CCAgentSessionView({
                 onContinueAfterUsageReset={
                   usageLimitRecovery && !remoteDeviceId ? handleContinueAfterUsageReset : undefined
                 }
+                usageLimitRecovery={usageLimitRecovery}
                 onCancel={handleDismissError}
                 agentKind={session?.agentKind}
                 remoteHostId={session?.remoteHostId ?? undefined}
