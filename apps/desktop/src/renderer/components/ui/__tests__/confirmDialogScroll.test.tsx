@@ -102,6 +102,13 @@ describe('ConfirmDialog 长内容布局', () => {
     expect(dialog.className).toContain('inset-0');
     expect(dialog.className).toContain('m-auto');
     expect(dialog.className).toContain('h-fit');
+    // 动画必须走无 translate 的 layout keyframes:共享 confirm-content-in/out
+    // 的每一帧都烘 translate(-50%, -50%),布局居中弹窗用它会在入退场期间
+    // 被甩出 no-drag 挖洞(tailwind.config.ts 注释同步钉住这条分工)。
+    expect(dialog.className).toContain('animate-confirm-content-layout-in');
+    expect(dialog.className).toContain('animate-confirm-content-layout-out');
+    expect(dialog.className).not.toContain('animate-confirm-content-in');
+    expect(dialog.className).not.toContain('animate-confirm-content-out');
   });
 
   it('关闭后全屏 drag 遮罩随 Presence 卸载,不留常驻拖拽区', () => {

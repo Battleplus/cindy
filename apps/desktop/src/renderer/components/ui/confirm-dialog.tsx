@@ -168,8 +168,11 @@ export function ConfirmDialog({
               'flex max-h-[85vh] flex-col',
               'w-full select-none rounded-xl p-4',
               'bg-[var(--confirm-bg)] shadow-[var(--confirm-shadow)]',
-              'data-[state=open]:animate-confirm-content-in',
-              'data-[state=closed]:animate-confirm-content-out',
+              // 布局居中弹窗用无 translate 的 layout keyframes;共享
+              // confirm-content-in/out 的每一帧都烘 translate(-50%, -50%),
+              // 动画期间会把弹窗整体甩出 no-drag 挖洞。
+              'data-[state=open]:animate-confirm-content-layout-in',
+              'data-[state=closed]:animate-confirm-content-layout-out',
             )}
             style={{ ...WINDOW_NO_DRAG_STYLE, maxWidth: maxWidth ?? 400, zIndex }}
             {...(describeContent && content
