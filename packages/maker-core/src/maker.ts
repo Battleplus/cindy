@@ -257,6 +257,7 @@ async function mergePiRuntimeSkillStatuses(
   if (manifest?.status !== 'loaded') return result;
   const loadedExplicitSkills = new Map<string, string>();
   const loadedLegacyProjectSkills = new Map<string, string>();
+  const loadedUserSkills = new Map<string, string>();
   const changedProjectSkills = new Map<string, string>();
   const fingerprintBudget = {
     remainingEntries: PI_PROJECT_SKILL_PALETTE_FINGERPRINT_ENTRY_BUDGET,
@@ -294,6 +295,17 @@ async function mergePiRuntimeSkillStatuses(
     const baseDir = command.sourceInfo.baseDir;
     if (command.source !== 'skill' || !command.name.startsWith('skill:')) continue;
     const skillName = command.name.slice('skill:'.length);
+    if (
+      command.sourceInfo.scope === 'user'
+      && command.sourceInfo.source === 'auto'
+      && command.runtimeSourcePath
+    ) {
+      loadedUserSkills.set(
+        await canonicalPiRuntimePath(command.runtimeSourcePath, deadlineAtMs),
+        command.name,
+      );
+      continue;
+    }
     if (command.sourceInfo.scope === 'project' && typeof baseDir === 'string') {
       loadedLegacyProjectSkills.set(
         [skillName, await canonicalPiRuntimePath(baseDir, deadlineAtMs)].join('\0'),
@@ -317,6 +329,7 @@ async function mergePiRuntimeSkillStatuses(
   if (
     loadedExplicitSkills.size === 0
     && loadedLegacyProjectSkills.size === 0
+    && loadedUserSkills.size === 0
     && changedProjectSkills.size === 0
   ) return result;
   const changedSkillErrors = [...changedProjectSkills.values()].map((skillPath) => ({
@@ -341,6 +354,10 @@ async function mergePiRuntimeSkillStatuses(
           }
         }
       }
+    } else if (skill.scope === 'user' && skill.path) {
+      runtimeCommandName = loadedUserSkills.get(
+        await canonicalPiRuntimePath(skill.path, deadlineAtMs),
+      );
     }
     skills.push(runtimeCommandName
       ? { ...skill, runtimeStatus: 'loaded' as const, runtimeCommandName }

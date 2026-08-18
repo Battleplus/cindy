@@ -137,11 +137,18 @@ async function runtimeUserSkillMatchesSource(
   );
   if (derivedFromBase !== selected) return false;
 
-  // baseDir only identifies the user Skill's lexical entry. Re-resolving that
-  // entry at dispatch time cannot prove which target Pi loaded if the entry is
-  // a symlink that was retargeted after get_commands. Without Pi's loaded path,
-  // there is no immutable runtime target to compare, so fail closed.
-  if (command.sourceInfo.path === undefined) return false;
+  // The host captures this physical target at get_commands time because pinned
+  // Pi omits sourceInfo.path for ordinary auto-loaded user Skills. Comparing the
+  // current lexical entry against that receipt rejects later symlink retargeting
+  // without rejecting Pi's normal pathless protocol response.
+  const capturedRuntimeSource = await canonicalLocalPath(
+    command.runtimeSourcePath,
+    dependencies,
+    deadlineAtMs,
+  );
+  if (!capturedRuntimeSource || capturedRuntimeSource !== selected) return false;
+
+  if (command.sourceInfo.path === undefined) return true;
   const runtimePath = await canonicalLocalPath(
     command.sourceInfo.path,
     dependencies,

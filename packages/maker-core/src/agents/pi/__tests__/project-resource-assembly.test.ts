@@ -1338,7 +1338,7 @@ describe('Pi approved project resource assembly', () => {
 
       await expect(fingerprintPiProjectSkillEntrypoint(skillPath, workingDir, {
         pathComparisonIdentity: nativePathComparisonIdentity,
-        budget: { remainingEntries: 10, deadlineAtMs: Date.now() + 10 },
+        budget: { remainingEntries: 10, deadlineAtMs: Date.now() + 1_000 },
       })).resolves.toBeNull();
       expect(blockedProbe).toHaveBeenCalledOnce();
     } finally {

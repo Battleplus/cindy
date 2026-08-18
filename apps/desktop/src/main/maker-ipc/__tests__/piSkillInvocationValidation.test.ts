@@ -222,6 +222,7 @@ describe('Pi Skill invocation validation', () => {
       commands: [{
         name: 'skill:demo',
         source: 'skill',
+        runtimeSourcePath: userSource,
         sourceInfo: {
           scope: 'user',
           source: 'auto',
@@ -276,6 +277,53 @@ describe('Pi Skill invocation validation', () => {
     )).toBe(false);
   });
 
+  it('accepts the pinned Pi pathless user Skill shape with a catalog-time source receipt', async () => {
+    const userBaseDir = path.join(repoRoot, 'pathless-user-skill', '.agents');
+    const userSource = path.join(userBaseDir, 'skills', 'demo');
+    fs.mkdirSync(userSource, { recursive: true });
+    fs.writeFileSync(path.join(userSource, 'SKILL.md'), '# pathless user skill\n');
+
+    expect(await isCurrentPiSkillInvocation(
+      item({ scope: 'user', sourcePath: userSource }),
+      manifest({
+        commands: [{
+          name: 'skill:demo',
+          source: 'skill',
+          runtimeSourcePath: userSource,
+          sourceInfo: {
+            scope: 'user',
+            source: 'auto',
+            baseDir: userBaseDir,
+          },
+        }],
+      }),
+      skills({ scope: 'user', path: userSource, runtimeStatus: 'loaded' }),
+    )).toBe(true);
+  });
+
+  it('rejects pathless user Skills whose catalog omitted a source receipt', async () => {
+    const userBaseDir = path.join(repoRoot, 'unsupported-pathless-user-skill', '.agents');
+    const userSource = path.join(userBaseDir, 'skills', 'demo');
+    fs.mkdirSync(userSource, { recursive: true });
+    fs.writeFileSync(path.join(userSource, 'SKILL.md'), '# unsupported pathless user skill\n');
+
+    expect(await isCurrentPiSkillInvocation(
+      item({ scope: 'user', sourcePath: userSource }),
+      manifest({
+        commands: [{
+          name: 'skill:demo',
+          source: 'skill',
+          sourceInfo: {
+            scope: 'user',
+            source: 'auto',
+            baseDir: userBaseDir,
+          },
+        }],
+      }),
+      skills({ scope: 'user', path: userSource, runtimeStatus: undefined }),
+    )).toBe(false);
+  });
+
   it('accepts a user Skill symlink whose selected name differs from its target', async () => {
     const userBaseDir = path.join(repoRoot, 'linked-user-skill', '.agents');
     const sharedSource = path.join(repoRoot, 'linked-user-skill-target', 'physical-name');
@@ -296,6 +344,7 @@ describe('Pi Skill invocation validation', () => {
           commands: [{
             name: 'skill:demo',
             source: 'skill',
+            runtimeSourcePath: sharedSource,
             sourceInfo: {
               scope: 'user',
               source: 'auto',
@@ -332,6 +381,7 @@ describe('Pi Skill invocation validation', () => {
         commands: [{
           name: 'skill:demo',
           source: 'skill',
+          runtimeSourcePath: firstTarget,
           sourceInfo: {
             scope: 'user',
             source: 'auto',

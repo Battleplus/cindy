@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { scanPiCustomizations } from '../customization-scanner.js';
+import { capturePiUserSkillRuntimeSourcePaths } from '../index.js';
 import { capturePiRuntimeCapabilityManifest } from '../runtime-capabilities.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -660,6 +661,22 @@ describe.skipIf(!existsSync(PI_BINARY))('Pi v0.83.0 RPC resource discovery facts
       'ready',
     );
     expect(manifest.status).toBe('loaded');
+    const pathlessRuntimeCommands = manifest.commands.map((command) => {
+      if (command.name !== 'skill:global-skill') return command;
+      const { path: _path, ...sourceInfo } = command.sourceInfo;
+      return { ...command, sourceInfo };
+    });
+    const commandsWithHostProvenance = await capturePiUserSkillRuntimeSourcePaths(
+      pathlessRuntimeCommands,
+      async (candidate) => realpathSync(candidate),
+    );
+    expect(commandsWithHostProvenance).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'skill:global-skill',
+        runtimeSourcePath: realpathSync(path.join(fixture.configHome, 'skills', 'global-skill')),
+        sourceInfo: expect.not.objectContaining({ path: expect.anything() }),
+      }),
+    ]));
     expect(manifest.commands).toEqual(expect.arrayContaining([
       expect.objectContaining({
         name: 'skill:global-skill',

@@ -43,6 +43,13 @@ export interface PiRuntimeCommand {
   description?: string;
   source: string;
   sourceInfo: PiRuntimeCommandSourceInfo;
+  /**
+   * Canonical Skill directory captured by Cindy while this catalog was built.
+   * Pi v0.83 omits sourceInfo.path for ordinary auto-loaded user Skills, so
+   * dispatch must use this immutable receipt rather than reinterpreting the
+   * later filesystem scan as proof of what that runtime loaded.
+   */
+  runtimeSourcePath?: string;
 }
 
 /** Startup-only Cindy approval/assembly fact for this isolated Pi runtime. */

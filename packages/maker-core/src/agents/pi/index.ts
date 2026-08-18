@@ -144,7 +144,10 @@ import {
   piContextTokensFromTree,
   userDraftTextFromPiEntry,
 } from './session-tree.js';
-import type { PiRuntimeCapabilityManifest } from '../../types/pi-runtime-capabilities.js';
+import type {
+  PiRuntimeCapabilityManifest,
+  PiRuntimeCommand,
+} from '../../types/pi-runtime-capabilities.js';
 
 const PI_PROVIDER_ID = 'cindy';
 // 既非 Cindy 网关(cindy/xd)也非经 compat proxy 的订阅直连(openai/anthropic)的 providerId = 显式 BYOM
@@ -382,6 +385,43 @@ function escapeLeadingSlashCommand(text: string): string {
   const trimmed = text.trimStart();
   if (trimmed.startsWith('/') && !trimmed.startsWith('/skill:')) return ' ' + text;
   return text;
+}
+
+/**
+ * Pin ordinary Pi user Skills to the physical target that existed when
+ * get_commands produced this catalog. Pi v0.83 omits sourceInfo.path for these
+ * entries, while project Skills already carry immutable snapshot receipts.
+ */
+export async function capturePiUserSkillRuntimeSourcePaths(
+  commands: readonly PiRuntimeCommand[],
+  realpath: (candidate: string) => Promise<string>,
+): Promise<readonly PiRuntimeCommand[]> {
+  return await Promise.all(commands.map(async (command) => {
+    if (
+      command.source !== 'skill'
+      || command.sourceInfo.scope !== 'user'
+      || command.sourceInfo.source !== 'auto'
+      || typeof command.sourceInfo.baseDir !== 'string'
+      || !command.name.startsWith('skill:')
+    ) return command;
+    const skillName = command.name.slice('skill:'.length);
+    if (!skillName || skillName.includes('/') || skillName.includes('\\')) return command;
+    const runtimeEntry = typeof command.sourceInfo.path === 'string'
+      ? path.basename(command.sourceInfo.path).toLowerCase() === 'skill.md'
+        ? path.dirname(command.sourceInfo.path)
+        : command.sourceInfo.path
+      : path.join(command.sourceInfo.baseDir, 'skills', skillName);
+    try {
+      return {
+        ...command,
+        runtimeSourcePath: await realpath(runtimeEntry),
+      };
+    } catch {
+      // Unsupported/unresolvable entries remain in the protocol manifest but do
+      // not acquire an executable receipt in the palette or dispatch path.
+      return command;
+    }
+  }));
 }
 
 /**
@@ -2321,8 +2361,12 @@ export class PiAgent extends BaseAgent {
         generation,
         stage,
       );
+      const commands = remote
+        ? capturedManifest.commands
+        : await capturePiUserSkillRuntimeSourcePaths(capturedManifest.commands, fs.realpath);
       const manifest = {
         ...capturedManifest,
+        commands,
         projectResources: reconcilePiProjectResourceRuntime(
           projectResourceAssembly,
           capturedManifest,

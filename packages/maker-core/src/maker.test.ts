@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import fsPromises from 'node:fs/promises';
@@ -1247,6 +1248,73 @@ describe('Maker session capabilities', () => {
 });
 
 describe('Maker Pi runtime skill status', () => {
+  it('marks a user Skill loaded only when its current target matches the catalog receipt', async () => {
+    const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'maker-pi-user-skill-')));
+    const workingDir = path.join(root, 'repo');
+    const firstTarget = path.join(root, 'target-a');
+    const secondTarget = path.join(root, 'target-b');
+    const skillPath = path.join(root, '.agents', 'skills', 'demo');
+    try {
+      mkdirSync(workingDir, { recursive: true });
+      mkdirSync(firstTarget, { recursive: true });
+      mkdirSync(secondTarget, { recursive: true });
+      mkdirSync(path.dirname(skillPath), { recursive: true });
+      writeFileSync(path.join(firstTarget, 'SKILL.md'), '# first\n');
+      writeFileSync(path.join(secondTarget, 'SKILL.md'), '# second\n');
+      symlinkSync(firstTarget, skillPath, process.platform === 'win32' ? 'junction' : 'dir');
+
+      const agent = createAgent(async () => {
+        const handle = createHandle({ id: 'pi-user-skill', agentKind: 'pi' });
+        handle.getRuntimeCapabilities = () => ({
+          capturedAt: '2026-08-18T00:00:00.000Z',
+          generation: 1,
+          status: 'loaded',
+          source: 'pi:get_commands',
+          commands: [{
+            name: 'skill:demo',
+            source: 'skill',
+            runtimeSourcePath: firstTarget,
+            sourceInfo: {
+              source: 'auto',
+              scope: 'user',
+              baseDir: path.dirname(path.dirname(skillPath)),
+            },
+          }],
+        });
+        return handle;
+      }, 'pi');
+      agent.listAgentSkills = vi.fn(async () => ({
+        skills: [{
+          kind: 'agent-skill' as const,
+          name: 'demo',
+          source: 'skill' as const,
+          scope: 'user' as const,
+          path: skillPath,
+        }],
+      }));
+      const maker = new Maker({ agents: { pi: agent }, storage: createStorage(), logger: createLogger() });
+      await maker.createSession({ id: 'user-skill', agentKind: 'pi', workingDir, model: 'm' });
+
+      await expect(maker.listAgentSkills('pi', {
+        workingDir,
+        sessionId: 'user-skill',
+      })).resolves.toMatchObject({
+        skills: [{ runtimeStatus: 'loaded', runtimeCommandName: 'skill:demo' }],
+      });
+
+      rmSync(skillPath, { recursive: true, force: true });
+      symlinkSync(secondTarget, skillPath, process.platform === 'win32' ? 'junction' : 'dir');
+      const retargeted = await maker.listAgentSkills('pi', {
+        workingDir,
+        sessionId: 'user-skill',
+      });
+      expect(retargeted.skills[0]).not.toHaveProperty('runtimeStatus');
+      expect(retargeted.skills[0]).not.toHaveProperty('runtimeCommandName');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when runtime path canonicalization exceeds its deadline', async () => {
     const workingDir = '/hung/repo';
     const agent = createAgent(async () => createHandle({ id: 'pi-timeout', agentKind: 'pi' }), 'pi');
