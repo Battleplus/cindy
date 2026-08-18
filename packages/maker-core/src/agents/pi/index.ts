@@ -210,6 +210,8 @@ const PI_PROMPT_ACCEPTANCE_PROGRESS_EVENTS = new Set([
 ]);
 /** 分支摘要同样可能触发一次完整 LLM 调用。 */
 const PI_BRANCH_NAVIGATION_TIMEOUT_MS = 600_000;
+/** Bound host provenance capture so a stalled user Skill filesystem cannot block catalog publication. */
+const PI_USER_SKILL_RUNTIME_SOURCE_CAPTURE_DEADLINE_MS = 30_000;
 
 /** PI 的 OpenAI Responses client 以 baseUrl 为 `/v1` 根；Anthropic client 则自行追加 `/v1/messages`。 */
 function piResponsesBaseUrl(endpoint: string): string {
@@ -395,6 +397,7 @@ function escapeLeadingSlashCommand(text: string): string {
 export async function capturePiUserSkillRuntimeSourcePaths(
   commands: readonly PiRuntimeCommand[],
   realpath: (candidate: string) => Promise<string>,
+  deadlineAtMs = Date.now() + PI_USER_SKILL_RUNTIME_SOURCE_CAPTURE_DEADLINE_MS,
 ): Promise<readonly PiRuntimeCommand[]> {
   return await Promise.all(commands.map(async (command) => {
     if (
@@ -411,15 +414,29 @@ export async function capturePiUserSkillRuntimeSourcePaths(
         ? path.dirname(command.sourceInfo.path)
         : command.sourceInfo.path
       : path.join(command.sourceInfo.baseDir, 'skills', skillName);
+    const remainingMs = deadlineAtMs - Date.now();
+    if (remainingMs <= 0) return command;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      const runtimeSourcePath = await Promise.race([
+        realpath(runtimeEntry),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('Pi user Skill runtime source capture deadline expired')),
+            remainingMs,
+          );
+        }),
+      ]);
       return {
         ...command,
-        runtimeSourcePath: await realpath(runtimeEntry),
+        runtimeSourcePath,
       };
     } catch {
-      // Unsupported/unresolvable entries remain in the protocol manifest but do
-      // not acquire an executable receipt in the palette or dispatch path.
+      // Unsupported, unresolvable, or timed-out entries remain in the protocol
+      // manifest but do not acquire an executable palette/dispatch receipt.
       return command;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }));
 }

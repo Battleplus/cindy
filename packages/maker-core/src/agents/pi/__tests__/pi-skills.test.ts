@@ -8,11 +8,12 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { PiAgent } from '../index.js';
+import { capturePiUserSkillRuntimeSourcePaths, PiAgent } from '../index.js';
 import type { AgentDeps } from '../../base-agent.js';
 import type { Logger } from '../../../interfaces/logger.js';
+import type { PiRuntimeCommand } from '../../../types/pi-runtime-capabilities.js';
 
 const noopLogger: Logger = {
   trace: () => {},
@@ -74,5 +75,37 @@ describe('PiAgent.listAgentSkills (filesystem discovery, no binary spawn)', () =
     const result = await agent.listAgentSkills({ workingDir });
     // 真实环境可能有用户级 ~/.agents/skills,故只断言"不抛 + 是数组",不断言空。
     expect(Array.isArray(result.skills)).toBe(true);
+  });
+});
+
+describe('capturePiUserSkillRuntimeSourcePaths', () => {
+  it('leaves a user Skill non-executable when realpath exceeds the shared deadline', async () => {
+    const command: PiRuntimeCommand = {
+      name: 'skill:demo-skill',
+      source: 'skill',
+      sourceInfo: {
+        source: 'auto',
+        scope: 'user',
+        baseDir: '/config-home',
+      },
+    };
+    const blockedRealpath = vi.fn(() => new Promise<string>(() => {}));
+
+    vi.useFakeTimers();
+    try {
+      const pending = capturePiUserSkillRuntimeSourcePaths(
+        [command],
+        blockedRealpath,
+        Date.now() + 10,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(pending).resolves.toEqual([command]);
+      expect(blockedRealpath).toHaveBeenCalledWith(
+        path.join('/config-home', 'skills', 'demo-skill'),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
