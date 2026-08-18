@@ -137,7 +137,11 @@ async function runtimeUserSkillMatchesSource(
   );
   if (derivedFromBase !== selected) return false;
 
-  if (command.sourceInfo.path === undefined) return true;
+  // baseDir only identifies the user Skill's lexical entry. Re-resolving that
+  // entry at dispatch time cannot prove which target Pi loaded if the entry is
+  // a symlink that was retargeted after get_commands. Without Pi's loaded path,
+  // there is no immutable runtime target to compare, so fail closed.
+  if (command.sourceInfo.path === undefined) return false;
   const runtimePath = await canonicalLocalPath(
     command.sourceInfo.path,
     dependencies,

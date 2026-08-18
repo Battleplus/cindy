@@ -215,6 +215,7 @@ describe('Pi Skill invocation validation', () => {
     const userBaseDir = path.join(repoRoot, 'user-skill-provenance', '.agents');
     const userSource = path.join(userBaseDir, 'skills', 'demo');
     fs.mkdirSync(userSource, { recursive: true });
+    fs.writeFileSync(path.join(userSource, 'SKILL.md'), '# user skill\n');
     const userItem = item({ scope: 'user', sourcePath: userSource });
     const userSkills = skills({ scope: 'user', path: userSource, runtimeStatus: undefined });
     const userManifest = manifest({
@@ -225,6 +226,7 @@ describe('Pi Skill invocation validation', () => {
           scope: 'user',
           source: 'auto',
           baseDir: userBaseDir,
+          path: path.join(userSource, 'SKILL.md'),
         },
       }],
     });
@@ -307,6 +309,53 @@ describe('Pi Skill invocation validation', () => {
     } finally {
       fs.rmSync(linkedSource, { recursive: true, force: true });
       fs.rmSync(sharedSource, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for a retargeted user Skill symlink when runtime provenance omits path', async () => {
+    const userBaseDir = path.join(repoRoot, 'retargeted-user-skill', '.agents');
+    const firstTarget = path.join(repoRoot, 'retargeted-user-skill-target-a');
+    const secondTarget = path.join(repoRoot, 'retargeted-user-skill-target-b');
+    const linkedSource = path.join(userBaseDir, 'skills', 'demo');
+    try {
+      fs.mkdirSync(firstTarget, { recursive: true });
+      fs.mkdirSync(secondTarget, { recursive: true });
+      fs.mkdirSync(path.dirname(linkedSource), { recursive: true });
+      fs.writeFileSync(path.join(firstTarget, 'SKILL.md'), '# first target\n');
+      fs.writeFileSync(path.join(secondTarget, 'SKILL.md'), '# second target\n');
+      fs.symlinkSync(
+        firstTarget,
+        linkedSource,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      const pathlessRuntimeManifest = manifest({
+        commands: [{
+          name: 'skill:demo',
+          source: 'skill',
+          sourceInfo: {
+            scope: 'user',
+            source: 'auto',
+            baseDir: userBaseDir,
+          },
+        }],
+      });
+
+      fs.unlinkSync(linkedSource);
+      fs.symlinkSync(
+        secondTarget,
+        linkedSource,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+
+      expect(await isCurrentPiSkillInvocation(
+        item({ scope: 'user', sourcePath: linkedSource }),
+        pathlessRuntimeManifest,
+        skills({ scope: 'user', path: linkedSource, runtimeStatus: undefined }),
+      )).toBe(false);
+    } finally {
+      fs.rmSync(linkedSource, { recursive: true, force: true });
+      fs.rmSync(firstTarget, { recursive: true, force: true });
+      fs.rmSync(secondTarget, { recursive: true, force: true });
     }
   });
 
