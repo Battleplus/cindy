@@ -1479,6 +1479,31 @@ export function registerSessionIpc(
         (p as Record<string, unknown>).sdkSessionId = reloc.persistedSdkSessionId;
       }
     }
+    // Pi / Codex 会话移动：没有 cc 那套 CLI 转录要搬，但已 spawn 的进程仍持有旧 cwd，
+    // 继续接 send 会在旧沙箱里跑（#2941）。与 cc 关 handle 同口径：软关闭活跃 handle，
+    // 下一次 send 用新 workingDir lazy-create。withRehydrateCloseSuppressed 保住 worktree /
+    // 临时附件；closeSession 对不在内存的会话是 no-op。best-effort，不阻断移动。
+    if (
+      beforeMove &&
+      (beforeMove.agentKind === 'pi' || beforeMove.agentKind === 'codex') &&
+      !beforeMove.remoteHostId &&
+      beforeMove.workingDir &&
+      typeof p.workingDir === 'string' &&
+      p.workingDir &&
+      normalizeWorkingDirForStorage(beforeMove.workingDir) !== p.workingDir
+    ) {
+      try {
+        const m = await import('../../maker-host/index.js');
+        await m.withRehydrateCloseSuppressed(sid, async () => {
+          await m.getMaker().closeSession(sid);
+        });
+      } catch (err) {
+        log.warn('pi/codex handle close on session move failed (session move proceeds)', {
+          sessionId: sid,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     const row = await selectSessionWithCount(db, sid);
     if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
     // 取消置顶后摘要不再有展示面,立刻清掉,避免列表/再次置顶前继续吃旧句。

@@ -25,6 +25,10 @@ const h = vi.hoisted(() => ({
   relocate: vi.fn(async (): Promise<{ persistedSdkSessionId: string | null }> => ({
     persistedSdkSessionId: null,
   })),
+  closeSession: vi.fn(async () => undefined),
+  withRehydrateCloseSuppressed: vi.fn(
+    async <T>(_sessionId: string, fn: () => Promise<T>): Promise<T> => fn(),
+  ),
   tapWindowBroadcast: vi.fn(),
   summarizeSession: vi.fn(async () => undefined),
   setPinnedSectionCardMode: vi.fn(),
@@ -69,6 +73,10 @@ vi.mock('../../../messagePersistBroadcaster', () => ({ noteSessionClearBoundary:
 vi.mock('../../../sessionIds', () => ({ resolveBusinessSessionId: (id: string) => id }));
 vi.mock('../../../maker-host/claude-transcript-relocation.js', () => ({
   relocateClaudeTranscriptsForSessionMove: h.relocate,
+}));
+vi.mock('../../../maker-host/index.js', () => ({
+  getMaker: () => ({ closeSession: h.closeSession }),
+  withRehydrateCloseSuppressed: h.withRehydrateCloseSuppressed,
 }));
 
 import { registerSessionIpc } from '../sessions';
@@ -115,6 +123,7 @@ function createDb(): void {
       orca_role TEXT,
       remote_host_id TEXT,
       codex_history_has_product_prompt INTEGER,
+      codex_plan_json TEXT,
       im_bot_context_id TEXT,
       im_user_id TEXT,
       summary TEXT,
@@ -143,6 +152,7 @@ function createDb(): void {
   `);
   insert.run('cc-local', '/old/dir', 'cc', null, 'dialogue');
   insert.run('codex-local', '/old/dir', 'codex', null, 'dialogue');
+  insert.run('pi-local', '/old/dir', 'pi', null, 'dialogue');
   insert.run('cc-remote', '/remote/dir', 'cc', 'host-1', 'project');
   sqlite
     .prepare(
@@ -338,9 +348,27 @@ describe('local-db:sessions:update handler wiring', () => {
     expect(h.relocate).not.toHaveBeenCalled();
   });
 
-  it('does nothing for codex sessions', async () => {
+  it('soft-closes the active handle when a local codex session actually moves', async () => {
     await invokeUpdate('codex-local', { workingDir: '/new/dir' });
     expect(h.relocate).not.toHaveBeenCalled();
+    expect(h.closeSession).toHaveBeenCalledWith('codex-local');
+    expect(h.withRehydrateCloseSuppressed).toHaveBeenCalled();
+  });
+
+  it('soft-closes the active handle when a local pi session actually moves', async () => {
+    await invokeUpdate('pi-local', { workingDir: '/new/dir' });
+    expect(h.closeSession).toHaveBeenCalledWith('pi-local');
+    expect(h.withRehydrateCloseSuppressed).toHaveBeenCalled();
+  });
+
+  it('does not close the handle when the codex workingDir does not change', async () => {
+    await invokeUpdate('codex-local', { workingDir: '/old/dir' });
+    expect(h.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('does not close the handle when the patch has no workingDir (move back to dialogue)', async () => {
+    await invokeUpdate('codex-local', { workspaceKind: 'dialogue' });
+    expect(h.closeSession).not.toHaveBeenCalled();
   });
 
   it('does nothing for remote sessions', async () => {
