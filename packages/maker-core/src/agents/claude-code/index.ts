@@ -99,6 +99,7 @@ import { scanClaudeAtResources, scanClaudeSlashCommands } from '../shared/palett
 // scanClaudeSlashCommands 仍是 listAgentSkills 的实际数据源, 名字保留(它扫的是 commands+skills 两类)。
 import { UsageTracker } from '../shared/usage-tracker.js';
 import { getDefaultImageResizer } from '../shared/image-resizer.js';
+import { formatManagedImageReferences } from '../shared/managed-image-reference.js';
 import { pickTurnStartStatus, type OneShotState } from '../shared/turn-start-phrases.js';
 import { ToolLoopGuard } from '../shared/loop-guard.js';
 import {
@@ -241,14 +242,23 @@ function isProviderRoutedModel(model: string): boolean {
 }
 
 /**
- * 结果感知的硬中断目前只覆盖既有 DeepSeek 与原生 Claude 系列。
+ * 结果感知的硬中断目前覆盖 DeepSeek、原生 Claude 与 xai Grok 系列
+ * (Grok 为 2026-08 维护者确认新增:单 turn 在 4 个不同 Grep 里轮转上千次调用的实锤)。
  * 其他 provider-routed 模型需要独立确认产品口径,不能因共用 Claude Code harness
- * 就自动扩大行为。会话级判断用 maker-core 公开 model id(deepseek/…);sidechain 的
- * 判断来自 SDK 流内的原始 id(可能是裸 deepseek-… 形态,同 toSdkModelString 的双形态),
- * 因此 DeepSeek 按家族前缀匹配,不带 [1m] 的 SDK 改写。
+ * 就自动扩大行为。会话级判断用 maker-core 公开 model id(deepseek/…、xai/…);
+ * sidechain 的判断来自 SDK 流内的原始 id(可能是裸 deepseek-… / grok-… 形态,
+ * 同 toSdkModelString 的双形态),因此按家族前缀匹配,不带 [1m] 的 SDK 改写。
+ * grok 家族按 model-providers classification 口径同时认三种形态:xai/(订阅直连)、
+ * x-ai/(网关命名空间,toSdkModelString 原样透传)与裸 grok-(sidechain 原始 id)。
  */
 function shouldUseToolLoopGuard(model: string): boolean {
-  return model.startsWith('deepseek') || model.startsWith('claude-');
+  return (
+    model.startsWith('deepseek')
+    || model.startsWith('claude-')
+    || model.startsWith('xai/')
+    || model.startsWith('x-ai/')
+    || model.startsWith('grok-')
+  );
 }
 
 /** URL → host(路由决策日志用,失败返回 undefined,不抛)。 */
@@ -558,7 +568,11 @@ export async function toClaudeSdkContent(
   });
 
   const prefix = refs.length > 0 ? `${refs.join(' ')} ` : '';
-  const text = `${prefix}${textParts.join('\n')}`.trim();
+  const managedImageReferences = formatManagedImageReferences(content);
+  const textBody = managedImageReferences
+    ? [...textParts, managedImageReferences].join('\n')
+    : textParts.join('\n');
+  const text = `${prefix}${textBody}`.trim();
   const imageBlocks = [...resolvedImages.values()].flatMap(({ block }) => (block ? [block] : []));
   if (imageBlocks.length === 0) return text || prefix.trim();
   return text ? [...imageBlocks, { type: 'text', text }] : imageBlocks;
@@ -1781,6 +1795,7 @@ export class ClaudeCodeAgent extends BaseAgent {
         const decision = await dispatchInteraction({
           kind: 'ask_user_question',
           requestId: options.toolUseID,
+          toolUseId: options.toolUseID,
           questions,
         });
         if (decision.kind !== 'ask_user_question') {
@@ -1816,6 +1831,7 @@ export class ClaudeCodeAgent extends BaseAgent {
         const decision = await dispatchInteraction({
           kind: 'plan_review',
           requestId: options.toolUseID,
+          toolUseId: options.toolUseID,
           plan,
           planFilePath,
         });
@@ -1958,6 +1974,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       const permissionRequest = {
         kind: 'permission' as const,
         requestId: options.toolUseID,
+        toolUseId: options.toolUseID,
         toolName,
         input: input as Record<string, unknown>,
         title: hostApprovalPresentation?.title ?? options.title,
@@ -2307,6 +2324,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       turnState.sawCompactBoundary = false;
       turnState.hasEmittedText = false;
       turnState.uiEmittedText = '';
+      runtimeState.streamStopTokenByKey.clear();
       turnState.pendingApiError = null;
       turnState.lastAssistantRequestId = undefined;
       turnState.lastAssistantMsgHadSubstance = true;
@@ -2906,6 +2924,7 @@ export class ClaudeCodeAgent extends BaseAgent {
               const decision = await dispatchWithTimeout({
                 kind: 'ask_user_question',
                 requestId: params.requestId,
+                toolUseId: params.requestId,
                 questions: (params.questions ?? askInput.questions ?? []) as AskUserQuestionItem[],
               });
               if (decision.kind !== 'ask_user_question') {
@@ -2930,6 +2949,7 @@ export class ClaudeCodeAgent extends BaseAgent {
               const decision = await dispatchWithTimeout({
                 kind: 'plan_review',
                 requestId: params.requestId,
+                toolUseId: params.requestId,
                 plan,
                 planFilePath: params.planFilePath ?? planInput.planFilePath,
               });
@@ -3055,6 +3075,7 @@ export class ClaudeCodeAgent extends BaseAgent {
             const remotePermissionRequest = {
               kind: 'permission' as const,
               requestId: params.requestId,
+              toolUseId: params.requestId,
               toolName: params.toolName ?? 'unknown',
               input: params.input ?? {},
               title: remoteHostApprovalPresentation?.title ?? params.title,
@@ -3866,14 +3887,16 @@ export class ClaudeCodeAgent extends BaseAgent {
     // 逐个发起 stopTask,但不在这里等待 RPC:interrupt 必须先按控制通道顺序发出。
     // 返回每个 RPC 的 promise,供 interrupt ACK 后只退休真正成功的任务;失败任务
     // 仍留在本地账中,等待 provider 的真实 completed/stopped 事件继续记账。
+    const runningWakeTaskIds = (): string[] =>
+      [...runningBackgroundTasks.entries()]
+        .filter(([, info]) => info.wake)
+        .map(([taskId]) => taskId);
+
     function stopRunningWakeBackgroundTasks(
       reason: string,
     ): Array<{ taskId: string; promise: Promise<void> }> {
       if (runningBackgroundTasks.size === 0) return [];
-      const wakeIds: string[] = [];
-      for (const [taskId, info] of runningBackgroundTasks) {
-        if (info.wake) wakeIds.push(taskId);
-      }
+      const wakeIds = runningWakeTaskIds();
       if (wakeIds.length === 0) return [];
       // 远端老 daemon / 老 SDK 没有 stopTask:退化为原行为(interrupt-only),
       // proxy 活动检测 + 「全部停止」兜底仍在。
@@ -3917,6 +3940,45 @@ export class ClaudeCodeAgent extends BaseAgent {
         requests.push({ taskId, promise });
       }
       return requests;
+    }
+
+    async function settleWakeStopRequests(
+      requests: Array<{ taskId: string; promise: Promise<void> }>,
+    ): Promise<{ fulfilledWakeIds: string[]; rejectedWakeIds: string[] }> {
+      const settled = await Promise.allSettled(requests.map(({ promise }) => promise));
+      const fulfilledWakeIds: string[] = [];
+      const rejectedWakeIds: string[] = [];
+      requests.forEach(({ taskId }, index) => {
+        if (settled[index]?.status === 'fulfilled') fulfilledWakeIds.push(taskId);
+        else rejectedWakeIds.push(taskId);
+      });
+      return { fulfilledWakeIds, rejectedWakeIds };
+    }
+
+    async function waitForGracefulStopStep<T>(
+      promise: Promise<T>,
+      signal?: AbortSignal,
+    ): Promise<T> {
+      if (!signal) return promise;
+      if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+      return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+          cleanup();
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        signal.addEventListener('abort', onAbort, { once: true });
+        void promise.then(
+          (value) => {
+            cleanup();
+            resolve(value);
+          },
+          (error) => {
+            cleanup();
+            reject(error);
+          },
+        );
+      });
     }
 
     // ── Middle-turn 事件过滤 (Codex review 3534925347 / 3535259132 / 3535293200) ──
@@ -5412,6 +5474,58 @@ export class ClaudeCodeAgent extends BaseAgent {
         armUpstreamResponseIdle();
       },
 
+      async requestGracefulStop(stopOpts) {
+        if (canceledBridgeQueries.has(q)) {
+          throw new Error('Claude query is no longer active');
+        }
+        const awaitingContinuation = activeContinuationClaim();
+        if (!turnInFlight && awaitingContinuation?.state !== 'awaiting') {
+          throw new Error('No active Claude turn to stop');
+        }
+        const generation = turnState.generation;
+        turnState.interruptRequested = true;
+        turnState.interruptGeneration = generation;
+        dismissAllPending('graceful_stop', 'deny');
+        // A parent result can leave the foreground idle while wake tasks still
+        // own an awaiting continuation. Interrupting that idle Query alone does
+        // not revoke the task-triggered follow-up turn. Share the same stopTask
+        // accounting as hard Stop, but keep graceful-stop fail-safe semantics:
+        // only confirmed task stops may close the local continuation contract,
+        // and any unsupported/rejected control request remains unconfirmed
+        // without closing the provider process.
+        const wakeIds = runningWakeTaskIds();
+        const stopRequests = stopRunningWakeBackgroundTasks('graceful_stop');
+        try {
+          await waitForGracefulStopStep(Promise.resolve().then(() => q.interrupt()), stopOpts?.signal);
+          const { fulfilledWakeIds, rejectedWakeIds } = await waitForGracefulStopStep(
+            settleWakeStopRequests(stopRequests),
+            stopOpts?.signal,
+          );
+          if (turnState.generation !== generation) return;
+          const fulfilledWakeIdSet = new Set(fulfilledWakeIds);
+          const unconfirmedWakeIds = runningWakeTaskIds().filter(
+            (taskId) => !fulfilledWakeIdSet.has(taskId),
+          );
+          if (
+            stopRequests.length !== wakeIds.length ||
+            rejectedWakeIds.length > 0 ||
+            unconfirmedWakeIds.length > 0
+          ) {
+            throw new Error('Claude graceful stop could not confirm all background task stops');
+          }
+          const stoppedClaim = markWakeTasksStopped(fulfilledWakeIds, 'graceful_stop');
+          const cancelledContinuation =
+            stoppedClaim ?? cancelActiveContinuation('graceful_stop');
+          if (cancelledContinuation) {
+            retireContinuationTasks(cancelledContinuation);
+            emitCancelledContinuationBoundary(cancelledContinuation, 'graceful_stop');
+          }
+        } catch (error) {
+          if (turnState.generation === generation) turnState.interruptRequested = false;
+          throw error;
+        }
+      },
+
       async abort() {
         // 只 interrupt 当前 turn, 不能 abortController.abort() ——
         // 那会杀掉整个 SDK Query, 让 streaming-input 流断开 (for await 抛
@@ -5513,10 +5627,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           // stopTask and interrupt share an ordered control channel: an
           // interrupt ACK guarantees these earlier stop requests have settled,
           // so allSettled intentionally has no extra timeout here.
-          const settledStops = await Promise.allSettled(stopRequests.map(({ promise }) => promise));
-          const fulfilledWakeIds = stopRequests
-            .filter((_, index) => settledStops[index]?.status === 'fulfilled')
-            .map(({ taskId }) => taskId);
+          const { fulfilledWakeIds } = await settleWakeStopRequests(stopRequests);
           // interrupt ACK authorizes retiring only wake tasks whose stop RPC
           // also succeeded. Rejected stops remain tracked for provider events,
           // preserving their continuation contract instead of creating an

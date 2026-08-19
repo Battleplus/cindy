@@ -62,6 +62,7 @@ import type {
   DynamicToolCallParams,
   DynamicToolCallResponse,
   DynamicToolSpec,
+  ReasoningEffort,
 } from './codex/app-server/protocol.js';
 import type {
   ScanAtResourcesOptions,
@@ -315,16 +316,20 @@ export interface PiExtraSpawnConfigContext {
 export interface CodexExtraSpawnConfig {
   extraArgs: string[];
   extraEnv: Record<string, string>;
+  /** Host 路由要求更强的 Codex 进程凭证时，冷启动以该模式重建 app-server。 */
+  requiredSpawnCredentialMode?: 'oauth-bearer';
   /** Cindy-side display fallback for Codex subagent cards. */
   subagentModelFallback?: string;
-  /** Provider route frozen alongside the default subagent model for this app-server. */
+  /** Provider route frozen alongside the locked subagent model for this app-server. */
   subagentRoute?: {
     providerId: string;
     catalogModel: string;
-    runtimeModel: string;
+    reasoningEffort: ReasoningEffort | null;
   };
   /** Whether this exact app-server spawn was provisioned with Codex Chrome. */
   codexBrowserUseAvailable?: boolean;
+  /** Whether the OpenAI identity provider on this app-server may use Responses WebSocket. */
+  codexOpenAiWebSocketsEnabled?: boolean;
   /** Exact verified Chrome plugin version provisioned into this app-server. */
   codexBrowserUseVersion?: string;
   /** Maximum startup wait copied from the verified companion descriptor. */
@@ -552,7 +557,7 @@ export interface AgentDeps {
    * - `openai-responses`：Model Access v3 明确指定的 Cindy AI Pi 路由；
    * - `anthropic-messages`：非 XD compat proxy 路由；
    * - `null`：模型属于 Cindy AI Pi 目录，但协议缺失或不匹配，Pi fail closed；
-   * - `undefined`：模型不属于当前来源的 XD Pi 目录，保留既有 Messages 协议。
+   * - `undefined`：当前来源未声明该模型的 Pi 协议；不得写入 `cindy` gateway 块。
    */
   resolvePiGatewayModelApi?: (
     providerId: string | null | undefined,
@@ -932,7 +937,7 @@ export interface AgentDeps {
     subagentRoute?: {
       providerId: string;
       catalogModel: string;
-      runtimeModel: string;
+      reasoningEffort: ReasoningEffort | null;
     };
   }) => void;
 
@@ -1179,6 +1184,32 @@ export class AgentNotAuthenticatedError extends Error {
   constructor(public readonly agentKind: string, msg?: string) {
     super(msg ?? `agent-not-authenticated:${agentKind}`);
     this.name = 'AgentNotAuthenticatedError';
+  }
+}
+
+/**
+ * The adapter dispatched a turn request but could not determine whether the
+ * provider accepted it. The Session wrapper must fence the ambiguous handle
+ * before surfacing this error. Fencing prevents further execution but does not
+ * roll back completed side effects, so orchestrators must not blindly replay
+ * the same turn.
+ */
+export class TurnDispatchUnconfirmedError extends Error {
+  readonly code = 'TURN_DISPATCH_UNCONFIRMED';
+
+  constructor(msg: string, options?: ErrorOptions) {
+    super(msg, options);
+    this.name = 'TurnDispatchUnconfirmedError';
+  }
+}
+
+/** The provider explicitly rejected the turn before accepting any work. */
+export class TurnDispatchRejectedError extends Error {
+  readonly code = 'TURN_DISPATCH_REJECTED';
+
+  constructor(msg: string, options?: ErrorOptions) {
+    super(msg, options);
+    this.name = 'TurnDispatchRejectedError';
   }
 }
 
@@ -1487,6 +1518,15 @@ export interface AgentSessionHandle {
 
   /** 中断当前 turn */
   abort(): Promise<void>;
+
+  /**
+   * 请求当前 turn 在 provider 的安全边界停止。
+   *
+   * 与 abort() 的产品语义不同：这里只发送 provider 原生的软中断请求，不得关闭
+   * Query、transport 或子进程，也不得升级为 kill/rebuild。Session 层负责等到当前
+   * 工具结果边界再调用，并对悬挂/失败做有界的 unconfirmed 降级。
+   */
+  requestGracefulStop?(opts?: { signal?: AbortSignal }): Promise<void>;
 
   /** Provider turn identity when the adapter exposes one (currently Codex). */
   getCurrentTurnId?(): string | null;

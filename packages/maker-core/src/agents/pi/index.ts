@@ -56,6 +56,8 @@ function validateSdkSessionId(value: string): string {
 import {
   AgentNotAuthenticatedError,
   BaseAgent,
+  TurnDispatchRejectedError,
+  TurnDispatchUnconfirmedError,
   TurnPermissionPolicyUnsupportedError,
   type AgentDeps,
   type AgentSessionHandle,
@@ -109,7 +111,9 @@ import type { AgentKind, Effort, UserMessage, UserContentBlock } from '../../typ
 import type { ListAgentSkillsOptions, ListAgentSkillsResult } from '../../types/palette.js';
 import type { ListCustomizationsOptions, ListCustomizationsResult } from '../../types/customizations.js';
 import { scanPiCustomizations } from './customization-scanner.js';
+import { AutoCompactController } from '../shared/auto-compact-controller.js';
 import { createAsyncQueue, type AsyncQueue } from '../shared/async-queue.js';
+import { formatManagedImageReferences } from '../shared/managed-image-reference.js';
 import { resolveMcpToolTarget } from '../shared/mcp-tool-target.js';
 import {
   assertReviewMessageContentPaths,
@@ -129,6 +133,7 @@ import {
 import {
   createPiTranslateContext,
   disposePiTranslateContext,
+  isFailedOrAbortedPiCompaction,
   translatePiEvent,
   usageSnapshotOf,
   type PiTranslateContext,
@@ -189,9 +194,46 @@ function isLoopbackOnlyBaseUrl(baseUrl: string): boolean {
     return false; // 非法 URL 不判 loopback(其它校验兜底)
   }
 }
+
+/**
+ * OpenAI subscription context profiles are catalog identities whose wire model id must be
+ * rewritten by Desktop's local compat handler. SSH Pi sessions do not traverse that handler,
+ * so publishing one remotely would leak the `[1m]` suffix to the gateway/upstream model id.
+ *
+ * An explicitly selected BYOM provider remains allowed: its owner controls the model id and
+ * endpoint, and must not be mistaken for Cindy's OpenAI subscription projection merely because
+ * it uses the same display namespace.
+ */
+function isLocalOnlyOpenAiPiContextProfile(
+  model: string,
+  providerId?: string | null,
+): boolean {
+  if (!model.startsWith('chatgpt/') || !model.endsWith('[1m]')) return false;
+  return providerId === undefined || providerId === null || providerId === 'openai';
+}
+
+function assertRemotePiContextProfileAvailable(
+  remoteHostId: string | null | undefined,
+  model: string,
+  providerId?: string | null,
+): void {
+  if (!remoteHostId || !isLocalOnlyOpenAiPiContextProfile(model, providerId)) return;
+  throw new Error(
+    '[REMOTE_PI_CONTEXT_PROFILE_UNAVAILABLE] remote Pi sessions cannot use this OpenAI context profile because its model-id rewrite is available only in the Desktop local subscription adapter; pick the XD gateway or a BYOM provider reachable from the SSH host',
+  );
+}
 const PI_IMAGE_INPUT_UNSUPPORTED_CODE = 'PI_IMAGE_INPUT_UNSUPPORTED';
 /** 手动压缩 = 一次完整 LLM 摘要调用(大上下文 + 网关排队),远超默认 30s RPC 超时。 */
 const PI_COMPACT_TIMEOUT_MS = 600_000;
+/** prompt 接受前可能自动压缩，同样必须覆盖一次完整摘要调用。 */
+const PI_PROMPT_ACCEPTANCE_TIMEOUT_MS = PI_COMPACT_TIMEOUT_MS;
+const PI_PROMPT_ACCEPTANCE_PROGRESS_EVENTS = new Set([
+  'compaction_start',
+  'compaction_end',
+  'summarization_retry_scheduled',
+  'summarization_retry_attempt_start',
+  'summarization_retry_finished',
+]);
 /** 分支摘要同样可能触发一次完整 LLM 调用。 */
 const PI_BRANCH_NAVIGATION_TIMEOUT_MS = 600_000;
 
@@ -488,6 +530,8 @@ async function buildPiPrompt(
       }
     }
   }
+  const managedImageReferences = formatManagedImageReferences(message.content);
+  if (managedImageReferences) textParts.push(managedImageReferences);
   return { text: textParts.join(' ').trim(), images };
 }
 
@@ -501,13 +545,65 @@ function piExtraDirsPrompt(dirs: readonly string[]): string {
   ].join('\n');
 }
 
+interface FailedPiStartupCleanup {
+  proc: PiRpcProcess;
+  promise: Promise<void> | null;
+  cleanupLocal?: () => void;
+}
+
 export class PiAgent extends BaseAgent {
   readonly kind: AgentKind = 'pi';
   readonly capabilities: Capabilities;
+  private readonly failedStartupCleanups = new Map<string, FailedPiStartupCleanup>();
+  private readonly inFlightStartups = new Set<Promise<AgentSessionHandle>>();
+  private disposeStarted = false;
 
   constructor(deps: AgentDeps) {
     super(deps);
     this.capabilities = this.buildCapabilities(PiAgent.baseCapabilities());
+  }
+
+  private async retryFailedStartupCleanup(
+    sessionId: string,
+    expectedEntry?: FailedPiStartupCleanup,
+  ): Promise<void> {
+    const entry = this.failedStartupCleanups.get(sessionId);
+    if (!entry || (expectedEntry && entry !== expectedEntry)) return;
+    const cleanup = entry.promise ?? entry.proc.close();
+    entry.promise = cleanup;
+    try {
+      await cleanup;
+    } catch (error) {
+      if (this.failedStartupCleanups.get(sessionId) === entry && entry.promise === cleanup) {
+        entry.promise = null;
+      }
+      throw error;
+    }
+    if (this.failedStartupCleanups.get(sessionId) === entry) {
+      this.failedStartupCleanups.delete(sessionId);
+      entry.cleanupLocal?.();
+    }
+  }
+
+  override async dispose(): Promise<void> {
+    this.disposeStarted = true;
+    const startupSnapshot = Array.from(this.inFlightStartups);
+    await Promise.allSettled(startupSnapshot);
+
+    // startSession registers before yielding and new starts are fenced above,
+    // so every failed pre-publication process is now visible in this snapshot.
+    const cleanupSnapshot = Array.from(this.failedStartupCleanups.entries());
+    const results = await Promise.allSettled(
+      cleanupSnapshot.map(([sessionId, entry]) =>
+        this.retryFailedStartupCleanup(sessionId, entry),
+      ),
+    );
+    const errors = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Pi startup process cleanup remains unconfirmed');
+    }
   }
 
   private static baseCapabilities(): Capabilities {
@@ -679,7 +775,12 @@ export class PiAgent extends BaseAgent {
     nativeProviders: PiNativeProviderSpec[] = [],
     retainedRuntimeModel?: ModelDescriptor,
     gatewayProviderId?: string | null,
-    opts: { remote?: boolean; fileOps?: PiRemoteFileOps; preview?: boolean } = {},
+    opts: {
+      remote?: boolean;
+      fileOps?: PiRemoteFileOps;
+      preview?: boolean;
+      offlineValidationOnly?: boolean;
+    } = {},
   ): Promise<{
     gatewayImageInputByModel: Map<string, boolean>;
     gatewayApiByModel: Map<string, 'anthropic-messages' | 'openai-responses'>;
@@ -712,7 +813,7 @@ export class PiAgent extends BaseAgent {
       : publicModels;
     const gatewayImageInputByModel = new Map<string, boolean>();
     const gatewayApiByModel = new Map<string, 'anthropic-messages' | 'openai-responses'>();
-    const models = runtimeModels.map((publicModel: ModelDescriptor) => {
+    const models = runtimeModels.flatMap((publicModel: ModelDescriptor) => {
       // availableModels 为跨 provider 拍平的公开能力；BYOM 同 id 冲突时 effort
       // 会按设计收敛成交集。cindy gateway 块则代表内置路由，必须回查其
       // provider-aware 描述符，不能被同名 non-reasoning BYOM 清空 reasoning。
@@ -730,14 +831,17 @@ export class PiAgent extends BaseAgent {
       ) {
         throw new Error(`Model Access v3 did not provide a Pi wire protocol for model: ${m.id}`);
       }
-      // undefined 明确表示该模型不属于 XD Pi 目录。订阅直连及 BYOM-only 模型仍需出现在
-      // cindy compat provider 的模型表中，沿用它们既有的 Messages 前门；只有 null 才是
-      // “属于 XD 但 v3 配置不完整”，上面已 fail closed。
+      // undefined means no protocol was declared for this concrete gateway route. Native
+      // subscription/BYOM models remain in their own provider blocks; normal sessions must not
+      // copy them into `cindy` under a guessed Claude protocol. Offline fork only needs Pi to
+      // parse a historical JSONL file and never sends a model request, so it gets a local-only
+      // structural placeholder.
+      if (resolvedApi === undefined && !opts.offlineValidationOnly) return [];
       const api = resolvedApi ?? 'anthropic-messages';
       gatewayApiByModel.set(m.id, api);
       const supportsImageInput = m.supportsImageInput === true;
       gatewayImageInputByModel.set(m.id, supportsImageInput);
-      return {
+      return [{
         id: m.id,
         name: m.displayName,
         // Pi 0.83 支持同一 provider 下逐模型覆盖 API/baseUrl。provider 身份仍是
@@ -759,12 +863,14 @@ export class PiAgent extends BaseAgent {
           cacheRead: m.cost?.cacheRead ?? 0,
           cacheWrite: m.cost?.cacheWrite ?? 0,
         },
-      };
+      }];
     });
     const providers: Record<string, unknown> = {
       [PI_PROVIDER_ID]: {
         name: 'Cindy AI',
         baseUrl: endpoint ?? 'http://127.0.0.1:0',
+        // Structural provider default for Pi's models.json schema only. Every selectable Cindy
+        // gateway model above carries its authoritative model-level api from Model Access v3.
         api: 'anthropic-messages',
         apiKey: `$${PI_API_KEY_ENV}`,
         // 本地 loopback compat proxy 用 session headers 做订阅 OAuth 注入;远端打真上游
@@ -861,7 +967,24 @@ export class PiAgent extends BaseAgent {
     };
   }
 
-  async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+  override async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    if (this.disposeStarted) {
+      throw new Error('Pi agent is disposing; refusing to start a new session');
+    }
+    const startup = this.startSessionWhileRunning(opts);
+    this.inFlightStartups.add(startup);
+    try {
+      return await startup;
+    } finally {
+      this.inFlightStartups.delete(startup);
+    }
+  }
+
+  private async startSessionWhileRunning(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    const startupCleanupKey = opts.sessionId ?? '<anonymous>';
+    // A previous pre-publication Pi process for this business session must be
+    // confirmed dead before another spawn can begin.
+    await this.retryFailedStartupCleanup(startupCleanupKey);
     // 轮 22 LOW-6:空串 remoteHostId 规范化 —— Boolean('') 是 false 会让会话
     // 被判定本地但后续仍把 '' 传给 resolvePiNativeProviders 等, 行为分裂。
     if (opts.remoteHostId === '') opts.remoteHostId = undefined;
@@ -872,6 +995,7 @@ export class PiAgent extends BaseAgent {
         message: 'pi remote sessions require a host-provided getRemotePiTransport hook',
       });
     }
+    assertRemotePiContextProfileAvailable(opts.remoteHostId, opts.model, opts.providerId);
     const reviewMode = opts.reviewMode === true;
 
     // BYOM:host 解析当前会话可用的原生 provider(用户自定义/本地模型)+ 需注入的 env(keys)。
@@ -1486,7 +1610,7 @@ export class PiAgent extends BaseAgent {
      * 用它当"撤销开关"(上一版就是这么用的,那是个空操作,review 连点两轮)。运行期要收回子代理
      * 能力只有一条可证明有效的路:终止会话。
      */
-    let subagentRoutingEnabled = !reviewMode;
+    const subagentRoutingEnabled = !reviewMode;
     const writeSubagentRuntimeFile = async (
       next: { model?: string; provider?: string; pending?: boolean },
     ): Promise<boolean> => {
@@ -1835,6 +1959,75 @@ export class PiAgent extends BaseAgent {
     // preparePiExtraSpawnConfig 注册、但 handle 尚未交出,close() 不会跑 → 单独
     // 兜底注销 ctx 再抛(构造失败没有 proc 可关)。catch 必抛,故其后 proc 恒已赋值。
     let proc: PiRpcProcess;
+    const getAutoCompactThresholdPct = (): number | undefined =>
+      this.deps.runtimeConfig.autoCompactThresholdPct;
+    const autoCompactController =
+      getAutoCompactThresholdPct() === undefined
+        ? null
+        : new AutoCompactController({
+            logger: this.deps.logger.child('auto-compact'),
+            workdir: opts.workingDir,
+            agentKind: 'pi',
+            getThresholdPct: getAutoCompactThresholdPct,
+          });
+    // compact / 所有 prompt(/plan、分支切换、用户发送) / set_model / set_thinking_level
+    // 共用一条双向串行链。只等 compact 再发控制 RPC 是单向的。
+    let sessionRpcChain: Promise<void> = Promise.resolve();
+    const waitForSessionRpcIdle = async (): Promise<void> => {
+      await sessionRpcChain.catch(() => undefined);
+    };
+    const runExclusivePiRpc = <T>(fn: () => Promise<T>): Promise<T> => {
+      const run = sessionRpcChain.then(fn);
+      sessionRpcChain = run.then(() => undefined, () => undefined);
+      return run;
+    };
+    const requestPiCompact = async (instructions?: string): Promise<ManualCompactResult> => {
+      const command: Record<string, unknown> = { type: 'compact' };
+      if (instructions && instructions.trim().length > 0) {
+        command.customInstructions = instructions.trim();
+      }
+      const resp = await proc.request(command, { timeoutMs: PI_COMPACT_TIMEOUT_MS });
+      if (!resp.success) {
+        const err = (resp.error ?? '').toLowerCase();
+        if (err.includes('nothing to compact') || err.includes('too small')) {
+          return { noop: true };
+        }
+        throw new Error(`pi compact failed: ${resp.error ?? 'unknown'}`);
+      }
+      const data = (resp.data ?? {}) as { tokensBefore?: number; estimatedTokensAfter?: number };
+      const result: ManualCompactResult = {};
+      if (typeof data.tokensBefore === 'number') result.tokensBefore = data.tokensBefore;
+      if (typeof data.estimatedTokensAfter === 'number') result.estimatedTokensAfter = data.estimatedTokensAfter;
+      return result;
+    };
+    const runPiCompact = (instructions?: string): Promise<ManualCompactResult> =>
+      runExclusivePiRpc(() => requestPiCompact(instructions));
+    const maybeHostAutoCompact = (): void => {
+      if (closed || ctx.isStreaming) return;
+      if (!autoCompactController?.shouldCompactNow()) return;
+      const snapshot = autoCompactController.getLatestSnapshot();
+      this.deps.logger.info('pi host auto-compact triggered', {
+        threshold: autoCompactController.getCurrentThresholdPct(),
+        ratio: snapshot ? Number(snapshot.ratio.toFixed(3)) : undefined,
+        contextTokens: snapshot?.contextTokens,
+        contextWindow: snapshot?.contextWindow,
+      });
+      ctx.hostAutoCompactInFlight = true;
+      void runPiCompact()
+        .then((result) => {
+          if (result.noop) {
+            ctx.hostAutoCompactInFlight = false;
+            autoCompactController.onCompactCanceled('host_auto_compact_noop');
+          }
+        })
+        .catch((err) => {
+          ctx.hostAutoCompactInFlight = false;
+          autoCompactController.onCompactCanceled('host_auto_compact_failed');
+          this.deps.logger.warn('pi host auto-compact failed', {
+            message: err instanceof Error ? err.message : String(err),
+          });
+        });
+    };
     let sessionTransport: PiTransport | undefined;
     let runtimeCapabilityManifest: PiRuntimeCapabilityManifest | undefined;
     let runtimeCapabilityGeneration = 0;
@@ -2061,6 +2254,21 @@ export class PiAgent extends BaseAgent {
             clearActiveTurnPermissionPolicy('turn_terminal', { dismissPending: true });
           }
           translatePiEvent(event, queue, ctx);
+          if (autoCompactController) {
+            if (event.type === 'compaction_end') {
+              if (isFailedOrAbortedPiCompaction(event)) {
+                autoCompactController.onCompactCanceled(
+                  event.aborted === true ? 'compaction_aborted' : 'compaction_failed',
+                );
+              } else {
+                autoCompactController.onCompactBoundary();
+              }
+              ctx.hostAutoCompactInFlight = false;
+            } else if (event.type === 'message_end' || event.type === 'agent_settled') {
+              autoCompactController.onUsageUpdate(ctx.contextTokens, ctx.contextWindow);
+            }
+            if (event.type === 'agent_settled') maybeHostAutoCompact();
+          }
         },
         onExit: ({ code, signal }) => {
           disposePiTranslateContext(ctx);
@@ -2367,16 +2575,35 @@ export class PiAgent extends BaseAgent {
       } catch {
         /* best-effort:注销失败不掩盖原始启动错误 */
       }
-      // 轮 42 P1(codex-connector fresh evidence):startup 失败路径的 proc.close()
-      // 被 .catch 吞掉 —— 远端 daemon 会话 killRemoteSession 失败时, pi 子进程
-      // 可能仍带着凭证 env 在跑, 这里再删 configHome/permission/subagent 会让
-      // 存活 pi 丢 bridge/permission 状态。与 onExit/close() 同口径: 远端会话
-      // 失败不清理 runtime 文件, 残留交给 daemon idle 回收 / 下次 startSession
-      // 的清陈旧目录兜底(轮 40-w4-t4); 本地 stdio close 后进程必死, 保持清理。
-      await proc.close().catch(() => {});
-      if (!remote) {
+      // startup 失败时必须确认 proc 已关闭。关闭失败的 proc 进入 session-keyed
+      // quarantine；后续同 session startSession 会先重试 cleanup，绝不直接 spawn。
+      // 远端失败时不清 runtime 文件；本地也只有确认进程结束后才清，避免存活
+      // 进程丢 bridge/permission 状态。
+      let closeError: unknown = null;
+      try {
+        await proc.close();
+      } catch (error) {
+        closeError = error;
+        this.failedStartupCleanups.set(startupCleanupKey, {
+          proc,
+          promise: null,
+          ...(!remote
+            ? { cleanupLocal: () => {
+                cleanupConfigHome();
+                cleanupRuntimeFiles();
+              } }
+            : {}),
+        });
+      }
+      if (!remote && !closeError) {
         cleanupConfigHome();
         cleanupRuntimeFiles();
+      }
+      if (closeError) {
+        throw new Error(
+          `pi startup failed and process cleanup remains unconfirmed: ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+          { cause: err },
+        );
       }
       throw err;
     }
@@ -2414,6 +2641,139 @@ export class PiAgent extends BaseAgent {
      * setModel 的临界区正文。经 `setModelChain` 串行化后调用 —— 不要直接调它,
      * 并发进入会让 pending / 落定两次写交错。
      */
+    const nativeOffersModel = (providerId: string, modelId: string): boolean => {
+      const native = nativeProviderById.get(providerId);
+      if (!native) return false;
+      const nativeModel = resolveNativeModelId(providerId, modelId);
+      // inheritModels 里没有 api/catalogAddition 的行是 Pi 自带目录,不是缺失模型。
+      return native.models.some((candidate) => candidate.id === nativeModel);
+    };
+    const sameRecord = (
+      left?: Record<string, string>,
+      right?: Record<string, string>,
+    ): boolean => {
+      const a = left ?? {};
+      const b = right ?? {};
+      const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+      for (const key of keys) {
+        if (a[key] !== b[key]) return false;
+      }
+      return true;
+    };
+    const terminateUnconfirmedCatalogReload = async (cause?: unknown): Promise<never> => {
+      this.deps.logger.error(
+        'pi: catalog state unconfirmed; terminating session',
+        { message: cause instanceof Error ? cause.message : cause != null ? String(cause) : undefined },
+      );
+      try {
+        await proc.close();
+      } catch (closeErr) {
+        this.deps.logger.warn(
+          'pi: session termination after unconfirmed catalog reload also failed',
+          { message: closeErr instanceof Error ? closeErr.message : String(closeErr) },
+        );
+      }
+      throw new Error(
+        '[PI_CATALOG_RELOAD_UNCONFIRMED] 模型目录重载未确认，已终止本任务。请重新打开任务后再切换模型。',
+      );
+    };
+    const restoreNativeCatalog = async (
+      previousProviders: PiNativeProviderSpec[],
+    ): Promise<void> => {
+      // 先写盘再改内存：写失败时磁盘仍是新目录，内存也保持新目录，避免分叉后再抛。
+      const written = await this.writeModelsJson(
+        configHome,
+        previousProviders,
+        retainedRuntimeModel,
+        authProviderId,
+        { remote, fileOps },
+      );
+      nativeProviders = previousProviders;
+      nativeProviderById.clear();
+      nativeProviderBySourceId.clear();
+      for (const spec of previousProviders) {
+        if (spec.id === PI_PROVIDER_ID) continue;
+        nativeProviderById.set(spec.id, spec);
+        nativeProviderBySourceId.set(spec.sourceProviderId ?? spec.id, spec);
+      }
+      gatewayApiByModel.clear();
+      for (const [key, value] of written.gatewayApiByModel) gatewayApiByModel.set(key, value);
+      gatewayImageInputByModel.clear();
+      for (const [key, value] of written.gatewayImageInputByModel) {
+        gatewayImageInputByModel.set(key, value);
+      }
+    };
+    const restoreNativeCatalogOrTerminate = async (
+      previousProviders: PiNativeProviderSpec[],
+    ): Promise<void> => {
+      try {
+        await restoreNativeCatalog(previousProviders);
+      } catch (err) {
+        await terminateUnconfirmedCatalogReload(err);
+      }
+    };
+    const refreshLiveXaiCatalog = async (
+      modelId: string,
+      providerId?: string | null,
+    ): Promise<boolean> => {
+      if (!this.deps.resolvePiNativeProviders) return false;
+      try {
+        const live = await this.deps.resolvePiNativeProviders({
+          workingDir: opts.workingDir,
+          remoteHostId: opts.remoteHostId,
+          providerId,
+          model: modelId,
+          resumeSessionId: sdkSessionId || opts.resumeSessionId,
+        });
+        const liveXai = live?.providers.find(
+          (provider) => (provider.sourceProviderId ?? provider.id) === 'xai',
+        );
+        if (!live || !liveXai) return false;
+        // 远端 hostProxyForward 依赖启动时注入的 session token / 代理登记。
+        // 登录后才出现的 xAI 块带上隧道,请求会因没有 CINDY_PI_SESSION_TOKEN 失败。
+        if (liveXai.hostProxyForward && !proxySessionToken) return false;
+        const currentXai = nativeProviderForSource('xai');
+        if (currentXai) {
+          if (currentXai.baseUrl !== liveXai.baseUrl) return false;
+          if (!sameRecord(currentXai.headers, liveXai.headers)) return false;
+          if (liveXai.hostProxyForward && !currentXai.hostProxyForward) return false;
+        }
+        const envKey = liveXai.apiKeyEnvVar;
+        if (envKey) {
+          if (!(envKey in nativeEnv)) return false;
+          if (live.env[envKey] !== undefined && live.env[envKey] !== nativeEnv[envKey]) {
+            return false;
+          }
+        }
+        nativeProviderById.set(liveXai.id, liveXai);
+        nativeProviderBySourceId.set(liveXai.sourceProviderId ?? liveXai.id, liveXai);
+        nativeProviders = [
+          ...nativeProviders.filter(
+            (provider) => (provider.sourceProviderId ?? provider.id) !== 'xai',
+          ),
+          liveXai,
+        ];
+        const written = await this.writeModelsJson(
+          configHome,
+          nativeProviders,
+          retainedRuntimeModel,
+          authProviderId,
+          { remote, fileOps },
+        );
+        gatewayApiByModel.clear();
+        for (const [key, value] of written.gatewayApiByModel) gatewayApiByModel.set(key, value);
+        gatewayImageInputByModel.clear();
+        for (const [key, value] of written.gatewayImageInputByModel) {
+          gatewayImageInputByModel.set(key, value);
+        }
+        return nativeOffersModel(liveXai.id, modelId);
+      } catch (err) {
+        this.deps.logger.warn('pi live xAI catalog refresh failed', {
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return false;
+      }
+    };
     const switchModel = async (
       model: string,
       setOpts?: { providerId?: string | null; effort?: Effort },
@@ -2421,6 +2781,106 @@ export class PiAgent extends BaseAgent {
       const requestedProviderId = setOpts && Object.hasOwn(setOpts, 'providerId')
         ? setOpts.providerId
         : undefined;
+      assertRemotePiContextProfileAvailable(opts.remoteHostId, model, requestedProviderId);
+      // 心跳复用活进程会把当前 (provider, model) 再下发一次。
+      // spawn 能靠 custom model id 跑在 Pi 自带目录没有的 SuperGrok
+      // 路由上（grok-4.6）；重复 set_model 反而 fail-closed。
+      // 只对显式非 null 来源做 no-op：model-only 与 providerId=null
+      // （钉回网关）仍走 RPC。
+      const assertGatewayProtocolForModel = (
+        nextModel: string,
+        nextRequestedProviderId: string | null | undefined,
+      ): void => {
+        const nextProvider = resolveProviderForModel(nextModel, nextRequestedProviderId);
+        if (nextProvider !== PI_PROVIDER_ID) return;
+        const routeProviderId = nextRequestedProviderId !== undefined
+          ? nextRequestedProviderId
+          : mutableProviderId;
+        const resolvedApi = this.deps.resolvePiGatewayModelApi?.(routeProviderId, nextModel);
+        if (
+          resolvedApi === null ||
+          (resolvedApi !== undefined &&
+            resolvedApi !== 'anthropic-messages' &&
+            resolvedApi !== 'openai-responses')
+        ) {
+          throw new Error(
+            `Model Access v3 did not provide a Pi wire protocol for model: ${nextModel}`,
+          );
+        }
+        if (resolvedApi === undefined) {
+          throw new Error(`Pi wire protocol is not configured for model: ${nextModel}`);
+        }
+        const desiredApi = resolvedApi;
+        const configuredApi = gatewayApiByModel.get(nextModel);
+        if (configuredApi && configuredApi !== desiredApi) {
+          throw new Error(
+            `pi: provider switch for model '${nextModel}' requires API '${desiredApi}', but this session ` +
+              `started with '${configuredApi}'; restart the Pi session to change provider wire protocol.`,
+          );
+        }
+      };
+      if (
+        model === mutableModel &&
+        requestedProviderId !== undefined &&
+        requestedProviderId !== null &&
+        Object.is(requestedProviderId, mutableProviderId)
+      ) {
+        if (setOpts?.effort) {
+          assertStartupEffortAllowed(activeEffortSnapshot, setOpts.effort);
+        }
+        assertGatewayProtocolForModel(model, requestedProviderId);
+        // 同路由不打 set_model，但仍要重试子代理快照：初始写失败或确认写失败
+        // 留下 pending 时，心跳复用活进程必须能把文件重建/清 pending，
+        // 否则扩展会一直 fail-closed。不带 pending，路由已确认。
+        const sameRouteProvider = resolveProviderForModel(model, requestedProviderId);
+        const sameRouteWire = resolveWireModel(sameRouteProvider, model);
+        if (!(await writeSubagentRuntimeFile({ model: sameRouteWire, provider: sameRouteProvider }))) {
+          deps.logger.warn('pi: same-route setModel could not refresh subagent snapshot', {
+            model,
+            provider: sameRouteProvider,
+          });
+        }
+        deps.logger.debug('pi: setModel no-op; already on requested route', {
+          model,
+          providerId: requestedProviderId,
+        });
+        return;
+      }
+      // null = 钉回网关,绝不按模型名推断 xAI。只有 undefined(旧会话未持久化来源)
+      // 才允许 xai/ 前缀回退。`??` 会把 null 也吃掉,误进 live catalog 刷新。
+      const sourceHint = requestedProviderId === undefined
+        ? (model.startsWith('xai/') ? 'xai' : undefined)
+        : (requestedProviderId ?? undefined);
+      const liveProviderHint = sourceHint ? nativeProviderForSource(sourceHint) : undefined;
+      const needsXaiCatalogReload = sourceHint === 'xai'
+        && (!liveProviderHint || !nativeOffersModel(liveProviderHint.id, model));
+      if (needsXaiCatalogReload) {
+        const previousProviders = nativeProviders.slice();
+        const refreshed = await refreshLiveXaiCatalog(model, requestedProviderId);
+        if (refreshed && sdkSessionId) {
+          // Claude 热切先 applyFlagSettings 扩白名单;Pi 的 set_model 不重读 models.json,
+          // 但 switch_session 会 createRuntime → ModelConfig.load,等于无重启扩名单。
+          // success:false = 确定没重载,回滚安全。reject/超时 = 不知道 Pi 侧有没有吃到新
+          // models.json,回滚和放行都可能分叉,按未确认 set_model 一样终止会话。
+          let reloaded;
+          try {
+            reloaded = await proc.request({
+              type: 'switch_session',
+              sessionPath: sdkSessionId,
+            });
+          } catch (err) {
+            return await terminateUnconfirmedCatalogReload(err);
+          }
+          if (!reloaded.success) {
+            await restoreNativeCatalogOrTerminate(previousProviders);
+            throw new Error(
+              `pi: failed to reload models after catalog update: ${reloaded.error ?? 'unknown'}`,
+            );
+          }
+        } else if (!refreshed) {
+          await restoreNativeCatalogOrTerminate(previousProviders);
+        }
+      }
       // 显式选一个启动快照 nativeProviderById 里“无法服务该 model”的 BYOM provider 时 fail
       // closed:要么该 provider 是会话启动后才新增的(不在快照),要么它虽在、但用户编辑
       // 配置后从中删/改了这个 model。两种都会让 resolveProviderForModel 静默回落 cindy 网关;
@@ -2435,30 +2895,18 @@ export class PiAgent extends BaseAgent {
       }
       const provider = resolveProviderForModel(model, requestedProviderId);
       const wireModel = resolveWireModel(provider, model);
-      if (provider === PI_PROVIDER_ID) {
-        const routeProviderId = requestedProviderId !== undefined
-          ? requestedProviderId
-          : mutableProviderId;
-        const resolvedApi = this.deps.resolvePiGatewayModelApi?.(routeProviderId, model);
-        if (
-          resolvedApi === null ||
-          (resolvedApi !== undefined &&
-            resolvedApi !== 'anthropic-messages' &&
-            resolvedApi !== 'openai-responses')
-        ) {
-          throw new Error(
-            `Model Access v3 did not provide a Pi wire protocol for model: ${model}`,
-          );
-        }
-        const desiredApi = resolvedApi ?? 'anthropic-messages';
-        const configuredApi = gatewayApiByModel.get(model);
-        if (configuredApi && configuredApi !== desiredApi) {
-          throw new Error(
-            `pi: provider switch for model '${model}' requires API '${desiredApi}', but this session ` +
-              `started with '${configuredApi}'; restart the Pi session to change provider wire protocol.`,
-          );
-        }
+      if (
+        requestedProviderId
+        && requestedProviderId !== PI_PROVIDER_ID
+        && requestedProviderId !== 'xd'
+        && provider === PI_PROVIDER_ID
+      ) {
+        throw new Error(
+          `pi: provider '${requestedProviderId}' cannot serve model '${model}' even after reloading the live catalog; ` +
+            'restart the Pi session if the provider was added after this task started.',
+        );
       }
+      assertGatewayProtocolForModel(model, requestedProviderId);
       // effort 能力校验必须排在写路由快照**之前**:它会抛错中止本次切换,而快照一旦落盘就
       // 指向了新 provider —— 那正是父子路由分叉的形状(upstream #1451 与本 PR 的合并点)。
       const nextEffortSnapshot = resolveStartupEffortSnapshot(provider, model);
@@ -2611,6 +3059,8 @@ export class PiAgent extends BaseAgent {
       const data = (resp.data ?? {}) as { contextWindow?: number };
       if (typeof data.contextWindow === 'number' && data.contextWindow > 0) {
         ctx.contextWindow = data.contextWindow;
+        autoCompactController?.onContextWindowChanged(data.contextWindow);
+        maybeHostAutoCompact();
       }
     };
 
@@ -2649,6 +3099,8 @@ export class PiAgent extends BaseAgent {
 
       async send(message: UserMessage, sendOpts?: SendOptions): Promise<void> {
         rejectIfCancelled(sendOpts, 'send');
+        await waitForSessionRpcIdle();
+        rejectIfCancelled(sendOpts, 'send');
         if (sendOpts) handle.validateSendOptions?.(sendOpts);
         // 本轮策略覆盖:无策略显式清 null,不继承上一轮渠道策略(§7.2.5);内部续跑
         // (plan 审批实施轮 / 自动继续)不经 send,仍读这份闭包值继承(§7.10)。
@@ -2656,6 +3108,7 @@ export class PiAgent extends BaseAgent {
         const previousTurnPermissionPolicy = activeTurnPermissionPolicy;
         activeTurnPermissionPolicy = sendOpts?.turnPermissionPolicy ?? null;
         let providerAccepted = false;
+        let promptRequestStarted = false;
         try {
           if (reviewMode) {
             await assertReviewMessageContentPaths(
@@ -2679,9 +3132,22 @@ export class PiAgent extends BaseAgent {
             ? await readPiUserEntryIds()
             : null;
           rejectIfCancelled(sendOpts, 'send');
-          const resp = await proc.request(command);
+          promptRequestStarted = true;
+          const resp = await runExclusivePiRpc(() => proc.request(command, {
+            timeoutMs: PI_PROMPT_ACCEPTANCE_TIMEOUT_MS,
+            // Prompt acceptance may legitimately span multiple compaction
+            // retries. Bound each silent interval, not the whole progressing
+            // preflight, so a healthy long compaction is not killed at 10m.
+            refreshTimeoutOnEvent: (event) =>
+              PI_PROMPT_ACCEPTANCE_PROGRESS_EVENTS.has(event.type),
+          }));
           if (!resp.success) {
-            throw new Error(`pi prompt rejected: ${resp.error ?? 'unknown'}`);
+            if (resp.command !== command.type) {
+              throw new Error('pi prompt rejection response missing matching command');
+            }
+            throw new TurnDispatchRejectedError(
+              `pi prompt rejected before acceptance: ${resp.error ?? 'unknown'}`,
+            );
           }
           providerAccepted = true;
           await reportAcceptedPiUserEntry(userEntriesBefore, sendOpts?.onTranscriptUserEntry);
@@ -2689,6 +3155,21 @@ export class PiAgent extends BaseAgent {
           // 只在 Provider 尚未接受本轮时回滚。接受后的 transcript 回调失败不代表
           // turn 没启动；此时恢复旧 policy 会让正在运行的新 turn 用错安全边界。
           if (!providerAccepted) activeTurnPermissionPolicy = previousTurnPermissionPolicy;
+          // Before proc.request the turn is known not to have reached Pi. Once
+          // request starts, a transport/write/envelope failure cannot prove
+          // whether Pi accepted the prompt; only success:false is an explicit
+          // rejection. Fence every other unknown result before Goal may resume.
+          if (
+            promptRequestStarted
+            && !providerAccepted
+            && !(err instanceof TurnDispatchRejectedError)
+          ) {
+            const detail = err instanceof Error ? err.message : String(err);
+            throw new TurnDispatchUnconfirmedError(
+              `Pi did not confirm prompt acceptance: ${detail}`,
+              { cause: err },
+            );
+          }
           throw err;
         }
       },
@@ -2711,10 +3192,20 @@ export class PiAgent extends BaseAgent {
         const promptText = composePiPromptText(text, piExtraDirsPrompt(mutableExtraDirs));
         const command: Record<string, unknown> = { type: 'steer', message: escapeLeadingSlashCommand(promptText) };
         if (images.length > 0) command.images = images;
-        const resp = await proc.request(command);
+        const resp = await runExclusivePiRpc(() => proc.request(command));
         if (!resp.success) {
           throw new Error(`pi steer rejected: ${resp.error ?? 'unknown'}`);
         }
+      },
+
+      async requestGracefulStop(): Promise<void> {
+        if (proc.isClosed) throw new Error('No active Pi turn to stop');
+        dismissAllPendingPrompts('turn_aborted', 'deny');
+        const resp = await proc.request({ type: 'abort' });
+        if (!resp.success) {
+          throw new Error(`Pi graceful stop rejected: ${resp.error ?? 'unknown'}`);
+        }
+        clearActiveTurnPermissionPolicy('turn_aborted');
       },
 
       async abort(): Promise<void> {
@@ -2755,22 +3246,14 @@ export class PiAgent extends BaseAgent {
             message: err instanceof Error ? err.message : String(err),
           });
         }
-        // 轮 40-w4-t10 MEDIUM(修复的修复):runtime 文件清理必须在 finally ——
-        // proc.close 抛错(如 killRemoteSession 失败)时旧实现会跳过 cleanup,
-        // 权限文件/subagent snapshot 残留在磁盘。清理不受 close 成败影响。
-        // 轮 42 P1(codex-connector 修正):**远端会话不清理** —— killRemoteSession
-        // 失败说明远端 pi 可能仍持有 configHome/permission/subagent runtime
-        // 继续跑(凭证仍在 env), 删文件会让存活 pi 丢 bridge/permission 状态。
-        // 与 onExit 同口径:远端残留交给 daemon idle 回收/下次 startSession 的
-        // 清陈旧目录兜底(轮 40-w4-t4); 本地 stdio 无 daemon, close 后进程必死。
-        try {
-          await proc.close();
-        } finally {
-          if (!remote) {
-            // 会话结束:清理隔离的 configHome 与 runtime 文件(onExit 幂等,二者先到先清)。
-            cleanupConfigHome();
-            cleanupRuntimeFiles();
-          }
+        // A local close is only complete after proc.close confirms process exit.
+        // Until then the still-live process may continue reading its isolated
+        // config, permission policy, and subagent routing snapshot.
+        await proc.close();
+        if (!remote) {
+          // 会话结束:清理隔离的 configHome 与 runtime 文件(onExit 幂等,二者先到先清)。
+          cleanupConfigHome();
+          cleanupRuntimeFiles();
         }
       },
 
@@ -2792,7 +3275,7 @@ export class PiAgent extends BaseAgent {
         // 并发或连点切换(本地 + 远程控制端同时切)若交错,A 写 pending、B 写 pending、A 落定 B 的
         // 内容,盘上就会出现没人确认过的组合。串行化之后每次切换都看到确定的前一状态,
         // `previousSnapshot` 才是真正可回滚的那一份(review)。
-        const run = setModelChain.then(() => switchModel(model, setOpts));
+        const run = setModelChain.then(() => runExclusivePiRpc(() => switchModel(model, setOpts)));
         // 链永不停在 rejected 上:一次失败之后的切换仍要能排进来。
         setModelChain = run.then(() => {}, () => {});
         return run;
@@ -2802,10 +3285,10 @@ export class PiAgent extends BaseAgent {
         if (reviewMode) return;
         assertStartupEffortAllowed(activeEffortSnapshot, effort);
         if (activeEffortSnapshot?.length === 0) return;
-        const resp = await proc.request({
+        const resp = await runExclusivePiRpc(() => proc.request({
           type: 'set_thinking_level',
           level: effortToPiThinkingLevel(effort),
-        });
+        }));
         if (!resp.success) throw new Error(`pi set_thinking_level failed: ${resp.error ?? 'unknown'}`);
       },
 
@@ -2892,7 +3375,7 @@ export class PiAgent extends BaseAgent {
           if (enabled === planModeActive) return;
           let resp: Awaited<ReturnType<typeof proc.request>>;
           try {
-            resp = await proc.request({ type: 'prompt', message: '/plan' });
+            resp = await runExclusivePiRpc(() => proc.request({ type: 'prompt', message: '/plan' }));
           } catch (error) {
             // transport 超时/断线不能证明命令未到达 Pi；它可能已经完成 toggle。
             // 旧 boolean 此后不再可信，下次调用必须先从持久 entry 重同步。
@@ -2930,25 +3413,8 @@ export class PiAgent extends BaseAgent {
       },
 
       async compactSession(instructions?: string): Promise<ManualCompactResult> {
-        // pi 原生 compact:调 LLM 生成摘要(耗时数秒起),压缩边界经
-        // compaction_start/end 事件流上报,translator 映射成 compact_boundary。
-        // 压缩请求本身可能远超 RPC 默认 30s 超时(大上下文 + 网关排队),放宽到 10 分钟。
-        const command: Record<string, unknown> = { type: 'compact' };
-        if (instructions && instructions.trim().length > 0) command.customInstructions = instructions.trim();
-        const resp = await proc.request(command, { timeoutMs: PI_COMPACT_TIMEOUT_MS });
-        if (!resp.success) {
-          // 良性拒绝:上下文太小 / 无内容可压缩 —— 不是错误,返回 noop 让 UI 给信息性提示。
-          const err = (resp.error ?? '').toLowerCase();
-          if (err.includes('nothing to compact') || err.includes('too small')) {
-            return { noop: true };
-          }
-          throw new Error(`pi compact failed: ${resp.error ?? 'unknown'}`);
-        }
-        const data = (resp.data ?? {}) as { tokensBefore?: number; estimatedTokensAfter?: number };
-        const result: ManualCompactResult = {};
-        if (typeof data.tokensBefore === 'number') result.tokensBefore = data.tokensBefore;
-        if (typeof data.estimatedTokensAfter === 'number') result.estimatedTokensAfter = data.estimatedTokensAfter;
-        return result;
+        // 与 host 百分比闸共用 runPiCompact，避免手动/自动双发。
+        return runPiCompact(instructions);
       },
 
       async previewRewindFiles(): Promise<RewindFilesResult> {
@@ -3036,10 +3502,10 @@ export class PiAgent extends BaseAgent {
           ...(customInstructions ? { customInstructions } : {}),
           ...(label ? { label } : {}),
         }));
-        const switched = await proc.request(
+        const switched = await runExclusivePiRpc(() => proc.request(
           { type: 'prompt', message: `/cindy-branch-switch ${payload}` },
           { timeoutMs: PI_BRANCH_NAVIGATION_TIMEOUT_MS },
-        );
+        ));
         if (!switched.success) {
           throw new Error(`pi branch navigation failed: ${switched.error ?? 'unknown'}`);
         }
@@ -3172,7 +3638,9 @@ export class PiAgent extends BaseAgent {
     // 用隔离的 coding-agent 目录承载 fork 专属 models.json(PI_CODING_AGENT_DIR),
     // --session-dir 仍指向共享 sessions(两者是独立 flag),互不干扰。
     const forkHome = joinRemotePosixPath(agentHome, 'fork-tmp', randomBytes(8).toString('hex'));
-    await this.writeModelsJson(forkHome);
+    await this.writeModelsJson(forkHome, [], undefined, undefined, {
+      offlineValidationOnly: true,
+    });
 
     // fork 全程离线(clone/fork 是纯 session 文件操作),真凭证拿不到也不影响;
     // 尽量取真 authEnv(含网关相关变量),失败则占位。
@@ -3335,7 +3803,7 @@ export class PiAgent extends BaseAgent {
    * pi extension UI 子协议桥。
    *
    * cindy-bridge 的权限询问走 confirm(title='cindy:permission', message=JSON
-   * {toolName, input}),映射成 InteractionRequest(kind='permission')交给
+   * {toolName, input, resolvedCredentialPaths}),映射成 InteractionRequest(kind='permission')交给
    * cindy 审批 UI;resolver 缺失或抛错一律 deny(fail-closed —— ask 档没人接
    * 不得放行)。其它 dialog 请求 cancelled 兜底,不挂死 agent loop。
    *
@@ -3433,15 +3901,33 @@ export class PiAgent extends BaseAgent {
     if (method === 'confirm' && event.title === 'cindy:permission') {
       let toolName = 'tool';
       let input: Record<string, unknown> = {};
+      let resolvedCredentialPaths: string[] | null | undefined;
       try {
         const payload = JSON.parse(typeof event.message === 'string' ? event.message : '{}') as {
           toolName?: unknown;
           input?: unknown;
+          resolvedCredentialPaths?: unknown;
         };
         if (typeof payload.toolName === 'string' && payload.toolName.length > 0) toolName = payload.toolName;
         if (payload.input && typeof payload.input === 'object') input = payload.input as Record<string, unknown>;
+        if (Object.hasOwn(payload, 'resolvedCredentialPaths')) {
+          resolvedCredentialPaths = Array.isArray(payload.resolvedCredentialPaths)
+            && payload.resolvedCredentialPaths.length <= 64
+            && payload.resolvedCredentialPaths.every((item) => typeof item === 'string' && item.length > 0)
+            ? payload.resolvedCredentialPaths as string[]
+            : null;
+        }
       } catch {
         /* keep defaults */
+      }
+      if (
+        (toolName === 'read' || toolName === 'grep' || toolName === 'find' || toolName === 'ls' || toolName === 'bash')
+        && resolvedCredentialPaths === undefined
+      ) {
+        // Readonly calls and bash input redirects only reach Host with bridge-supplied
+        // canonical-path evidence. Missing evidence means an old or malformed bridge,
+        // not a safe read; require explicit consent instead of trusting a link name.
+        resolvedCredentialPaths = null;
       }
       const {
         resolver,
@@ -3527,6 +4013,7 @@ export class PiAgent extends BaseAgent {
           const permissionRequest = {
             kind: 'permission' as const,
             requestId: id,
+            toolUseId: id,
             toolName,
             input,
             ...(hostApprovalPresentation?.title
@@ -3682,6 +4169,7 @@ export class PiAgent extends BaseAgent {
           const action = normalizePiToolForAutoReview({
             toolName,
             input,
+            resolvedCredentialPaths,
             workspaceRoots,
             readRoots,
           });
