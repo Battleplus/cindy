@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
     persistedSdkSessionId: null,
   })),
   closeSession: vi.fn(async () => undefined),
+  getSession: vi.fn(() => undefined),
   withRehydrateCloseSuppressed: vi.fn(
     async <T>(_sessionId: string, fn: () => Promise<T>): Promise<T> => fn(),
   ),
@@ -75,7 +76,7 @@ vi.mock('../../../maker-host/claude-transcript-relocation.js', () => ({
   relocateClaudeTranscriptsForSessionMove: h.relocate,
 }));
 vi.mock('../../../maker-host/index.js', () => ({
-  getMaker: () => ({ closeSession: h.closeSession }),
+  getMaker: () => ({ closeSession: h.closeSession, getSession: h.getSession }),
   withRehydrateCloseSuppressed: h.withRehydrateCloseSuppressed,
 }));
 
@@ -380,6 +381,16 @@ describe('local-db:sessions:update handler wiring', () => {
 
     expect(h.routeLock).toHaveBeenCalledWith('codex-local', expect.any(Function));
     expect(h.closeSession).toHaveBeenCalledWith('codex-local');
+  });
+
+  it('skips the handle close when an accepted turn is still running', async () => {
+    // route lock 在 provider acceptance 时就释放，不是 turn 结束；移动抢到锁时若
+    // turn 仍在跑，关 handle 会打断它。锁内复查 live turn，跑着就不关。
+    h.getSession.mockReturnValue({ isTurnRunning: () => true });
+
+    await invokeUpdate('codex-local', { workingDir: '/new/dir' });
+
+    expect(h.closeSession).not.toHaveBeenCalled();
   });
 
   it('does not close the handle when the codex workingDir does not change', async () => {

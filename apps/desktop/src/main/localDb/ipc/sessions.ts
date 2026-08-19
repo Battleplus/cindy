@@ -1522,6 +1522,18 @@ export function registerSessionIpc(
       ) {
         try {
           const m = await import('../../maker-host/index.js');
+          // route lock 在 provider acceptance（Session.send 返回 accepted）时就释放，
+          // 不是 turn 结束：移动可能在 accepted 的 turn 仍在跑时抢到锁。锁内复查 live
+          // turn，跑着就不关，避免打断正在跑的 Pi/Codex turn（review P1）。该轮在旧
+          // cwd 上收尾；后续 send 走 lazy-create + reconcileCreateOptsWithDb 用新
+          // workingDir 重建。
+          const liveSession = m.getMaker().getSession(sid);
+          if (liveSession?.isTurnRunning()) {
+            log.warn('pi/codex handle close skipped on session move (turn still running)', {
+              sessionId: sid,
+            });
+            return;
+          }
           await m.withRehydrateCloseSuppressed(sid, async () => {
             await m.getMaker().closeSession(sid);
           });
