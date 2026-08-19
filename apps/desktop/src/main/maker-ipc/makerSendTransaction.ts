@@ -15,6 +15,7 @@ import {
 } from '../maker-host/send-outcome.js';
 import { isCredentialModeSwitchBusyError } from '../maker-host/codex-credential-switch.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
+import { normalizeWorkingDirForStorage } from '../../shared/workingDir.js';
 import {
   extractPlainText,
   prependHandoffToUserMessage,
@@ -619,6 +620,29 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       }
       await deps.ensureRemoteReadyForSessionStart({ session: sess, createOpts });
 
+      if (sess) {
+        // 会话在 handle 存活期间被移动、且当时 turn 仍在跑(move 侧 close 被跳过):
+        // 活 handle 仍持有旧 workDir,直接复用会在旧沙箱跑(#2941 竞态复发)。对比 DB
+        // 权威 working_dir,不一致则软关闭旧 handle 落回 lazy-create,下次 spawn 用新 cwd。
+        const dbWorkingDir = await deps.readSessionWorkingDirFromDb(sessionId).catch(() => null);
+        const handleWorkingDir = normalizeWorkingDirForStorage(sess.workDir);
+        if (dbWorkingDir && handleWorkingDir && handleWorkingDir !== dbWorkingDir) {
+          deps.log.info('send: live handle working_dir is stale after session move; recreating', {
+            sessionId,
+            handleWorkingDir,
+            workingDir: dbWorkingDir,
+          });
+          try {
+            await deps.withRehydrateCloseSuppressed(sessionId, () => deps.closeSession(sessionId));
+          } catch (err) {
+            deps.log.warn('send: close stale handle after session move failed; falling back to lazy-create', {
+              sessionId,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          sess = undefined;
+        }
+      }
       if (sess) {
         const ok = await deps.checkWorkDirExists(
           sessionId,

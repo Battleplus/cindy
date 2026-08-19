@@ -26,7 +26,9 @@ const h = vi.hoisted(() => ({
     persistedSdkSessionId: null,
   })),
   closeSession: vi.fn(async () => undefined),
-  getSession: vi.fn(() => undefined),
+  getSession: vi.fn(
+    (): { isTurnRunning: () => boolean } | undefined => undefined,
+  ),
   withRehydrateCloseSuppressed: vi.fn(
     async <T>(_sessionId: string, fn: () => Promise<T>): Promise<T> => fn(),
   ),

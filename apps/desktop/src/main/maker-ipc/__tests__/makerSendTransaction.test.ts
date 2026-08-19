@@ -883,6 +883,57 @@ describe('maker SEND transaction', () => {
     expect(recoveredSession.send).toHaveBeenCalled();
   });
 
+  it('recreates a live session whose working_dir moved while the handle stayed alive', async () => {
+    // 场景:move 与运行中 turn 竞态,move 侧跳过了 close;活 handle 仍持旧 cwd。
+    const liveSession = createSession({ id: 'session-1', workDir: '/data/old-sandbox' });
+    const rebuiltSession = createSession({ id: 'session-1', workDir: '/data/new-sandbox' });
+    const createOpts: MakerSessionCreateOpts = {
+      id: 'session-1',
+      agentKind: 'codex',
+      workingDir: '/data/new-sandbox',
+      model: 'gpt-5.4',
+    };
+    const { deps } = createDeps({
+      getSession: vi.fn(() => liveSession),
+      readSessionWorkingDirFromDb: vi.fn(async () => '/data/new-sandbox'),
+      bootstrapSession: vi.fn(async () => ({
+        session: rebuiltSession,
+        didInjectOrcaInstructions: false,
+        didInjectProjectContext: false,
+      })),
+    });
+    const transaction = createMakerSendTransaction(deps);
+
+    await expect(transaction.sendToAgentAccepted('session-1', 'hello', createOpts)).resolves.toMatchObject({
+      accepted: true,
+      outcome: { kind: 'session-dispatch', dispatched: true },
+    });
+
+    expect(deps.closeSession).toHaveBeenCalledWith('session-1');
+    expect(deps.bootstrapSession).toHaveBeenCalledWith(
+      expect.objectContaining({ workingDir: '/data/new-sandbox' }),
+    );
+    expect(liveSession.send).not.toHaveBeenCalled();
+    expect(rebuiltSession.send).toHaveBeenCalled();
+  });
+
+  it('reuses a live session when its working_dir still matches the DB value', async () => {
+    const liveSession = createSession({ id: 'session-1', workDir: '/data/same-sandbox' });
+    const { deps } = createDeps({
+      getSession: vi.fn(() => liveSession),
+      readSessionWorkingDirFromDb: vi.fn(async () => '/data/same-sandbox'),
+    });
+    const transaction = createMakerSendTransaction(deps);
+
+    await expect(transaction.sendToAgentAccepted('session-1', 'hello')).resolves.toMatchObject({
+      accepted: true,
+    });
+
+    expect(deps.closeSession).not.toHaveBeenCalled();
+    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+    expect(liveSession.send).toHaveBeenCalled();
+  });
+
   it('lazy-create adopts the DB working_dir when the caller-provided one is stale', async () => {
     // 场景:输入队列崩溃快照回放,createOpts 内嵌启动 sweep 改写前的老路径。
     const staleDir = '/data/xdt-maker/dialogues/2026-06-22/lazy-1';
