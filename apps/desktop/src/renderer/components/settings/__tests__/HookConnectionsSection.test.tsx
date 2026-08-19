@@ -993,6 +993,53 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
     expect(ipc.setEnabled).not.toHaveBeenCalled();
   });
 
+  it('re-runs the add flow instead of rebinding when an add attempt fails as already-bound', async () => {
+    const alreadyBound = {
+      state: 'failed' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: 'already-bound',
+      installUrl: null,
+      teamId: 'TEAM_ACTIVE',
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: alreadyBound,
+        binding: {
+          ...alreadyBound,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.addBinding).toHaveBeenCalledOnce());
+    expect(ipc.rebindTeam).not.toHaveBeenCalled();
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
   it('blocks conflicting Slack authorization controls while reauthorization is in flight', async () => {
     let resolveAdd: ((value: { hook: SlackHookView }) => void) | undefined;
     ipc.addBinding.mockReturnValue(

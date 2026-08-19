@@ -1860,12 +1860,17 @@ export function HookConnectionsSection() {
                   </span>
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      const pending = hook.pendingBind;
+                      // already-bound 的「新增」失败也携带 teamId, 但这不是要重绑那个
+                      // team —— 用户本意是新增另一个 workspace, 重试应回到 add 流程,
+                      // 让授权页可以切换 workspace; 只有真正的重绑终止态才 pin 到 team。
+                      const alreadyBound = pending?.reason === HOOK_BIND_REASON_ALREADY_BOUND;
                       handleReauthorize(
-                        hook.pendingBind?.teamId ? 'rebind' : 'add',
-                        hook.pendingBind?.teamId ?? undefined,
-                      )
-                    }
+                        !alreadyBound && pending?.teamId ? 'rebind' : 'add',
+                        !alreadyBound ? pending?.teamId ?? undefined : undefined,
+                      );
+                    }}
                     disabled={slackAuthActionPending}
                     aria-busy={slackAuthActionPending}
                     className={pillBtn}
