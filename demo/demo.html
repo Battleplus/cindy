@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mobileVoiceInput 语音插入行为演示</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 32px; background: #f6f7f9;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #1f2328; width: 1180px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #57606a; margin-bottom: 20px; line-height: 1.6; }
+  .note {
+    background: #fff8e5; border: 1px solid #f0d48a; border-radius: 8px;
+    padding: 10px 14px; font-size: 12.5px; color: #6b5b1a; margin-bottom: 20px; line-height: 1.55;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card {
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 10px; color: #0969da; }
+  .row { display: flex; align-items: baseline; gap: 10px; font-size: 14px; margin: 7px 0; }
+  .label { flex: 0 0 78px; color: #57606a; font-size: 12.5px; text-align: right; }
+  .mono {
+    font-family: "SF Mono", Consolas, "Courier New", monospace;
+    background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px;
+    padding: 4px 8px; white-space: pre; font-size: 14px;
+  }
+  .caret { color: #d73a49; font-weight: bold; }
+  .ins { background: #d4f4dd; color: #116329; padding: 1px 2px; border-radius: 3px; }
+  .old { color: #a40e26; text-decoration: line-through; text-decoration-color: #d73a49; }
+  .tag {
+    display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px;
+    font-weight: 600; margin-left: 6px; vertical-align: middle;
+  }
+  .tag-new { background: #d4f4dd; color: #116329; }
+  .tag-old { background: #ffebe9; color: #a40e26; }
+  .caretline { color: #57606a; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>移动端语音输入 · 光标插入行为演示</h1>
+  <div class="sub">
+    演示对象：<b>appendVoiceTranscriptDraftWithRange</b>（纯函数，与
+    <code>apps/mobile/src/session/mobileVoiceInput.ts</code> 逐字一致，由单测交叉验证）。<br>
+    语义：录音开始时捕获一次光标/选区（<code>caret.start</code> / <code>caret.end</code>），识别文本就地插入或替换选区。
+  </div>
+  <div class="note">
+    ⚠️ 本图为<b>逻辑层演示</b>：本开发环境无 iOS 设备/模拟器，无法录制真机语音链路。
+    下图为该纯函数的真实输入/输出，四组场景对应单测
+    <code>mobileVoiceInput.test.ts</code> 中断言的字面量结果。
+  </div>
+  <div class="grid" id="grid"></div>
+
+<script>
+// ==== 与 apps/mobile/src/session/mobileVoiceInput.ts 逐字一致的函数实现 ====
+function appendVoiceTranscriptDraftWithRange(current, transcript, caret) {
+  const text = transcript.trim();
+  if (!text) return { draft: current, insertion: null };
+  if (caret) {
+    const start = Math.max(0, Math.min(current.length, caret.start));
+    const end = Math.max(start, Math.min(current.length, caret.end));
+    return {
+      draft: `${current.slice(0, start)}${text}${current.slice(end)}`,
+      insertion: { start, end: start + text.length, text },
+    };
+  }
+  const base = current.trimEnd();
+  if (!base) {
+    return { draft: text, insertion: { start: 0, end: text.length, text } };
+  }
+  if (/[\s\n]$/.test(current)) {
+    const start = current.length;
+    return { draft: `${current}${text}`, insertion: { start, end: start + text.length, text } };
+  }
+  const start = base.length + 1;
+  return { draft: `${base}\n${text}`, insertion: { start, end: start + text.length, text } };
+}
+// ==== 函数实现结束 ====
+
+function renderDraftWithCaret(draft, caret) {
+  const before = draft.slice(0, caret.start);
+  const sel = draft.slice(caret.start, caret.end);
+  const after = draft.slice(caret.end);
+  return (
+    '<span class="mono">' +
+    escapeHtml(before) +
+    (sel ? '<span class="caret">▌' + escapeHtml(sel) + '▌</span>' : '<span class="caret">▌</span>') +
+    escapeHtml(after) +
+    '</span>'
+  );
+}
+
+function highlightInsertion(draft, ins) {
+  return (
+    '<span class="mono">' +
+    escapeHtml(draft.slice(0, ins.start)) +
+    '<span class="ins">' + escapeHtml(draft.slice(ins.start, ins.end)) + '</span>' +
+    escapeHtml(draft.slice(ins.end)) +
+    '</span>'
+  );
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '␤\n');
+}
+
+const cases = [
+  { title: '场景 1 · 光标在开头', draft: '世界', caret: { start: 0, end: 0 }, transcript: '你好' },
+  { title: '场景 2 · 光标在中间', draft: '世界', caret: { start: 1, end: 1 }, transcript: '你好' },
+  { title: '场景 3 · 光标在末尾', draft: '世界', caret: { start: 2, end: 2 }, transcript: '你好' },
+  { title: '场景 4 · 选中替换', draft: '世界你好', caret: { start: 0, end: 2 }, transcript: '欢迎' },
+];
+
+const grid = document.getElementById('grid');
+for (const c of cases) {
+  const fixed = appendVoiceTranscriptDraftWithRange(c.draft, c.transcript, c.caret);
+  const old = appendVoiceTranscriptDraftWithRange(c.draft, c.transcript, null); // 修复前：忽略光标
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML =
+    '<h2>' + escapeHtml(c.title) +
+    '  <span class="caretline">caret={' + c.caret.start + ',' + c.caret.end + '}</span></h2>' +
+    '<div class="row"><span class="label">录音前草稿</span>' +
+      renderDraftWithCaret(c.draft, c.caret) + '</div>' +
+    '<div class="row"><span class="label">语音识别</span>' +
+      '<span class="mono">' + escapeHtml(c.transcript) + '</span></div>' +
+    '<div class="row"><span class="label">修复后</span>' +
+      highlightInsertion(fixed.draft, fixed.insertion) +
+      '<span class="tag tag-new">本 PR</span></div>' +
+    '<div class="row"><span class="label">修复前</span>' +
+      '<span class="mono old">' + escapeHtml(old.draft) + '</span>' +
+      '<span class="tag tag-old">旧行为</span></div>';
+  grid.appendChild(card);
+}
+</script>
+</body>
+</html>
