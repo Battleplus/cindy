@@ -361,6 +361,27 @@ describe('local-db:sessions:update handler wiring', () => {
     expect(h.withRehydrateCloseSuppressed).toHaveBeenCalled();
   });
 
+  it('holds the session route lock across the move write and handle close', async () => {
+    let locked = false;
+    h.routeLock.mockImplementation(async (_sessionId, task) => {
+      locked = true;
+      try {
+        return await task();
+      } finally {
+        locked = false;
+      }
+    });
+    h.closeSession.mockImplementation(async () => {
+      // send 与移动共用同一把 route lock：close 必须在锁内执行，才不会打断刚起的 send。
+      expect(locked).toBe(true);
+    });
+
+    await invokeUpdate('codex-local', { workingDir: '/new/dir' });
+
+    expect(h.routeLock).toHaveBeenCalledWith('codex-local', expect.any(Function));
+    expect(h.closeSession).toHaveBeenCalledWith('codex-local');
+  });
+
   it('does not close the handle when the codex workingDir does not change', async () => {
     await invokeUpdate('codex-local', { workingDir: '/old/dir' });
     expect(h.closeSession).not.toHaveBeenCalled();

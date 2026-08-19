@@ -8100,6 +8100,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           providerId: sessions.providerId,
           effort: sessions.effort,
           fastMode: sessions.fastMode,
+          workingDir: sessions.workingDir,
         })
         .from(sessions)
         .where(eq(sessions.id, sessionId))
@@ -8135,6 +8136,17 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       co.providerId = row.providerId;
       co.effort = (row.effort ?? undefined) as CreateOpts['effort'];
       co.fastMode = !!row.fastMode;
+      // 会话移动后，renderer/输入队列里缓存的 createOpts 仍可能内嵌旧 workingDir
+      // （review P1 #2941）：DB 行是唯一真源，行上有 workingDir 时无条件对齐，避免
+      // 下次 lazy-create 在旧 cwd 上重新 spawn。
+      if (row.workingDir && row.workingDir !== co.workingDir) {
+        log.warn('lazy-create: createOpts workingDir drifted from DB (session move); reconciling', {
+          sessionId,
+          staleWorkingDir: co.workingDir,
+          dbWorkingDir: row.workingDir,
+        });
+        co.workingDir = row.workingDir;
+      }
     } catch (error) {
       // context.rebuild clears sdk_session_id before the next bootstrap. If the
       // DB truth cannot be read, continuing with caller-supplied opts could

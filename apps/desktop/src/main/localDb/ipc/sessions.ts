@@ -1466,43 +1466,77 @@ export function registerSessionIpc(
       !beforeMove.remoteHostId &&
       beforeMove.workingDir &&
       typeof p.workingDir === 'string' &&
-      p.workingDir &&
-      normalizeWorkingDirForStorage(beforeMove.workingDir) !== p.workingDir
-    ) {
-      const m = await import('../../maker-host/claude-transcript-relocation.js');
-      const reloc = await m.relocateClaudeTranscriptsForSessionMove(
-        sid,
-        beforeMove.workingDir,
-        p.workingDir,
-      );
-      if (reloc.persistedSdkSessionId) {
-        (p as Record<string, unknown>).sdkSessionId = reloc.persistedSdkSessionId;
+      !!p.workingDir &&
+      normalizeWorkingDirForStorage(beforeMove.workingDir) !== p.workingDir;
+    const writeAndFinalize = async (): Promise<void> => {
+      await writeSessionPatch(db, sid, setObj, p.status);
+      // session-git-pr-context:/clear 经此处写 clearedAt——边界之前的消息对用户
+      // 不可见,PR 引用同步重算(fire-and-forget,内部按 clearedAt/rewindAt 过滤)。
+      if (p.clearedAt !== undefined) {
+        noteSessionClearBoundary(sid, p.clearedAt as string | null);
+        // sidebar-card-mode(codex review):summary 是基于 clear 前内容生成的,clear 后
+        // 已过时;SessionCard / rail flyout 优先用 summary 而非 preview,不清就会继续
+        // 显示旧任务摘要。这里一并清空,待 clear 后新一轮 turn-done 重新生成。
+        await db.update(sessions).set({ summary: null }).where(eq(sessions.id, sid));
+        // 广播 summary:null,让已挂载的 sidebar 立即清掉旧摘要(codex review)——renderer 的
+        // clearSession 乐观 patch 只带 sdkSessionId/clearedAt、不含 summary,本 update handler
+        // 也不另发 patched;不广播则卡片/rail 会继续显示 clear 前摘要直到一次全量 refresh。
+        if (isOwnerScopeCurrent(ownerScope)) {
+          broadcastSessionPatched(sid, { summary: null }, ownerScope);
+        }
+        void recomputePrRefsForSession(sid).catch(() => undefined);
       }
-    }
-    // Pi / Codex 会话移动：没有 cc 那套 CLI 转录要搬，但已 spawn 的进程仍持有旧 cwd，
-    // 继续接 send 会在旧沙箱里跑（#2941）。与 cc 关 handle 同口径：软关闭活跃 handle，
-    // 下一次 send 用新 workingDir lazy-create。withRehydrateCloseSuppressed 保住 worktree /
-    // 临时附件；closeSession 对不在内存的会话是 no-op。best-effort，不阻断移动。
-    if (
-      beforeMove &&
-      (beforeMove.agentKind === 'pi' || beforeMove.agentKind === 'codex') &&
-      !beforeMove.remoteHostId &&
-      beforeMove.workingDir &&
-      typeof p.workingDir === 'string' &&
-      p.workingDir &&
-      normalizeWorkingDirForStorage(beforeMove.workingDir) !== p.workingDir
-    ) {
-      try {
-        const m = await import('../../maker-host/index.js');
-        await m.withRehydrateCloseSuppressed(sid, async () => {
-          await m.getMaker().closeSession(sid);
-        });
-      } catch (err) {
-        log.warn('pi/codex handle close on session move failed (session move proceeds)', {
-          sessionId: sid,
-          err: err instanceof Error ? err.message : String(err),
-        });
+      // workingDir 实际变化的本机 cc 会话:迁移 CLI 转录后再查询返回行/广播,保证
+      // renderer 拿到更新结果时转录已就位(用户可立即续聊),且迁移中持久化的最新
+      // sdkSessionId 能进返回行与广播 patch——否则 renderer 留着旧 resume id,下一次
+      // lazy-create 仍会 resume 到 pre-fork 会话。内部 best-effort 不抛错。
+      // 动态 import 避免 localDb → maker-host 的静态模块环(同下方 sessionTaskSummary)。
+      if (
+        beforeMove &&
+        beforeMove.agentKind === 'cc' &&
+        !beforeMove.remoteHostId &&
+        beforeMove.workingDir &&
+        typeof p.workingDir === 'string' &&
+        p.workingDir &&
+        isWorkingDirMove
+      ) {
+        const m = await import('../../maker-host/claude-transcript-relocation.js');
+        const reloc = await m.relocateClaudeTranscriptsForSessionMove(
+          sid,
+          beforeMove.workingDir,
+          p.workingDir,
+        );
+        if (reloc.persistedSdkSessionId) {
+          (p as Record<string, unknown>).sdkSessionId = reloc.persistedSdkSessionId;
+        }
       }
+      // Pi / Codex 会话移动：没有 cc 那套 CLI 转录要搬，但已 spawn 的进程仍持有旧 cwd，
+      // 继续接 send 会在旧沙箱里跑（#2941）。与 cc 关 handle 同口径：软关闭活跃 handle，
+      // 下一次 send 用新 workingDir lazy-create。withRehydrateCloseSuppressed 保住 worktree /
+      // 临时附件；closeSession 对不在内存的会话是 no-op。best-effort，不阻断移动。
+      if (
+        beforeMove &&
+        (beforeMove.agentKind === 'pi' || beforeMove.agentKind === 'codex') &&
+        !beforeMove.remoteHostId &&
+        isWorkingDirMove
+      ) {
+        try {
+          const m = await import('../../maker-host/index.js');
+          await m.withRehydrateCloseSuppressed(sid, async () => {
+            await m.getMaker().closeSession(sid);
+          });
+        } catch (err) {
+          log.warn('pi/codex handle close on session move failed (session move proceeds)', {
+            sessionId: sid,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    };
+    if (isWorkingDirMove || p.status !== undefined) {
+      await withSessionRouteLock(sid, writeAndFinalize);
+    } else {
+      await writeAndFinalize();
     }
     const row = await selectSessionWithCount(db, sid);
     if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
