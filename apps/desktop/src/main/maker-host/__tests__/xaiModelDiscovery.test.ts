@@ -123,6 +123,33 @@ describe('xAI account model discovery', () => {
     expect(applySnapshot).toHaveBeenCalledWith([]);
   });
 
+  it('skips discovery cleanly when no access token is available (not logged in)', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'cindy-xai-models-'));
+    tempDirs.push(dir);
+    const cacheFile = path.join(dir, 'xai-models.json');
+    const applySnapshot = vi.fn();
+    const fetchImpl = vi.fn();
+    const deps = {
+      fetchImpl: fetchImpl as typeof fetch,
+      getAccessToken: async () => {
+        throw new Error('xAI 未登录:请先在「设置 → 模型供应商」登录 xAI(SuperGrok)');
+      },
+      peekAccessToken: () => null,
+      hasLogin: () => false,
+      getConnectionSource: () => 'explicit-provider-oauth' as const,
+      getScopeKey: () => 'owner-a:1',
+      cacheFilePath: () => cacheFile,
+      applySnapshot,
+      invalidateAuth: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn() },
+    };
+
+    await expect(refreshXaiModelsFromHttp(deps)).resolves.toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(applySnapshot).not.toHaveBeenCalled();
+    expect(deps.log.warn).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the current snapshot on temporary failure and never applies late account results', async () => {
     const applySnapshot = vi.fn();
     await expect(
