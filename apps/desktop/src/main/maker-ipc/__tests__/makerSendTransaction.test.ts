@@ -917,6 +917,25 @@ describe('maker SEND transaction', () => {
     expect(rebuiltSession.send).toHaveBeenCalled();
   });
 
+  it('keeps the live handle when working_dir moved but no createOpts was provided (legacy direct send)', async () => {
+    // 场景:move 与运行中 turn 竞态跳过 close 后，旧版 controller 的 direct
+    // maker:send 省略 createOpts。此时无从 lazy-create 重建，不应软关闭后 NOT_FOUND。
+    const liveSession = createSession({ id: 'session-1', workDir: '/data/old-sandbox' });
+    const { deps } = createDeps({
+      getSession: vi.fn(() => liveSession),
+      readSessionWorkingDirFromDb: vi.fn(async () => '/data/new-sandbox'),
+    });
+    const transaction = createMakerSendTransaction(deps);
+
+    await expect(transaction.sendToAgentAccepted('session-1', 'hello')).resolves.toMatchObject({
+      accepted: true,
+    });
+
+    expect(deps.closeSession).not.toHaveBeenCalled();
+    expect(deps.bootstrapSession).not.toHaveBeenCalled();
+    expect(liveSession.send).toHaveBeenCalled();
+  });
+
   it('reuses a live session when its working_dir still matches the DB value', async () => {
     const liveSession = createSession({ id: 'session-1', workDir: '/data/same-sandbox' });
     const { deps } = createDeps({

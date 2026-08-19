@@ -627,20 +627,33 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
         const dbWorkingDir = await deps.readSessionWorkingDirFromDb(sessionId).catch(() => null);
         const handleWorkingDir = normalizeWorkingDirForStorage(sess.workDir);
         if (dbWorkingDir && handleWorkingDir && handleWorkingDir !== dbWorkingDir) {
-          deps.log.info('send: live handle working_dir is stale after session move; recreating', {
-            sessionId,
-            handleWorkingDir,
-            workingDir: dbWorkingDir,
-          });
-          try {
-            await deps.withRehydrateCloseSuppressed(sessionId, () => deps.closeSession(sessionId));
-          } catch (err) {
-            deps.log.warn('send: close stale handle after session move failed; falling back to lazy-create', {
+          if (!createOpts) {
+            // 旧版 controller 的 direct maker:send 可合法省略 createOpts
+            // (sessionSendHandler 兼容这类调用):没有 createOpts 就无法 lazy-create
+            // 重建，软关闭后下方会抛 NOT_FOUND，把原本可向存活会话发送的消息误拒。
+            // 保留活 handle 继续发送（仍是旧 cwd，但优于硬失败），等带 createOpts 的
+            // 后续 send / 显式 close 再重建。
+            deps.log.warn('send: live handle working_dir is stale after session move, but no createOpts to rebuild; keeping handle', {
               sessionId,
-              err: err instanceof Error ? err.message : String(err),
+              handleWorkingDir,
+              workingDir: dbWorkingDir,
             });
+          } else {
+            deps.log.info('send: live handle working_dir is stale after session move; recreating', {
+              sessionId,
+              handleWorkingDir,
+              workingDir: dbWorkingDir,
+            });
+            try {
+              await deps.withRehydrateCloseSuppressed(sessionId, () => deps.closeSession(sessionId));
+            } catch (err) {
+              deps.log.warn('send: close stale handle after session move failed; falling back to lazy-create', {
+                sessionId,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+            sess = undefined;
           }
-          sess = undefined;
         }
       }
       if (sess) {
