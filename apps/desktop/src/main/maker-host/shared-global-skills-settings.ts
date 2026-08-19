@@ -51,9 +51,13 @@ const store = createOverrideSettingsFile<SharedGlobalSkillsSettings>({
 });
 
 export function readSharedGlobalSkillsSettings(): SharedGlobalSkillsSettings {
+  // 隐藏配置约定：直接改文件也是正式 opt-in 入口，读取前按 mtime 失效缓存，
+  // 否则运行期间写入 crossAgentSyncEnabled 仍会读到旧值直到重启（review P2）。
+  store.invalidateIfChanged();
   return store.read();
 }
 
 export function readSharedGlobalSkillsSettingsState(): OverrideSettingsState<SharedGlobalSkillsSettings> {
+  store.invalidateIfChanged();
   return store.readState();
 }
