@@ -223,6 +223,11 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
   // Set synchronously (before any await) in onOpen so the auto-fetch path
   // can bail out if manual dialog was opened while the fetch was in flight.
   const dialogOpenedRef = useRef(false);
+  // Once a user explicitly opens either manual history or a pre-install
+  // preview, suppress the pending automatic retry for this hook lifetime.
+  // This must outlive dialogOpenedRef: dismiss() intentionally resets the
+  // latter, but the automatic attempt must not resurrect after dismissal.
+  const autoNoticeSuppressedRef = useRef(false);
   // Stored handle for the dismiss cleanup timer so onOpen can cancel it if
   // the user re-opens the dialog before the 200ms animation delay fires.
   const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -281,6 +286,7 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
     if (lastRead === appVersion) return;
 
     let cancelled = false;
+    autoNoticeSuppressedRef.current = false;
 
     (async () => {
       // A transient CDN miss should not permanently lose the upgrade notice for
@@ -291,13 +297,13 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
         // version's notes. We don't want to blast a new user with 30 versions
         // of history on first launch.
         const index = lastRead === null ? null : await fetchReleaseNotesIndex();
-        if (cancelled || dialogOpenedRef.current) return;
+        if (cancelled || dialogOpenedRef.current || autoNoticeSuppressedRef.current) return;
 
         const targets = versionsToFetch(index, lastRead, appVersion).slice(
           -MAX_AGGREGATED_VERSIONS,
         );
         const results = await fetchVersionsForCurrentLocale(targets);
-        if (cancelled || dialogOpenedRef.current) return;
+        if (cancelled || dialogOpenedRef.current || autoNoticeSuppressedRef.current) return;
         const notes = results.filter((n): n is ReleaseNotes => n !== null);
 
         if (notes.length > 0 && notes.some((n) => n.version === appVersion)) {
@@ -327,7 +333,12 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
           return;
         }
 
-        if (attempt === 0 && !cancelled && !dialogOpenedRef.current) {
+        if (
+          attempt === 0 &&
+          !cancelled &&
+          !dialogOpenedRef.current &&
+          !autoNoticeSuppressedRef.current
+        ) {
           await new Promise<void>((resolve) => {
             setTimeout(resolve, AUTO_NOTICE_RETRY_DELAY_MS);
           });
@@ -397,6 +408,7 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
     }
     // Set synchronously so the auto-fetch path can see it immediately even
     // before this async IIFE has called setOpen/setMode.
+    autoNoticeSuppressedRef.current = true;
     dialogOpenedRef.current = true;
     const appVersion = window.electronAPI.appVersion;
 
@@ -467,6 +479,7 @@ export function useUpdateNotice(): UseUpdateNoticeReturn {
       clearTimeout(dismissTimerRef.current);
       dismissTimerRef.current = null;
     }
+    autoNoticeSuppressedRef.current = true;
     dialogOpenedRef.current = true;
     const appVersion = window.electronAPI.appVersion;
 
