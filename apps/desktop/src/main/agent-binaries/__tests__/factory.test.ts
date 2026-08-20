@@ -125,3 +125,41 @@ describe('createBinaryProvisioner emit 时序', () => {
     expect(statuses[statuses.length - 1]).toBe('ready');
   });
 });
+
+
+describe('离线启动 fallback', () => {
+  it('本地有已验证版本时:manifest fetch 失败仍返回 ready', async () => {
+    // 获取真实 userData 路径（electron-stub 提供 tmp 目录）
+    const { app } = await import('electron');
+    const userData = app.getPath('userData');
+    const installSubdir = 'offline-fallback-test';
+    const version = '1.2.3-verified';
+    const binaryName = 'test-binary';
+
+    // 创建本地已验证版本目录结构
+    const versionDir = path.join(userData, installSubdir, version);
+    fs.mkdirSync(versionDir, { recursive: true });
+    const binPath = path.join(versionDir, binaryName);
+    fs.writeFileSync(binPath, 'fake binary');
+    fs.chmodSync(binPath, 0o755);
+    // 创建 .verified 标记文件
+    fs.writeFileSync(path.join(versionDir, '.verified'), '');
+
+    // 让 manifest 和 cache 都返回 null（模拟 CDN 不可达）
+    const { getCachedManifest, fetchManifest } = await import('../../manifestService.js');
+    vi.mocked(getCachedManifest).mockReturnValue(null as any);
+    vi.mocked(fetchManifest).mockResolvedValue(null as any);
+
+    const provisioner = createBinaryProvisioner({
+      vendorKey: 'test',
+      manifestField: 'testField',
+      installSubdir,
+      artifact: { kind: 'raw', binaryName },
+    });
+
+    const result = await provisioner.prepare();
+
+    expect(result.ready).toBe(true);
+    expect(result.binaryPath).toBe(binPath);
+  });
+});

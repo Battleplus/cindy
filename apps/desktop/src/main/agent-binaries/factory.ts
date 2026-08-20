@@ -177,19 +177,20 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
     async prepare(opts) {
       const onProgress = opts?.onProgress;
       try {
-        // 1. 拉 manifest（不带 dev fallback —— dev mode 归属在 Boss 2 包壳层）
+        // 1. 先检查本地已验证版本（离线秒启动，避免 manifest 超时等待）
+        const binaryName = deriveBinaryName();
+        const local = findLatestVerifiedBinary(config.installSubdir, binaryName);
+        if (local) {
+          emit({ status: 'ready', installedVersion: local.version, binaryPath: local.binaryPath }, onProgress);
+          // 静默拉 manifest 更新缓存（不阻塞启动）
+          getCachedManifest() ?? fetchManifest(undefined, opts?.signal).catch(() => {});
+          return { ready: true, binaryPath: local.binaryPath };
+        }
+
+        // 2. 本地无已验证版本，拉 manifest 获取最新信息
         let manifest = getCachedManifest();
         if (!manifest) manifest = await fetchManifest(undefined, opts?.signal);
         if (!manifest) {
-          // Offline fallback: scan for locally installed + verified versions.
-          // The manifest may be unavailable (CDN down, proxy failure) while
-          // the runtime binary is already installed and verified on disk.
-          const binaryName = deriveBinaryName();
-          const local = findLatestVerifiedBinary(config.installSubdir, binaryName);
-          if (local) {
-            emit({ status: 'ready', installedVersion: local.version, binaryPath: local.binaryPath }, onProgress);
-            return { ready: true, binaryPath: local.binaryPath };
-          }
           emit({
             status: 'failed',
             error: { code: 'manifest_failed', message: 'Failed to fetch manifest from CDN' },
@@ -197,7 +198,7 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
           return { ready: false, binaryPath: '', error: 'manifest_failed' };
         }
 
-        // 2. 取 vendor asset
+        // 3. 取 vendor asset
         const asset: VendorAsset | undefined = getVendorAsset(manifest, config.manifestField);
         if (!asset) {
           emit({
@@ -226,7 +227,6 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
         emit({ availableVersion: asset.version }, onProgress);
 
         // 3. 已安装命中
-        const binaryName = deriveBinaryName();
         const finalBinPath = getFinalBinPath(config.installSubdir, asset.version, binaryName);
         if (isInstalled(config.installSubdir, asset.version, binaryName)) {
           emit({
