@@ -993,6 +993,8 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
     expect(ipc.setEnabled).not.toHaveBeenCalled();
   });
 
+  // The server may include the collided teamId in an add failure; that identity
+  // describes the conflict, not a request to pin the next OAuth flow to that team.
   it('re-runs the add flow instead of rebinding when an add attempt fails as already-bound', async () => {
     const alreadyBound = {
       state: 'failed' as const,
