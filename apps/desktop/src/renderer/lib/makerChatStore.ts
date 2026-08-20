@@ -6107,6 +6107,12 @@ const BACKGROUND_TASK_RECONCILE_DELAY_MS = 3000;
  */
 const WAKE_BRIDGE_RECONCILE_MIN_AGE_MS = 10_000;
 const backgroundTaskReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/**
+ * A local_bash task may outlive the first active:false snapshot. Allow one
+ * bounded follow-up snapshot so a later missing terminal event can still be
+ * reconciled, without turning this lifecycle hook into polling.
+ */
+const backgroundTaskStaleRetrySessions = new Set<string>();
 
 function cancelBackgroundTaskReconcile(sessionId: string): void {
   const timer = backgroundTaskReconcileTimers.get(sessionId);
@@ -6155,6 +6161,25 @@ function scheduleBackgroundTaskReconcile(sessionId: string): void {
             authorityPendingContinuations:
               typeof pendingContinuations === 'number' ? pendingContinuations : null,
           });
+
+          // A task that is still present in this first snapshot may finish
+          // after the activity edge and lose its terminal event. Take exactly
+          // one bounded follow-up snapshot; the next response either sees the
+          // task again (and leaves it alone) or proves it stale and stops it.
+          const candidateStillAlive = tasks.some(
+            (task) =>
+              (typeof task.taskId === 'string' && staleRunningCandidates.has(task.taskId)) ||
+              (typeof task.toolUseId === 'string' && staleRunningCandidates.has(task.toolUseId)),
+          );
+          const hasRetriedStaleCandidates = backgroundTaskStaleRetrySessions.has(sessionId);
+          if (candidateStillAlive && !hasRetriedStaleCandidates) {
+            backgroundTaskStaleRetrySessions.add(sessionId);
+            scheduleBackgroundTaskReconcile(sessionId);
+          } else {
+            // The bounded retry window is complete, whether the task was
+            // stopped or remained alive. Do not retain session IDs forever.
+            backgroundTaskStaleRetrySessions.delete(sessionId);
+          }
         })
         .catch(() => {
           // 静默:与其余快照拉取失败同口径(失败不对账,下次翻转沿 / 挂载重试)。
@@ -7987,9 +8012,12 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       const p = raw as { sessionId?: string; active?: boolean } | null;
       if (!p || typeof p.sessionId !== 'string' || !p.sessionId) return;
       if (p.active) {
+        backgroundTaskStaleRetrySessions.delete(p.sessionId);
         cancelBackgroundTaskReconcile(p.sessionId);
         return;
       }
+      // A new inactive edge starts a fresh, bounded stale-task retry window.
+      backgroundTaskStaleRetrySessions.delete(p.sessionId);
       if (isRemoteSessionSticky(p.sessionId)) return;
       // 调度前粗筛:没有 running 条目就不必挂定时器;到点后还会再次捕获候选集。
       // 唤醒桥接(pendingTaskWake)泄漏时 running 条目为空,同样需要对账,放行。
@@ -9231,18 +9259,17 @@ function settleRemoteOptimisticFailure(sessionId: string, clientId: string, erro
 async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
   const existing = remoteOptimisticPumps.get(sessionId);
   if (existing) return existing;
-  // Self-reference is intentional: a detached clear/owner generation must not
-  // keep draining after a newer pump replaces this Promise in the registry.
-  // eslint-disable-next-line prefer-const
-  let run!: Promise<void>;
-  run = (async () => {
+  // The holder avoids a temporal-dead-zone type error while allowing the async
+  // body to compare its identity with a newer pump after its first await.
+  const runRef: { promise?: Promise<void> } = {};
+  const run = (async () => {
     while (true) {
       const record = firstUnacceptedRemoteOptimisticSend(sessionId);
       if (!record || record.dispatching) return;
       const prepared = await prepareRemoteOptimisticSend(sessionId, record);
       if (prepared.kind === 'deferred') return;
       if (prepared.kind === 'cancelled') {
-        if (remoteOptimisticPumps.get(sessionId) !== run) return;
+        if (remoteOptimisticPumps.get(sessionId) !== runRef.promise) return;
         continue;
       }
       if (prepared.kind === 'failed') {
@@ -9257,7 +9284,7 @@ async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
       // the active pump to dispatch them deterministically. A clear/owner boundary,
       // however, detaches the old pump so it cannot race a newer generation.
       if (result.kind === 'cancelled') {
-        if (remoteOptimisticPumps.get(sessionId) !== run) return;
+        if (remoteOptimisticPumps.get(sessionId) !== runRef.promise) return;
         continue;
       }
       if (result.kind === 'failed') {
@@ -9266,8 +9293,9 @@ async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
       }
     }
   })().finally(() => {
-    if (remoteOptimisticPumps.get(sessionId) === run) remoteOptimisticPumps.delete(sessionId);
+    if (remoteOptimisticPumps.get(sessionId) === runRef.promise) remoteOptimisticPumps.delete(sessionId);
   });
+  runRef.promise = run;
   remoteOptimisticPumps.set(sessionId, run);
   return run;
 }
