@@ -201,9 +201,10 @@ describe('user rename notification ordering', () => {
     // 智能标题仍能满足 `WHERE title = 期望值` 把用户刚保存的名字盖掉(review P1)。
     for (const [note, write] of [
       // local-db:sessions:update(本机重命名框)
+      // 写库在 writeAndFinalize 闭包内执行(与 move 原子段共用 route lock)。
       [
         "if (typeof p.title === 'string') noteUserTitleWritten(sid);",
-        'await withStatusWriteLock(sid, p.status, () => writeSessionPatch(db, sid, setObj, p.status));',
+        'await writeSessionPatch(db, sid, setObj, p.status);',
       ],
       // patchSessionMetaInDb(device-link 远程改名)
       [
