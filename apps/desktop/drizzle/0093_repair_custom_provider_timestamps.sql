@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` ADD `codex_plan_json` text;

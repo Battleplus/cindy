@@ -438,6 +438,58 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     expect((await getCustomProvider('openrouter'))?.name).toBe('Edited in another window');
   });
 
+  it('recovers malformed stored updated_at values in both update paths', async () => {
+    mountDb();
+    const rows = [
+      ['iso-update', '2026-08-19T01:45:07Z'],
+      ['invalid-update', 'not-a-timestamp'],
+      ['numeric-discovery', '1234'],
+      ['iso-discovery', '2026-08-19T01:45:07Z'],
+    ] as const;
+    const insert = raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const [id, updatedAt] of rows) {
+      insert.run(id, id, JSON.stringify(valid.runtimes), null, 0, 1, updatedAt);
+    }
+
+    await updateCustomProvider('iso-update', { ...valid, id: 'iso-update' }, 2_000);
+    await updateCustomProvider('invalid-update', { ...valid, id: 'invalid-update' }, 3_000);
+    const numericSnapshot = await getCustomProvider('numeric-discovery');
+    expect(numericSnapshot).not.toBeNull();
+    expect(
+      await updateCustomProviderIfUnchanged(
+        'numeric-discovery',
+        numericSnapshot!,
+        { ...numericSnapshot!, name: 'numeric-discovery-updated' },
+        1_000,
+      ),
+    ).toBe(true);
+    const isoSnapshot = await getCustomProvider('iso-discovery');
+    expect(isoSnapshot).not.toBeNull();
+    expect(
+      await updateCustomProviderIfUnchanged(
+        'iso-discovery',
+        isoSnapshot!,
+        { ...isoSnapshot!, name: 'iso-discovery-updated' },
+        4_000,
+      ),
+    ).toBe(true);
+
+    const updated = raw!.prepare('SELECT id, updated_at FROM custom_providers ORDER BY id').all() as Array<{
+      id: string;
+      updated_at: unknown;
+    }>;
+    expect(updated).toEqual([
+      { id: 'invalid-update', updated_at: 3_000 },
+      { id: 'iso-discovery', updated_at: 4_000 },
+      { id: 'iso-update', updated_at: 2_000 },
+      { id: 'numeric-discovery', updated_at: 1_235 },
+    ]);
+  });
+
   it('never persists headers and still dedupes models on normalize', async () => {
     mountDb();
     await createCustomProvider({
