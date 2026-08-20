@@ -134,6 +134,8 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
         // rg exit code 1 = no matches(--files 模式下不会出现);其它非零是真错。
         // 但 --files 即使工作目录空也是 exit 0,所以非 0 必然异常。
         log.warn('rg exited non-zero', { code, signal, elapsedMs, files: files.length });
+        reject(new Error(`ripgrep exited with code ${code}${signal ? ` (signal: ${signal})` : ''}`));
+        return;
       }
       log.debug('rg done', { workdir: args.workdir, files: files.length, truncated, elapsedMs });
       resolve({ files, truncated, elapsedMs });

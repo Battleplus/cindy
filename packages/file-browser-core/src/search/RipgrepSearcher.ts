@@ -230,6 +230,11 @@ export class RipgrepSearcher extends EventEmitter {
     child.on('close', (code, signal) => {
       if (state.ended) return;
       // rg 退出码: 0 = 有命中, 1 = 无命中, 2 = 致命错误。
+      if (code === 2 && signal === null) {
+        this.log.warn('rg exited with fatal error', { searchId, code });
+        this.emitError(searchId, `ripgrep exited with fatal error (code ${code})`);
+        return;
+      }
       if (code !== 0 && code !== 1 && signal === null) {
         this.log.warn('rg exited non-zero', { searchId, code });
       }
@@ -251,6 +256,21 @@ export class RipgrepSearcher extends EventEmitter {
   /** 取消所有活跃搜索(用于 window 关闭等清理场景)。 */
   cancelAll(): void {
     for (const id of Array.from(this.active.keys())) this.cancel(id);
+  }
+
+  /** Emit an error event and clean up the search state. */
+  private emitError(searchId: string, message: string): void {
+    const state = this.active.get(searchId);
+    if (!state || state.ended) return;
+    state.ended = true;
+    try { state.reader.close(); } catch { /* ignore */ }
+    this.killChild(state.child);
+    this.active.delete(searchId);
+    this.emit('event', {
+      type: 'error',
+      searchId,
+      message,
+    } satisfies SearchEvent);
   }
 
   private finalize(searchId: string, truncated: boolean): void {
