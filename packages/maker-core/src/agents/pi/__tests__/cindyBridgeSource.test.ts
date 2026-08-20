@@ -1599,4 +1599,20 @@ describe('cindy-bridge extension source', () => {
       ).toContain(sourcePath);
     },
   );
+
+
+  it('does not delete CINDY_PI_BASH_PACKAGE_HOME from process.env', () => {
+    // #3070: cindyBridge() must NOT delete the env var after reading it.
+    // When cindyBridge() is called again in the same process (hot reload,
+    // bridge rewrite), the var must still be available.
+    // See also: CINDY_PI_PACKAGE_MANAGEMENT_ENV is still deleted (defense in depth).
+    expect(CINDY_BRIDGE_EXTENSION_SOURCE).not.toContain(
+      'delete process.env[PI_BASH_PACKAGE_HOME_ENV]',
+    );
+    // Verify the other secret IS still deleted (as intended).
+    expect(CINDY_BRIDGE_EXTENSION_SOURCE).toContain(
+      'delete process.env[PI_PACKAGE_MANAGEMENT_ENV]',
+    );
+  });
+
 });
