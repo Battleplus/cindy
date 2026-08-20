@@ -842,7 +842,7 @@ import {
   resetSchedulerReady,
 } from './maker-ipc/schedule.js';
 import { registerProjectAutomationIpc } from './maker-ipc/project-automation.js';
-import { startGoalController, getGoalController } from './goal-host/index.js';
+import { startGoalController, getGoalController, resetGoalController } from './goal-host/index.js';
 import { startLearnHost, getLearnController, resetLearnController } from './learn-host/index.js';
 import { fetchHubSkillReference } from './learn-host/hubReference.js';
 import { registerLearnIpc, broadcastLearnEvent } from './learn-host/registerIpc.js';
@@ -1380,9 +1380,11 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
       const maker = getMakerIfReady();
       if (maker) await maker.shutdown();
       resetMaker();
+      resetGoalController();
     } catch (err) {
       authBoundaryLog.error(`maker shutdown on ${reason} failed (non-fatal):`, err);
       resetMaker();
+      resetGoalController();
     }
     // device-link 单持有者仲裁:必须在 dispose DbClient **之前**释放持有权行
     // (dispose 同步 clearCurrentDbClient,之后 store 不可用,只能等 15s+ 心跳
