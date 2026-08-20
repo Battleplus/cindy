@@ -3,7 +3,7 @@
  * 覆盖: rg 致命退出(非零 exit code)应 reject 而非返回空结果。
  */
 
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
