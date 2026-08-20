@@ -364,6 +364,62 @@ describe('活动熄灭触发的 stale running 对账', () => {
     }
   });
 
+  it('active:true 在快照请求飞行中到达时,丢弃旧响应且不安排重试', async () => {
+    const sid = `active-inflight-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      applyTask(sid, { taskId: 't-active', status: 'running', taskType: 'local_bash' });
+      let resolveList!: (value: { tasks: unknown[] }) => void;
+      listTasks.mockReturnValue(
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+      );
+
+      emitActivity({ sessionId: sid, active: false });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(listTasks).toHaveBeenCalledTimes(1);
+
+      emitActivity({ sessionId: sid, active: true });
+      resolveList({ tasks: [] });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(listTasks).toHaveBeenCalledTimes(1);
+      expect(makerChatStore.getSnapshot(sid).taskUpdates?.get('t-active')?.status).toBe(
+        'running',
+      );
+    } finally {
+      makerChatStore.purgeSession(sid);
+    }
+  });
+
+  it('purge 在快照请求飞行中到达时,旧响应不会重建会话或安排重试', async () => {
+    const sid = `purge-inflight-${Math.random().toString(36).slice(2, 8)}`;
+    let resolveList!: (value: { tasks: unknown[] }) => void;
+    try {
+      applyTask(sid, { taskId: 't-purged', status: 'running', taskType: 'local_bash' });
+      listTasks.mockReturnValue(
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+      );
+
+      emitActivity({ sessionId: sid, active: false });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(listTasks).toHaveBeenCalledTimes(1);
+
+      makerChatStore.purgeSession(sid);
+      resolveList({ tasks: [] });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(listTasks).toHaveBeenCalledTimes(1);
+      expect(makerChatStore.getSnapshot(sid).taskUpdates?.size ?? 0).toBe(0);
+    } finally {
+      makerChatStore.purgeSession(sid);
+    }
+  });
+
   it('到点前 active:true 取消对账;仍在快照中的任务不被收口', async () => {
     const sid = `act2-${Math.random().toString(36).slice(2, 8)}`;
     try {
