@@ -5632,6 +5632,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
     const live = maker.getSession(sessionId);
     // pendingContinuations:「任务已终态、wake turn 尚未启动或仍在跑」的
+
     // continuation claim 数。tasks 在任务终态后立即不含该任务,renderer 的
     // 唤醒桥接对账不能拿空 tasks 当「无后续」—— 必须本字段为 0 才允许收口。
     // session 不活跃时返回 undefined(序列化后 renderer 收到 null),语义为
