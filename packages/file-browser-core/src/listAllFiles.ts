@@ -37,6 +37,8 @@ export interface ListAllFilesArgs {
   rgPath: string;
   /** 自定义上限(默认 LIST_ALL_FILES_CAP);超出后 kill rg + 标记 truncated。 */
   cap?: number;
+  /** 额外环境变量(传给 rg 子进程);会和当前进程环境合并。 */
+  env?: Record<string, string>;
 }
 
 export interface ListAllFilesResult {
@@ -75,6 +77,7 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
       child = spawn(args.rgPath, rgArgs, {
         cwd: args.workdir,
         windowsHide: true,
+        ...(args.env ? { env: { ...process.env, ...args.env } } : undefined),
       });
     } catch (err) {
       log.error('rg spawn failed', { workdir: args.workdir, error: String(err) });
@@ -131,9 +134,11 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
       const elapsedMs = Date.now() - start;
       // truncated 时 rg 因被我们 SIGTERM 退出,code/signal 不一定 0 — 仍当 success。
       if (!truncated && code !== 0 && code !== null) {
-        // rg exit code 1 = no matches(--files 模式下不会出现);其它非零是真错。
-        // 但 --files 即使工作目录空也是 exit 0,所以非 0 必然异常。
-        log.warn('rg exited non-zero', { code, signal, elapsedMs, files: files.length });
+        // rg --files 即使工作目录空也是 exit 0,所以非 0 必然是 rg 配置/文件系统错误。
+        // 不应把部分或空结果当成功返回——调用方无法区分"真的没文件"和"rg 崩了"。
+        log.error('rg exited non-zero', { code, signal, elapsedMs, files: files.length });
+        reject(new Error(`rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`));
+        return;
       }
       log.debug('rg done', { workdir: args.workdir, files: files.length, truncated, elapsedMs });
       resolve({ files, truncated, elapsedMs });

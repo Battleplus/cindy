@@ -229,9 +229,18 @@ export class RipgrepSearcher extends EventEmitter {
 
     child.on('close', (code, signal) => {
       if (state.ended) return;
-      // rg 退出码: 0 = 有命中, 1 = 无命中, 2 = 致命错误。
-      if (code !== 0 && code !== 1 && signal === null) {
-        this.log.warn('rg exited non-zero', { searchId, code });
+      // rg 退出码: 0 = 有命中, 1 = 无命中, 2 = 致命错误(配置/文件系统)。
+      // 退出码 2 应报告为 error,让调用方区分"没匹配"和"搜索失败"。
+      // 退出码 >2 或 signal 终止视作异常(用户取消走 cancel 路径,signal=null)。
+      if (code === 2 || (code !== 0 && code !== 1 && signal === null)) {
+        this.log.error('rg exited with error', { searchId, code, signal });
+        this.emit('event', {
+          type: 'error',
+          searchId,
+          message: `rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`,
+        } satisfies SearchEvent);
+        this.finalize(searchId, false);
+        return;
       }
       this.finalize(searchId, false);
     });
