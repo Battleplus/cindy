@@ -559,6 +559,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
         reason: 'not-installed',
         installUrl: `https://hook.example.test/slack/install?team=${teamId}`,
         teamId,
+        intent: 'add',
       },
       binding: {
         state: 'failed',
@@ -611,6 +612,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
         reason: 'not-installed',
         installUrl: 'https://hook.example.test/slack/install?team=TEAM_A',
         teamId: 'TEAM_A',
+        intent: 'add',
       },
       binding: {
         state: 'failed',
@@ -872,6 +874,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
       reason: null,
       installUrl: null,
       teamId: null,
+      intent: 'add',
     };
     ipc.get.mockResolvedValue({
       hook: {
@@ -908,6 +911,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
       reason: null,
       installUrl: null,
       teamId: null,
+      intent: 'add',
     };
     ipc.get.mockResolvedValue({
       hook: {
@@ -954,6 +958,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
       reason: null,
       installUrl: null,
       teamId: 'TEAM_PINNED',
+      intent: 'rebind',
     };
     ipc.get.mockResolvedValue({
       hook: {
@@ -1003,6 +1008,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
       reason: 'already-bound',
       installUrl: null,
       teamId: 'TEAM_ACTIVE',
+      intent: 'add',
     };
     ipc.get.mockResolvedValue({
       hook: {
@@ -1042,6 +1048,57 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
     expect(ipc.setEnabled).not.toHaveBeenCalled();
   });
 
+  // An add attempt that ends denied/expired/failed also carries the collided
+  // teamId from the server reply; the retry must stay in the add flow so the
+  // user can pick a different workspace, not pin the OAuth page to that team.
+  it('keeps the retry in the add flow when a terminal add state echoes a teamId', async () => {
+    const deniedWithTeam = {
+      state: 'denied' as const,
+      message: null,
+      authorizeUrl: null,
+      reason: null,
+      installUrl: null,
+      teamId: 'TEAM_ECHOED',
+      intent: 'add' as const,
+    };
+    ipc.get.mockResolvedValue({
+      hook: {
+        ...BASE_HOOK,
+        enabled: true,
+        status: 'connected',
+        serverMultiTeam: true,
+        bindings: [
+          {
+            teamId: 'TEAM_ACTIVE',
+            teamName: 'Active workspace',
+            slackUserId: 'USER_ACTIVE',
+            slackUserName: 'active-user',
+            displaced: false,
+          },
+        ],
+        pendingBind: deniedWithTeam,
+        binding: {
+          ...deniedWithTeam,
+          slackUserId: null,
+          slackUserName: null,
+          teamName: null,
+        },
+      },
+    });
+
+    render(<HookConnectionsSection />);
+    await expandChannelCard(SLACK_CARD);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'settings.remoteControl.hook.binding.reauthorize',
+      }),
+    );
+
+    await waitFor(() => expect(ipc.addBinding).toHaveBeenCalledOnce());
+    expect(ipc.rebindTeam).not.toHaveBeenCalled();
+    expect(ipc.setEnabled).not.toHaveBeenCalled();
+  });
+
   it('blocks conflicting Slack authorization controls while reauthorization is in flight', async () => {
     let resolveAdd: ((value: { hook: SlackHookView }) => void) | undefined;
     ipc.addBinding.mockReturnValue(
@@ -1056,6 +1113,7 @@ describe('HookConnectionsSection binding actions (Telegram / X)', () => {
       reason: null,
       installUrl: null,
       teamId: null,
+      intent: 'add',
     };
     ipc.get.mockResolvedValue({
       hook: {

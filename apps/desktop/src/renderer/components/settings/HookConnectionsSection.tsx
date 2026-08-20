@@ -1862,13 +1862,14 @@ export function HookConnectionsSection() {
                     type="button"
                     onClick={() => {
                       const pending = hook.pendingBind;
-                      // already-bound 的「新增」失败也携带 teamId, 但这不是要重绑那个
-                      // team —— 用户本意是新增另一个 workspace, 重试应回到 add 流程,
-                      // 让授权页可以切换 workspace; 只有真正的重绑终止态才 pin 到 team。
-                      const alreadyBound = pending?.reason === HOOK_BIND_REASON_ALREADY_BOUND;
+                      // 重试入口由发起意图决定, 不能靠 teamId 猜: add 流的终止态
+                      // (denied/expired/failed/already-bound)即使 server 回显 teamId
+                      // 也是「新增」失败, 重试必须回 add 流程让授权页可切换 workspace;
+                      // 只有发起时就 pin 到 team 的定向重绑才走 rebindTeam。
+                      const rebindIntent = pending?.intent === 'rebind';
                       handleReauthorize(
-                        !alreadyBound && pending?.teamId ? 'rebind' : 'add',
-                        !alreadyBound ? pending?.teamId ?? undefined : undefined,
+                        rebindIntent ? 'rebind' : 'add',
+                        rebindIntent ? pending?.teamId ?? undefined : undefined,
                       );
                     }}
                     disabled={slackAuthActionPending}

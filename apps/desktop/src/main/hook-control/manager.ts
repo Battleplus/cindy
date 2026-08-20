@@ -1799,6 +1799,7 @@ export function createHookControlManager(deps: HookControlManagerDeps): HookCont
         reason: null,
         installUrl: null,
         teamId: null,
+        intent: 'add',
       };
     } else {
       markBindingPending();
@@ -1823,6 +1824,7 @@ export function createHookControlManager(deps: HookControlManagerDeps): HookCont
       reason: null,
       installUrl: null,
       teamId,
+      intent: teamId !== null ? 'rebind' : 'add',
     };
     armBindWatchdog();
     notifyStatus(toView());
@@ -1916,6 +1918,7 @@ export function createHookControlManager(deps: HookControlManagerDeps): HookCont
             reason: HOOK_BIND_REASON_ALREADY_BOUND,
             installUrl: null,
             teamId,
+            intent: 'add',
           };
         }
         if (idx >= 0) multiBindings[idx] = row;
@@ -1976,6 +1979,9 @@ export function createHookControlManager(deps: HookControlManagerDeps): HookCont
       // 授权流早期 server 不带 teamId(用户尚未选 workspace), 保留本地发起时
       // 记下的目标 team(重绑场景)供 UI 定位
       teamId: payload.teamId ?? pendingBind?.teamId ?? null,
+      // 发起意图在本地记录并全程保留(server 回放/终止态更新都不改写):
+      // add 流终止态即使带 teamId 也是新增失败, 重试必须回 add 流程
+      intent: pendingBind?.intent ?? (payload.teamId !== null && payload.teamId !== undefined ? 'rebind' : 'add'),
     };
     // 授权/安装看门狗跟随真实状态(语义同老路径, 见各 arm 函数注释)
     if (state !== 'pending') clearBindWatchdog();
