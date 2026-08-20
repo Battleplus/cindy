@@ -72,4 +72,19 @@ describe('0093 repair custom provider timestamps', () => {
       db.close();
     }
   });
+
+  it('surfaces an unexpected schema error instead of marking repair successful', () => {
+    const db = new Database(':memory:');
+    try {
+      db.exec(`
+        CREATE TABLE custom_providers (
+          id TEXT PRIMARY KEY NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+      `);
+      expect(() => migration0093.run(db)).toThrow(/no such column: updated_at/i);
+    } finally {
+      db.close();
+    }
+  });
 });

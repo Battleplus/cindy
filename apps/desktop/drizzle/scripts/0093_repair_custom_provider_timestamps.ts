@@ -40,9 +40,13 @@ function run(db: Database.Database): void {
          FROM custom_providers`,
       )
       .all() as ProviderTimestampRow[];
-  } catch {
-    // Older/partial databases may not have reached the custom provider migration.
-    return;
+  } catch (error) {
+    // Older databases may not have reached the custom provider migration. Do not
+    // hide schema drift or a missing column as a successful data repair.
+    if (error instanceof Error && /no such table:\s*custom_providers/i.test(error.message)) {
+      return;
+    }
+    throw error;
   }
 
   const now = Date.now();
