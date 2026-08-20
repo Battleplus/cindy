@@ -41,12 +41,20 @@ const noopLog = {
 function collectEvents(searcher: RipgrepSearcher, searchId: string): Promise<SearchEvent[]> {
   return new Promise((resolve) => {
     const events: SearchEvent[] = [];
+    let errorTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (errorTimer) clearTimeout(errorTimer);
+      searcher.off('event', handler);
+      resolve(events);
+    };
     const handler = (ev: SearchEvent) => {
       if (ev.searchId !== searchId) return;
       events.push(ev);
-      if (ev.type === 'end' || ev.type === 'error') {
-        searcher.off('event', handler);
-        resolve(events);
+      if (ev.type === 'end') {
+        finish();
+      } else if (ev.type === 'error') {
+        // Keep listening briefly so a contradictory end event is observable.
+        errorTimer = setTimeout(finish, 25);
       }
     };
     searcher.on('event', handler);
@@ -97,6 +105,20 @@ describe('RipgrepSearcher', () => {
     if (end && end.type === 'end') {
       expect(end.totalMatches).toBe(0);
     }
+  });
+
+  it('emits error without end when rg cannot be started', async () => {
+    const searcher = new RipgrepSearcher({ rgPath: path.join(workdir, 'missing-rg'), logger: noopLog });
+    const searchId = searcher.start({
+      workdir,
+      query: 'anything',
+      caseSensitive: false,
+      maxMatches: 100,
+    });
+    const events = await collectEvents(searcher, searchId);
+
+    expect(events.some((e) => e.type === 'error')).toBe(true);
+    expect(events.some((e) => e.type === 'end')).toBe(false);
   });
 
   it('emits error when rg exits with fatal code 2', async () => {

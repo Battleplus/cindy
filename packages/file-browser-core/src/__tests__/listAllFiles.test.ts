@@ -61,6 +61,16 @@ describe('listAllFiles', () => {
     ).rejects.toThrow();
   });
 
+  it('resolves with an empty list when rg finds no files (exit code 1)', async () => {
+    await rm(path.join(workdir, 'a.txt'));
+    await rm(path.join(workdir, 'b.ts'));
+
+    const res = await listAllFiles({ workdir, rgPath: rg });
+
+    expect(res.files).toEqual([]);
+    expect(res.truncated).toBe(false);
+  });
+
   it('rejects when rg exits non-zero (exit code 2 via bad config)', async () => {
     // 创建坏的 ripgrep 配置——无效 flag 触发 exit code 2。
     const badConf = path.join(workdir, 'bad-ripgrep.conf');

@@ -224,7 +224,9 @@ export class RipgrepSearcher extends EventEmitter {
         searchId,
         message: String(err),
       } satisfies SearchEvent);
-      this.finalize(searchId, false);
+      // An error is terminal by itself. Do not call finalize(), because it
+      // emits `end` and would make one failed search look successful.
+      this.cleanupAfterError(searchId);
     });
 
     child.on('close', (code, signal) => {
@@ -240,8 +242,7 @@ export class RipgrepSearcher extends EventEmitter {
           message: `rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`,
         } satisfies SearchEvent);
         // Do NOT finalize here: it emits a contradictory end event.
-        const _st = this.active.get(searchId);
-        if (_st) { try { _st.reader.close(); } catch { /* ignore */ } this.active.delete(searchId); }
+        this.cleanupAfterError(searchId);
         return;
       }
       this.finalize(searchId, false);
@@ -262,6 +263,15 @@ export class RipgrepSearcher extends EventEmitter {
   /** 取消所有活跃搜索(用于 window 关闭等清理场景)。 */
   cancelAll(): void {
     for (const id of Array.from(this.active.keys())) this.cancel(id);
+  }
+
+  /** Clean up a failed search without emitting the normal completion event. */
+  private cleanupAfterError(searchId: string): void {
+    const state = this.active.get(searchId);
+    if (!state || state.ended) return;
+    state.ended = true;
+    try { state.reader.close(); } catch { /* ignore */ }
+    this.active.delete(searchId);
   }
 
   private finalize(searchId: string, truncated: boolean): void {

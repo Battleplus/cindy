@@ -133,7 +133,9 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
     child.on('close', (code, signal) => {
       reader.close();
       const elapsedMs = Date.now() - start;
-      if (!truncated && (code !== 0 && code !== null || signal !== null)) {
+      // rg exit 1 means "no matches"; for --files this is a valid empty directory.
+      // Only exit 2+, an unknown code, or signal termination indicates failure.
+      if (!truncated && (signal !== null || (code !== 0 && code !== 1))) {
         log.error('rg exited non-zero', { code, signal, elapsedMs, files: files.length });
         reject(new Error(`rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`));
         return;
