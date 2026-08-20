@@ -132,10 +132,7 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
     child.on('close', (code, signal) => {
       reader.close();
       const elapsedMs = Date.now() - start;
-      // truncated 时 rg 因被我们 SIGTERM 退出,code/signal 不一定 0 — 仍当 success。
-      if (!truncated && code !== 0 && code !== null) {
-        // rg --files 即使工作目录空也是 exit 0,所以非 0 必然是 rg 配置/文件系统错误。
-        // 不应把部分或空结果当成功返回——调用方无法区分"真的没文件"和"rg 崩了"。
+      if (!truncated && (code !== 0 && code !== null || signal !== null)) {
         log.error('rg exited non-zero', { code, signal, elapsedMs, files: files.length });
         reject(new Error(`rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`));
         return;

@@ -239,7 +239,9 @@ export class RipgrepSearcher extends EventEmitter {
           searchId,
           message: `rg exited with code ${code}${signal ? ` (signal ${signal})` : ''}`,
         } satisfies SearchEvent);
-        this.finalize(searchId, false);
+        // Do NOT finalize here: it emits a contradictory end event.
+        const _st = this.active.get(searchId);
+        if (_st) { try { _st.reader.close(); } catch { /* ignore */ } this.active.delete(searchId); }
         return;
       }
       this.finalize(searchId, false);
