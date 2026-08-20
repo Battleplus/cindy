@@ -444,6 +444,7 @@ export class GoalController {
   private readonly consecutiveOverloadTurns = new Map<string, number>();
   private readonly now: () => number;
   private readonly debounceMs: number;
+  private disposed = false;
 
   constructor(private readonly deps: GoalControllerDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -521,6 +522,7 @@ export class GoalController {
       }
       throw error;
     }
+    if (this.disposed) return null;
     if (this.turns.get(sessionId) !== entryBoundary) return null;
     const ts = this.now();
 
@@ -533,6 +535,7 @@ export class GoalController {
       let session: SessionLike | undefined;
       try {
         session = await this.deps.ensureSession(sessionId);
+        if (this.disposed) return null;
       } catch (error) {
         if (this.turns.get(sessionId) !== failureBoundary) return null;
         this.deps.logger.warn('[goal] setGoal edit: session restore failed', {
@@ -547,6 +550,7 @@ export class GoalController {
         );
         throw new GoalSessionRestoreError(error);
       }
+    if (this.disposed) return null;
       if (this.turns.get(sessionId) !== entryBoundary) return null;
       if (!session) {
         this.deps.logger.warn('[goal] setGoal edit: no live session', { sessionId });
@@ -1508,6 +1512,7 @@ export class GoalController {
 
   /** 关停所有监听 + 计时器(测试 / 进程退出)。 */
   dispose(): void {
+    this.disposed = true;
     for (const sessionId of [...this.unsubscribers.keys()]) {
       this.stopSession(sessionId);
     }
