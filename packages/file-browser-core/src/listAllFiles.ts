@@ -127,6 +127,7 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
       log.error('rg process error', { error: String(err) });
       reader.close();
       reject(err);
+
     });
 
     child.on('close', (code, signal) => {
