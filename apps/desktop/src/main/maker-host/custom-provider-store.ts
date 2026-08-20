@@ -730,6 +730,20 @@ function parseRuntimes(raw: string): Partial<Record<AgentKind, CustomProviderRun
   return out;
 }
 
+/**
+ * 安全解析 updatedAt 值——可能是整数或 ISO 日期字符串（历史坏数据）。
+ * 列定义为 INTEGER NOT NULL，ISO 字符串是非法值，需要先转换为毫秒时间戳。
+ * 解析失败时兜底为 0（会触发乐观锁失败，不会写入 NaN）。
+ */
+function parseUpdatedAt(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const ts = Date.parse(value);
+    if (Number.isFinite(ts)) return ts;
+  }
+  return 0;
+}
+
 function rowToConfig(row: typeof customProviders.$inferSelect): CustomProviderConfig {
   const auth = parseAuth(row.auth);
   const runtimes = parseRuntimes(row.runtimes);
@@ -812,7 +826,7 @@ export async function updateCustomProvider(
       name: c.name,
       runtimes: JSON.stringify(c.runtimes),
       auth: c.auth ? JSON.stringify(c.auth) : null,
-      updatedAt: Math.max(now, existing.updatedAt + 1),
+      updatedAt: Math.max(now, parseUpdatedAt(existing.updatedAt) + 1),
     })
     .where(eq(customProviders.id, id));
   return c;
@@ -850,7 +864,7 @@ export async function updateCustomProviderIfUnchanged(
       name: nextConfig.name,
       runtimes: JSON.stringify(nextConfig.runtimes),
       auth: nextConfig.auth ? JSON.stringify(nextConfig.auth) : null,
-      updatedAt: Math.max(now, existing.updatedAt + 1),
+      updatedAt: Math.max(now, parseUpdatedAt(existing.updatedAt) + 1),
     })
     .where(and(eq(customProviders.id, id), eq(customProviders.updatedAt, existing.updatedAt)));
   return result.changes === 1;
