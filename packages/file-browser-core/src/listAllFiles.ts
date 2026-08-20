@@ -130,6 +130,12 @@ export function listAllFiles(args: ListAllFilesArgs): Promise<ListAllFilesResult
       reader.close();
       const elapsedMs = Date.now() - start;
       // truncated 时 rg 因被我们 SIGTERM 退出,code/signal 不一定 0 — 仍当 success。
+      // signal 非空 = 被 OOM killer / SIGKILL 等意外终止(code 为 null)。
+      if (!truncated && signal !== null) {
+        log.warn('rg killed by signal', { signal, elapsedMs, files: files.length });
+        reject(new Error(`ripgrep killed by signal ${signal}`));
+        return;
+      }
       // exit code 1 = no matches (--files 模式下空目录/全部被忽略);>= 2 = 致命错误。
       if (!truncated && code !== null && code >= 2) {
         log.warn('rg exited with fatal error', { code, signal, elapsedMs, files: files.length });
