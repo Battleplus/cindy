@@ -132,7 +132,7 @@ describe('离线启动 fallback', () => {
     // 获取真实 userData 路径（electron-stub 提供 tmp 目录）
     const { app } = await import('electron');
     const userData = app.getPath('userData');
-    const installSubdir = 'offline-fallback-test';
+    const installSubdir = `offline-fallback-test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const version = '1.2.3-verified';
     const binaryName = 'test-binary';
 
