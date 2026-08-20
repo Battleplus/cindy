@@ -55,6 +55,41 @@ function getVerifiedMarker(installSubdir: string, version: string): string {
   return path.join(getVersionDir(installSubdir, version), '.verified');
 }
 
+/**
+ * Find the latest locally installed and verified version.
+ * Scans the install root for directories containing a .verified marker file,
+ * then checks that the binary exists and is executable.
+ * Returns the binary path if found, null otherwise.
+ */
+function findLatestVerifiedBinary(
+  installSubdir: string,
+  binaryName: string,
+): { version: string; binaryPath: string } | null {
+  try {
+    const root = getInstallRoot(installSubdir);
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    const verified: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        fs.accessSync(getVerifiedMarker(installSubdir, entry.name));
+        verified.push(entry.name);
+      } catch { /* no .verified marker */ }
+    }
+    if (verified.length === 0) return null;
+    // Sort descending by version string (semver-like: higher = later)
+    verified.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of verified) {
+      const binPath = getFinalBinPath(installSubdir, v, binaryName);
+      try {
+        fs.accessSync(binPath, fs.constants.X_OK);
+        return { version: v, binaryPath: binPath };
+      } catch { /* binary missing or not executable */ }
+    }
+  } catch { /* install root doesn't exist or unreadable */ }
+  return null;
+}
+
 function isInstalled(installSubdir: string, version: string, binaryName: string): boolean {
   try {
     fs.accessSync(getFinalBinPath(installSubdir, version, binaryName), fs.constants.X_OK);
@@ -146,6 +181,15 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
         let manifest = getCachedManifest();
         if (!manifest) manifest = await fetchManifest(undefined, opts?.signal);
         if (!manifest) {
+          // Offline fallback: scan for locally installed + verified versions.
+          // The manifest may be unavailable (CDN down, proxy failure) while
+          // the runtime binary is already installed and verified on disk.
+          const binaryName = deriveBinaryName();
+          const local = findLatestVerifiedBinary(config.installSubdir, binaryName);
+          if (local) {
+            emit({ status: 'ready', installedVersion: local.version, binaryPath: local.binaryPath }, onProgress);
+            return { ready: true, binaryPath: local.binaryPath };
+          }
           emit({
             status: 'failed',
             error: { code: 'manifest_failed', message: 'Failed to fetch manifest from CDN' },
