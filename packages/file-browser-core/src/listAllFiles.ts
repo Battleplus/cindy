@@ -201,3 +201,4 @@ export async function listAllFilesWalk(args: ListAllFilesWalkArgs): Promise<List
   log.debug('walk done', { workdir: args.workdir, files: files.length, truncated, elapsedMs });
   return { files, truncated, elapsedMs };
 }
+
