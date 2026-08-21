@@ -672,8 +672,13 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
       },
       { modelRegistry: BUNDLED_CATALOG.modelRegistry },
     );
-    // openai/gpt-5.6-sol should match registry entry gpt-5.6-sol and inherit efforts
-    expect(p.models['claude-code']?.[0]?.efforts?.length).toBeGreaterThan(0);
+    // openai/gpt-5.6-sol must match registry entry gpt-5.6-sol and inherit its efforts;
+    // without prefix-stripping, the model ID wouldn't match any registry entry
+    // and efforts would remain empty.
+    const model = p.models['claude-code']?.[0];
+    expect(model?.efforts?.length).toBeGreaterThan(0);
+    // gpt-5.6-sol in the registry supports 'xhigh' — a capability no custom default provides
+    expect(model?.efforts).toContain('xhigh');
   });
 
   it('strips xd/ prefix to match registry effort metadata for codex', () => {
@@ -690,8 +695,9 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
       },
       { modelRegistry: BUNDLED_CATALOG.modelRegistry },
     );
-    // xd/gpt-5.6-sol should match registry entry and inherit efforts
-    expect(p.models.codex?.[0]?.efforts?.length).toBeGreaterThan(0);
+    const model = p.models.codex?.[0];
+    expect(model?.efforts?.length).toBeGreaterThan(0);
+    expect(model?.efforts).toContain('xhigh');
   });
 
   it('exports only the explicitly supported effort levels for a Pi reasoning model', () => {
