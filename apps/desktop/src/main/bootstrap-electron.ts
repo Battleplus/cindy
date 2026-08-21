@@ -843,7 +843,7 @@ import {
   resetSchedulerReady,
 } from './maker-ipc/schedule.js';
 import { registerProjectAutomationIpc } from './maker-ipc/project-automation.js';
-import { startGoalController, getGoalController, resetGoalController } from './goal-host/index.js';
+import { startGoalController, getGoalController, resetGoalController, getGoalTeardownGeneration } from './goal-host/index.js';
 import { startLearnHost, getLearnController, resetLearnController } from './learn-host/index.js';
 import { fetchHubSkillReference } from './learn-host/hubReference.js';
 import { registerLearnIpc, broadcastLearnEvent } from './learn-host/registerIpc.js';
@@ -928,7 +928,14 @@ async function attemptStartScheduler(): Promise<void> {
   // 触发时可能发生），_initialCustomMcpRefresh 刚启动但尚未落地；在 startScheduler 前
   // await，确保第一个 scheduler tick 能看到用户已保存的自定义 MCP 配置。
   // 若 Maker 已被 registerMakerIpcsAfterSplash 构造过，promise 早已 resolve，no-op。
+  const goalGenBefore = getGoalTeardownGeneration();
   await waitForInitialCustomMcpRefresh();
+  // If a teardown raced the await, bail out — the next account's activation
+  // pass will re-trigger attemptStartScheduler with fresh state.
+  if (getGoalTeardownGeneration() !== goalGenBefore) {
+    console.log('[bootstrap-electron] attemptStartScheduler: teardown raced await, aborting');
+    return;
+  }
   const automationGitBaselineHooks = createAutomationUserTurnGitBaselineHooks();
   try {
     const scheduler = await startScheduler({
