@@ -129,11 +129,10 @@ export function buildCodexProxySpawnArgs(
       //  - prompt 改走原生 developerInstructions:Codex 0.145 自动 compact 会把当前
       //    session 的 canonical developer context 重新注入 replacement history(中途
       //    compact)或下一次正常采样(pre-turn compact),无需 proxy 逐请求重复注入。
-      // Codex 的 WS 会话按 thread 建立；upgrade 带 thread id，collab_spawn 还会带
-      // subagent 身份与 parent thread id。loopback proxy 因此可以只对命中独立
-      // Subagent Provider 路由的子 thread 回 426，让该会话降到 HTTP transform，
-      // 无需牺牲父 thread 的原生 WS。
-      '-c', `model_providers.${o}.supports_websockets=true`,
+      // 子代理绑定了独立 Provider 路由时，proxy 通过 cindy_gateway 路由子代理请求
+      // (已 supports_websockets=false)。父会话的 ChatGPT 订阅使用 cindy_openai，
+      // 保持 WebSocket 启用——全局禁用会中断父会话的 WebSocket 连接(#3119)。
+      '-c', `model_providers.${o}.supports_websockets=${opts.openAiWebSocketsEnabled !== false}`,
       // is_openai + codex-backend OAuth 命中时 codex 默认对 /responses 请求体做 zstd
       // 压缩(enable_request_compression 默认开);loopback proxy 要整段 JSON.parse
       // 改写请求体,无法解 zstd,必须显式关掉(仅少传输优化,无功能损失)。

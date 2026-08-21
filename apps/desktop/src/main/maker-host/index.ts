@@ -1540,6 +1540,11 @@ export function getMaker(): Maker {
             };
           }
         }
+        // When a subagent has its own provider route, the proxy routes those
+        // requests via cindy_gateway (which already has supports_websockets=false).
+        // The parent session's ChatGPT subscription uses cindy_openai and should
+        // keep WebSocket enabled — disabling it globally breaks the parent session.
+        const openAiWebSocketsEnabled = true;
         return {
           // 子代理护栏/默认模型每次 createHost 现读 store:DeferredCodexRestart 兑现
           // (dispose host)后的新 spawn 自动带新值。agents.* 对 control-plane 的
