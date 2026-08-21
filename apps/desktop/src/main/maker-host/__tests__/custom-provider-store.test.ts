@@ -1099,4 +1099,107 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     mountDb();
     expect(await listCustomProviders()).toEqual([]);
   });
+
+  it('CAS: MAX_SAFE_INTEGER seed — writer B succeeds, stale reader A is rejected', async () => {
+    mountDb();
+
+    // Seed a provider with updated_at = MAX_SAFE_INTEGER (corrupted/legacy data)
+    raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('max-cas', 'MaxCAS', JSON.stringify(valid.runtimes), null, 0, 1, Number.MAX_SAFE_INTEGER);
+
+    // Read raw updated_at to snapshot version
+    const versionA = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('max-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionA).toBe(Number.MAX_SAFE_INTEGER);
+
+    // Reader A reads the config snapshot
+    const readerA = await getCustomProvider('max-cas');
+    expect(readerA).not.toBeNull();
+
+    // Writer B performs a normal edit
+    await updateCustomProvider('max-cas', {
+      ...valid,
+      id: 'max-cas',
+      name: 'MaxCAS Edited by B',
+    }, 1_700_000_000_000);
+
+    // B's write must produce a different updated_at
+    const versionB = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('max-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionB).not.toBe(Number.MAX_SAFE_INTEGER);
+    expect(versionB).not.toBe(versionA);
+
+    // Verify B's content is correct
+    const afterB = await getCustomProvider('max-cas');
+    expect(afterB).not.toBeNull();
+    expect(afterB!.name).toBe('MaxCAS Edited by B');
+
+    // Reader A tries a stale CAS update — must fail because versionA != versionB
+    const staleResult = await updateCustomProviderIfUnchanged(
+      'max-cas',
+      readerA!,
+      { ...readerA!, name: 'Stale A overwrite' },
+      1_700_000_010_000,
+    );
+    expect(staleResult).toBe(false);
+
+    // Verify B's content was NOT overwritten by A
+    const final_ = await getCustomProvider('max-cas');
+    expect(final_).not.toBeNull();
+    expect(final_!.name).toBe('MaxCAS Edited by B');
+  });
+
+  it('CAS: normal seed — writer B succeeds, stale reader A is rejected', async () => {
+    mountDb();
+
+    // Seed with normal updated_at
+    raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('normal-cas', 'NormalCAS', JSON.stringify(valid.runtimes), null, 0, 1, 1000);
+
+    // Reader A snapshots the version
+    const versionA = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('normal-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionA).toBe(1000);
+
+    // Reader A reads config snapshot
+    const readerA = await getCustomProvider('normal-cas');
+    expect(readerA).not.toBeNull();
+
+    // Writer B edits
+    await updateCustomProvider('normal-cas', {
+      ...valid,
+      id: 'normal-cas',
+      name: 'NormalCAS Edited by B',
+    }, 2000);
+
+    // B's updated_at changed
+    const versionB = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('normal-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionB).not.toBe(versionA);
+
+    // Reader A stale CAS update must fail
+    const staleResult = await updateCustomProviderIfUnchanged(
+      'normal-cas',
+      readerA!,
+      { ...readerA!, name: 'Stale A overwrite' },
+      3000,
+    );
+    expect(staleResult).toBe(false);
+
+    // B's content preserved
+    const final_ = await getCustomProvider('normal-cas');
+    expect(final_).not.toBeNull();
+    expect(final_!.name).toBe('NormalCAS Edited by B');
+  });
+
 });
