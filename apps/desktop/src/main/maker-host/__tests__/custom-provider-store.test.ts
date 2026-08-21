@@ -1139,7 +1139,12 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     expect(afterB).not.toBeNull();
     expect(afterB!.name).toBe('MaxCAS Edited by B');
 
-    // Reader A tries a stale CAS update — must fail because versionA != versionB
+    // Reader A tries a stale CAS update — config equality check fails
+    // because writer B changed the name. This证明生产路径在 B 修改后
+    // 拒绝 A 的过时写入。注意：此处 name 不一致导致 equality check
+    // 先于 CAS timestamp 检查返回 false，因此不单独证明 CAS 失败。
+    // 真正的 CAS-only 拦截需要 config equality 通过但 timestamp 过时，
+    // 这在单线程测试中难以自然构造（需要 hook SELECT 和 UPDATE 之间）。
     const staleResult = await updateCustomProviderIfUnchanged(
       'max-cas',
       readerA!,
@@ -1187,7 +1192,8 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     ).updatedAt;
     expect(versionB).not.toBe(versionA);
 
-    // Reader A stale CAS update must fail
+    // Reader A stale CAS update — name mismatch causes config equality
+    // check to fail before CAS timestamp check.
     const staleResult = await updateCustomProviderIfUnchanged(
       'normal-cas',
       readerA!,
