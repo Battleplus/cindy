@@ -4304,4 +4304,46 @@ describe('GoalController', () => {
     expect(st?.lastReason).toBe('usage limit reached');
   });
 
+
+  it('rejects setGoal after dispose (account switch fence)', async () => {
+    // Regression: when the user switches accounts, bootstrap-electron calls
+    // resetGoalController() which disposes the old GoalController. If a goal
+    // was mid-flight (awaiting ensureSession), the old controller must not
+    // continue dispatching work to the abandoned session.
+    await startGoal(h);
+    expect((await h.storage.get('s1'))?.status).toBe('active');
+
+    // Simulate account switch: dispose the controller.
+    h.controller.dispose();
+
+    // Any new setGoal must throw GoalControllerDisposedError.
+    await expect(
+      h.controller.setGoal({
+        sessionId: 's1',
+        objective: 'should not start',
+        agentKind: 'claude-code',
+      }),
+    ).rejects.toThrow('GoalController has been disposed');
+  });
+
+  it('dispose prevents new goals from starting', async () => {
+    // Regression: dispose must prevent new goals from starting so the old
+    // GoalController does not dispatch work to abandoned sessions.
+    await startGoal(h);
+    
+    // Verify session is active before dispose.
+    const before = await h.storage.get('s1');
+    expect(before?.status).toBe('active');
+
+    h.controller.dispose();
+
+    // After dispose, setGoal on a new session should fail.
+    await expect(
+      h.controller.setGoal({
+        sessionId: 's2',
+        objective: 'should not start',
+        agentKind: 'claude-code',
+      }),
+    ).rejects.toThrow('GoalController has been disposed');
+  });
 });
