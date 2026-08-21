@@ -256,6 +256,29 @@ it('strips xd/ prefix to match registry effort metadata (entry.id ≠ custom id)
     });
   });
 
+  it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom id)', () => {
+    const p = buildUserProvider(
+      {
+        id: 'openai-relay',
+        name: 'OpenAI Relay',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://openai-relay.example/v1',
+            models: [{ id: 'openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // openai/gpt-5.6-sol → strips to gpt-5.6-sol → matches registry entry
+    // entry.id = 'gpt-5.6-sol' ≠ custom id 'openai/gpt-5.6-sol'
+    expect(p.models.codex?.[0]).toMatchObject({
+      id: 'openai/gpt-5.6-sol',
+      efforts: expect.arrayContaining(['ultra']),
+      defaultEffort: 'high',
+    });
+  });
+
   it('unregistered prefix falls back to CUSTOM_EFFORTS', () => {
     const p = buildUserProvider(
       {
