@@ -200,7 +200,75 @@ describe('buildUserProvider (per-runtime)', () => {
     });
   });
 
-  it('falls back safely for ambiguous matches, missing target routes and invalid defaults', () => {
+it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom id)', () => {
+    const p = buildUserProvider(
+      {
+        id: 'my-provider',
+        name: 'My Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://my-provider.example/v1',
+            models: [{ id: 'openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // openai/gpt-5.6-sol → strips to gpt-5.6-sol → matches registry entry openai/gpt-5.6-sol
+    // entry.id ('openai/gpt-5.6-sol') ≠ custom model id ('openai/gpt-5.6-sol') — but the route
+    // match is by stripped id 'gpt-5.6-sol' which is unique for codex agent.
+    expect(p.models.codex?.[0]).toMatchObject({
+      id: 'openai/gpt-5.6-sol',
+      efforts: expect.arrayContaining(['ultra']),
+      defaultEffort: 'high',
+    });
+  });
+
+  it('strips xd/ prefix to match registry effort metadata', () => {
+    const p = buildUserProvider(
+      {
+        id: 'xd-relay',
+        name: 'XD Relay',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://xd-relay.example/v1',
+            models: [{ id: 'xd/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // xd/gpt-5.6-sol → strips to gpt-5.6-sol → matches registry entry
+    expect(p.models.codex?.[0]).toMatchObject({
+      id: 'xd/gpt-5.6-sol',
+      efforts: expect.arrayContaining(['ultra']),
+      defaultEffort: 'high',
+    });
+  });
+
+  it('unregistered prefix falls back to CUSTOM_EFFORTS', () => {
+    const p = buildUserProvider(
+      {
+        id: 'unknown-relay',
+        name: 'Unknown Relay',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://unknown.example/v1',
+            models: [{ id: 'custom/my-model', name: 'My Model' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // custom/my-model → no registry match → CUSTOM_EFFORTS for codex
+    expect(p.models.codex?.[0]).toMatchObject({
+      id: 'custom/my-model',
+      efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      defaultEffort: 'high',
+    });
+  });
+
+    it('falls back safely for ambiguous matches, missing target routes and invalid defaults', () => {
     const registry = structuredClone(BUNDLED_CATALOG.modelRegistry);
     if (!registry) throw new Error('missing bundled model registry');
     const baseEntry = registry.models.find((entry) => entry.id === 'openai/gpt-5.6-sol');

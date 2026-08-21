@@ -76,8 +76,11 @@ function registryEffortMetadata(
   if (agent === 'pi' || !registry) return undefined;
 
   const candidates = new Set([modelId]);
-  if (modelId.startsWith('chatgpt/')) {
-    candidates.add(modelId.slice('chatgpt/'.length));
+  // Also try stripping common provider prefixes so third-party custom API
+  // models (e.g. "openai/gpt-5.6-sol" or "xd/gpt-5.6-sol") can match
+  // registry entries whose route.modelId is just "gpt-5.6-sol".
+  for (const prefix of ['openai/', 'xd/', 'chatgpt/']) {
+    if (modelId.startsWith(prefix)) candidates.add(modelId.slice(prefix.length));
   }
   const matches = registry.models.filter((entry) =>
     entry.routes.some(
