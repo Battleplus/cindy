@@ -429,4 +429,68 @@ describe('活动熄灭触发的 stale running 对账', () => {
       makerChatStore.purgeSession(idleSid);
     }
   });
+
+  // Handler 回归测试(P1 from MagicLizi): !live 时 pendingContinuations 应返回 0
+  // (权威确认无后续),而非 undefined(信号不可用)。renderer 只在 === 0 时收口;
+  // null(旧 main 缺字段)不收口。
+  // 本测试验证: authorityPendingContinuations=null 时 wake bridge 不被清零,
+  // 而 authorityPendingContinuations=0 时不阻塞收口(其他条件满足时允许清零)。
+  it('authorityPendingContinuations=0 允许收口;null 不收口(回归: !live 返回 0)', () => {
+    const sid = `auth-pc-${Math.random().toString(36).slice(2, 8)}`;
+    const sid2 = `auth-pc-null-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      // === 场景 1: authority=0 → authorityConfirmsNoContinuation=true ===
+      makerChatStore.__applyStatusUpdateForTest(sid, {
+        sessionId: sid, tokenUsage: 0, contextTokens: 0, contextWindow: 0,
+        isRunning: true, status: 'Working',
+      });
+      makerChatStore.__applyStatusUpdateForTest(sid, {
+        sessionId: sid, tokenUsage: 0, contextTokens: 0, contextWindow: 0,
+        isRunning: false, status: 'Done',
+      });
+      makerChatStore.__applyStreamEventForTest(sid, {
+        sessionId: sid, type: 'agent_task_update', source: 'claude-code',
+        data: { provider: 'claude-code', taskId: 't-wake', taskType: 'local_agent', status: 'completed' },
+      });
+      expect(makerChatStore.getSnapshot(sid).pendingTaskWake).toBe(1);
+
+      const captured = makerChatStore.capturePendingWakeBridge(sid);
+      // authority=0: !live 时返回 0 → authorityConfirmsNoContinuation=true
+      // (bridgeAgedOut 可能不足,但 authority 条件不阻塞)
+      makerChatStore.seedBackgroundTaskSnapshots(sid, [], {
+        reconcileWakeBridge: captured,
+        authorityPendingContinuations: 0,
+      });
+      // authority 条件满足 → 不因 authority 阻塞(bridge 可能因 age 保留,但不被 authority 挡)
+      expect(makerChatStore.getSnapshot(sid).taskUpdates?.get('t-wake')?.status).toBe('completed');
+
+      // === 场景 2: authority=null → authorityConfirmsNoContinuation=false ===
+      makerChatStore.__applyStatusUpdateForTest(sid2, {
+        sessionId: sid2, tokenUsage: 0, contextTokens: 0, contextWindow: 0,
+        isRunning: true, status: 'Working',
+      });
+      makerChatStore.__applyStatusUpdateForTest(sid2, {
+        sessionId: sid2, tokenUsage: 0, contextTokens: 0, contextWindow: 0,
+        isRunning: false, status: 'Done',
+      });
+      makerChatStore.__applyStreamEventForTest(sid2, {
+        sessionId: sid2, type: 'agent_task_update', source: 'claude-code',
+        data: { provider: 'claude-code', taskId: 't-wake2', taskType: 'local_agent', status: 'completed' },
+      });
+      expect(makerChatStore.getSnapshot(sid2).pendingTaskWake).toBe(1);
+
+      const captured2 = makerChatStore.capturePendingWakeBridge(sid2);
+      // null: 旧 main 缺字段 → authorityConfirmsNoContinuation=false → 不收口
+      makerChatStore.seedBackgroundTaskSnapshots(sid2, [], {
+        reconcileWakeBridge: captured2,
+        authorityPendingContinuations: null,
+      });
+      // null → 不允许收口, pendingTaskWake 保留
+      expect(makerChatStore.getSnapshot(sid2).pendingTaskWake).toBe(1);
+    } finally {
+      makerChatStore.purgeSession(sid);
+      makerChatStore.purgeSession(sid2);
+    }
+  });
+
 });
