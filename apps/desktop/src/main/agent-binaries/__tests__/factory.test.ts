@@ -151,7 +151,7 @@ describe('离线启动 fallback', () => {
     vi.mocked(fetchManifest).mockResolvedValue(null as any);
 
     const provisioner = createBinaryProvisioner({
-      vendorKey: 'test',
+      vendorKey: 'claude',
       manifestField: 'testField',
       installSubdir,
       artifact: { kind: 'raw', binaryName },
