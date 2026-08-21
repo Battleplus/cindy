@@ -393,7 +393,14 @@ async function runRefresh(
       });
       if (outcome !== 'refreshed' && outcome !== 'superseded') return false;
       if (deps.getScopeKey() !== scopeKey || !deps.hasLogin()) return false;
-      token = await deps.getAccessToken();
+      try {
+        token = await deps.getAccessToken();
+      } catch (tokenError) {
+        deps.log.warn('xAI account model discovery: token refresh after invalidate failed', {
+          error: tokenError instanceof Error ? tokenError.message : String(tokenError),
+        });
+        return false;
+      }
       if (!isCurrent(deps, scopeKey, token)) return false;
     }
   }
