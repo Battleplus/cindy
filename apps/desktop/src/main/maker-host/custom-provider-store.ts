@@ -62,8 +62,12 @@ function nextUpdatedAt(now: number, stored: unknown): number {
         ? Number(stored)
         : Number.NaN;
   if (!Number.isSafeInteger(previous)) return current;
-  const incremented = previous >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : previous + 1;
-  return Math.max(current, incremented);
+  // CAS contract: every successful write must produce a strictly different
+  // updated_at. When previous is at MAX_SAFE_INTEGER, incrementing is
+  // impossible; return current (a real timestamp) which is guaranteed to
+  // differ from the stale MAX_SAFE_INTEGER snapshot.
+  if (previous >= Number.MAX_SAFE_INTEGER) return current;
+  return Math.max(current, previous + 1);
 }
 
 /** 验证结果：ok 或带 code + message（供 handler 映射成 throwIpcError）。 */
