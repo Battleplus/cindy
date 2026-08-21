@@ -52,6 +52,16 @@ export class GoalControllerInputError extends Error {
   readonly code = 'INVALID_PARAMS';
 }
 
+/** GoalController has been disposed; all public entry points should reject. */
+export class GoalControllerDisposedError extends Error {
+  readonly code = 'GONE';
+
+  constructor() {
+    super('GoalController has been disposed');
+    this.name = 'GoalControllerDisposedError';
+  }
+}
+
 /** Goal 已保守收敛，但本次入口无法恢复其底层 Agent Session。 */
 export class GoalSessionRestoreError extends Error {
   readonly code = 'PRECONDITION_FAILED';
@@ -446,6 +456,12 @@ export class GoalController {
   private readonly debounceMs: number;
   private disposed = false;
 
+
+  /** Throw if the controller has been disposed. */
+  private assertActive(): void {
+    if (this.disposed) throw new GoalControllerDisposedError();
+  }
+
   constructor(private readonly deps: GoalControllerDeps) {
     this.now = deps.now ?? (() => Date.now());
     this.debounceMs = deps.continuationDebounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -524,6 +540,8 @@ export class GoalController {
     }
     if (this.disposed) return null;
     if (this.turns.get(sessionId) !== entryBoundary) return null;
+    // Guard: dispose() may have been called during the await above.
+    this.assertActive();
     const ts = this.now();
 
     if (existing) {
@@ -535,7 +553,7 @@ export class GoalController {
       let session: SessionLike | undefined;
       try {
         session = await this.deps.ensureSession(sessionId);
-        if (this.disposed) return null;
+        this.assertActive();
       } catch (error) {
         if (this.turns.get(sessionId) !== failureBoundary) return null;
         this.deps.logger.warn('[goal] setGoal edit: session restore failed', {
