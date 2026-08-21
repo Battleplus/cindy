@@ -78,6 +78,7 @@ export function buildCodexGatewayBaseUrl(upstream = claudeUpstreamEndpoint()): s
 export function buildCodexProxySpawnArgs(
   baseUrl: string,
   authMode: CodexProxySpawnAuthMode,
+  options?: { openAiWebSocketsEnabled?: boolean },
 ): string[] {
   const p = CODEX_GATEWAY_PROVIDER_ID;
   const authArg = authMode === 'oauth-bearer'
@@ -132,7 +133,7 @@ export function buildCodexProxySpawnArgs(
       // 子代理绑定了独立 Provider 路由时，proxy 通过 cindy_gateway 路由子代理请求
       // (已 supports_websockets=false)。父会话的 ChatGPT 订阅使用 cindy_openai，
       // 保持 WebSocket 启用——全局禁用会中断父会话的 WebSocket 连接(#3119)。
-      '-c', `model_providers.${o}.supports_websockets=${opts.openAiWebSocketsEnabled !== false}`,
+      '-c', `model_providers.${o}.supports_websockets=${options?.openAiWebSocketsEnabled !== false}`,
       // is_openai + codex-backend OAuth 命中时 codex 默认对 /responses 请求体做 zstd
       // 压缩(enable_request_compression 默认开);loopback proxy 要整段 JSON.parse
       // 改写请求体,无法解 zstd,必须显式关掉(仅少传输优化,无功能损失)。

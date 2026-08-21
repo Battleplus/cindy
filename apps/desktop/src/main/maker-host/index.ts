@@ -1556,7 +1556,7 @@ export function getMaker(): Maker {
                   forceDisableSubagents,
                 })
               : []),
-            ...buildCodexProxySpawnArgs(endpoint, authInjection),
+            ...buildCodexProxySpawnArgs(endpoint, authInjection, { openAiWebSocketsEnabled }),
           ],
           extraEnv: mcpExtraEnv,
           ...(subagentModelFallback ? { subagentModelFallback } : {}),
