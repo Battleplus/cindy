@@ -216,7 +216,7 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
         runtimes: {
           codex: {
             baseUrl: 'https://my-provider.example/v1',
-            models: [{ id: 'openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+            models: [{ id: 'xd/codex/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
           },
         },
       },
@@ -226,7 +226,7 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
     // entry.id ('openai/gpt-5.6-sol') ≠ custom model id ('openai/gpt-5.6-sol') — but the route
     // match is by stripped id 'gpt-5.6-sol' which is unique for codex agent.
     expect(p.models.codex?.[0]).toMatchObject({
-      id: 'openai/gpt-5.6-sol',
+      id: 'xd/codex/gpt-5.6-sol',
       efforts: expect.arrayContaining(['ultra']),
       defaultEffort: 'high',
     });
@@ -666,7 +666,7 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
         runtimes: {
           'claude-code': {
             baseUrl: 'https://my-provider.example/v1',
-            models: [{ id: 'openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+            models: [{ id: 'xd/codex/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
           },
         },
       },
