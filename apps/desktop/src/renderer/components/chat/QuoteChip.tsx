@@ -2,22 +2,27 @@
  * QuoteChip — 输入框与已发送用户消息共用的紧凑引用胶囊。
  *
  * 默认只展示单行摘要，完整引用与文件来源放在 hover tooltip 中；输入框与
- * 消息气泡复用同一套紧凑尺寸、颜色与截断规则，均不显示关闭按钮。
+ * 消息气泡复用同一套紧凑尺寸、颜色与截断规则。当提供 `onRemove` 回调时
+ * 渲染右上角小删除按钮，仅限草稿/输入框内引用块使用。
  */
-import { FileText, MessageSquareQuote } from 'lucide-react';
+import { FileText, MessageSquareQuote, X } from 'lucide-react';
 import type { ChatQuote } from '@/lib/chatQuotes';
 import { quoteSourceDisplayLabel } from '@/lib/chatQuotes';
+import { cn } from '@/lib/utils';
 import { InlineReferenceChip } from './InlineReferenceChip';
 
 interface QuoteChipProps {
   quote: ChatQuote;
   selected?: boolean;
+  /** 提供此回调时渲染小删除按钮，点击调用此回调移除该引用。 */
+  onRemove?: () => void;
 }
 
 /** 渲染紧凑、不可选中的引用摘要；完整内容仅在 tooltip 中展开。 */
 export function QuoteChip({
   quote,
   selected = false,
+  onRemove,
 }: QuoteChipProps) {
   const sourceLabel = quoteSourceDisplayLabel(quote);
   const compactText = quote.text.replace(/\s+/g, ' ').trim();
@@ -40,17 +45,39 @@ export function QuoteChip({
   );
 
   return (
-    <InlineReferenceChip
-      label={compactText}
-      icon={<MessageSquareQuote aria-hidden />}
-      tooltip={tooltip}
-      tooltipContentClassName="max-h-64 w-80 max-w-[70vw] overflow-y-auto whitespace-normal"
-      ariaLabel={quote.text}
-      selected={selected}
-      // 刻意的例外:chip 上是把换行折叠成单行的**摘要**,不是引用原文。让它进
-      // 剪贴板等于把压扁过的文本混进复制结果,原文本身就在被引用的那条消息里。
-      // 其余消息内 chip(文件名、会话、项目)展示的是完整实体名,默认可复制。
-      textSelectable={false}
-    />
+    <span className="relative inline-flex">
+      <InlineReferenceChip
+        label={compactText}
+        icon={<MessageSquareQuote aria-hidden />}
+        tooltip={tooltip}
+        tooltipContentClassName="max-h-64 w-80 max-w-[70vw] overflow-y-auto whitespace-normal"
+        ariaLabel={quote.text}
+        selected={selected}
+        // 刻意的例外:chip 上是把换行折叠成单行的**摘要**,不是引用原文。让它进
+        // 剪贴板等于把压扁过的文本混进复制结果,原文本身就在被引用的那条消息里。
+        // 其余消息内 chip(文件名、会话、项目)展示的是完整实体名,默认可复制。
+        textSelectable={false}
+        className={cn(onRemove && 'pr-4')}
+      />
+      {onRemove ? (
+        <button
+          type="button"
+          aria-label={`Remove quote: ${quote.text}`}
+          className={cn(
+            'absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center',
+            'rounded-full bg-[var(--surface-secondary)] text-[var(--text-tertiary)]',
+            'opacity-0 transition-opacity hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]',
+            'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--focus-ring)]',
+          )}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <X className="h-2.5 w-2.5" aria-hidden />
+        </button>
+      ) : null}
+    </span>
   );
 }
