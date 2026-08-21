@@ -17,6 +17,7 @@ import {
   storedCustomProviderId,
 } from "../user-provider.js";
 import type { CustomProviderConfig } from "../types.js";
+import type { ModelRegistry } from "../modelAccessBean.js";
 import { BUNDLED_CATALOG } from "../catalog.js";
 
 const codexOnly: CustomProviderConfig = {
@@ -698,6 +699,62 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
     const model = p.models.codex?.[0];
     expect(model?.efforts?.length).toBeGreaterThan(0);
     expect(model?.efforts).toContain('xhigh');
+  });
+
+  it('synthetic registry: prefix stripping is required for openai/xd/chatgpt/ prefixes', () => {
+    // Synthetic registry where entry id = 'synthetic-gpt' with 'ultra' effort.
+    // Custom model id = 'openai/synthetic-gpt' can only match via prefix stripping.
+    // If strip-prefix code is removed, efforts would remain empty.
+    const syntheticRegistry: ModelRegistry = {
+      updatedAt: '2026-01-01T00:00:00Z',
+      schemaVersion: 2,
+      models: [
+        {
+          id: 'synthetic-gpt',
+          name: 'Synthetic GPT',
+          efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          defaultEffort: 'high',
+          routes: [
+            { providerId: 'test-provider', modelId: 'synthetic-gpt', agents: ['claude-code', 'codex'] },
+          ],
+        },
+      ],
+    };
+
+    // openai/ prefix: should strip and match synthetic-gpt
+    const pOpenai = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { 'claude-code': { baseUrl: 'https://x/v1', models: [{ id: 'openai/synthetic-gpt', name: 'G' }] } } },
+      { modelRegistry: syntheticRegistry },
+    );
+    expect(pOpenai.models['claude-code']?.[0]?.efforts).toContain('ultra');
+
+    // xd/ prefix: should strip and match
+    const pXd = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { codex: { baseUrl: 'https://x/v1', models: [{ id: 'xd/synthetic-gpt', name: 'G' }] } } },
+      { modelRegistry: syntheticRegistry },
+    );
+    expect(pXd.models.codex?.[0]?.efforts).toContain('ultra');
+
+    // chatgpt/ prefix: should strip and match
+    const pChatgpt = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { 'claude-code': { baseUrl: 'https://x/v1', models: [{ id: 'chatgpt/synthetic-gpt', name: 'G' }] } } },
+      { modelRegistry: syntheticRegistry },
+    );
+    expect(pChatgpt.models['claude-code']?.[0]?.efforts).toContain('ultra');
+
+    // unknown prefix: should NOT match registry, gets default CUSTOM_EFFORTS (no 'ultra')
+    const pUnknown = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { 'claude-code': { baseUrl: 'https://x/v1', models: [{ id: 'unknown/synthetic-gpt', name: 'G' }] } } },
+      { modelRegistry: syntheticRegistry },
+    );
+    expect(pUnknown.models['claude-code']?.[0]?.efforts).not.toContain('ultra');
+
+    // no prefix: should match directly
+    const pDirect = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { 'claude-code': { baseUrl: 'https://x/v1', models: [{ id: 'synthetic-gpt', name: 'G' }] } } },
+      { modelRegistry: syntheticRegistry },
+    );
+    expect(pDirect.models['claude-code']?.[0]?.efforts).toContain('ultra');
   });
 
   it('exports only the explicitly supported effort levels for a Pi reasoning model', () => {
