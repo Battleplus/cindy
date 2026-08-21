@@ -658,7 +658,43 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
     });
   });
 
-  it("exports only the explicitly supported effort levels for a Pi reasoning model", () => {
+  it('strips openai/ prefix to match registry effort metadata for claude-code', () => {
+    const p = buildUserProvider(
+      {
+        id: 'my-provider',
+        name: 'My Provider',
+        runtimes: {
+          'claude-code': {
+            baseUrl: 'https://my-provider.example/v1',
+            models: [{ id: 'openai/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // openai/gpt-5.6-sol should match registry entry gpt-5.6-sol and inherit efforts
+    expect(p.models['claude-code']?.[0]?.efforts?.length).toBeGreaterThan(0);
+  });
+
+  it('strips xd/ prefix to match registry effort metadata for codex', () => {
+    const p = buildUserProvider(
+      {
+        id: 'xd-relay',
+        name: 'XD Relay',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://xd-relay.example/v1',
+            models: [{ id: 'xd/gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+          },
+        },
+      },
+      { modelRegistry: BUNDLED_CATALOG.modelRegistry },
+    );
+    // xd/gpt-5.6-sol should match registry entry and inherit efforts
+    expect(p.models.codex?.[0]?.efforts?.length).toBeGreaterThan(0);
+  });
+
+  it('exports only the explicitly supported effort levels for a Pi reasoning model', () => {
     const p = buildUserProvider({
       id: "reasoning-pi",
       name: "Reasoning Pi",
