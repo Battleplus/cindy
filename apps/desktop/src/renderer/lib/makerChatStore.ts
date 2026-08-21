@@ -9284,17 +9284,18 @@ function settleRemoteOptimisticFailure(sessionId: string, clientId: string, erro
 async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
   const existing = remoteOptimisticPumps.get(sessionId);
   if (existing) return existing;
-  // The holder avoids a temporal-dead-zone type error while allowing the async
-  // body to compare its identity with a newer pump after its first await.
-  const runRef: { promise?: Promise<void> } = {};
-  const run = (async () => {
+  // Self-reference is intentional: a detached clear/owner generation must not
+  // keep draining after a newer pump replaces this Promise in the registry.
+  // eslint-disable-next-line prefer-const
+  let run!: Promise<void>;
+  run = (async () => {
     while (true) {
       const record = firstUnacceptedRemoteOptimisticSend(sessionId);
       if (!record || record.dispatching) return;
       const prepared = await prepareRemoteOptimisticSend(sessionId, record);
       if (prepared.kind === 'deferred') return;
       if (prepared.kind === 'cancelled') {
-        if (remoteOptimisticPumps.get(sessionId) !== runRef.promise) return;
+        if (remoteOptimisticPumps.get(sessionId) !== run) return;
         continue;
       }
       if (prepared.kind === 'failed') {
@@ -9309,7 +9310,7 @@ async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
       // the active pump to dispatch them deterministically. A clear/owner boundary,
       // however, detaches the old pump so it cannot race a newer generation.
       if (result.kind === 'cancelled') {
-        if (remoteOptimisticPumps.get(sessionId) !== runRef.promise) return;
+        if (remoteOptimisticPumps.get(sessionId) !== run) return;
         continue;
       }
       if (result.kind === 'failed') {
@@ -9318,9 +9319,8 @@ async function pumpRemoteOptimisticSends(sessionId: string): Promise<void> {
       }
     }
   })().finally(() => {
-    if (remoteOptimisticPumps.get(sessionId) === runRef.promise) remoteOptimisticPumps.delete(sessionId);
+    if (remoteOptimisticPumps.get(sessionId) === run) remoteOptimisticPumps.delete(sessionId);
   });
-  runRef.promise = run;
   remoteOptimisticPumps.set(sessionId, run);
   return run;
 }
