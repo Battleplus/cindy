@@ -862,7 +862,7 @@ import {
   resetSchedulerReady,
 } from './maker-ipc/schedule.js';
 import { registerProjectAutomationIpc } from './maker-ipc/project-automation.js';
-import { startGoalController, getGoalController } from './goal-host/index.js';
+import { startGoalController, getGoalController, resetGoalController } from './goal-host/index.js';
 import { startLearnHost, getLearnController, resetLearnController } from './learn-host/index.js';
 import { fetchHubSkillReference } from './learn-host/hubReference.js';
 import { registerLearnIpc, broadcastLearnEvent } from './learn-host/registerIpc.js';
@@ -1355,6 +1355,15 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
     // Hardware must stop before the long async drain. Otherwise a held stick or
     // microphone keeps acting on the outgoing account while caches and IM stop.
     suspendInputDeviceTaskSlots();
+    // Dispose GoalController immediately to cancel any pending timers/dispatches
+    // before async teardown drains. GoalController.dispose() is what cancels
+    // continuation and usage-resume timers; deferring it past the await allows
+    // stale async continuations to persist old-account state.
+    try {
+      resetGoalController();
+    } catch (err) {
+      authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
+    }
     // The boundary is already marked pending by every caller. New actions now
     // fail closed; drain an action that crossed the boundary before closing its DB.
     try {
