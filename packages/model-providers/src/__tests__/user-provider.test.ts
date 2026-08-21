@@ -209,7 +209,7 @@ describe("buildUserProvider (per-runtime)", () => {
     });
   });
 
-it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom id)', () => {
+it('strips xd/ prefix to match registry effort metadata (entry.id ≠ custom id)', () => {
     const p = buildUserProvider(
       {
         id: 'my-provider',
@@ -223,9 +223,10 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
       },
       { modelRegistry: BUNDLED_CATALOG.modelRegistry },
     );
-    // openai/gpt-5.6-sol → strips to gpt-5.6-sol → matches registry entry openai/gpt-5.6-sol
-    // entry.id ('openai/gpt-5.6-sol') ≠ custom model id ('openai/gpt-5.6-sol') — but the route
-    // match is by stripped id 'gpt-5.6-sol' which is unique for codex agent.
+    // xd/codex/gpt-5.6-sol → strips to codex/gpt-5.6-sol → no exact match
+    // → further strips? no, only openai/xd/chatgpt/ are stripped.
+    // Actually xd/codex/gpt-5.6-sol starts with xd/ → stripped to codex/gpt-5.6-sol
+    // which matches route.modelId for codex agent.
     expect(p.models.codex?.[0]).toMatchObject({
       id: 'xd/codex/gpt-5.6-sol',
       efforts: expect.arrayContaining(['ultra']),
@@ -659,7 +660,7 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
     });
   });
 
-  it('strips openai/ prefix to match registry effort metadata for claude-code', () => {
+  it('strips xd/ prefix to match registry effort metadata for claude-code', () => {
     const p = buildUserProvider(
       {
         id: 'my-provider',
@@ -673,12 +674,11 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
       },
       { modelRegistry: BUNDLED_CATALOG.modelRegistry },
     );
-    // openai/gpt-5.6-sol must match registry entry gpt-5.6-sol and inherit its efforts;
+    // xd/codex/gpt-5.6-sol → strips xd/ → codex/gpt-5.6-sol → matches route for claude-code
     // without prefix-stripping, the model ID wouldn't match any registry entry
-    // and efforts would remain empty.
+    // and efforts would fall back to CUSTOM_EFFORTS (no 'xhigh' from registry).
     const model = p.models['claude-code']?.[0];
     expect(model?.efforts?.length).toBeGreaterThan(0);
-    // gpt-5.6-sol in the registry supports 'xhigh' — a capability no custom default provides
     expect(model?.efforts).toContain('xhigh');
   });
 
@@ -755,6 +755,91 @@ it('strips openai/ prefix to match registry effort metadata (entry.id ≠ custom
       { modelRegistry: syntheticRegistry },
     );
     expect(pDirect.models['claude-code']?.[0]?.efforts).toContain('ultra');
+  });
+
+  it('Case A: exact match takes priority over prefix-stripped match (no ambiguity)', () => {
+    // Registry has two entries:
+    //   A: id='openai/foo', route.modelId='openai/foo', efforts=['ultra']
+    //   B: id='other', route.modelId='foo', efforts=['low']
+    // Custom model: openai/foo
+    // Stage 1 exact: matches A (entry.id='openai/foo') → unique → use A's efforts
+    // Without two-stage: both A and B match → ambiguous → fallback
+    const reg: ModelRegistry = {
+      updatedAt: '2026-01-01T00:00:00Z',
+      schemaVersion: 2,
+      models: [
+        {
+          id: 'openai/foo', name: 'OpenAI Foo',
+          efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          defaultEffort: 'high',
+          routes: [{ providerId: 'openai', modelId: 'openai/foo', agents: ['codex'] }],
+        },
+        {
+          id: 'other', name: 'Other Foo',
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'low',
+          routes: [{ providerId: 'other', modelId: 'foo', agents: ['codex'] }],
+        },
+      ],
+    };
+    const p = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { codex: { baseUrl: 'https://x/v1', models: [{ id: 'openai/foo', name: 'F' }] } } },
+      { modelRegistry: reg },
+    );
+    // Must select entry A (exact match), not ambiguous fallback
+    expect(p.models.codex?.[0]?.efforts).toContain('ultra');
+    expect(p.models.codex?.[0]?.defaultEffort).toBe('high');
+  });
+
+  it('Case B: no exact match → prefix fallback finds unique entry', () => {
+    // No entry with id='openai/bar' or route.modelId='openai/bar'
+    // But route.modelId='bar' exists → strip openai/ to find it
+    const reg: ModelRegistry = {
+      updatedAt: '2026-01-01T00:00:00Z',
+      schemaVersion: 2,
+      models: [
+        {
+          id: 'registry-bar', name: 'Registry Bar',
+          efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          defaultEffort: 'max',
+          routes: [{ providerId: 'test', modelId: 'bar', agents: ['claude-code'] }],
+        },
+      ],
+    };
+    const p = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { 'claude-code': { baseUrl: 'https://x/v1', models: [{ id: 'openai/bar', name: 'B' }] } } },
+      { modelRegistry: reg },
+    );
+    // Stage 1: no exact match for 'openai/bar'
+    // Stage 2: strip openai/ → 'bar' → matches route.modelId → unique
+    expect(p.models['claude-code']?.[0]?.efforts).toContain('ultra');
+    expect(p.models['claude-code']?.[0]?.defaultEffort).toBe('max');
+  });
+
+  it('Case C: no exact match → prefix fallback yields ambiguity → CUSTOM_EFFORTS', () => {
+    // Two entries both have route.modelId='baz' after stripping openai/
+    const reg: ModelRegistry = {
+      updatedAt: '2026-01-01T00:00:00Z',
+      schemaVersion: 2,
+      models: [
+        {
+          id: 'entry-1', name: 'E1',
+          efforts: ['low', 'ultra'],
+          routes: [{ providerId: 'p1', modelId: 'baz', agents: ['codex'] }],
+        },
+        {
+          id: 'entry-2', name: 'E2',
+          efforts: ['low', 'high'],
+          routes: [{ providerId: 'p2', modelId: 'baz', agents: ['codex'] }],
+        },
+      ],
+    };
+    const p = buildUserProvider(
+      { id: 'relay', name: 'R', runtimes: { codex: { baseUrl: 'https://x/v1', models: [{ id: 'openai/baz', name: 'B' }] } } },
+      { modelRegistry: reg },
+    );
+    // Ambiguous → falls back to CUSTOM_EFFORTS (no 'ultra')
+    expect(p.models.codex?.[0]?.efforts).not.toContain('ultra');
   });
 
   it('exports only the explicitly supported effort levels for a Pi reasoning model', () => {
