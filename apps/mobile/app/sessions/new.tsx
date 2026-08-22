@@ -1618,7 +1618,20 @@ export default function NewRemoteSessionScreen() {
     setVoiceState('idle');
     setVoiceError(null);
     discardPendingPrewarm();
-    if (controller) void controller.cancel().catch(() => undefined);
+    if (controller) {
+      void controller.cancel().catch(() => undefined).finally(() => {
+        // cancel() keeps any transcript already published to the draft. The
+        // listening effect may have moved the native caret to the end while
+        // the cancellation was in flight; restore the surviving insertion
+        // endpoint so device switches/background cancellation do not strand
+        // subsequent typing at the document end.
+        requestAnimationFrame(() => {
+          const end = controller.currentInsertionEnd();
+          if (end == null) return;
+          firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+        });
+      });
+    }
     void setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
   }, [setVoiceState]);
 
