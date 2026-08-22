@@ -1365,6 +1365,25 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
       path.join(app.getPath('userData'), 'pi-agent-home'),
     );
   } catch (err) {
+    // The handover is aborting before the owner commit, so the outgoing Maker
+    // and DB remain authoritative. Recreate the controller disposed above;
+    // otherwise a transient fence failure leaves the still-active account with
+    // no goal IPC/runtime until the whole app restarts.
+    try {
+      const maker = getMakerCore();
+      const automationGitBaselineHooks = createAutomationUserTurnGitBaselineHooks();
+      startGoalController({
+        maker,
+        getDb: () => getDbClient().drizzle,
+        broadcastStatus: broadcastGoalStatus,
+        ...automationGitBaselineHooks,
+      });
+    } catch (restoreErr) {
+      authBoundaryLog.error(
+        `restore GoalController after launch-fence failure on ${reason} failed:`,
+        restoreErr,
+      );
+    }
     // Fail closed, unlike quit and the relaunch. Those two are allowed to
     // continue without a fence because the process is about to disappear
     // (quit) or the operation is cancelled outright (relaunch). Here the
