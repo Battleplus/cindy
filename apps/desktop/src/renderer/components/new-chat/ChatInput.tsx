@@ -7968,16 +7968,16 @@ export function ChatInput({
                     )}
                     aria-hidden="true"
                   >
-                    <span className="min-w-0 truncate">{recommendedPrompt}</span>
+                    <span className="min-w-0 flex-1 truncate">{recommendedPrompt}</span>
                     <kbd
                       className={cn(
-                        'ml-1.5 inline-flex shrink-0 items-center rounded border',
+                        'ml-1.5 inline-flex shrink-0 items-center rounded-full border',
                         'border-[var(--chat-input-border)] bg-[var(--perm-code-bg)]',
                         'px-1 py-[1px] text-11 font-normal',
                         'text-[var(--status-bar-meta)]',
                       )}
                     >
-                      {t('Tab', 'Tab')}
+                      {t('newChat.chatInput.recommendationShortcut')}
                     </kbd>
                   </div>
                 )}
