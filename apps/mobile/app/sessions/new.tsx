@@ -682,6 +682,15 @@ export default function NewRemoteSessionScreen() {
   // 光标捕获时的草稿快照：onSelectionChange 同时存草稿文本，
   // start() 用它检测「光标位置对应的是旧草稿」这种竞态。
   const firstMessageCaretDraftRef = useRef<string | null>(null);
+  const voiceRecordingCaretRef = useRef<{
+    selection: { start: number; end: number };
+    draft: string;
+  } | null>(null);
+  // While listening the native input is forced to the document end so the
+  // hidden TextInput does not steal the visible caret. Keep that forced end
+  // separate from the recording-start anchor so we can restore the anchor only
+  // when the user has not moved the caret since listening began.
+  const voiceListeningCaretEndRef = useRef<number | null>(null);
   const voiceDraftScrollRef = useRef<ScrollView>(null);
   const voiceRecordingActiveRef = useRef(false);
   const voicePermissionRequestInFlightRef = useRef(false);
@@ -1583,8 +1592,9 @@ export default function NewRemoteSessionScreen() {
           charOffsetInLine = insertionEnd - accumulated;
           break;
         }
-        // 软换行不新增 plain-text 字符，只在有显式 \n 时加 1
-        accumulated += lineLen + (line.text.endsWith('\n') ? 1 : 0);
+        // TextLayoutEvent.lines[].text already includes any explicit \n;
+        // soft wrapping does not add a plain-text character.
+        accumulated += lineLen;
       }
     }
     // Use a measured prefix width for the waveform x-coordinate instead of the
@@ -1601,6 +1611,16 @@ export default function NewRemoteSessionScreen() {
         ? currentFrame
         : nextFrame
     ));
+  }, []);
+
+  const restoreVoiceRecordingAnchorIfStillAtListeningEnd = useCallback(() => {
+    const anchor = voiceRecordingCaretRef.current;
+    if (!anchor || firstMessageRef.current !== anchor.draft) return;
+    const current = firstMessageCaretRef.current;
+    const listeningEnd = voiceListeningCaretEndRef.current;
+    if (!current || listeningEnd == null) return;
+    if (current.start !== listeningEnd || current.end !== listeningEnd) return;
+    firstMessageInputRef.current?.setNativeProps({ selection: anchor.selection });
   }, []);
 
   const cancelVoiceForDeviceSwitch = useCallback(() => {
@@ -1627,13 +1647,17 @@ export default function NewRemoteSessionScreen() {
         // subsequent typing at the document end.
         requestAnimationFrame(() => {
           const end = controller.currentInsertionEnd();
-          if (end == null) return;
-          firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+          if (end != null) {
+            firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+          } else {
+            restoreVoiceRecordingAnchorIfStillAtListeningEnd();
+          }
+          voiceRecordingCaretRef.current = null;
         });
       });
     }
     void setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
-  }, [setVoiceState]);
+  }, [restoreVoiceRecordingAnchorIfStillAtListeningEnd, setVoiceState]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
@@ -3013,6 +3037,18 @@ export default function NewRemoteSessionScreen() {
         setVoiceError(mobileVoiceRealtimeAudioUnavailableError());
         return;
       }
+      // Capture the caret before any permission/audio awaits. Only retain it
+      // when the selection callback observed the same draft, otherwise an
+      // in-flight edit could make a stale anchor look valid.
+      const recordingDraft = firstMessageRef.current;
+      const recordingSelection = firstMessageCaretRef.current;
+      voiceRecordingCaretRef.current = (
+        recordingSelection
+        && firstMessageCaretDraftRef.current === recordingDraft
+      ) ? {
+        selection: { ...recordingSelection },
+        draft: recordingDraft,
+      } : null;
       permissionRequestSeq = voicePermissionRequestSeqRef.current + 1;
       voicePermissionRequestSeqRef.current = permissionRequestSeq;
       const currentPermissionAbortController = new AbortController();
@@ -3251,7 +3287,10 @@ export default function NewRemoteSessionScreen() {
         const end = controller.currentInsertionEnd();
         if (end != null) {
           firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+        } else {
+          restoreVoiceRecordingAnchorIfStillAtListeningEnd();
         }
+        voiceRecordingCaretRef.current = null;
       });
       return latestDraft;
     } catch (err) {
@@ -3264,7 +3303,7 @@ export default function NewRemoteSessionScreen() {
     } finally {
       voiceStopInFlightRef.current = false;
     }
-  }, [voiceState]);
+  }, [restoreVoiceRecordingAnchorIfStillAtListeningEnd, voiceState]);
 
   const openVoiceSettings = useCallback(() => {
     void Linking.openSettings().catch((err) => {
@@ -3335,11 +3374,20 @@ export default function NewRemoteSessionScreen() {
     if (!voiceIsListening) return undefined;
     const frame = requestAnimationFrame(() => {
       const end = firstMessageRef.current.length;
+      voiceListeningCaretEndRef.current = end;
+      firstMessageCaretRef.current = { start: end, end };
+      firstMessageCaretDraftRef.current = firstMessageRef.current;
       firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
       voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
     });
-    return () => cancelAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(frame);
+    };
   }, [composerInputContentHeight, draft.firstMessage, voiceIsListening]);
+
+  useEffect(() => {
+    if (!voiceIsListening) voiceListeningCaretEndRef.current = null;
+  }, [voiceIsListening]);
 
   useEffect(() => {
     if (voiceIsListening && draft.firstMessage.length > 0) return;

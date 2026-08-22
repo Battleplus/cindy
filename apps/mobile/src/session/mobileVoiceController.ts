@@ -308,6 +308,10 @@ export function createMobileVoiceControllerSession(
   // the refiner uses the current draft's end-of-text context instead of the
   // old caret context. Called from both publishText() and stop().
   const reconcileStaleAnchor = (currentDraft: string): void => {
+    // A draft difference is expected once this controller has published its
+    // own ASR insertion. Preserve the original selection context while that
+    // insertion is still intact; only edits inside the insertion invalidate it.
+    if (voiceInsertion && isInsertionIntact(currentDraft, voiceInsertion)) return;
     if (caretAnchor !== null && caretAnchorDraft !== currentDraft) {
       refinementSelectionOverride = buildStaleAnchorRefinementContext(currentDraft);
       caretAnchor = null;
