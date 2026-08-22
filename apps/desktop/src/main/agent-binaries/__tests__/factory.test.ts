@@ -162,4 +162,44 @@ describe('离线启动 fallback', () => {
     expect(result.ready).toBe(true);
     expect(result.binaryPath).toBe(binPath);
   });
+
+  it('download 失败时:本地有已验证版本仍返回 ready', async () => {
+    const { app } = await import('electron');
+    const userData = app.getPath('userData');
+    const installSubdir = `download-fallback-test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const version = '2.0.0-verified';
+    const binaryName = 'test-binary';
+
+    // 创建本地已验证版本
+    const versionDir = path.join(userData, installSubdir, version);
+    fs.mkdirSync(versionDir, { recursive: true });
+    const binPath = path.join(versionDir, binaryName);
+    fs.writeFileSync(binPath, 'fake binary');
+    fs.chmodSync(binPath, 0o755);
+    fs.writeFileSync(path.join(versionDir, '.verified'), '');
+
+    // manifest 返回成功，但 download 会抛错（模拟 CDN 拦截）
+    const { getCachedManifest, fetchManifest } = await import('../../manifestService.js');
+    vi.mocked(getCachedManifest).mockReturnValue(null as any);
+    vi.mocked(fetchManifest).mockResolvedValue({
+      version: '2.0.0',
+      claude: { file: '/linux-x64/claude.bin', sha256: 'abc', size: 100 },
+    } as any);
+
+    // Mock download to throw
+    const downloader = await import('../../downloader/index.js');
+    vi.mocked(downloader.download).mockRejectedValue(new Error('CDN blocked'));
+
+    const provisioner = createBinaryProvisioner({
+      vendorKey: 'claude',
+      manifestField: 'claude',
+      installSubdir,
+      artifact: { kind: 'raw', binaryName },
+    });
+
+    const result = await provisioner.prepare();
+
+    expect(result.ready).toBe(true);
+    expect(result.binaryPath).toBe(binPath);
+  });
 });

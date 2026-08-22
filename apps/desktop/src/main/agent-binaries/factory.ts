@@ -322,6 +322,19 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
           throw err;
         }
         const code = err instanceof DownloadError ? err.code : 'unknown';
+        // P1 fix: download/extract failures should also try local fallback.
+        // A proxy that permits manifest URLs but blocks CDN binaries would
+        // otherwise leave the user stuck even when a verified local version
+        // exists.
+        const localFallback = findLatestVerifiedBinary(config.installSubdir, binaryName);
+        if (localFallback) {
+          emit({
+            status: 'ready',
+            installedVersion: localFallback.version,
+            binaryPath: localFallback.binaryPath,
+          }, opts?.onProgress);
+          return { ready: true, binaryPath: localFallback.binaryPath };
+        }
         emit({
           status: 'failed',
           error: { code, message },
