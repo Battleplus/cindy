@@ -1339,13 +1339,19 @@ function clearAccountBoundaryAbortMark(): void {
 
 async function teardownAuthAccountBoundary(reason: string): Promise<void> {
   const blockingFailures: unknown[] = [];
-  // Raised before anything else in this function, because everything below
-  // it is destructive: input device slots are suspended, the custom provider
-  // catalog is cleared, IM, the scheduler, embedding and the Ghost projection
-  // are stopped. Failing to raise it aborts the handover — and it used to do
-  // that *after* those services were already down, leaving the user on a
-  // half-dismantled old account with no way back except a restart. From here
-  // the abort costs nothing: nothing has been taken apart yet.
+  // Goal timers can dispatch through the outgoing Maker while launch-fence
+  // acquisition waits behind queued filesystem work. Invalidate them before
+  // the first await; resetGoalController() synchronously disposes the current
+  // controller and cancels continuation / usage-resume timers.
+  try {
+    resetGoalController();
+  } catch (err) {
+    authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
+  }
+  // Raise the durable-run fence before the remaining destructive teardown:
+  // input device slots are suspended, the custom provider catalog is cleared,
+  // and IM, scheduler, embedding and Ghost projection are stopped. Failing to
+  // raise it still aborts the handover before those services are taken apart.
   //
   // Holding it for the whole teardown rather than only the shutdown+sweep is
   // the intended widening: a durable launch is exactly what must not start
@@ -1377,15 +1383,6 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
     // Hardware must stop before the long async drain. Otherwise a held stick or
     // microphone keeps acting on the outgoing account while caches and IM stop.
     suspendInputDeviceTaskSlots();
-    // Dispose GoalController immediately to cancel any pending timers/dispatches
-    // before async teardown drains. GoalController.dispose() is what cancels
-    // continuation and usage-resume timers; deferring it past the await allows
-    // stale async continuations to persist old-account state.
-    try {
-      resetGoalController();
-    } catch (err) {
-      authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
-    }
     // The boundary is already marked pending by every caller. New actions now
     // fail closed; drain an action that crossed the boundary before closing its DB.
     try {
