@@ -67,9 +67,14 @@ export interface StartSchedulerDeps {
 let _scheduler: Scheduler | null = null;
 let _storage: DrizzleScheduleStorage | null = null;
 let _loader: ProjectAutomationLoader | null = null;
+// Reset increments this before awaiting stop(). A start that was already
+// blocked in scheduler.start() must not publish its stale instance after the
+// account boundary has moved on.
+let _startupGeneration = 0;
 
 export async function startScheduler(deps: StartSchedulerDeps): Promise<Scheduler> {
   if (_scheduler) return _scheduler;
+  const startupGeneration = _startupGeneration;
 
   const storage = new DrizzleScheduleStorage(deps.getDb);
   _storage = storage;
@@ -197,6 +202,12 @@ export async function startScheduler(deps: StartSchedulerDeps): Promise<Schedule
   } catch (err) {
     deps.logger.warn?.(`[scheduler-host] deleteOrphanRuns failed (non-fatal): ${String(err)}`);
   }
+  if (_startupGeneration !== startupGeneration) {
+    // resetScheduler() raced the asynchronous startup. Stop the unpublished
+    // scheduler and leave the singleton slots owned by the next generation.
+    await scheduler.stop();
+    throw new Error('scheduler startup superseded by reset');
+  }
   _scheduler = scheduler;
   _loader = loader;
   deps.logger.info?.(`[scheduler-host] started${passive ? ' (passive: auto-fire disabled)' : ''}`);
@@ -243,6 +254,7 @@ export function getProjectAutomationLoader(): ProjectAutomationLoader {
  * 当前 resetMaker（maker-host:131）也不会调本函数。
  */
 export async function resetScheduler(): Promise<void> {
+  _startupGeneration++;
   if (_scheduler) {
     await _scheduler.stop();
   }

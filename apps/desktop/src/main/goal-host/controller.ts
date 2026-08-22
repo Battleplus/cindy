@@ -1477,12 +1477,20 @@ export class GoalController {
    * "active 却永远不动"的 dormant 死状态。
    */
   async resumeActiveGoals(): Promise<void> {
+    // Startup recovery is intentionally fire-and-forget. A logout/account
+    // switch can dispose the controller while either storage query is waiting;
+    // check the terminal fence after every await so the old maker cannot be
+    // reattached or receive a resumed turn after teardown.
+    if (this.disposed) return;
     const active = await this.deps.storage.listActive();
+    if (this.disposed) return;
     let resumed = 0;
     for (const snapshot of active) {
+      if (this.disposed) return;
       // listActive 是启动扫描快照；并发 Stop 可能已经立 cancelled boundary 或写成 paused。
       if (this.turns.has(snapshot.sessionId)) continue;
       const state = await this.deps.storage.get(snapshot.sessionId);
+      if (this.disposed) return;
       if (!state || state.status !== 'active' || this.turns.has(snapshot.sessionId)) continue;
       // 保守:只对**已经活着**的会话重挂 + 续跑;不在启动时强行 spawn agent
       //(开机就偷偷跑目标过于激进)。没活的留 dormant,等用户重发 /goal 时由
@@ -1513,9 +1521,12 @@ export class GoalController {
 
     // usageLimited 行:重启后 timer 丢了,按存档的 usageResetAt 重排自动续跑
     //(已过点 → delay 0 触发;未知 resetAt → 不排,留待手动 resume)。
+    if (this.disposed) return;
     const limited = await this.deps.storage.listUsageLimited();
+    if (this.disposed) return;
     let rescheduled = 0;
     for (const g of limited) {
+      if (this.disposed) return;
       if (g.usageResetAt == null) continue;
       this.scheduleUsageResume(g.sessionId, g.usageResetAt);
       rescheduled += 1;

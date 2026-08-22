@@ -965,6 +965,14 @@ async function attemptStartScheduler(): Promise<void> {
       logger: createSchedulerLogger('scheduler-host'),
       ...automationGitBaselineHooks,
     });
+    // startScheduler fences resets while its async startup is in flight. Keep
+    // the boundary check immediately before listener publication as a second
+    // guard so a stale generation can never make readiness visible.
+    if (getGoalTeardownGeneration() !== goalGenBefore) {
+      console.log('[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting stale scheduler attach');
+      await resetScheduler();
+      return;
+    }
     // scheduler 真正 ready 后挂 listener + 喂入 readiness holder。WeakSet 按实例
     // 去重:localDb onReady 重试可能再次拿到同实例，此时 no-op；
     // 切账号后新实例不在 set 里，会重新 attach。
@@ -979,12 +987,11 @@ async function attemptStartScheduler(): Promise<void> {
   } catch (err) {
     console.error('[bootstrap-electron] startScheduler failed (non-fatal):', err);
   }
-  // Re-check teardown generation after the long scheduler start await. A logout
-  // or account switch that raced startScheduler() would have reset the controller
-  // and incremented _teardownGeneration; proceeding with the stale maker would
-  // re-create the old controller and block the new account's startup.
+  // A superseded startup is reported as a non-fatal error by the catch above;
+  // keep the old post-await fence as well so it cannot continue into
+  // GoalController/learn-host startup with the stale maker.
   if (getGoalTeardownGeneration() !== goalGenBefore) {
-    console.log('[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting goal controller startup');
+    console.log('[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting stale account startup');
     return;
   }
   // GoalController 与 scheduler 同就绪点启动(maker + localDb 均 ready):内部幂等
