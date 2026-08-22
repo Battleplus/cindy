@@ -184,7 +184,12 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
         
         // 2. manifest 获取失败时，检查本地已验证版本（离线 fallback）
         if (!manifest) {
-          const local = findLatestVerifiedBinary(config.installSubdir, binaryName);
+          // Optional assets (currently Pi) must remain disabled when the
+          // manifest is unavailable; a stale local install may have been
+          // withdrawn for this platform/channel and must not be resurrected.
+          const local = config.optionalAsset
+            ? null
+            : findLatestVerifiedBinary(config.installSubdir, binaryName);
           if (local) {
             emit({ status: 'ready', installedVersion: local.version, binaryPath: local.binaryPath }, onProgress);
             return { ready: true, binaryPath: local.binaryPath };
@@ -326,7 +331,9 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
         // A proxy that permits manifest URLs but blocks CDN binaries would
         // otherwise leave the user stuck even when a verified local version
         // exists.
-        const localFallback = findLatestVerifiedBinary(config.installSubdir, config.artifact.binaryName);
+        const localFallback = config.optionalAsset
+          ? null
+          : findLatestVerifiedBinary(config.installSubdir, config.artifact.binaryName);
         if (localFallback) {
           emit({
             status: 'ready',

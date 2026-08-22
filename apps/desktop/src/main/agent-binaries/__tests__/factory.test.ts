@@ -253,4 +253,60 @@ describe('离线启动 fallback', () => {
       local.cleanup();
     }
   });
+
+  it('可选 runtime 在 manifest 失败时不复用旧版本', async () => {
+    const installSubdir = `optional-manifest-failure-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const local = await mountVerifiedBinary(installSubdir, '4.0.0-verified', 'pi');
+
+    try {
+      const { getCachedManifest, fetchManifest } = await import('../../manifestService.js');
+      vi.mocked(getCachedManifest).mockReturnValue(null as any);
+      vi.mocked(fetchManifest).mockResolvedValue(null as any);
+
+      const provisioner = createBinaryProvisioner({
+        vendorKey: 'pi',
+        manifestField: 'pi',
+        installSubdir,
+        optionalAsset: true,
+        artifact: { kind: 'raw', binaryName: 'pi' },
+      });
+
+      const result = await provisioner.prepare();
+
+      expect(result.ready).toBe(false);
+      expect(result.error).toBe('manifest_failed');
+    } finally {
+      local.cleanup();
+    }
+  });
+
+  it('可选 runtime 在下载失败时不复用旧版本', async () => {
+    const installSubdir = `optional-download-failure-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const local = await mountVerifiedBinary(installSubdir, '5.0.0-verified', 'pi');
+
+    try {
+      const { getCachedManifest, fetchManifest } = await import('../../manifestService.js');
+      vi.mocked(getCachedManifest).mockReturnValue(null as any);
+      vi.mocked(fetchManifest).mockResolvedValue({
+        version: '5.0.0',
+        pi: { file: 'pi/pi-5.0.0.gz', sha256: FAKE_SHA, size: 3 },
+      } as any);
+      mocks.download.mockRejectedValue(new Error('CDN blocked'));
+
+      const provisioner = createBinaryProvisioner({
+        vendorKey: 'pi',
+        manifestField: 'pi',
+        installSubdir,
+        optionalAsset: true,
+        artifact: { kind: 'gz', binaryName: 'pi' },
+      });
+
+      const result = await provisioner.prepare();
+
+      expect(result.ready).toBe(false);
+      expect(result.error).toBe('unknown');
+    } finally {
+      local.cleanup();
+    }
+  });
 });
