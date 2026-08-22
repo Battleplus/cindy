@@ -1584,7 +1584,7 @@ export default function NewRemoteSessionScreen() {
           break;
         }
         // 软换行不新增 plain-text 字符，只在有显式 \n 时加 1
-        accumulated += lineLen + (line.text.endsWith('\n') ? 0 : (line === lines[lines.length - 1] ? 0 : 0));
+        accumulated += lineLen + (line.text.endsWith('\n') ? 1 : 0);
       }
     }
     // Use a measured prefix width for the waveform x-coordinate instead of the
