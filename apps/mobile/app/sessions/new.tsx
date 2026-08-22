@@ -1653,6 +1653,7 @@ export default function NewRemoteSessionScreen() {
             restoreVoiceRecordingAnchorIfStillAtListeningEnd();
           }
           voiceRecordingCaretRef.current = null;
+          voiceListeningCaretEndRef.current = null;
         });
       });
     }
@@ -3291,6 +3292,7 @@ export default function NewRemoteSessionScreen() {
           restoreVoiceRecordingAnchorIfStillAtListeningEnd();
         }
         voiceRecordingCaretRef.current = null;
+        voiceListeningCaretEndRef.current = null;
       });
       return latestDraft;
     } catch (err) {
@@ -3384,10 +3386,6 @@ export default function NewRemoteSessionScreen() {
       cancelAnimationFrame(frame);
     };
   }, [composerInputContentHeight, draft.firstMessage, voiceIsListening]);
-
-  useEffect(() => {
-    if (!voiceIsListening) voiceListeningCaretEndRef.current = null;
-  }, [voiceIsListening]);
 
   useEffect(() => {
     if (voiceIsListening && draft.firstMessage.length > 0) return;
