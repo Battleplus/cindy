@@ -196,6 +196,13 @@ export async function startScheduler(deps: StartSchedulerDeps): Promise<Schedule
   scriptRunner.attachScheduler(scheduler);
 
   await scheduler.start();
+  if (_startupGeneration !== startupGeneration) {
+    // Do not run cleanup queries through an instance that lost its account
+    // generation while start() was awaiting. Stop it before any post-start
+    // work and leave the singleton slots for the next generation.
+    await scheduler.stop();
+    throw new Error('scheduler startup superseded by reset');
+  }
   try {
     const orphans = await storage.deleteOrphanRuns();
     if (orphans > 0) deps.logger.info?.(`[scheduler-host] cleaned ${orphans} orphan run(s)`);
