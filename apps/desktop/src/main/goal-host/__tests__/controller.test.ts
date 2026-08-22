@@ -4381,4 +4381,59 @@ describe('GoalController disposal', () => {
     h.controller.dispose();
     h.controller.dispose(); // should not throw
   });
+
+  it('does not persist a create marker when disposal wins the storage race', async () => {
+    const h = makeController();
+    const originalUpsert = h.storage.upsert.bind(h.storage);
+    let markUpsertStarted!: () => void;
+    const upsertStarted = new Promise<void>((resolve) => {
+      markUpsertStarted = resolve;
+    });
+    let releaseUpsert!: () => void;
+    const blockedUpsert = new Promise<void>((resolve) => {
+      releaseUpsert = resolve;
+    });
+    vi.spyOn(h.storage, 'upsert').mockImplementationOnce(async (state) => {
+      markUpsertStarted();
+      await blockedUpsert;
+      return originalUpsert(state);
+    });
+
+    const create = h.controller.setGoal({ sessionId: 's1', objective: 'outgoing objective' });
+    await upsertStarted;
+    h.controller.dispose();
+    releaseUpsert();
+
+    await expect(create).resolves.toBeNull();
+    expect(h.userMessages).toHaveLength(0);
+    expect(h.session.sends).toHaveLength(0);
+  });
+
+  it('does not persist an edit marker when disposal wins the storage race', async () => {
+    const h = makeController();
+    await h.storage.set(seededGoal({ status: 'paused', objective: 'old objective' }));
+    const originalUpdate = h.storage.update.bind(h.storage);
+    let markUpdateStarted!: () => void;
+    const updateStarted = new Promise<void>((resolve) => {
+      markUpdateStarted = resolve;
+    });
+    let releaseUpdate!: () => void;
+    const blockedUpdate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    vi.spyOn(h.storage, 'update').mockImplementationOnce(async (sessionId, patch) => {
+      markUpdateStarted();
+      await blockedUpdate;
+      return originalUpdate(sessionId, patch);
+    });
+
+    const edit = h.controller.setGoal({ sessionId: 's1', objective: 'outgoing edit' });
+    await updateStarted;
+    h.controller.dispose();
+    releaseUpdate();
+
+    await expect(edit).resolves.toBeNull();
+    expect(h.userMessages).toHaveLength(0);
+    expect(h.session.sends).toHaveLength(0);
+  });
 });

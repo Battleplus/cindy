@@ -1628,6 +1628,11 @@ export class GoalController {
     afterPersist?: (value: T) => void | Promise<void>,
   ): Promise<T> {
     const committed = operation.then(async (value) => {
+      // Account teardown makes disposal terminal. The storage write may already
+      // be in flight and cannot be cancelled, but its follow-up callback must
+      // not start a new account-scoped message write after the controller has
+      // been detached from its owner.
+      if (this.disposed) return value;
       await afterPersist?.(value);
       return value;
     });
