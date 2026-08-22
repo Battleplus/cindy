@@ -698,7 +698,8 @@ export default function NewRemoteSessionScreen() {
   const [voiceDraftCaretFrame, setVoiceDraftCaretFrame] = useState({ left: 0, top: 0 });
   // 本次录音的实际落点行顶(relative to overlay content);无有效落点时为 0。
   // 浮层滚动跟随它而不是永远 scrollToEnd,否则中部插入时波形光标在屏幕外。
-  const voiceDraftCaretTopRef = useRef(0);
+  // null = no valid caret position (use scrollToEnd); number = scroll to that y.
+  const voiceDraftCaretTopRef = useRef<number | null>(null);
   // 自动默认运行配置(跟随最近会话 / 区域默认 / 列表最上面)的守卫:用户一旦手动选过模型,就不再自动覆盖;
   // 记录已自动应用过的设备,切设备时(未手动选过)按新设备重算。
   const userTouchedRuntimeRef = useRef(false);
@@ -1572,21 +1573,29 @@ export default function NewRemoteSessionScreen() {
     // end 为 null(落点已失效,回退文末追加)时退化为旧行为:最后一行。
     const insertionEnd = voiceControllerSessionRef.current?.currentInsertionEnd();
     let caretLine = lines[lines.length - 1];
+    let charOffsetInLine = caretLine.text.length; // default: end of line
     if (insertionEnd != null) {
       let accumulated = 0;
       for (const line of lines) {
-        if (accumulated + line.text.length >= insertionEnd) {
+        const lineLen = line.text.length;
+        if (accumulated + lineLen >= insertionEnd) {
           caretLine = line;
+          charOffsetInLine = insertionEnd - accumulated;
           break;
         }
-        accumulated += line.text.length + 1; // 视觉行之间的隐式换行占 1 个 plain-text 偏移
+        // 软换行不新增 plain-text 字符，只在有显式 \n 时加 1
+        accumulated += lineLen + (line.text.endsWith('\n') ? 0 : (line === lines[lines.length - 1] ? 0 : 0));
       }
     }
+    // Use a measured prefix width for the waveform x-coordinate instead of the
+    // full line width, so the waveform sits at the actual insertion column.
+    const fraction = charOffsetInLine / Math.max(1, caretLine.text.length);
+    const measuredWidth = caretLine.width * fraction;
     const nextFrame = {
-      left: Math.max(0, Math.round(caretLine.x + caretLine.width + COMPOSER_VOICE_CARET_GAP)),
+      left: Math.max(0, Math.round(caretLine.x + measuredWidth + COMPOSER_VOICE_CARET_GAP)),
       top: Math.max(0, Math.round(caretLine.y + ((caretLine.height - MOBILE_COMPOSER_INPUT_LINE_HEIGHT) / 2))),
     };
-    voiceDraftCaretTopRef.current = Math.max(0, Math.round(caretLine.y));
+    voiceDraftCaretTopRef.current = Math.round(caretLine.y);
     setVoiceDraftCaretFrame((currentFrame) => (
       currentFrame.left === nextFrame.left && currentFrame.top === nextFrame.top
         ? currentFrame
@@ -3224,8 +3233,12 @@ export default function NewRemoteSessionScreen() {
       setVoiceState('done');
       requestAnimationFrame(() => {
         // 录音结束后光标应停在刚插入的听写文本之后，而不是全文末尾。
-        const end = controller.currentInsertionEnd() ?? latestDraft.length;
-        firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+        // currentInsertionEnd() 返回 null 时（无 transcript 或落点已失效），
+        // 不移动光标——尊重用户当前编辑位置，避免把中间光标抢到文末。
+        const end = controller.currentInsertionEnd();
+        if (end != null) {
+          firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+        }
       });
       return latestDraft;
     } catch (err) {
@@ -3481,7 +3494,7 @@ export default function NewRemoteSessionScreen() {
         requestAnimationFrame(() => {
           // 跟随实际落点(scrollToEnd 会让中部插入的转写滚出屏幕)。
           const targetTop = voiceDraftCaretTopRef.current;
-          if (targetTop > 0) {
+          if (targetTop != null) {
             voiceDraftScrollRef.current?.scrollTo({ y: targetTop, animated: false });
           } else {
             voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
@@ -3491,7 +3504,7 @@ export default function NewRemoteSessionScreen() {
       onLayout={() => {
         requestAnimationFrame(() => {
           const targetTop = voiceDraftCaretTopRef.current;
-          if (targetTop > 0) {
+          if (targetTop != null) {
             voiceDraftScrollRef.current?.scrollTo({ y: targetTop, animated: false });
           } else {
             voiceDraftScrollRef.current?.scrollToEnd({ animated: false });

@@ -303,6 +303,18 @@ export function createMobileVoiceControllerSession(
     pendingDraftToPublish = draft;
   };
 
+  // Synchronously detect whether the caret anchor is still valid (draft hasn't
+  // changed since capture). When stale, invalidates the refinement context so
+  // the refiner uses the current draft's end-of-text context instead of the
+  // old caret context. Called from both publishText() and stop().
+  const reconcileStaleAnchor = (currentDraft: string): void => {
+    if (caretAnchor !== null && caretAnchorDraft !== currentDraft) {
+      refinementSelectionOverride = buildStaleAnchorRefinementContext(currentDraft);
+      caretAnchor = null;
+      caretAnchorDraft = null;
+    }
+  };
+
   const publishText = (
     text: string,
     segmentIds: string[],
@@ -335,9 +347,7 @@ export function createMobileVoiceControllerSession(
     // 快照不一致，偏移就不再有意义，作废锚点回退到安全的末尾追加。
     const anchorIsFresh = caretAnchor !== null && caretAnchorDraft === currentDraft;
     if (caretAnchor !== null && !anchorIsFresh) {
-      // 落点回退到文末的同时,润色语境也要同步作废:清掉按旧光标切分的
-      // selectedText/selectionAfter,并把 selectionBefore 换成当前草稿尾部。
-      refinementSelectionOverride = buildStaleAnchorRefinementContext(currentDraft);
+      reconcileStaleAnchor(currentDraft);
     }
     const result = appendVoiceTranscriptDraftWithRange(currentDraft, normalized, anchorIsFresh ? caretAnchor : null);
     if (!result.insertion) return undefined;
@@ -559,6 +569,12 @@ export function createMobileVoiceControllerSession(
         );
       }
       notifyReadyForEndCue();
+      // P1 fix: reconcile anchor before optimistic refinement. If the user
+      // edited the draft before the first ASR result and then called stop(),
+      // publishText() was never called, so the stale-anchor fallback never ran.
+      // Without this, the refiner would receive the old caret context instead
+      // of the current draft's end-of-text fallback context.
+      reconcileStaleAnchor(readCurrentDraft());
       await controller.stop();
       if (state === 'error' || controllerError) {
         runPhase = 'failed';
