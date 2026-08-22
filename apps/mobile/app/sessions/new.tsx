@@ -3003,13 +3003,18 @@ export default function NewRemoteSessionScreen() {
   // 用 controller 的实际插入区间恢复到听写文本之后；插入已被用户改动时
   // currentInsertionEnd() 返回 null,此时尊重用户当前编辑，不强行抢光标。
   const restoreVoiceCaretAfterError = useCallback((controller: MobileVoiceControllerSession | null) => {
-    if (controller?.currentInsertionEnd() == null) return;
+    if (!controller) return;
     requestAnimationFrame(() => {
       const end = controller.currentInsertionEnd();
-      if (end == null) return;
-      firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+      if (end != null) {
+        firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+      } else {
+        restoreVoiceRecordingAnchorIfStillAtListeningEnd();
+      }
+      voiceRecordingCaretRef.current = null;
+      voiceListeningCaretEndRef.current = null;
     });
-  }, []);
+  }, [restoreVoiceRecordingAnchorIfStillAtListeningEnd]);
 
   const startVoiceRecording = useCallback(async () => {
     if (
@@ -3156,6 +3161,13 @@ export default function NewRemoteSessionScreen() {
       // currentDraft 会与最新光标不同步，导致润色语境来自错误文本。
       const draftAtStartup = firstMessageRef.current;
       const caretAtStart = firstMessageCaretRef.current;
+      voiceRecordingCaretRef.current = (
+        caretAtStart
+        && firstMessageCaretDraftRef.current === draftAtStartup
+      ) ? {
+        selection: { ...caretAtStart },
+        draft: draftAtStartup,
+      } : null;
       const clampedCaretStart = caretAtStart ? Math.max(0, Math.min(draftAtStartup.length, caretAtStart.start)) : null;
       const clampedCaretEnd = caretAtStart && clampedCaretStart != null
         ? Math.max(clampedCaretStart, Math.min(draftAtStartup.length, caretAtStart.end))
