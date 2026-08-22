@@ -1170,4 +1170,36 @@ describe('mobileVoiceController', () => {
 
     await session.cancel();
   });
+
+  it('reconciles stale anchor before stop() so refiner gets end-append context', async () => {
+    dictationRefinerOptions.length = 0;
+    let currentDraft = '世界';
+    const asr = new FakeAsrProvider();
+    const session = createMobileVoiceControllerSession({
+      credential: credential(),
+      initialDraft: currentDraft,
+      readCurrentDraft: () => currentDraft,
+      readCaret: () => ({ start: 0, end: 0 }),
+      asr,
+      refinerTargetProvider: async () => ({ url: 'https://refine.test/v1', authorization: 'Bearer test' }),
+      startAudio: async () => async () => undefined,
+      onDraftChanged: (draft) => {
+        currentDraft = draft;
+      },
+    });
+
+    await session.start();
+    // Edit draft before any ASR result → anchor becomes stale.
+    currentDraft = '已编辑的世界';
+    // Immediately stop without any ASR result — publishText() was never called.
+    const result = await session.stop();
+
+    // The refiner should have received end-append context (stale anchor
+    // reconciled in stop()), not the old caret context.
+    expect(dictationRefinerOptions.length).toBe(1);
+    const context = dictationRefinerOptions[0].contextProvider?.();
+    expect(context?.selectionBefore).toBe('已编辑的世界');
+    expect(context?.selectedText).toBeUndefined();
+    expect(context?.selectionAfter).toBeUndefined();
+  });
 });
