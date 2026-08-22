@@ -4334,6 +4334,34 @@ describe('GoalController disposal', () => {
     await expect(h.controller.clearGoal('s1')).resolves.toBeUndefined();
   });
 
+  it('all public lifecycle entry points stay inert after dispose', async () => {
+    const h = makeController();
+    await h.storage.set(seededGoal({ status: 'paused' }));
+    h.controller.dispose();
+
+    await expect(h.controller.updateGoal('s1', { objective: 'later' })).resolves.toBeNull();
+    await expect(h.controller.pauseGoal('s1')).resolves.toBeUndefined();
+    await expect(h.controller.resumeGoal('s1')).resolves.toBeUndefined();
+    await expect(h.controller.maybeContinueActiveGoal('s1')).resolves.toBeUndefined();
+    await expect(h.controller.resumeOnOpen('s1')).resolves.toBeUndefined();
+    await expect(h.controller.resumeActiveGoals()).resolves.toBeUndefined();
+    await expect(h.controller.getStatus('s1')).resolves.toBeNull();
+    await expect(
+      h.controller.applyClarificationAnswer(
+        's1',
+        { objective: 'later' },
+        [{ options: [{ label: 'task' }] }],
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(await h.storage.get('s1')).toMatchObject({
+      status: 'paused',
+      objective: 'old objective',
+    });
+    expect(h.session.sends).toHaveLength(0);
+    expect(h.updates).toHaveLength(0);
+  });
+
   it('dispose clears turns and listeners', async () => {
     const h = makeController();
     await startGoal(h);
