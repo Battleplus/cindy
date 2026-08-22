@@ -7962,13 +7962,23 @@ export function ChatInput({
                 {showRecommendationOverlay && (
                   <div
                     className={cn(
-                      'pointer-events-none absolute left-0 top-0 w-full truncate py-[3px]',
+                      'pointer-events-none absolute left-0 top-0 flex w-full min-w-0 items-center truncate py-[3px]',
                       'text-15 leading-[1.467] font-normal',
                       'text-[var(--chat-input-placeholder-subtle)]',
                     )}
                     aria-hidden="true"
                   >
-                    {recommendedPrompt}
+                    <span className="min-w-0 truncate">{recommendedPrompt}</span>
+                    <kbd
+                      className={cn(
+                        'ml-1.5 inline-flex shrink-0 items-center rounded border',
+                        'border-[var(--chat-input-border)] bg-[var(--perm-code-bg)]',
+                        'px-1 py-[1px] text-11 font-normal',
+                        'text-[var(--status-bar-meta)]',
+                      )}
+                    >
+                      {t('Tab', 'Tab')}
+                    </kbd>
                   </div>
                 )}
               </div>
