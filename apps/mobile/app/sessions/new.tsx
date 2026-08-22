@@ -699,6 +699,10 @@ export default function NewRemoteSessionScreen() {
   const voiceStartupInFlightRef = useRef(false);
   const voiceStopInFlightRef = useRef(false);
   const voiceStartupSeqRef = useRef(0);
+  // Each logical recording/cancellation gets a monotonically increasing
+  // generation.  Teardown is asynchronous; an older controller.cancel()
+  // must not restore or clear caret state captured by a newer recording.
+  const voiceRecordingGenerationRef = useRef(0);
   const voiceControllerSessionRef = useRef<MobileVoiceControllerSession | null>(null);
   const voiceDictionaryLearningTrackerRef = useRef<MobileVoiceDictionaryLearningTracker | null>(null);
   const creatingRef = useRef(false);
@@ -1624,6 +1628,8 @@ export default function NewRemoteSessionScreen() {
   }, []);
 
   const cancelVoiceForDeviceSwitch = useCallback(() => {
+    const cancelGeneration = voiceRecordingGenerationRef.current + 1;
+    voiceRecordingGenerationRef.current = cancelGeneration;
     voicePermissionRequestSeqRef.current += 1;
     voicePermissionRequestAbortRef.current?.abort();
     voicePermissionRequestAbortRef.current = null;
@@ -1640,12 +1646,14 @@ export default function NewRemoteSessionScreen() {
     discardPendingPrewarm();
     if (controller) {
       void controller.cancel().catch(() => undefined).finally(() => {
+        if (voiceRecordingGenerationRef.current !== cancelGeneration) return;
         // cancel() keeps any transcript already published to the draft. The
         // listening effect may have moved the native caret to the end while
         // the cancellation was in flight; restore the surviving insertion
         // endpoint so device switches/background cancellation do not strand
         // subsequent typing at the document end.
         requestAnimationFrame(() => {
+          if (voiceRecordingGenerationRef.current !== cancelGeneration) return;
           const end = controller.currentInsertionEnd();
           if (end != null) {
             firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
@@ -3025,6 +3033,9 @@ export default function NewRemoteSessionScreen() {
       || voiceState === 'listening'
       || voiceIsProcessing
     ) return;
+    // Invalidate any cancellation callback still waiting on the previous
+    // controller before capturing the new recording's caret anchor.
+    voiceRecordingGenerationRef.current += 1;
     setVoiceError(null);
     let permissionRequestSeq: number | null = null;
     let permissionRequestAbortController: AbortController | null = null;
