@@ -2,11 +2,11 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Migration companion scripts intentionally use CommonJS so the runtime loader can replay them.
-const { default: migration0093 } = (await import(
-  '../../../../drizzle/scripts/0093_repair_custom_provider_timestamps'
+const { default: migration0094 } = (await import(
+  '../../../../drizzle/scripts/0094_repair_custom_provider_timestamps'
 )) as { default: { run(db: Database.Database): void } };
 
-describe('0093 repair custom provider timestamps', () => {
+describe('0094 repair custom provider timestamps', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -47,7 +47,7 @@ describe('0093 repair custom provider timestamps', () => {
          VALUES (?, ?, '{}', 0, ?, ?)`,
       ).run('invalid-text', 'Invalid text', 1, 'not-a-timestamp');
 
-      migration0093.run(db);
+      migration0094.run(db);
 
       expect(db.prepare('SELECT id, updated_at, typeof(updated_at) AS type FROM custom_providers ORDER BY id').all())
         .toEqual([
@@ -57,7 +57,7 @@ describe('0093 repair custom provider timestamps', () => {
           { id: 'numeric-text', updated_at: 1_234, type: 'integer' },
         ]);
 
-      expect(() => migration0093.run(db)).not.toThrow();
+      expect(() => migration0094.run(db)).not.toThrow();
       expect(db.prepare('SELECT COUNT(*) AS count FROM custom_providers').get()).toEqual({ count: 4 });
     } finally {
       db.close();
@@ -67,7 +67,7 @@ describe('0093 repair custom provider timestamps', () => {
   it('is safe when the custom provider table is absent', () => {
     const db = new Database(':memory:');
     try {
-      expect(() => migration0093.run(db)).not.toThrow();
+      expect(() => migration0094.run(db)).not.toThrow();
     } finally {
       db.close();
     }
@@ -82,7 +82,7 @@ describe('0093 repair custom provider timestamps', () => {
           created_at INTEGER NOT NULL
         );
       `);
-      expect(() => migration0093.run(db)).toThrow(/no such column: updated_at/i);
+      expect(() => migration0094.run(db)).toThrow(/no such column: updated_at/i);
     } finally {
       db.close();
     }
