@@ -326,7 +326,7 @@ export function createBinaryProvisioner(config: BinaryProvisionerConfig): Binary
         // A proxy that permits manifest URLs but blocks CDN binaries would
         // otherwise leave the user stuck even when a verified local version
         // exists.
-        const localFallback = findLatestVerifiedBinary(config.installSubdir, binaryName);
+        const localFallback = findLatestVerifiedBinary(config.installSubdir, config.artifact.binaryName);
         if (localFallback) {
           emit({
             status: 'ready',
