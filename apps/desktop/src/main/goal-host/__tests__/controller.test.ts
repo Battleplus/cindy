@@ -4305,3 +4305,52 @@ describe('GoalController', () => {
   });
 
 });
+
+// ── dispose / GoalControllerDisposedError ───────────────────────────────────
+
+describe('GoalController disposal', () => {
+  it('setGoal rejects after dispose', async () => {
+    const h = makeController();
+    h.controller.dispose();
+    await expect(
+      h.controller.setGoal({ sessionId: 's1', objective: 'x', agentKind: 'claude-code' }),
+    ).rejects.toThrow('GoalController has been disposed');
+  });
+
+  it('resumeGoal is no-op after dispose (auto)', async () => {
+    const h = makeController();
+    await startGoal(h);
+    h.controller.dispose();
+    // resumeGoal with auto:true returns early when turns map is empty (no throw).
+    await expect(h.controller.resumeGoal('s1', { auto: true })).resolves.toBeUndefined();
+  });
+
+  it('clearGoal is no-op after dispose', async () => {
+    const h = makeController();
+    await startGoal(h);
+    h.controller.dispose();
+    // clearGoal does not call assertActive — it is a safe cleanup operation.
+    // After dispose it should not throw; the turns map is already empty.
+    await expect(h.controller.clearGoal('s1')).resolves.toBeUndefined();
+  });
+
+  it('dispose clears turns and listeners', async () => {
+    const h = makeController();
+    await startGoal(h);
+    // Start a turn to register listeners.
+    h.session.emitGoalTurn({ toolUse: true, tokens: 100 });
+    await new Promise((r) => setTimeout(r, 0));
+    const updatesBefore = h.updates.length;
+    h.controller.dispose();
+    // After dispose, no more status updates should be emitted.
+    h.session.emitGoalTurn({ toolUse: true, tokens: 200 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(h.updates.length).toBe(updatesBefore);
+  });
+
+  it('dispose is idempotent', () => {
+    const h = makeController();
+    h.controller.dispose();
+    h.controller.dispose(); // should not throw
+  });
+});

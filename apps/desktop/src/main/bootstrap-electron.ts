@@ -979,6 +979,14 @@ async function attemptStartScheduler(): Promise<void> {
   } catch (err) {
     console.error('[bootstrap-electron] startScheduler failed (non-fatal):', err);
   }
+  // Re-check teardown generation after the long scheduler start await. A logout
+  // or account switch that raced startScheduler() would have reset the controller
+  // and incremented _teardownGeneration; proceeding with the stale maker would
+  // re-create the old controller and block the new account's startup.
+  if (getGoalTeardownGeneration() !== goalGenBefore) {
+    console.log('[bootstrap-electron] attemptStartScheduler: teardown raced scheduler start, aborting goal controller startup');
+    return;
+  }
   // GoalController 与 scheduler 同就绪点启动(maker + localDb 均 ready):内部幂等
   // (_controller 已存在则直接返回),启动时 resume 所有 active goal。失败非致命。
   try {
