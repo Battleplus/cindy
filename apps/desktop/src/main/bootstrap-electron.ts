@@ -1360,11 +1360,6 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
   // disposal itself only settles owner-scoped persistence and cannot launch a
   // new durable runner after the controller has been fenced.
   const goalDispose = resetGoalController();
-  try {
-    await goalDispose;
-  } catch (err) {
-    authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
-  }
   // Raise the durable-run fence before the remaining destructive teardown:
   // input device slots are suspended, the custom provider catalog is cleared,
   // and IM, scheduler, embedding and Ghost projection are stopped. Failing to
@@ -1382,6 +1377,9 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
       path.join(app.getPath('userData'), 'pi-agent-home'),
     );
   } catch (err) {
+    void goalDispose.catch((disposeErr) => {
+      authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, disposeErr);
+    });
     // The handover is aborting before the owner commit, so the outgoing Maker
     // and DB remain authoritative. Recreate the controller disposed above;
     // otherwise a transient fence failure leaves the still-active account with
@@ -1420,6 +1418,11 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
       err,
       'the PI Subagent launch fence could not be raised',
     );
+  }
+  try {
+    await goalDispose;
+  } catch (err) {
+    authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
   }
   try {
     // Hardware must stop before the long async drain. Otherwise a held stick or
