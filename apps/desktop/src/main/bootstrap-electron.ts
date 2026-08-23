@@ -1377,9 +1377,11 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
       path.join(app.getPath('userData'), 'pi-agent-home'),
     );
   } catch (err) {
-    void goalDispose.catch((disposeErr) => {
+    try {
+      await goalDispose;
+    } catch (disposeErr) {
       authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, disposeErr);
-    });
+    }
     // The handover is aborting before the owner commit, so the outgoing Maker
     // and DB remain authoritative. Recreate the controller disposed above;
     // otherwise a transient fence failure leaves the still-active account with
