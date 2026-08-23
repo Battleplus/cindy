@@ -1902,6 +1902,11 @@ export class GoalController {
       await this.trackCompletion(
         turn,
         (async () => {
+          // Account teardown disposes the controller synchronously before the
+          // owner DB is released. Every lazy completion side effect must honor
+          // that terminal fence so a continuation that was waiting on message
+          // persistence cannot resolve getDb() against the next account.
+          if (this.disposed) return;
           if (this.deps.persistGoalCompletion) {
             try {
               await this.deps.persistGoalCompletion(sessionId, {
@@ -1914,7 +1919,9 @@ export class GoalController {
               this.deps.logger.warn('[goal] persistGoalCompletion failed', { sessionId, error: String(e) });
             }
           }
+          if (this.disposed) return;
           await this.deps.storage.clear(sessionId);
+          if (this.disposed) return;
           // null emit 属于同一顺序提交；后续新目标必须在它之后再 emit active，
           // 否则旧 completion 的迟到 null 会把新 chip 隐藏。
           this.deps.emitStatus({ sessionId, goal: null });

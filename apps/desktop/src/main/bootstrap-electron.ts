@@ -919,7 +919,19 @@ async function waitForCurrentAccountProviderModelsReady(): Promise<void> {
  * startScheduler 返回同一实例，WeakSet 防止 scheduler.on 重复挂 listener。切账号后
  * resetScheduler 把 _scheduler 置 null，新实例不在 WeakSet 里，会重新 attach 一次。
  */
-async function attemptStartScheduler(): Promise<void> {
+// Provider/DB readiness can trigger this entry from several places. Serialize
+// complete account-host attempts, not only Scheduler construction: when an
+// account-boundary reset supersedes an older attempt, its cleanup must finish
+// before an abort recovery starts Scheduler, GoalController, and Learn again.
+let attemptStartSchedulerBarrier: Promise<void> = Promise.resolve();
+
+function attemptStartScheduler(): Promise<void> {
+  const attempt = attemptStartSchedulerBarrier.then(() => attemptStartSchedulerOnce());
+  attemptStartSchedulerBarrier = attempt.catch(() => undefined);
+  return attempt;
+}
+
+async function attemptStartSchedulerOnce(): Promise<void> {
   // 两个前置条件必须满足才能启动：
   //   1. maker 单例已构造 (splash check-environment 完成 → registerMakerIpcsAfterSplash)
   //   2. DbClient 已 smoke 通过 (user login → renderer 触发 'local-db:ensure-ready' IPC)
@@ -1378,6 +1390,12 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
         broadcastStatus: broadcastGoalStatus,
         ...automationGitBaselineHooks,
       });
+      // A startup already in flight before resetGoalController() will exit on
+      // its generation fence (and may stop a scheduler it just constructed).
+      // Queue a fresh full account-host attempt behind that cleanup so the
+      // still-active account also regains Scheduler and Learn. Do not await it:
+      // the original fence error must remain the handover result.
+      void attemptStartScheduler();
     } catch (restoreErr) {
       authBoundaryLog.error(
         `restore GoalController after launch-fence failure on ${reason} failed:`,

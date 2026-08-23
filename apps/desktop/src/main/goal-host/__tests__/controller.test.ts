@@ -2509,6 +2509,65 @@ describe('GoalController', () => {
     expect(local.updates.filter((update) => update.goal === null)).toHaveLength(1);
   });
 
+  it('does not continue a pending completion commit after controller disposal', async () => {
+    let completionCalls = 0;
+    let releaseCompletion!: () => void;
+    const blockedCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve;
+    });
+    const local = makeController({
+      persistGoalCompletion: async () => {
+        completionCalls += 1;
+        await blockedCompletion;
+      },
+    });
+    const clear = vi.spyOn(local.storage, 'clear');
+    await startGoal(local);
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"complete","reason":"done"}\n```',
+    });
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    local.controller.dispose();
+    releaseCompletion();
+    await tick();
+
+    expect(clear).not.toHaveBeenCalled();
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'active' });
+    expect(local.updates.filter((update) => update.goal === null)).toHaveLength(0);
+  });
+
+  it('does not publish a stale completion after disposal races an in-flight clear', async () => {
+    const local = makeController();
+    const originalClear = local.storage.clear.bind(local.storage);
+    let clearCalls = 0;
+    let releaseClear!: () => void;
+    const blockedClear = new Promise<void>((resolve) => {
+      releaseClear = resolve;
+    });
+    vi.spyOn(local.storage, 'clear').mockImplementation(async (sessionId) => {
+      clearCalls += 1;
+      await blockedClear;
+      await originalClear(sessionId);
+    });
+    await startGoal(local);
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"complete","reason":"done"}\n```',
+    });
+    await vi.waitFor(() => expect(clearCalls).toBe(1));
+
+    local.controller.dispose();
+    releaseClear();
+    await tick();
+
+    expect(await local.storage.get('s1')).toBeNull();
+    expect(local.updates.filter((update) => update.goal === null)).toHaveLength(0);
+  });
+
   it('finishes the completion commit if Stop arrives while clearing goal storage', async () => {
     const local = makeController();
     const originalClear = local.storage.clear.bind(local.storage);

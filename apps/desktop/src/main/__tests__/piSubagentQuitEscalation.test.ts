@@ -284,9 +284,19 @@ describe('PI Subagent quit sweep', () => {
     expect(recovery).toContain('const maker = getMakerCore();');
     expect(recovery).toContain('getDb: () => getDbClient().drizzle');
     expect(recovery).toContain('createAutomationUserTurnGitBaselineHooks()');
-    // Restoration is direct and synchronous; retrying the full scheduler start
-    // would introduce another await before the original fence error is surfaced.
-    expect(recovery).not.toContain('attemptStartScheduler()');
+    // Goal IPC is restored synchronously, while the full Scheduler/Goal/Learn
+    // startup is queued behind any superseded in-flight attempt. The original
+    // fence error is still surfaced without awaiting that background recovery.
+    expect(recovery).toContain('void attemptStartScheduler();');
+    expect(recovery).not.toContain('await attemptStartScheduler()');
+    const startup = source.slice(
+      source.indexOf('let attemptStartSchedulerBarrier: Promise<void>'),
+      source.indexOf('const _scheduleIpcRegistered'),
+    );
+    expect(startup).toContain(
+      'attemptStartSchedulerBarrier.then(() => attemptStartSchedulerOnce())',
+    );
+    expect(startup).toContain('attemptStartSchedulerBarrier = attempt.catch(() => undefined)');
   });
 
   it('raises the account-boundary fence before the remaining destructive teardown', () => {
