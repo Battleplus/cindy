@@ -145,10 +145,11 @@ export function getGoalController(): GoalController | null {
 }
 
 /** 切账号 / 登出时调(与 resetScheduler 对齐;当前 bootstrap 不联动)。 */
-export function resetGoalController(): void {
-  if (_controller) _controller.dispose();
+export async function resetGoalController(): Promise<void> {
+  const controller = _controller;
   _controller = null;
   _teardownGeneration++;
+  if (controller) await controller.dispose();
 }
 
 /** Return current teardown generation. Callers that await across a teardown

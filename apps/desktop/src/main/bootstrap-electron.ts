@@ -1356,7 +1356,7 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
   // the first await; resetGoalController() synchronously disposes the current
   // controller and cancels continuation / usage-resume timers.
   try {
-    resetGoalController();
+    await resetGoalController();
   } catch (err) {
     authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
   }

@@ -455,10 +455,13 @@ export class GoalController {
   private readonly now: () => number;
   private readonly debounceMs: number;
   private disposed = false;
+  /** Disposal is two-phase: detach synchronously, then drain old-owner writes. */
+  private disposing = false;
+  private disposePromise: Promise<void> | null = null;
 
   /** Throw if the controller has been disposed. */
   private assertActive(): void {
-    if (this.disposed) throw new GoalControllerDisposedError();
+    if (this.disposed || this.disposing) throw new GoalControllerDisposedError();
   }
 
   constructor(private readonly deps: GoalControllerDeps) {
@@ -1557,8 +1560,13 @@ export class GoalController {
   }
 
   /** 关停所有监听 + 计时器(测试 / 进程退出)。 */
-  dispose(): void {
-    this.disposed = true;
+  async dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposing = true;
+    // Snapshot completion barriers before stopSession removes their owners.
+    const pendingCompletions = [...this.turns.values()]
+      .map((turn) => turn.pendingCompletion)
+      .filter((pending): pending is Promise<void> => Boolean(pending));
     for (const sessionId of [...this.unsubscribers.keys()]) {
       this.stopSession(sessionId);
     }
@@ -1571,9 +1579,13 @@ export class GoalController {
     this.deferredManualResumes.clear();
     this.deferredManualResumeContexts.clear();
     this.unpersistedDispatchFailures.clear();
-    this.turns.clear();
     this.consecutiveOverloadTurns.clear();
     this.dispatchRejectionRetries.clear();
+    this.disposePromise = Promise.allSettled(pendingCompletions).then(() => {
+      this.disposed = true;
+      this.turns.clear();
+    });
+    return this.disposePromise;
   }
 
   // ── 内部 ───────────────────────────────────────────────────────────────────
@@ -1921,7 +1933,9 @@ export class GoalController {
           }
           if (this.disposed) return;
           await this.deps.storage.clear(sessionId);
-          if (this.disposed) return;
+          // A retiring controller still drains the old owner's durable clear,
+          // but must not publish a status into the next account's renderer.
+          if (this.disposed || this.disposing) return;
           // null emit 属于同一顺序提交；后续新目标必须在它之后再 emit active，
           // 否则旧 completion 的迟到 null 会把新 chip 隐藏。
           this.deps.emitStatus({ sessionId, goal: null });

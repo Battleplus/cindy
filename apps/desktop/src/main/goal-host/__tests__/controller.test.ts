@@ -2509,7 +2509,7 @@ describe('GoalController', () => {
     expect(local.updates.filter((update) => update.goal === null)).toHaveLength(1);
   });
 
-  it('does not continue a pending completion commit after controller disposal', async () => {
+  it('drains a pending completion commit before controller disposal completes', async () => {
     let completionCalls = 0;
     let releaseCompletion!: () => void;
     const blockedCompletion = new Promise<void>((resolve) => {
@@ -2530,16 +2530,17 @@ describe('GoalController', () => {
     });
     await vi.waitFor(() => expect(completionCalls).toBe(1));
 
-    local.controller.dispose();
+    const disposing = local.controller.dispose();
     releaseCompletion();
+    await disposing;
     await tick();
 
-    expect(clear).not.toHaveBeenCalled();
-    expect(await local.storage.get('s1')).toMatchObject({ status: 'active' });
+    expect(clear).toHaveBeenCalledWith('s1');
+    expect(await local.storage.get('s1')).toBeNull();
     expect(local.updates.filter((update) => update.goal === null)).toHaveLength(0);
   });
 
-  it('does not publish a stale completion after disposal races an in-flight clear', async () => {
+  it('drains an in-flight completion clear during disposal without publishing stale status', async () => {
     const local = makeController();
     const originalClear = local.storage.clear.bind(local.storage);
     let clearCalls = 0;
@@ -2560,8 +2561,9 @@ describe('GoalController', () => {
     });
     await vi.waitFor(() => expect(clearCalls).toBe(1));
 
-    local.controller.dispose();
+    const disposing = local.controller.dispose();
     releaseClear();
+    await disposing;
     await tick();
 
     expect(await local.storage.get('s1')).toBeNull();
