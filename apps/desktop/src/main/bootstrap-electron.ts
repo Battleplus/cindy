@@ -1355,8 +1355,13 @@ async function teardownAuthAccountBoundary(reason: string): Promise<void> {
   // acquisition waits behind queued filesystem work. Invalidate them before
   // the first await; resetGoalController() synchronously disposes the current
   // controller and cancels continuation / usage-resume timers.
+  // Start disposal synchronously, then drain it before waiting on the
+  // cross-process launch fence. This closes the Goal boundary immediately;
+  // disposal itself only settles owner-scoped persistence and cannot launch a
+  // new durable runner after the controller has been fenced.
+  const goalDispose = resetGoalController();
   try {
-    await resetGoalController();
+    await goalDispose;
   } catch (err) {
     authBoundaryLog.error(`resetGoalController on ${reason} failed (non-fatal):`, err);
   }

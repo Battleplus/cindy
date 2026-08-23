@@ -736,7 +736,7 @@ export class GoalController {
   }
 
   async updateGoal(sessionId: string, patch: GoalUpdatePatch): Promise<GoalState | null> {
-    if (this.disposed) return null;
+    if (this.disposed || this.disposing) return null;
     const normalized = normalizeGoalUpdatePatch(patch);
     const existingBoundary = this.turns.get(sessionId);
     const operationBoundary = existingBoundary ?? freshTurn();
@@ -998,7 +998,7 @@ export class GoalController {
     answers: Record<string, string>,
     questions?: readonly GoalClarifyQuestion[],
   ): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     if (this.clarificationApplied.has(sessionId)) return; // 每目标只澄清改写一次
     const next = deriveObjectiveFromAnswers(answers);
     if (!next) return;
@@ -1064,7 +1064,7 @@ export class GoalController {
 
   /** 清除目标(用户主动)。删行 + 停止一切续跑 + 取消 usage 自动续 + 通知 renderer 隐藏指示器。 */
   async clearGoal(sessionId: string): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     this.clarificationApplied.delete(sessionId);
     this.consecutiveOverloadTurns.delete(sessionId);
     this.cancelDeferredManualResume(sessionId);
@@ -1110,7 +1110,7 @@ export class GoalController {
    * reason 供 UI 展示(如 rewind 传 "paused: conversation rewound")。
    */
   async pauseGoal(sessionId: string, reason?: string): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     // Stop 的控制边界不能排在存储 IO 后面：读写一旦卡住，在途 turn 的终态事件仍会
     // 落到旧 listener，idle 兜底会把 active goal 立即续起来。先同步 detach listener、
     // continuation timer 与 firing 状态，再用同一 turns owner 留下 cancelled 边界，
@@ -1166,7 +1166,7 @@ export class GoalController {
    * /已 active 不处理。
    */
   async resumeGoal(sessionId: string, opts?: { auto?: boolean }): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     let existingBoundary = this.turns.get(sessionId);
     let state: GoalState | null | undefined;
     if (existingBoundary?.cancelled) {
@@ -1371,7 +1371,7 @@ export class GoalController {
 
   /** GET_GOAL_STATUS:返回当前状态扁平 payload(无 goal 返回 null)。 */
   async getStatus(sessionId: string): Promise<GoalStatusPayload | null> {
-    if (this.disposed) return null;
+    if (this.disposed || this.disposing) return null;
     const state = await this.deps.storage.get(sessionId);
     if (this.disposed) return null;
     return state ? toPayload(state) : null;
@@ -1389,7 +1389,7 @@ export class GoalController {
     sessionId: string,
     opts?: { waitForDispatch?: boolean },
   ): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     const pendingFailure = this.unpersistedDispatchFailures.get(sessionId);
     if (pendingFailure) {
       const persisted = await this.blockDispatchFailure(
@@ -1412,7 +1412,7 @@ export class GoalController {
       if (this.turns.get(sessionId) === lifecycleBoundary) this.turns.delete(sessionId);
       throw error;
     }
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     if (this.turns.get(sessionId) !== lifecycleBoundary) return;
     if (!state || state.status !== 'active') {
       if (this.turns.get(sessionId) === lifecycleBoundary) this.turns.delete(sessionId);
@@ -1726,7 +1726,7 @@ export class GoalController {
   }
 
   private emit(state: GoalState): void {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     this.deps.emitStatus({ sessionId: state.sessionId, goal: toPayload(state) });
   }
 
@@ -1737,7 +1737,7 @@ export class GoalController {
    * listener 再重挂到新 session,保证新引擎 turn 的 done/error 事件仍进 finalizeTurn。
    */
   private attachListener(sessionId: string): void {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
     const session = this.deps.getSession(sessionId);
     if (!session) return;
     if (this.unsubscribers.has(sessionId)) {
