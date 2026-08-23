@@ -7,6 +7,7 @@ export type ComposerWebMessage =
    */
   | { type: 'ready' | 'focus' | 'blur' }
   | { type: 'height'; height: number }
+  | { type: 'selection'; start: number; end: number }
   | { type: 'change'; document: unknown }
   | { type: 'paste-text-request'; requestId: string; text?: string }
   | { type: 'paste-images-start'; requestId: string; count: number }
@@ -44,6 +45,14 @@ export function parseComposerWebMessage(raw: string): ComposerWebMessage | null 
     if (message.type === 'height') {
       return typeof message.height === 'number' && Number.isFinite(message.height)
         ? { type: 'height', height: message.height }
+        : null;
+    }
+    if (message.type === 'selection') {
+      const start = message.start;
+      const end = message.end;
+      return Number.isSafeInteger(start) && Number.isSafeInteger(end)
+        && (start as number) >= 0 && (end as number) >= (start as number)
+        ? { type: 'selection', start: start as number, end: end as number }
         : null;
     }
     if (message.type === 'change') {

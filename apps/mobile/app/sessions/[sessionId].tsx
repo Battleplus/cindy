@@ -2740,9 +2740,23 @@ export default function SessionScreen() {
     const lines = event.nativeEvent.lines;
     const lastLine = lines[lines.length - 1];
     if (!lastLine) return;
+    const insertionEnd = voiceControllerSessionRef.current?.currentInsertionEnd();
+    let caretLine = lastLine;
+    let charOffsetInLine = lastLine.text.length;
+    if (insertionEnd != null) {
+      let accumulated = 0;
+      for (const line of lines) {
+        if (accumulated + line.text.length >= insertionEnd) {
+          caretLine = line;
+          charOffsetInLine = Math.max(0, insertionEnd - accumulated);
+          break;
+        }
+        accumulated += line.text.length;
+      }
+    }
     const nextFrame = {
-      left: Math.max(0, Math.round(lastLine.x + lastLine.width + COMPOSER_VOICE_CARET_GAP)),
-      top: Math.max(0, Math.round(lastLine.y + ((lastLine.height - COMPOSER_INPUT_LINE_HEIGHT) / 2))),
+      left: Math.max(0, Math.round(caretLine.x + caretLine.width * (charOffsetInLine / Math.max(1, caretLine.text.length)) + COMPOSER_VOICE_CARET_GAP)),
+      top: Math.max(0, Math.round(caretLine.y + ((caretLine.height - COMPOSER_INPUT_LINE_HEIGHT) / 2))),
     };
     setVoiceDraftCaretFrame((currentFrame) => (
       currentFrame.left === nextFrame.left && currentFrame.top === nextFrame.top
@@ -5145,6 +5159,8 @@ export default function SessionScreen() {
           refinementContext: buildMobileVoiceSessionRefinementContext(draft, renderItems),
           localVoiceInputHistory,
           readCurrentDraft: () => draftRef.current,
+          readCaret: () => composerInputRef.current?.readCaret() ?? null,
+          readCaretDraft: () => draftRef.current,
           onDraftChanged: setComposerDraft,
           onStateChanged: setVoiceState,
           onError: (message) => {

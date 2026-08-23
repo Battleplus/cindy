@@ -24,6 +24,7 @@ export interface ComposerRichInputHandle {
   blur(): void;
   focus(): void;
   insertNode(node: ComposerNode): void;
+  readCaret(): { start: number; end: number } | null;
 }
 
 export interface ComposerRichInputProps {
@@ -91,6 +92,7 @@ export const ComposerRichInput = forwardRef<ComposerRichInputHandle, ComposerRic
     const pastedImageFileSequenceRef = useRef(0);
     /** 尚未交接给附件上传 hook 的 WebView 粘贴缓存文件。 */
     const pendingPastedImageFilesRef = useRef(new Set<string>());
+    const caretRef = useRef<{ start: number; end: number } | null>(null);
     const disposedRef = useRef(false);
     const initialConfigRef = useRef({
       accessibilityLabel,
@@ -181,6 +183,7 @@ export const ComposerRichInput = forwardRef<ComposerRichInputHandle, ComposerRic
           }
           inject(`window.cindyComposer.insertNode(${JSON.stringify(node)});`);
         },
+        readCaret: () => caretRef.current,
         // 注意:曾有过 setSelectionToEnd: focusEditor 的别名——web 侧 placeCaretAtEnd
         // 必须 root.focus(),而 keyboardDisplayRequiresUserAction={false} 让任何程序化
         // focus 都会弹软键盘。「只挪选区不聚焦」在这个 WebView 编辑器上不成立,需要
@@ -344,6 +347,10 @@ export const ComposerRichInput = forwardRef<ComposerRichInputHandle, ComposerRic
         if (Number.isFinite(message.height)) {
           onHeightChange?.(Math.max(COMPOSER_SINGLE_LINE_HEIGHT, Math.min(maxHeight, message.height)));
         }
+        return;
+      }
+      if (message.type === 'selection') {
+        caretRef.current = { start: message.start, end: message.end };
         return;
       }
       if (message.type === 'focus') return onFocus?.();

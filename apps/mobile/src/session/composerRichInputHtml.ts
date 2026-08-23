@@ -225,6 +225,42 @@ export function buildComposerRichInputHtml(config: ComposerRichInputConfig): str
     return { version: 1, nodes };
   };
   const reportHeight = () => post({ type: 'height', height: Math.min(config.maxHeight, Math.max(${COMPOSER_SINGLE_LINE_HEIGHT}, root.scrollHeight)) });
+  const projectedNodeLength = (node) => {
+    if (!node || typeof node !== 'object') return 0;
+    if (node.type === 'quote') return 0;
+    if (node.type === 'text' || node.type === 'pasted-text') return String(node.text || '').length;
+    if (node.type === 'mention') return String(node.raw || '').length;
+    if (node.type === 'session-link') return String(node.label || node.href || '').length;
+    return 0;
+  };
+  const projectedLengthBefore = (container, offset) => {
+    const measure = (parent, limit) => {
+      let total = 0;
+      const children = Array.from(parent.childNodes);
+      for (let index = 0; index < Math.min(limit, children.length); index += 1) {
+        const child = children[index];
+        if (child.nodeType === Node.TEXT_NODE) total += String(child.nodeValue || '').split(CARET_ANCHOR).join('').length;
+        else if (child.nodeType === Node.ELEMENT_NODE && child.classList.contains('atom')) {
+          try { total += projectedNodeLength(JSON.parse(decodeURIComponent(child.dataset.node || ''))); } catch (_) {}
+        } else if (child.nodeType === Node.ELEMENT_NODE) total += measure(child, child.childNodes.length);
+      }
+      if (parent === container && parent.nodeType === Node.TEXT_NODE) return total;
+      return total;
+    };
+    if (container.nodeType === Node.TEXT_NODE) {
+      return measure(container.parentNode, Array.prototype.indexOf.call(container.parentNode.childNodes, container))
+        + String(container.nodeValue || '').slice(0, offset).split(CARET_ANCHOR).join('').length;
+    }
+    return measure(container, offset);
+  };
+  const reportSelection = () => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || !root.contains(selection.anchorNode) || !root.contains(selection.focusNode)) return;
+    const range = selection.getRangeAt(0);
+    const start = projectedLengthBefore(range.startContainer, range.startOffset);
+    const end = projectedLengthBefore(range.endContainer, range.endOffset);
+    post({ type: 'selection', start: Math.min(start, end), end: Math.max(start, end) });
+  };
   const notify = () => {
     if (applying || composing) return;
     const value = readDocument();
@@ -414,6 +450,8 @@ export function buildComposerRichInputHtml(config: ComposerRichInputConfig): str
   };
 
   root.addEventListener('input', notify);
+  root.addEventListener('input', reportSelection);
+  document.addEventListener('selectionchange', reportSelection);
   root.addEventListener('compositionstart', () => { composing = true; });
   root.addEventListener('compositionend', () => { composing = false; notify(); });
   root.addEventListener('focus', () => post({ type: 'focus' }));
