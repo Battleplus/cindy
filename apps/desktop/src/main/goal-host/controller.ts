@@ -1563,11 +1563,19 @@ export class GoalController {
   async dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
     this.disposing = true;
-    // Snapshot completion barriers before stopSession removes their owners.
-    const pendingCompletions = [...this.turns.values()]
-      .map((turn) => turn.pendingCompletion)
-      .filter((pending): pending is Promise<void> => Boolean(pending));
-    for (const sessionId of [...this.unsubscribers.keys()]) {
+    // Snapshot all old-owner persistence barriers before stopSession removes
+    // their owners.  The DB may be closed as soon as account teardown returns;
+    // dropping either a completion clear or a goal-state write leaves stale
+    // active rows behind (or lets a late write hit the next account).
+    const pendingWrites = [...this.turns.values()].flatMap((turn) =>
+      [turn.pendingPersistence, turn.pendingCompletion].filter(
+        (pending): pending is Promise<void> => Boolean(pending),
+      ),
+    );
+    for (const sessionId of new Set([
+      ...this.unsubscribers.keys(),
+      ...this.turns.keys(),
+    ])) {
       this.stopSession(sessionId);
     }
     for (const sessionId of [...this.usageResumeTimers.keys()]) {
@@ -1581,7 +1589,7 @@ export class GoalController {
     this.unpersistedDispatchFailures.clear();
     this.consecutiveOverloadTurns.clear();
     this.dispatchRejectionRetries.clear();
-    this.disposePromise = Promise.allSettled(pendingCompletions).then(() => {
+    this.disposePromise = Promise.allSettled(pendingWrites).then(() => {
       this.disposed = true;
       this.turns.clear();
     });

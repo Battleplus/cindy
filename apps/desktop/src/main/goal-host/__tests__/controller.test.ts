@@ -4443,7 +4443,7 @@ describe('GoalController disposal', () => {
     h.controller.dispose(); // should not throw
   });
 
-  it('does not persist a create marker when disposal wins the storage race', async () => {
+  it('drains a create marker before disposal completes', async () => {
     const h = makeController();
     const originalUpsert = h.storage.upsert.bind(h.storage);
     let markUpsertStarted!: () => void;
@@ -4462,15 +4462,17 @@ describe('GoalController disposal', () => {
 
     const create = h.controller.setGoal({ sessionId: 's1', objective: 'outgoing objective' });
     await upsertStarted;
-    h.controller.dispose();
+    const disposing = h.controller.dispose();
     releaseUpsert();
+    await disposing;
 
     await expect(create).resolves.toBeNull();
-    expect(h.userMessages).toHaveLength(0);
+    expect(await h.storage.get('s1')).toMatchObject({ status: 'active', objective: 'outgoing objective' });
+    expect(h.userMessages).toHaveLength(1);
     expect(h.session.sends).toHaveLength(0);
   });
 
-  it('does not persist an edit marker when disposal wins the storage race', async () => {
+  it('drains an edit marker before disposal completes', async () => {
     const h = makeController();
     await h.storage.set(seededGoal({ status: 'paused', objective: 'old objective' }));
     const originalUpdate = h.storage.update.bind(h.storage);
@@ -4490,11 +4492,13 @@ describe('GoalController disposal', () => {
 
     const edit = h.controller.setGoal({ sessionId: 's1', objective: 'outgoing edit' });
     await updateStarted;
-    h.controller.dispose();
+    const disposing = h.controller.dispose();
     releaseUpdate();
+    await disposing;
 
     await expect(edit).resolves.toBeNull();
-    expect(h.userMessages).toHaveLength(0);
+    expect(await h.storage.get('s1')).toMatchObject({ status: 'active', objective: 'outgoing edit' });
+    expect(h.userMessages).toHaveLength(1);
     expect(h.session.sends).toHaveLength(0);
   });
 });
