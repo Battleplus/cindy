@@ -466,6 +466,64 @@ describe('nodeRuntimeBroker · 进程生命周期', () => {
     expect(child.killed).toBe(true);
     expect(broker.stateOf('node-ghost')).toBe('off');
   });
+
+  it('idle-stopped worker waits for old process exit before forking replacement (#3330)', async () => {
+    vi.useFakeTimers();
+    const ghost = fakeGhost({ lifecycle: 'on-demand' });
+    const children: FakeNodeProcess[] = [];
+
+    const broker = new GhostNodeRuntimeBroker({
+      getGhost: () => ghost,
+      spawnProcess: () => {
+        const child = makeAutoReplyProcess();
+        children.push(child);
+        return child as unknown as NodeWorkerProcess;
+      },
+    });
+
+    // Start first worker.
+    const p1 = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p1).resolves.toMatchObject({ ok: true });
+    expect(children).toHaveLength(1);
+    const firstChild = children[0];
+
+    // Override kill to NOT auto-emit exit (simulate Windows delayed exit).
+    firstChild.removeAllListeners('exit');
+    firstChild.kill = vi.fn(() => {
+      firstChild.killed = true;
+      return true;
+    });
+
+    // Trigger idle stop by advancing past idle timeout (120s).
+    await vi.advanceTimersByTimeAsync(120_000 + 1);
+    expect(firstChild.killed).toBe(true);
+    expect(broker.stateOf('node-ghost')).toBe('off');
+
+    // Second request arrives while old process hasn't exited.
+    let resolved = false;
+    const p2 = broker.handleRequest('node-ghost', rpcRequest()).then((r) => {
+      resolved = true;
+      return r;
+    });
+
+    // ensureWorker should be awaiting draining — not yet resolved.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(resolved).toBe(false);
+    expect(children).toHaveLength(1); // no new child forked yet
+
+    // Old process finally exits.
+    firstChild.emit('exit', null, 'SIGTERM');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Now the new child should start.
+    expect(children).toHaveLength(2);
+    const secondChild = children[1];
+    secondChild.emit('spawn');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p2).resolves.toMatchObject({ ok: true });
+    expect(broker.stateOf('node-ghost')).toBe('running');
+  });
 });
 
 describe('nodeRuntimeBroker · 启动瞬时失败重试(2026-07-24)', () => {

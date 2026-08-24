@@ -1076,9 +1076,25 @@ export class GhostNodeRuntimeBroker {
     } catch {
       // 已退出即视为停止成功。
     }
+    // Record draining exit so ensureWorker waits before forking a replacement.
+    // Resolves on real exit or after hardKill timeout as a safety net.
+    const draining = new Promise<void>((resolve) => {
+      const onExit = () => {
+        entry.child.removeListener?.("exit", onExit);
+        resolve();
+      };
+      entry.child.once("exit", onExit);
+      // Safety: resolve after hard-kill timeout even if exit never fires.
+      const fallback = this.setTimer(() => {
+        entry.child.removeListener?.("exit", onExit);
+        resolve();
+      }, PROCESS_STOP_GRACE_MS + 1000);
+      fallback.unref?.();
+    });
+    this.drainingExits.set(key, draining);
+
     this.sendStatus(entry.ghost, 'stopped', undefined, entry.entryRel);
   }
-
   /** Cindy 退出时收掉全部随包 Node 进程。 */
   destroyAll(): void {
     this.destroyed = true;
@@ -1094,6 +1110,13 @@ export class GhostNodeRuntimeBroker {
 
   /** 每次 handleExit 递增,settleExit 仅在世代未推进时发布 crashed。 */
   private readonly exitGen = new Map<string, number>();
+
+  /**
+   * idle stop 或 stopWorker 后，旧进程的 exit Promise。
+   * ensureWorker 在 fork 新进程前必须等待旧进程真正退出，
+   * 防止 Windows 上旧进程残留导致新 bootstrap 失败 (#3330)。
+   */
+  private readonly drainingExits = new Map<string, Promise<void>>();
 
   /** destroyAll(主机退出)后置真:退避中的重试不得再拉新进程。 */
   private destroyed = false;
@@ -1116,6 +1139,18 @@ export class GhostNodeRuntimeBroker {
       this.assertOwnerScopeUsable(ghost.manifest.id, ownerScopeSnapshot);
       this.assertOwnerScopeUsable(ghost.manifest.id, existing.ownerScopeSnapshot);
       return existing;
+    }
+    // Wait for any previous process for this key to fully exit before forking.
+    // On Windows, the old UtilityProcess may still hold file locks or ports
+    // that prevent the new bootstrap from succeeding (#3330).
+    const draining = this.drainingExits.get(key);
+    if (draining) {
+      this.drainingExits.delete(key);
+      this.deps.log?.info("ghost node waiting for previous process exit", {
+        ghostId: ghost.manifest.id,
+        entry: entryRel,
+      });
+      await draining;
     }
     this.startingWorkerScopes.set(key, ownerScopeSnapshot);
     const starting = this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
