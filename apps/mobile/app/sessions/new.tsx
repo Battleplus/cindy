@@ -1583,8 +1583,9 @@ export default function NewRemoteSessionScreen() {
           charOffsetInLine = insertionEnd - accumulated;
           break;
         }
-        // 软换行不新增 plain-text 字符，只在有显式 \n 时加 1
-        accumulated += lineLen + (line.text.endsWith('\n') ? 0 : (line === lines[lines.length - 1] ? 0 : 0));
+        // React Native onTextLayout 的 line.text 已包含显式 \n，
+        // 软换行不会在 text 中插入额外字符，直接累加即可。
+        accumulated += lineLen;
       }
     }
     // Use a measured prefix width for the waveform x-coordinate instead of the
