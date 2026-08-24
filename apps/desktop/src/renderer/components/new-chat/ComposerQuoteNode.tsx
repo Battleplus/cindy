@@ -56,8 +56,7 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
       <QuoteChip quote={quote} selected={selected} />
       {/* Remove button — sibling of the chip, not inside it.
           opacity-0 by default; visible on group hover and keyboard focus. */}
-      <button
-        type="button"
+      <span role="button" tabIndex={0}
         aria-label={`Remove quote: ${quote.text}`}
         className={cn(
           'absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center',
@@ -73,7 +72,7 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
         onMouseDown={(e) => e.stopPropagation()}
       >
         <X className="h-2.5 w-2.5" aria-hidden />
-      </button>
+      </span>
     </NodeViewWrapper>
   );
 }
