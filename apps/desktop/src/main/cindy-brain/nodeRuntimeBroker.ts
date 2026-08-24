@@ -1079,15 +1079,18 @@ export class GhostNodeRuntimeBroker {
     // Record draining exit so ensureWorker waits before forking a replacement.
     // Resolves on real exit or after hardKill timeout as a safety net.
     const draining = new Promise<void>((resolve) => {
+      let invoked = false;
       const onExit = () => {
-        entry.child.removeListener?.("exit", onExit);
+        if (invoked) return;
+        invoked = true;
         resolve();
       };
       entry.child.once("exit", onExit);
-      // Reject after hard-kill timeout if exit never fires: forking a replacement
+      // Safety: resolve after hard-kill timeout even if exit never fires.
       const fallback = this.setTimer(() => {
-        entry.child.removeListener?.("exit", onExit);
-        reject(new Error("Old process did not exit within grace period"));
+        if (invoked) return;
+        invoked = true;
+        resolve();
       }, PROCESS_STOP_GRACE_MS + 1000);
       fallback.unref?.();
     });
