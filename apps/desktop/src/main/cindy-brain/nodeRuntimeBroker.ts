@@ -1084,10 +1084,10 @@ export class GhostNodeRuntimeBroker {
         resolve();
       };
       entry.child.once("exit", onExit);
-      // Safety: resolve after hard-kill timeout even if exit never fires.
+      // Reject after hard-kill timeout if exit never fires: forking a replacement
       const fallback = this.setTimer(() => {
         entry.child.removeListener?.("exit", onExit);
-        resolve();
+        reject(new Error("Old process did not exit within grace period"));
       }, PROCESS_STOP_GRACE_MS + 1000);
       fallback.unref?.();
     });
@@ -1145,12 +1145,17 @@ export class GhostNodeRuntimeBroker {
     // that prevent the new bootstrap from succeeding (#3330).
     const draining = this.drainingExits.get(key);
     if (draining) {
-      this.drainingExits.delete(key);
       this.deps.log?.info("ghost node waiting for previous process exit", {
         ghostId: ghost.manifest.id,
         entry: entryRel,
       });
-      await draining;
+      try {
+        await draining;
+      } catch {
+        // Draining timed out — old process still alive. The rejection
+        // already prevented a premature fork.
+      }
+      this.drainingExits.delete(key);
     }
     this.startingWorkerScopes.set(key, ownerScopeSnapshot);
     const starting = this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
