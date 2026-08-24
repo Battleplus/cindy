@@ -45,7 +45,7 @@ export function QuoteChip({
   );
 
   return (
-    <span className="relative inline-flex">
+    <span className="group relative inline-flex">
       <InlineReferenceChip
         label={compactText}
         icon={<MessageSquareQuote aria-hidden />}
@@ -65,8 +65,8 @@ export function QuoteChip({
           aria-label={`Remove quote: ${quote.text}`}
           className={cn(
             'absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center',
-            'rounded-full bg-[var(--surface-secondary)] text-[var(--text-tertiary)]',
-            'opacity-0 transition-opacity hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]',
+            'rounded-full bg-[var(--surface-chip-alt)] text-[var(--text-tertiary)]',
+            'opacity-0 transition-opacity group-hover:opacity-100 hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]',
             'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--focus-ring)]',
           )}
           onClick={(e) => {
