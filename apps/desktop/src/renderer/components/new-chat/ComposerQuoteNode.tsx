@@ -72,6 +72,7 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
+            e.stopPropagation();
             e.preventDefault();
             handleRemove();
           }
