@@ -70,6 +70,12 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
           handleRemove();
         }}
         onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            handleRemove();
+          }
+        }}
       >
         <X className="h-2.5 w-2.5" aria-hidden />
       </span>
