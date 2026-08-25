@@ -14214,7 +14214,16 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
     return;
   }
   void response
-    .catch((err) => log.error('Failed to respond to permission:', err))
+    .catch((err) => {
+      log.error('Failed to respond to permission:', err);
+      // The resolve never reached the host (device-link disconnect / timeout
+      // before settling).  We already promoted A out of the queue and showed
+      // B, but the host is still waiting on A.  Reconcile against the
+      // authoritative host snapshot: if A is still pending there it is
+      // restored as the head; if the host actually resolved it, A is not
+      // resurrected.  Never let the renderer guess — the host owns the truth.
+      void reconcilePendingInteractions(sessionId).catch(() => undefined);
+    })
     .finally(() => {
       armPermissionResponseGuard(sessionId);
     });
