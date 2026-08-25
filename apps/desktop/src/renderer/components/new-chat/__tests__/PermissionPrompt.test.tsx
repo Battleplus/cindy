@@ -174,4 +174,30 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
       expect.objectContaining({ decisionClassification: 'user_permanent' }),
     );
   });
+
+  it('repeated keydown events (e.repeat) are ignored', () => {
+    const onRespond = vi.fn();
+    render(<PermissionPrompt permission={permission([bashRule])} onRespond={onRespond} />);
+
+    fireEvent.keyDown(window, { key: 'Enter', code: 'Enter', repeat: false });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(window, { key: 'Enter', code: 'Enter', repeat: true });
+    fireEvent.keyDown(window, { key: 'Enter', code: 'Enter', repeat: true });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+  });
+
+  it('Escape repeat is also ignored', () => {
+    const onRespond = vi.fn();
+    render(<PermissionPrompt permission={permission([bashRule])} onRespond={onRespond} />);
+
+    fireEvent.keyDown(window, { key: 'Escape', code: 'Escape', repeat: false });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond).toHaveBeenCalledWith(
+      expect.objectContaining({ behavior: 'deny' }),
+    );
+
+    fireEvent.keyDown(window, { key: 'Escape', code: 'Escape', repeat: true });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+  });
 });

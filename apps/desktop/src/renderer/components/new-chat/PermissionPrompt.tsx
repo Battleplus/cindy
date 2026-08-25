@@ -134,6 +134,7 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
       // IME 组合期间的 Enter(确认候选词)不算快捷键;焦点在可编辑元素上时
       // (侧栏重命名/查找栏等)也不劫持按键,避免把输入操作误判成授权决定。
       if (e.isComposing) return;
+      if (e.repeat) return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
