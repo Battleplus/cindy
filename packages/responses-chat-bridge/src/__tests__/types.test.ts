@@ -94,6 +94,25 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
   });
 
+  it('accepts a Codex-extracted plain-text capability rejection', () => {
+    // Codex extracts error.message from the wrapped upstream_error envelope, so
+    // the coordinator sees the plain-text message after the unexpected-status
+    // prefix instead of the JSON envelope.
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        codexUnexpectedResponse('image_url content part is not supported by this model'),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects Codex-extracted invalid-image-content errors (not capability rejection)', () => {
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        codexUnexpectedResponse('Invalid image_url: image exceeds maximum size'),
+      ),
+    ).toBe(false);
+  });
+
   it('accepts a handler-wrapped rejection whose inner error uses error.type', () => {
     const innerError = JSON.stringify({
       error: { type: 'invalid_request_error', message: 'image input is not supported' },

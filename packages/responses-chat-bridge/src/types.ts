@@ -517,7 +517,12 @@ export function isUnsupportedResponsesImageErrorPayload(payload: string | null):
 
   const message = stripCodexErrorMetadata(renderedBody);
   const feature = unsupportedResponsesFeatureFromMessage(message);
-  return feature !== null && isUnsupportedResponsesImageFeature(feature);
+  if (feature !== null && isUnsupportedResponsesImageFeature(feature)) return true;
+  // Codex extracts error.message from the wrapped upstream_error envelope, so a
+  // plain-text capability rejection (e.g. "image_url content part is not
+  // supported by this model, url: ...") arrives directly after the prefix.
+  // Classify the stripped plain text with the same keyword set as the JSON path.
+  return imageRejectionKeywords(message);
 }
 
 export class UnsupportedResponsesFeatureError extends Error {
