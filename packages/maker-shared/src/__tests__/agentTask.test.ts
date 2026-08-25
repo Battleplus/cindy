@@ -5,6 +5,7 @@ import {
   deriveAgentTaskStatus,
   findAgentTaskUpdate,
   isAgentTaskToolName,
+  isSubagentResultError,
   isSubagentSpawnToolName,
   mergeAgentTaskUpdate,
   PI_SUBAGENT_TOOL_NAME,
