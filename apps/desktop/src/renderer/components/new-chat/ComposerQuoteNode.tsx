@@ -10,6 +10,7 @@
  * preserving the composer chip presentation invariant.
  */
 import { X } from 'lucide-react';
+import i18n from '../../i18n';
 import { Node, mergeAttributes } from '@tiptap/core';
 import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from '@tiptap/react';
 import {
@@ -57,7 +58,7 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
       {/* Remove button — sibling of the chip, not inside it.
           opacity-0 by default; visible on group hover and keyboard focus. */}
       <span role="button" tabIndex={0}
-        aria-label={`Remove quote: ${quote.text}`}
+        aria-label={i18n.t("chat.quote.remove")}
         className={cn(
           'absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center',
           'rounded-full bg-[var(--surface-chip-alt)] text-[var(--text-tertiary)]',
