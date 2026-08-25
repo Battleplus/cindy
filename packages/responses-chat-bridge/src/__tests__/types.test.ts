@@ -74,6 +74,56 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
   });
 
+  it('accepts upstream rejection using error.type without a code field', () => {
+    const payload = JSON.stringify({
+      error: {
+        type: 'invalid_request_error',
+        message: 'This model does not support image_url content parts',
+      },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
+  it('accepts a plain-text (non-JSON) upstream 400 body wrapped by the handler', () => {
+    const payload = JSON.stringify({
+      error: {
+        code: 'upstream_error',
+        message: 'image_url content part is not supported by this model',
+      },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
+  it('accepts a handler-wrapped rejection whose inner error uses error.type', () => {
+    const innerError = JSON.stringify({
+      error: { type: 'invalid_request_error', message: 'image input is not supported' },
+    });
+    const payload = JSON.stringify({
+      error: { code: 'upstream_error', message: innerError },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
+  it.each([
+    JSON.stringify({
+      error: { code: 'invalid_request_error', message: 'Invalid image_url: image exceeds maximum size' },
+    }),
+    JSON.stringify({
+      error: { code: 'invalid_request_error', message: 'image_url must be a valid URL' },
+    }),
+    JSON.stringify({
+      error: { code: 'invalid_request_error', message: 'image exceeds maximum size' },
+    }),
+    JSON.stringify({
+      error: { code: 'upstream_error', message: 'Invalid image_url: image exceeds maximum size' },
+    }),
+  ])('rejects invalid-image-content errors (not capability rejection): %s', (payload) => {
+    // A message about the image being invalid (size, format, URL) is NOT a
+    // capability rejection — stripping the attachment would resend text without
+    // the image the user asked about.
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(false);
+  });
+
   it.each([
     unsupportedFeaturePayload("input content part 'input_file'"),
     unsupportedFeaturePayload("input content part 'input_image'", 'invalid_request'),
