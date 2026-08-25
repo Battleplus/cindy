@@ -133,6 +133,21 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     ).toBe(true);
   });
 
+  it('accepts Codex-rendered 422 with HTTP reason phrase', () => {
+    // Codex includes the HTTP reason phrase, e.g.
+    // 'unexpected status 422 Unprocessable Entity: ...'.
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        'unexpected status 422 Unprocessable Entity: image_url content part is not supported by this model, url: http://127.0.0.1/v1/responses',
+      ),
+    ).toBe(true);
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        'unexpected status 415 Unsupported Media Type: image input is not supported by this model, url: http://127.0.0.1/v1/responses',
+      ),
+    ).toBe(true);
+  });
+
   it('accepts a JSON error whose error value is a plain string (Ollama-style)', () => {
     const payload = JSON.stringify({
       error: { code: 'upstream_error', message: JSON.stringify({ error: 'this model does not support images' }) },

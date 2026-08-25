@@ -368,7 +368,8 @@ export interface ResponsesChatBridgeHandler {
 const UNSUPPORTED_RESPONSES_FEATURE_MESSAGE_PREFIX =
   'Responses feature is not supported by the Chat Completions bridge: ';
 const RESPONSES_IMAGE_CONTENT_PART_TYPES = new Set(['input_image', 'image_url', 'image']);
-const CODEX_UNEXPECTED_BAD_REQUEST_PREFIX = /^unexpected status (?:400(?: Bad Request)?|415|422): /;
+const CODEX_UNEXPECTED_BAD_REQUEST_PREFIX =
+  /^unexpected status (?:400(?: Bad Request)?|415(?: Unsupported Media Type)?|422(?: Unprocessable Entity)?): /;
 const CODEX_ERROR_METADATA_MARKERS = [
   ', url: ',
   ', cf-ray: ',
