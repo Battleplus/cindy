@@ -447,6 +447,50 @@ describe('device-link 远程交互往返 — permission', () => {
     expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('fresh-permission');
     expect(makerChatStore.getSnapshot(s).pendingPermissionQueue).toEqual([]);
   });
+
+  it('reconnect snapshot A-B rearm guard: A delayed input does not approve B, then B actionable', async () => {
+    const s = openRemoteSession();
+    host.hostInteraction(s, {
+      kind: 'permission',
+      requestId: 'reconnect-guard-a',
+      toolName: 'Read',
+      input: { file_path: '/a.txt' },
+    });
+    await flush();
+
+    // A is in flight: the response guard is armed for the session.
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+    expect(host.resolved.map((item) => item.requestId)).toEqual(['reconnect-guard-a']);
+
+    // Reconnect: the authoritative snapshot replaces A with B. The stale
+    // displayed request must be dropped and B promoted.
+    host.seedPending(s, {
+      kind: 'permission',
+      requestId: 'reconnect-guard-b',
+      toolName: 'Read',
+      input: { file_path: '/b.txt' },
+    });
+    await makerChatStore.reconcilePendingInteractions(s);
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('reconnect-guard-b');
+
+    // Within the gesture window, A's delayed double-click must NOT approve B.
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+    expect(host.resolved.map((item) => item.requestId)).toEqual(['reconnect-guard-a']);
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('reconnect-guard-b');
+
+    // After the window, B's real response is delivered.
+    await waitPastPermissionGuardWindow();
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+    expect(host.resolved.map((item) => item.requestId)).toEqual([
+      'reconnect-guard-a',
+      'reconnect-guard-b',
+    ]);
+    expect(makerChatStore.getSnapshot(s).pendingPermission).toBeNull();
+  });
 });
 
 describe('device-link 远程交互往返 — plan_review', () => {

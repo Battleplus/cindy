@@ -9285,15 +9285,19 @@ function reconcilePendingInteractions(
         };
       });
       // When the authoritative snapshot replaces the displayed permission (e.g.
-      // device-link reconnects while old request was in flight), release the
-      // stale guard so the newly promoted request can be acted on immediately.
+      // device-link reconnects while old request A was in flight), rearm the
+      // gesture-dedupe guard instead of releasing it. Releasing here would let
+      // A's delayed double-click / key-repeat read the newly promoted B's
+      // requestId and approve B without an independent user decision. Rearming
+      // is symmetric with the dismissal path: B stays protected for the
+      // gesture window, then becomes actionable normally.
       const newPendingPermission = getOrCreateState(sessionId).pendingPermission;
       if (
         oldPendingPermission !== newPendingPermission &&
         oldPendingPermission !== null &&
         permissionResponseInFlight.has(sessionId)
       ) {
-        releasePermissionResponseGuard(sessionId);
+        rearmPermissionResponseGuard(sessionId);
       }
       for (const item of list) {
         if (!isCurrentInteractionReconcile()) return 0;
