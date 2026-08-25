@@ -723,7 +723,7 @@ export function translateSdkMessage(
       for (const pair of fullPairs) {
         if (pair.fullText.startsWith('<tool_use_error>')) {
           const retryState = ctx.rt.subagentRetryStateByParentToolUseId.get(pair.toolUseId);
-          if (retryState && !retryState.projected) {
+          if (!retryState || !retryState.projected) {
             projectSubagentLaunchFailure(queue, ctx, pair.toolUseId, {
               errorMessage: pair.fullText.slice(0, 200),
             });
