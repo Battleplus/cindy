@@ -404,15 +404,31 @@ function isUnsupportedResponsesImageFeature(feature: string): boolean {
 // the user's attachment and resend text without the image they asked about.
 function imageRejectionKeywords(msg: string): boolean {
   const m = msg.toLowerCase();
-  return (m.includes('not support') || m.includes('does not support')
-      || m.includes("isn't supported") || m.includes('is not supported'))
-    && (m.includes('image') || m.includes('vision') || m.includes('multimodal'))
-    || m.includes('multimodal input is not supported')
-    || m.includes('image input is not supported')
-    || m.includes('vision is not supported')
-    || m.includes('images are not supported')
-    || m.includes('image_url content part is not supported')
-    || m.includes('image content part is not supported');
+  // Capability rejection: the model/provider explicitly says it does not support
+  // image/vision input. This is distinct from content errors like "image format
+  // not supported" or "image exceeds maximum size" which describe invalid content.
+  const capabilityPhrases = [
+    'image input is not supported',
+    'vision is not supported',
+    'images are not supported',
+    'image_url content part is not supported',
+    'image content part is not supported',
+    'multimodal input is not supported',
+    'does not support image input',
+    'does not support vision input',
+    'does not support image_url',
+    'does not support images',
+    'does not support multimodal',
+    'does not support image',
+    'does not support vision',
+    'not support image',
+    'not support vision',
+    'not support multimodal',
+  ];
+  for (const phrase of capabilityPhrases) {
+    if (m.includes(phrase)) return true;
+  }
+  return false;
 }
 
 function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
@@ -436,9 +452,15 @@ function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
   // Accept both `code` (OpenAI-style) and `type` (some providers only emit
   // `type: 'invalid_request_error'` with no code at all) as the
   // request-invalid signal.
+  // Accept invalid_request (400), unsupported_media_type (415), and
+  // unprocessable_entity (422) as request-invalid signals. Some providers use
+  // 415/422 to indicate the model does not accept image content parts.
   const invalidRequest =
-    (typeof code === 'string' && code.includes('invalid_request'))
-    || (typeof type === 'string' && type.toLowerCase().includes('invalid_request'));
+    (typeof code === 'string' && (code.includes('invalid_request')
+      || code.includes('unsupported_media') || code.includes('unprocessable')))
+    || (typeof type === 'string' && (type.toLowerCase().includes('invalid_request')
+      || type.toLowerCase().includes('unsupported_media')
+      || type.toLowerCase().includes('unprocessable')));
   if (invalidRequest
       && !message.startsWith(UNSUPPORTED_RESPONSES_FEATURE_MESSAGE_PREFIX)) {
     if (imageRejectionKeywords(message)) return true;
@@ -452,8 +474,11 @@ function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
         const it = (innerErr as Record<string, unknown>).type;
         const im = (innerErr as Record<string, unknown>).message;
         const innerInvalid =
-          (typeof ic === 'string' && ic.includes('invalid_request'))
-          || (typeof it === 'string' && it.toLowerCase().includes('invalid_request'));
+          (typeof ic === 'string' && (ic.includes('invalid_request')
+            || ic.includes('unsupported_media') || ic.includes('unprocessable')))
+          || (typeof it === 'string' && (it.toLowerCase().includes('invalid_request')
+            || it.toLowerCase().includes('unsupported_media')
+            || it.toLowerCase().includes('unprocessable')));
         if (innerInvalid && typeof im === 'string' && imageRejectionKeywords(im)) {
           return true;
         }
