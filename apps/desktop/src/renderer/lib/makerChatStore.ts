@@ -14165,21 +14165,28 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
   if (!state.pendingPermission) return;
 
   // Capture the exact permission object BEFORE any guard check or state mutation.
-  // If a reconnect snapshot or dismissal replaces A with B between the user click
-  // and this function body, the stale click must not approve B.
   const capturedRequest = state.pendingPermission;
   const { requestId } = capturedRequest;
 
   // Session-scoped guard: block all responses during the gesture-dedupe window.
-  // This prevents double-click / key-repeat from approving the newly promoted card.
   if (permissionResponseInFlight.has(sessionId)) return;
 
   permissionResponseInFlight.add(sessionId);
   bumpInteractionReconcileEpoch(sessionId);
 
-  // Clear the displayed permission immediately and promote the next parallel
-  // request. Main keeps every resolver by requestId; the renderer must do the
-  // same rather than dropping the first tool_use when a later card arrives.
+  // Verify the captured permission is STILL the head of the queue.
+  // Between the user click and this function body, a dismissal or reconnect
+  // may have replaced A with B.  Because setState is synchronous, we must
+  // check the live state AFTER arming the guard but BEFORE the transition.
+  const preState = getOrCreateState(sessionId);
+  if (preState.pendingPermission !== capturedRequest) {
+    // Permission was replaced between click and guard arm.  A different card
+    // is now the head — our click is stale.  Release guard and bail.
+    releasePermissionResponseGuard(sessionId);
+    return;
+  }
+
+  // Promote the next parallel request from the queue.
   setState(sessionId, (s) => {
     const [nextPermission = null, ...remainingPermissions] = s.pendingPermissionQueue;
     return {
@@ -14188,15 +14195,6 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
       pendingPermissionQueue: remainingPermissions,
     };
   });
-
-  // Verify that the captured permission is still the authoritative head.
-  // If a reconnect snapshot or dismissal promoted B while we were arming the
-  // guard, the stale click must not approve B.  Release the guard and bail.
-  const currentHead = getOrCreateState(sessionId).pendingPermission;
-  if (currentHead !== capturedRequest) {
-    releasePermissionResponseGuard(sessionId);
-    return;
-  }
 
   // Send to maker (InteractionDecision kind: 'permission').
   let response: Promise<unknown>;
