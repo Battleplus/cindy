@@ -14164,7 +14164,11 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
   const state = getOrCreateState(sessionId);
   if (!state.pendingPermission) return;
 
-  const { requestId } = state.pendingPermission;
+  // Capture the exact permission object BEFORE any guard check or state mutation.
+  // If a reconnect snapshot or dismissal replaces A with B between the user click
+  // and this function body, the stale click must not approve B.
+  const capturedRequest = state.pendingPermission;
+  const { requestId } = capturedRequest;
 
   // Session-scoped guard: block all responses during the gesture-dedupe window.
   // This prevents double-click / key-repeat from approving the newly promoted card.
@@ -14185,8 +14189,16 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
     };
   });
 
+  // Verify that the captured permission is still the authoritative head.
+  // If a reconnect snapshot or dismissal promoted B while we were arming the
+  // guard, the stale click must not approve B.  Release the guard and bail.
+  const currentHead = getOrCreateState(sessionId).pendingPermission;
+  if (currentHead !== capturedRequest) {
+    releasePermissionResponseGuard(sessionId);
+    return;
+  }
+
   // Send to maker (InteractionDecision kind: 'permission').
-  // Capture requestId for gesture-dedupe: only arm if guard still belongs to this request.
   let response: Promise<unknown>;
   try {
     response = makerApiFor(sessionId).resolveInteraction(requestId, {
