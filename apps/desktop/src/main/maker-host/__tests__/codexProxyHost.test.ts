@@ -661,9 +661,9 @@ describe('chatBridgeCapabilitiesForRoute', () => {
     ['https://coding.dashscope.aliyuncs.com.evil.example/v1', 'qwen3.7-plus'],
     ['https://example.com/v1', 'qwen3.7-plus'],
     ['https://coding.dashscope.aliyuncs.com/v1', 'qwen3-coder-next'],
-  ])('keeps image input disabled for non-matching route %s / %s', async (upstream, model) => {
+  ])('enables image_url by default for non-matching route %s / %s (fail-open)', async (upstream, model) => {
     const { chatBridgeCapabilitiesForRoute } = await freshCodexProxyHost();
-    expect(chatBridgeCapabilitiesForRoute(upstream, model).imageInput).toBeUndefined();
+    expect(chatBridgeCapabilitiesForRoute(upstream, model).imageInput).toBe('image_url');
   });
 
   it('passes image support into the handler for a preset-derived custom Kimi route', async () => {

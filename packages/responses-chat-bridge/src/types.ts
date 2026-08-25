@@ -290,8 +290,8 @@ export interface ChatBridgeCapabilities {
    */
   reasoningHistoryField?: ChatReasoningHistoryField;
   /**
-   * Responses `input_image` 的上游等价形态。默认未声明 = fail closed；只由
-   * 已确认支持视觉输入的运行时（当前为 upstream 白名单）开启。
+   * Responses `input_image` 的上游等价形态。默认 `image_url`（fail-open：桥接层
+   * 负责格式转换，上游不支持时由客户端检测并提示用户）。
    */
   imageInput?: ChatImageInput;
   /** Responses `input_file` 的上游等价形态；默认未声明 = fail closed。 */
@@ -396,14 +396,49 @@ function isUnsupportedResponsesImageFeature(feature: string): boolean {
     || contentPartType.startsWith('input_image.');
 }
 
+function imageRejectionKeywords(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return m.includes('image_url') || m.includes('input_image')
+    || m.includes('image content') || m.includes('multimodal')
+    || m.includes('vision') || m.includes('image_url content part');
+}
+
 function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const error = (value as Record<string, unknown>).error;
   if (typeof error !== 'object' || error === null || Array.isArray(error)) return false;
   const { code, message } = error as Record<string, unknown>;
-  if (code !== 'unsupported_feature' || typeof message !== 'string') return false;
-  const feature = unsupportedResponsesFeatureFromMessage(message);
-  return feature !== null && isUnsupportedResponsesImageFeature(feature);
+  if (typeof message !== 'string') return false;
+  // Bridge-generated unsupported_feature error (fail-closed path)
+  if (code === 'unsupported_feature') {
+    const feature = unsupportedResponsesFeatureFromMessage(message);
+    return feature !== null && isUnsupportedResponsesImageFeature(feature);
+  }
+  // Upstream provider rejection: detect image-related 400 errors from providers
+  // that don't support vision (e.g. DeepSeek, Ollama without vision model).
+  //
+  // The handler (handler.ts) wraps upstream errors as:
+  //   {error: {code: "upstream_error", message: "<raw upstream JSON body>"}}
+  // So we check both the outer code and also parse the wrapped inner error.
+  if (typeof code === 'string' && code.includes('invalid_request')
+      && !message.startsWith(UNSUPPORTED_RESPONSES_FEATURE_MESSAGE_PREFIX)) {
+    if (imageRejectionKeywords(message)) return true;
+  }
+  if (code === 'upstream_error' && typeof message === 'string') {
+    const inner = parseJson(message);
+    if (inner && typeof inner === 'object' && inner !== null) {
+      const innerErr = (inner as Record<string, unknown>).error;
+      if (innerErr && typeof innerErr === 'object') {
+        const ic = (innerErr as Record<string, unknown>).code;
+        const im = (innerErr as Record<string, unknown>).message;
+        if (typeof ic === 'string' && ic.includes('invalid_request')
+            && typeof im === 'string' && imageRejectionKeywords(im)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function parseJson(value: string): unknown {

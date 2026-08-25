@@ -715,6 +715,7 @@ const CHAT_BRIDGE_DEFAULT_CAPABILITIES: ChatBridgeCapabilities = {
   maxTokensField: 'max_tokens',
   reasoningField: 'none',
   streamUsage: true,
+  imageInput: 'image_url',
   // Responses fields with direct Chat equivalents. Provider-specific unsupported fields can
   // be removed later when the model capability catalog becomes more granular.
   passthroughFields: [
@@ -788,14 +789,11 @@ function rewriteChatBridgeModel(model: string, stripPrefix: string | undefined):
 /**
  * 在模型级多模态能力元数据接入路由前,图片桥接先按已验证的上游能力显式开启。
  *
- * 当前覆盖:
- * - Moonshot Kimi K3
- * - Volcengine Doubao Seed 系列
- * - Alibaba Cloud Bailian Coding Plan Qwen 3.7 Plus
+ * 默认已启用 `imageInput: 'image_url'`（fail-open）。此函数仅在已验证路由上
+ * 显式覆盖,确保白名单路由的 `imageInput` 始终为 `'image_url'`。
  *
- * 这里认官方 DNS 边界 + 上游 model,不认 provider id(预设创建后会生成用户自定义
- * id),也不对所有 openai-chat 供应商放开。未命中继续沿用 fail-closed 默认——
- * 无图片能力的上游(如 DeepSeek)保持发送前显式报错,不静默吞图。
+ * 非白名单路由同样走 fail-open：桥接层转换格式，上游不支持时返回错误，
+ * 客户端通过 `isUnsupportedResponsesImageErrorPayload` 检测并提示用户。
  */
 export function chatBridgeCapabilitiesForRoute(
   upstream: string,

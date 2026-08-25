@@ -43,6 +43,37 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     expect(isUnsupportedResponsesImageErrorPayload(codexUnexpectedResponse(payload))).toBe(true);
   });
 
+  it('accepts upstream provider image rejection (DeepSeek-style 400)', () => {
+    const payload = JSON.stringify({
+      error: {
+        code: 'invalid_request_error',
+        message: 'image_url content part is not supported by this model',
+      },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
+  it('accepts upstream provider multimodal rejection', () => {
+    const payload = JSON.stringify({
+      error: {
+        code: 'invalid_request',
+        message: 'This model does not support multimodal input',
+      },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
+  it('accepts handler-wrapped upstream image rejection (DeepSeek via bridge)', () => {
+    // handler.ts wraps: responsesError(status, 'upstream_error', rawUpstreamBody)
+    const innerError = JSON.stringify({
+      error: { code: 'invalid_request_error', message: 'image_url content part is not supported' },
+    });
+    const payload = JSON.stringify({
+      error: { code: 'upstream_error', message: innerError },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
+  });
+
   it.each([
     unsupportedFeaturePayload("input content part 'input_file'"),
     unsupportedFeaturePayload("input content part 'input_image'", 'invalid_request'),
