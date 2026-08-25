@@ -716,20 +716,6 @@ export function translateSdkMessage(
         });
       }
       // 单独遍历: 不能复用 extractToolResultFullText, 见 onToolResultDone JSDoc。
-      // P1 fix: detect <tool_use_error> in tool result text and project failure
-      // for the matching sidechain. This is identity-bearing terminal evidence
-      // from the Claude protocol -- the tool_use_id in the result pairs back to
-      // the specific sidechain that produced it.
-      for (const pair of fullPairs) {
-        if (pair.fullText.startsWith('<tool_use_error>')) {
-          const retryState = ctx.rt.subagentRetryStateByParentToolUseId.get(pair.toolUseId);
-          if (!retryState || !retryState.projected) {
-            projectSubagentLaunchFailure(queue, ctx, pair.toolUseId, {
-              errorMessage: pair.fullText.slice(0, 200),
-            });
-          }
-        }
-      }
       const completedToolUseIds = new Set(fullPairs.map((pair) => pair.toolUseId));
       const content = msg.message?.content;
       if (ctx.onToolResultDone) {
