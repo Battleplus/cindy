@@ -184,6 +184,33 @@ export function deriveAgentTaskStatus(
 }
 
 /**
+ * 判断子任务工具结果是否以失败收尾(历史回放恢复 failed 的依据)。判定为“是”的
+ * 形态:结构化 JSON 错误记录(ok:false / success:false / status ∈ error|failed|failure
+ * / 非空 error|errors|exception|stderr 字段)、`<tool_use_error>` 标记、或以
+ * Error/失败句式开头的短结果。与 messagePresentation.isErrorRecord 语义对齐
+ * (该函数不可达:agentTask 是叶子模块),但只读 result 字符串,不依赖工具元数据。
+ */
+export function isSubagentResultError(result: string | undefined): boolean {
+  const text = typeof result === 'string' ? result.trim() : '';
+  if (text.length === 0) return false;
+  // Only trust protocol-level error markers. Subagent result content is arbitrary
+  // user work product -- fields like "errors", "status", "stderr" in JSON output
+  // are data, not execution failure signals. Parsing arbitrary body for
+  // error-looking fields creates false positives that mark successful tasks as
+  // failed after Desktop reload / Mobile reconnect.
+  //
+  // Authority sources:
+  // 1. Claude protocol <tool_use_error> -- emitted by the SDK when a tool call fails
+  // 2. Persisted structured terminal status (agentTaskStatus) -- written by
+  //    messagePersistBroadcaster on terminal observations
+  //
+  // Note: <error> prefix removed -- too generic. A subagent returning
+  // `<error>校验报告</error>` as work output would be misclassified as failure.
+  // Only <tool_use_error> is a reliable protocol-owned error marker.
+  return text.startsWith('<tool_use_error>');
+}
+
+/**
  * Tool names that spawn a sub-agent task: Claude `Task`/`Agent`, Codex collab agents,
  * PI `subagent`(Cindy 自有扩展注册的工具名,与 pi 社区惯例一致)。
  *
