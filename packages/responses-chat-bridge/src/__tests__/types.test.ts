@@ -19,6 +19,10 @@ function codexUnexpectedResponse(messageOrBody: string): string {
   return `unexpected status 400 Bad Request: ${messageOrBody}, url: http://127.0.0.1/v1/responses`;
 }
 
+function codexUnexpectedStatus(status: number, messageOrBody: string): string {
+  return `unexpected status ${status}: ${messageOrBody}, url: http://127.0.0.1/v1/responses`;
+}
+
 describe('isUnsupportedResponsesImageErrorPayload', () => {
   it.each([
     "input content part 'input_image'",
@@ -111,6 +115,29 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
         codexUnexpectedResponse('Invalid image_url: image exceeds maximum size'),
       ),
     ).toBe(false);
+  });
+
+  it('accepts Codex-rendered 415/422 capability rejections (non-400 client errors)', () => {
+    // Some OpenAI-compatible upstreams use 415 (unsupported_media_type) or
+    // 422 (unprocessable_entity) to signal the model does not accept image
+    // content parts. The plain-text classifier must not be gated on 400.
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        codexUnexpectedStatus(415, 'image_url content part is not supported by this model'),
+      ),
+    ).toBe(true);
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        codexUnexpectedStatus(422, 'image input is not supported by this model'),
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts a JSON error whose error value is a plain string (Ollama-style)', () => {
+    const payload = JSON.stringify({
+      error: { code: 'upstream_error', message: JSON.stringify({ error: 'this model does not support images' }) },
+    });
+    expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
   });
 
   it('accepts a handler-wrapped rejection whose inner error uses error.type', () => {

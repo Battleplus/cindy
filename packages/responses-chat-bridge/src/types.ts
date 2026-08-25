@@ -368,7 +368,7 @@ export interface ResponsesChatBridgeHandler {
 const UNSUPPORTED_RESPONSES_FEATURE_MESSAGE_PREFIX =
   'Responses feature is not supported by the Chat Completions bridge: ';
 const RESPONSES_IMAGE_CONTENT_PART_TYPES = new Set(['input_image', 'image_url', 'image']);
-const CODEX_UNEXPECTED_BAD_REQUEST_PREFIX = /^unexpected status 400(?: Bad Request)?: /;
+const CODEX_UNEXPECTED_BAD_REQUEST_PREFIX = /^unexpected status (?:400(?: Bad Request)?|415|422): /;
 const CODEX_ERROR_METADATA_MARKERS = [
   ', url: ',
   ', cf-ray: ',
@@ -469,7 +469,12 @@ function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
     const inner = parseJson(message);
     if (inner && typeof inner === 'object' && inner !== null) {
       const innerErr = (inner as Record<string, unknown>).error;
-      if (innerErr && typeof innerErr === 'object') {
+      if (typeof innerErr === 'string') {
+        // Some providers (e.g. Ollama) return a native JSON error whose
+        // `error` value is a plain string, e.g. {"error":"this model
+        // does not support images"}. Classify it directly.
+        if (imageRejectionKeywords(innerErr)) return true;
+      } else if (innerErr && typeof innerErr === 'object') {
         const ic = (innerErr as Record<string, unknown>).code;
         const it = (innerErr as Record<string, unknown>).type;
         const im = (innerErr as Record<string, unknown>).message;
