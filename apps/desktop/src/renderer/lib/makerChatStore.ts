@@ -10095,6 +10095,10 @@ function retryInvalidatedInitialHistoryFetchIfNeeded(
   origin: string | undefined,
   epoch: number,
 ): void {
+  // Release the shared pagination lock so that loadOlderMessages is not
+  // permanently blocked when this invalidated request exits without retrying.
+  // If a retry does happen, ensureInitialMessages will re-acquire the lock.
+  setState(sessionId, (s) => (s.isLoadingMore ? { ...s, isLoadingMore: false } : s));
   const ownsFetch = _historyFetchToken.get(sessionId) === token;
   const epochChanged = (_messagesEpoch.get(sessionId) ?? 0) !== epoch;
   const originUnchanged = remoteProjectsStore.getSessionDeviceId(sessionId) === origin;
@@ -10655,7 +10659,7 @@ function ensureInitialMessages(sessionId: string): void {
       // rewind 之类的粘滞抑制(见 releaseCacheHydrationAfterFailure)。屏上已 hydrate 的
       // 缓存行**保持不动**:离线时它是用户唯一能看到的历史,清掉纯属倒退。
       releaseCacheHydrationAfterFailure(sessionId);
-      setState(sessionId, (s) => ({ ...s, historyLoaded: false }));
+      setState(sessionId, (s) => ({ ...s, historyLoaded: false, isLoadingMore: false }));
     });
 }
 
