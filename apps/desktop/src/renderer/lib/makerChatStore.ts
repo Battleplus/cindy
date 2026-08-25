@@ -9930,11 +9930,13 @@ function retryInvalidatedInitialHistoryFetchIfNeeded(
   origin: string | undefined,
   epoch: number,
 ): void {
-  // Release the shared pagination lock so that loadOlderMessages is not
-  // permanently blocked when this invalidated request exits without retrying.
-  // If a retry does happen, ensureInitialMessages will re-acquire the lock.
-  setState(sessionId, (s) => (s.isLoadingMore ? { ...s, isLoadingMore: false } : s));
   const ownsFetch = _historyFetchToken.get(sessionId) === token;
+  // Release the shared pagination lock only when this fetch still owns the
+  // token.  A stale callback from a superseded fetch must not clear the lock
+  // that a newer replacement backfill is actively holding.
+  if (ownsFetch) {
+    setState(sessionId, (s) => (s.isLoadingMore ? { ...s, isLoadingMore: false } : s));
+  }
   const epochChanged = (_messagesEpoch.get(sessionId) ?? 0) !== epoch;
   const originUnchanged = remoteProjectsStore.getSessionDeviceId(sessionId) === origin;
   releaseHistoryFetchIfCurrent(sessionId, token);
