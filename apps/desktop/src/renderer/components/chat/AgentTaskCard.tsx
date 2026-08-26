@@ -14,6 +14,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import {
   deriveAgentTaskStatus,
+  isSubagentResultError,
   type AgentTaskTerminalStatus,
 } from '@cindy/maker-shared/agent-task';
 
@@ -235,6 +236,7 @@ export function AgentTaskCard({
         resultIsLaunchReceipt:
           subagentSpawnReceiptName(toolCall?.toolName, toolCall?.toolInput, result) !== undefined
           || subagentSpawnResultIndicatesRunning(toolCall?.toolName, result),
+        resultIsError: update?.provider === 'claude-code' && isSubagentResultError(result),
       });
   const StatusIcon = statusIcon(status);
   const statusIconClassName = cn(

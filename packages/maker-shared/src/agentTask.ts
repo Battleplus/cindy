@@ -174,11 +174,13 @@ export function deriveAgentTaskStatus(
   options?: {
     resultIsLaunchReceipt?: boolean;
     persistedStatus?: AgentTaskTerminalStatus;
+    resultIsError?: boolean;
   },
 ): AgentTaskStatus {
   const persistedStatus = normalizeAgentTaskTerminalStatus(options?.persistedStatus);
   if (persistedStatus) return persistedStatus;
   const hasResult = typeof result === 'string' && result.trim().length > 0;
+  if (options?.resultIsError && hasResult) return 'failed';
   if (updateStatus === 'running' && hasResult && !options?.resultIsLaunchReceipt) return 'completed';
   return updateStatus ?? (hasResult ? 'completed' : 'running');
 }

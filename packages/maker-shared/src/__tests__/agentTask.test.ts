@@ -114,6 +114,31 @@ describe('deriveAgentTaskStatus', () => {
       persistedStatus: 'cancelled' as never,
     })).toBe('completed');
   });
+
+  it('returns failed when resultIsError is true and result is non-empty', () => {
+    expect(deriveAgentTaskStatus(undefined, '<tool_use_error>Auth failed</tool_use_error>', {
+      resultIsError: true,
+    })).toBe('failed');
+  });
+
+  it('returns failed even when updateStatus is running when resultIsError is true', () => {
+    expect(deriveAgentTaskStatus('running', '<tool_use_error>timeout</tool_use_error>', {
+      resultIsError: true,
+    })).toBe('failed');
+  });
+
+  it('persisted status wins over resultIsError', () => {
+    expect(deriveAgentTaskStatus(undefined, '<tool_use_error>fail</tool_use_error>', {
+      resultIsError: true,
+      persistedStatus: 'completed',
+    })).toBe('completed');
+  });
+
+  it('resultIsError is ignored when result is empty', () => {
+    expect(deriveAgentTaskStatus(undefined, '', {
+      resultIsError: true,
+    })).toBe('running');
+  });
 });
 
 describe('mergeAgentTaskUpdate', () => {
