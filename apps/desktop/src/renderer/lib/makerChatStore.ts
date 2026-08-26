@@ -9294,19 +9294,16 @@ function reconcilePendingInteractions(
           pendingRemoteDesktopConfirmationQueue: remainingRemoteConfirmations,
         };
       });
-      // When the authoritative snapshot replaces the displayed permission (e.g.
-      // device-link reconnects while old request A was in flight), rearm the
-      // gesture-dedupe guard instead of releasing it. Releasing here would let
-      // A's delayed double-click / key-repeat read the newly promoted B's
-      // requestId and approve B without an independent user decision. Rearming
-      // is symmetric with the dismissal path: B stays protected for the
-      // gesture window, then becomes actionable normally.
+      // P1 security: When the authoritative snapshot replaces the displayed
+      // permission (e.g. device-link reconnects while old request A was in
+      // flight), we must use requestId-based comparison — not reference equality
+      // — because reconciliation may recreate the permission object with the
+      // same requestId.  If the permission actually changed (different
+      // requestId), rearm the gesture window to protect the newly promoted card.
       const newPendingPermission = getOrCreateState(sessionId).pendingPermission;
-      if (
-        oldPendingPermission !== newPendingPermission &&
-        oldPendingPermission !== null &&
-        permissionResponseInFlight.has(sessionId)
-      ) {
+      const oldRequestId = oldPendingPermission?.requestId;
+      const newRequestId = newPendingPermission?.requestId;
+      if (permissionResponseInFlight.has(sessionId) && oldRequestId !== newRequestId && oldRequestId != null) {
         rearmPermissionResponseGuard(sessionId);
       }
       for (const item of list) {
@@ -14169,14 +14166,21 @@ function respondToPluginSetup(
 /**
  * F-PERM-2: Send a permission decision to the main process and clear pendingPermission.
  */
-function respondToPermission(sessionId: string, result: CCAgentPermissionResult): void {
+function respondToPermission(
+  sessionId: string,
+  result: CCAgentPermissionResult,
+  capturedRequestId?: string,
+): void {
   if (!sessionId) return;
   const state = getOrCreateState(sessionId);
   if (!state.pendingPermission) return;
 
-  // Capture the exact permission object BEFORE any guard check or state mutation.
-  const capturedRequest = state.pendingPermission;
-  const { requestId } = capturedRequest;
+  // P1 security: use the explicit requestId from the UI component if provided.
+  // This is the identity the user acted on when they clicked/pressed Enter.
+  // Falling back to state.pendingPermission.requestId only when the caller
+  // did not provide one (e.g. hardware approval path that doesn't go through
+  // PermissionPrompt).
+  const requestId = capturedRequestId ?? state.pendingPermission.requestId;
 
   // Session-scoped guard: block all responses during the gesture-dedupe window.
   if (permissionResponseInFlight.has(sessionId)) return;
@@ -14184,12 +14188,13 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
   permissionResponseInFlight.set(sessionId, requestId);
   bumpInteractionReconcileEpoch(sessionId);
 
-  // Verify the captured permission is STILL the head of the queue.
+  // P1 security: verify the captured requestId is STILL the head of the queue.
   // Between the user click and this function body, a dismissal or reconnect
-  // may have replaced A with B.  Because setState is synchronous, we must
-  // check the live state AFTER arming the guard but BEFORE the transition.
+  // may have replaced A with B.  We compare by requestId value (not object
+  // reference) so that even if the permission object was recreated during
+  // reconciliation, the identity check is correct.
   const preState = getOrCreateState(sessionId);
-  if (preState.pendingPermission !== capturedRequest) {
+  if (preState.pendingPermission?.requestId !== requestId) {
     // Permission was replaced between click and guard arm.  A different card
     // is now the head — our click is stale.  Release guard and bail.
     releasePermissionResponseGuard(sessionId);

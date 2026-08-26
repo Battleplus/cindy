@@ -13,7 +13,7 @@
  *   Esc         → Deny
  */
 
-import { useCallback, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { cn } from '@/lib/utils';
@@ -101,10 +101,17 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
 
   // ── Action handlers ──
 
+  // P1 security: capture the requestId at mount time so that a stale callback
+  // (e.g. keyboard Enter arriving after the permission was swapped) always
+  // carries the identity of the permission the user actually acted on,
+  // instead of reading the current state which may now be a different card.
+  const capturedRequestId = useRef(permission.requestId);
+
   const handleAllowOnce = useCallback(() => {
     onRespond({
       behavior: 'allow',
-    });
+      requestId: capturedRequestId.current,
+    } as CCAgentPermissionResult);
   }, [onRespond]);
 
   const handleAlwaysAllow = useCallback(() => {
@@ -116,7 +123,8 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
       behavior: 'allow',
       updatedPermissions: sessionSuggestions,
       decisionClassification: 'user_permanent',
-    });
+      requestId: capturedRequestId.current,
+    } as CCAgentPermissionResult);
   }, [canAlwaysAllowForSession, handleAllowOnce, onRespond, sessionSuggestions]);
 
   const handleDeny = useCallback(() => {
@@ -124,7 +132,8 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
       behavior: 'deny',
       message: 'User denied',
       decisionClassification: 'user_reject',
-    });
+      requestId: capturedRequestId.current,
+    } as CCAgentPermissionResult);
   }, [onRespond]);
 
   // ── Keyboard shortcuts ──

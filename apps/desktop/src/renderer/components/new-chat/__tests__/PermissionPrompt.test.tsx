@@ -161,6 +161,7 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
       behavior: 'allow',
       updatedPermissions: [bashRule],
       decisionClassification: 'user_permanent',
+      requestId: 'req-1',
     });
   });
 
