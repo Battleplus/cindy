@@ -236,7 +236,7 @@ export function AgentTaskCard({
         resultIsLaunchReceipt:
           subagentSpawnReceiptName(toolCall?.toolName, toolCall?.toolInput, result) !== undefined
           || subagentSpawnResultIndicatesRunning(toolCall?.toolName, result),
-        resultIsError: update?.provider === 'claude-code' && isSubagentResultError(result),
+        resultIsError: isSubagentResultError(result),
       });
   const StatusIcon = statusIcon(status);
   const statusIconClassName = cn(
