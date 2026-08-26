@@ -564,7 +564,7 @@ export function useCCAgentChat(
       // P1 security: forward the captured requestId from the UI component
       // so respondToPermission uses the identity the user acted on, not the
       // current state which may have changed.
-      makerChatStore.respondToPermission(sessionId, result, (result as Record<string, unknown>).requestId as string | undefined);
+      makerChatStore.respondToPermission(sessionId, result, result.requestId);
     },
     [sessionId],
   );

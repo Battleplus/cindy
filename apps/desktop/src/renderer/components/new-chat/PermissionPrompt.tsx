@@ -101,11 +101,14 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
 
   // ── Action handlers ──
 
-  // P1 security: capture the requestId at mount time so that a stale callback
-  // (e.g. keyboard Enter arriving after the permission was swapped) always
-  // carries the identity of the permission the user actually acted on,
-  // instead of reading the current state which may now be a different card.
+  // P1 security: keep the requestId in a ref so callbacks created for the
+  // current card always carry the identity the user actually acted on. React
+  // may reuse this instance when the FIFO promotes the next card, so update
+  // synchronously during render rather than waiting for an effect.
   const capturedRequestId = useRef(permission.requestId);
+  if (capturedRequestId.current !== permission.requestId) {
+    capturedRequestId.current = permission.requestId;
+  }
 
   const handleAllowOnce = useCallback(() => {
     onRespond({

@@ -188,6 +188,18 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
     expect(onRespond).toHaveBeenCalledTimes(1);
   });
 
+  it('刷新到队列下一张卡后使用新的 requestId', () => {
+    const onRespond = vi.fn();
+    const first = permission();
+    const second = { ...permission(), requestId: 'req-2', input: { command: 'git status' } };
+    const { rerender } = render(<PermissionPrompt permission={first} onRespond={onRespond} />);
+
+    rerender(<PermissionPrompt permission={second} onRespond={onRespond} />);
+    fireEvent.click(screen.getByText('agentIsland.native.allowOnce'));
+
+    expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow', requestId: 'req-2' });
+  });
+
   it('Escape repeat is also ignored', () => {
     const onRespond = vi.fn();
     render(<PermissionPrompt permission={permission([bashRule])} onRespond={onRespond} />);
