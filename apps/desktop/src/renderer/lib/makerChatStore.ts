@@ -2894,7 +2894,8 @@ const sessions = new Map<string, SessionChatState>();
  * Prevents double-click / key-repeat from approving the newly promoted permission
  * card within the gesture-dedupe window (300ms after IPC settle).
  */
-const permissionResponseInFlight = new Set<string>();
+/** Maps sessionId → requestId of the in-flight permission response. */
+const permissionResponseInFlight = new Map<string, string>();
 /** Gesture dedupe window: prevents double-click from approving the newly promoted card. */
 const PERMISSION_RESPONSE_GUARD_WINDOW_MS = 300;
 /** Timer per session for gesture dedupe release (purge / dismissal cleanup). */
@@ -2908,6 +2909,7 @@ const permissionResponseGuardTimers = new Map<string, ReturnType<typeof setTimeo
  */
 function rearmPermissionResponseGuard(sessionId: string): void {
   if (!permissionResponseInFlight.has(sessionId)) return;
+  // Keep the existing requestId — only restart the dedupe timer.
   const timer = permissionResponseGuardTimers.get(sessionId);
   if (timer !== undefined) clearTimeout(timer);
   const next = setTimeout(
@@ -2930,8 +2932,15 @@ function releasePermissionResponseGuard(sessionId: string): void {
 
 /**
  * Arm gesture-dedupe window after IPC settle.
+ * @param requestId  The permission request that just settled.
+ *                   Only this request may arm the guard — a stale
+ *                   caller whose requestId no longer matches the
+ *                   in-flight entry must not overwrite the guard.
  */
-function armPermissionResponseGuard(sessionId: string): void {
+function armPermissionResponseGuard(sessionId: string, requestId: string): void {
+  // Ownership check: if a newer request already took over, do not interfere.
+  const current = permissionResponseInFlight.get(sessionId);
+  if (current !== undefined && current !== requestId) return;
   const timer = permissionResponseGuardTimers.get(sessionId);
   if (timer !== undefined) clearTimeout(timer);
   const next = setTimeout(
@@ -2939,6 +2948,7 @@ function armPermissionResponseGuard(sessionId: string): void {
     PERMISSION_RESPONSE_GUARD_WINDOW_MS,
   );
   permissionResponseGuardTimers.set(sessionId, next);
+  permissionResponseInFlight.set(sessionId, requestId);
 }
 const listeners = new Map<string, Set<() => void>>();
 const lightSnapshotCache = new Map<string, SessionChatLightState>();
@@ -14171,7 +14181,7 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
   // Session-scoped guard: block all responses during the gesture-dedupe window.
   if (permissionResponseInFlight.has(sessionId)) return;
 
-  permissionResponseInFlight.add(sessionId);
+  permissionResponseInFlight.set(sessionId, requestId);
   bumpInteractionReconcileEpoch(sessionId);
 
   // Verify the captured permission is STILL the head of the queue.
@@ -14225,7 +14235,7 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
       void reconcilePendingInteractions(sessionId).catch(() => undefined);
     })
     .finally(() => {
-      armPermissionResponseGuard(sessionId);
+      armPermissionResponseGuard(sessionId, requestId);
     });
 }
 
