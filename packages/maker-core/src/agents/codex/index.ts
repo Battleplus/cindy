@@ -4315,9 +4315,20 @@ export class CodexAgent extends BaseAgent {
     }
     if (requiresCodexCapabilitySkillDiscovery(capabilityRoutingPolicy)) {
       try {
+        // Custom providers (provider-oauth) use a dedicated control-plane host for
+        // skill discovery to avoid triggering OAuth refresh on the session host.
+        // The session host for provider-oauth may be a reused ChatGPT OAuth host,
+        // and skills/list RPC can trigger config reload → OAuth refresh → failure.
+        // See: https://github.com/makecindy/cindy/issues/3467
+        const skillDiscoveryHost = sessionCredentialMode === 'provider-oauth'
+          ? await this.getHost(undefined, 'provider-oauth', {
+              keyOverride: localControlPlaneHostKey('provider-oauth'),
+              hostPurpose: 'control-plane',
+            })
+          : host;
         assertCurrentHost('capability Skill discovery');
         const { skills, errors } = await this.listSkillsForHost(
-          host,
+          skillDiscoveryHost,
           opts.workingDir,
           false,
           CRITICAL_THREAD_RPC_TIMEOUT_MS,
