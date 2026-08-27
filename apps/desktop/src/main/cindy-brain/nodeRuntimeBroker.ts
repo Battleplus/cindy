@@ -1143,6 +1143,20 @@ export class GhostNodeRuntimeBroker {
       this.assertOwnerScopeUsable(ghost.manifest.id, existing.ownerScopeSnapshot);
       return existing;
     }
+    // Reserve the start before awaiting a previous process drain. This closes
+    // the gap where concurrent callers all observe the same completed drain and
+    // then each begin a replacement.
+    let resolveStartReservation!: (promise: Promise<WorkerEntry>) => void;
+    let rejectStartReservation!: (reason: unknown) => void;
+    const startReservation = new Promise<WorkerEntry>((resolve, reject) => {
+      resolveStartReservation = resolve;
+      rejectStartReservation = reject;
+    });
+    // Attach the rejection handler immediately; callers that arrive during
+    // the drain wait must not create an unhandled rejection if the owner dies.
+    startReservation.catch(() => undefined);
+    this.startingWorkers.set(key, startReservation);
+
     // Wait for any previous process for this key to fully exit before forking.
     // On Windows, the old UtilityProcess may still hold file locks or ports
     // that prevent the new bootstrap from succeeding (#3330).
@@ -1158,16 +1172,22 @@ export class GhostNodeRuntimeBroker {
         // Draining timed out — old process still alive. The rejection
         // already prevented a premature fork.
       }
-      this.drainingExits.delete(key);
+      // Keep the completed drain marker until the replacement reservation is
+      // installed.  Deleting it before reserving a new start creates a window
+      // where concurrent callers can both pass the absence checks and fork
+      // duplicate replacements.
     }
     this.startingWorkerScopes.set(key, ownerScopeSnapshot);
     const starting = this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
-    this.startingWorkers.set(key, starting);
+    starting.then(resolveStartReservation, rejectStartReservation);
     try {
       return await starting;
     } finally {
       this.startingWorkers.delete(key);
       this.startingWorkerScopes.delete(key);
+      // A completed drain is consumed only after the replacement reservation
+      // has existed; clear it now so the next restart does not wait forever.
+      if (this.drainingExits.get(key) === draining) this.drainingExits.delete(key);
     }
   }
 

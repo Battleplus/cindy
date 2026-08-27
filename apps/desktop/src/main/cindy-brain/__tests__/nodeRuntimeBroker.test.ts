@@ -524,6 +524,44 @@ describe('nodeRuntimeBroker · 进程生命周期', () => {
     await expect(p2).resolves.toMatchObject({ ok: true });
     expect(broker.stateOf('node-ghost')).toBe('running');
   });
+
+  it('同一 key 的并发 replacement 请求只启动一个 worker', async () => {
+    vi.useFakeTimers();
+    const ghost = fakeGhost({ lifecycle: 'on-demand' });
+    const children: FakeNodeProcess[] = [];
+    const brokers = new GhostNodeRuntimeBroker({
+      getGhost: () => ghost,
+      spawnProcess: () => {
+        const child = makeAutoReplyProcess();
+        children.push(child);
+        return child as unknown as NodeWorkerProcess;
+      },
+    });
+
+    const first = brokers.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(first).resolves.toMatchObject({ ok: true });
+    const old = children[0];
+    old.removeAllListeners('exit');
+    old.kill = vi.fn(() => {
+      old.killed = true;
+      return true;
+    });
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    const a = brokers.handleRequest('node-ghost', rpcRequest());
+    const b = brokers.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(children).toHaveLength(1);
+    old.emit('exit', null, 'SIGTERM');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(children).toHaveLength(2);
+    children[1].emit('spawn');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(a).resolves.toMatchObject({ ok: true });
+    await expect(b).resolves.toMatchObject({ ok: true });
+    brokers.destroyAll();
+  });
 });
 
 describe('nodeRuntimeBroker · 启动瞬时失败重试(2026-07-24)', () => {
