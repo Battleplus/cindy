@@ -186,11 +186,17 @@ export function deriveAgentTaskStatus(
 }
 
 /**
- * 判断子任务工具结果是否以失败收尾(历史回放恢复 failed 的依据)。判定为“是”的
- * 形态:结构化 JSON 错误记录(ok:false / success:false / status ∈ error|failed|failure
- * / 非空 error|errors|exception|stderr 字段)、`<tool_use_error>` 标记、或以
- * Error/失败句式开头的短结果。与 messagePresentation.isErrorRecord 语义对齐
- * (该函数不可达:agentTask 是叶子模块),但只读 result 字符串,不依赖工具元数据。
+ * 判断子任务工具结果是否以协议级错误收尾(历史回放恢复 failed 的依据)。
+ *
+ * 仅识别 Claude SDK 协议标记 `<tool_use_error>` — 这是 SDK 在 tool call 失败时
+ * 发出的结构化错误格式。不解析任意 JSON 字段或自然语言错误短语,因为子任务结果
+ * 内容是用户工作产物,其中 "errors"/"status"/"stderr" 等字段是数据而非执行信号。
+ *
+ * 调用方约束:此函数仅应在已确认为子任务上下文的调用点使用
+ * (AgentTaskCard / listSessionTasks)。普通工具结果包含 `<tool_use_error>` 时
+ * 不应传入此函数,否则会将非子任务结果误判为失败。
+ *
+ * Authority: Claude protocol `<tool_use_error>` — SDK 在 tool call 失败时发出。
  */
 export function isSubagentResultError(result: string | undefined): boolean {
   const text = typeof result === 'string' ? result.trim() : '';
