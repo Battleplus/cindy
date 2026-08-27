@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const h = vi.hoisted(() => ({
   captured: null as Record<string, unknown> | null,
   updateSet: null as Record<string, unknown> | null,
-  updateReturning: [] as Array<{ id: string }>,
+  runResult: { changes: 0 } as { changes: number },
   whereCalled: false,
 }));
 
@@ -32,7 +32,7 @@ vi.mock('../../localDb/client/current.js', () => ({
           return {
             where: () => {
               h.whereCalled = true;
-              return { returning: async () => h.updateReturning };
+              return { run: async () => h.runResult };
             },
           };
         },
@@ -160,17 +160,27 @@ describe('DesktopSessionStorage.create workingDir 规范化', () => {
 describe('DesktopSessionStorage.compareAndClearSdkSessionId', () => {
   beforeEach(() => {
     h.updateSet = null;
-    h.updateReturning = [];
+    h.runResult = { changes: 0 };
     h.whereCalled = false;
   });
-  it('用单条条件 update 清空旧 id，并按 returning 报告 CAS 是否命中', async () => {
+  it('CAS hit: .run() returns changes=1, method returns true', async () => {
     const storage = new DesktopSessionStorage();
-    h.updateReturning = [{ id: 'session-1' }];
+    h.runResult = { changes: 1 };
     await expect(storage.compareAndClearSdkSessionId('session-1', 'sdk-old')).resolves.toBe(true);
     expect(h.updateSet?.sdkSessionId).toBeNull();
     expect(h.updateSet?.updatedAt).toEqual(expect.any(Number));
     expect(h.whereCalled).toBe(true);
-    h.updateReturning = [];
+  });
+  it('CAS miss: .run() returns changes=0, method returns false, preserves new ID', async () => {
+    const storage = new DesktopSessionStorage();
+    h.runResult = { changes: 0 };
     await expect(storage.compareAndClearSdkSessionId('session-1', 'sdk-stale')).resolves.toBe(false);
+  });
+  it('concurrent path: hit then miss, each call correct', async () => {
+    const storage = new DesktopSessionStorage();
+    h.runResult = { changes: 1 };
+    await expect(storage.compareAndClearSdkSessionId('s1', 'sdk-a')).resolves.toBe(true);
+    h.runResult = { changes: 0 };
+    await expect(storage.compareAndClearSdkSessionId('s1', 'sdk-a')).resolves.toBe(false);
   });
 });
