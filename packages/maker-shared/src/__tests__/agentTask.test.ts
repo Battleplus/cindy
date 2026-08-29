@@ -127,6 +127,13 @@ describe('deriveAgentTaskStatus', () => {
     })).toBe('failed');
   });
 
+  it('shared card model projects protocol error results as failed', () => {
+    expect(buildAgentTaskCardModel({
+      toolName: 'Task',
+      result: '<tool_use_error>launch failed</tool_use_error>',
+    }).status).toBe('failed');
+  });
+
   it('persisted status wins over resultIsError', () => {
     expect(deriveAgentTaskStatus(undefined, '<tool_use_error>fail</tool_use_error>', {
       resultIsError: true,

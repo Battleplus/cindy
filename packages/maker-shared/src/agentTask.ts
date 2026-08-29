@@ -477,10 +477,10 @@ export function buildAgentTaskCardModel(input: {
 }): AgentTaskCardModel {
   const { toolName, toolInput, update, result, persistedStatus } = input;
   const status = deriveAgentTaskStatus(update?.status, result, {
-    persistedStatus,
-    resultIsLaunchReceipt:
+    persistedStatus,      resultIsLaunchReceipt:
       subagentSpawnReceiptName(toolName, toolInput, result) !== undefined
       || subagentSpawnResultIndicatesRunning(toolName, result),
+    resultIsError: isSubagentResultError(result),
   });
   const provider: 'claude-code' | 'codex' | 'pi' =
     update?.provider

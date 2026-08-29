@@ -344,7 +344,9 @@ export function listSessionTasks(input: {
               || subagentSpawnResultIndicatesRunning(toolName, resultText),
             resultIsError: isSubagentResultError(resultText),
           })
-        : (settled ? 'completed' : isSessionStreaming ? 'running' : 'stopped');
+        : (settled
+          ? (isSubagentResultError(resultText) ? 'failed' : 'completed')
+          : isSessionStreaming ? 'running' : 'stopped');
     const provider: SessionTaskItem['provider'] =
       update?.provider ?? (toolName.startsWith('collab:') ? 'codex' : 'claude-code');
 
