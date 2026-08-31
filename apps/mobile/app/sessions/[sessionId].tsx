@@ -34,6 +34,7 @@ import {
 } from 'expo-audio';
 import {
   addScreenshotListener,
+  renderConversationShareHtmlToPng,
 } from 'xdt-screenshot-monitor';
 import { useFocusEffect, useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject, type SetStateAction } from 'react';
@@ -88,7 +89,19 @@ import {
 } from '@/device-link/remoteStatus';
 import { agentAuthGateHint, agentAuthGateVerdict } from '@/session/agentAuthGate';
 import { isTransientRemoteError, withTransientRemoteRetry } from '@/device-link/remoteRetry';
-import { useRemoteSyncCoordinator, type RemoteSyncRun } from '@/device-link/remoteSyncTask';
+import {
+  createRemoteSyncReopenCoordinator,
+  useRemoteSyncCoordinator,
+  type RemoteSyncRun,
+} from '@/device-link/remoteSyncTask';
+import {
+  runConnectionScopedSessionMetadataRead,
+  runIndependentSnapshotReads,
+  runSessionMessagesSnapshotSingleFlight,
+  runSessionPendingInteractionsSnapshotSingleFlight,
+  runSessionProjectionSnapshotSingleFlight,
+} from '@/device-link/sessionSnapshotSingleFlight';
+import { createTransientTopicSubscriptionCoordinator } from '@/device-link/transientTopicSubscription';
 import { useMobileMakerTransport } from '@/device-link/useMobileMakerTransport';
 import { createMobileMakerTransport } from '@/device-link/mobileMakerTransport';
 import { startFocusedTopicSubscription } from '@/device-link/focusedTopicSubscription';
@@ -100,6 +113,7 @@ import {
   type ShareableMessageViewport,
 } from '@/session/MessageRenderer';
 import {
+  bundledAssetToDataUri,
   cleanupConversationSharePngTemps,
   deleteConversationSharePngTemp,
   writeConversationSharePngTemp,
@@ -109,6 +123,7 @@ import {
   type ConversationShareSvgHandle,
 } from '@/session/ConversationShareSvg';
 import {
+  buildConversationShareHtml,
   type ConversationShareMessage,
   type ConversationShareWebViewColors,
 } from '@/session/conversationShareWebViewHtml';
@@ -172,7 +187,7 @@ import { ModelPickerSheet } from '@/session/ModelPickerSheet';
 import { MobileModelIconMark } from '@/session/MobileProviderMark';
 import { getModel } from '@cindy/model-providers/registry';
 import { clearSessionMirror, makeSessionMirrorAccessors } from '@/session/sessionModelMirror';
-import { rowFastEditable } from '@/session/modelPickerRows';
+import { effortLabelFromRuntime, rowFastEditable } from '@/session/modelPickerRows';
 import {
   buildMobileModelSections,
   isSelectedSourceDisconnected,
@@ -212,6 +227,7 @@ import {
 } from '@/session/useComposerImageAnnotations';
 import { buildMediaPayload } from '@/session/messagePayload';
 import type { MobileMessageGalleryImage } from '@/session/messageGallery';
+import { canBrowsePhotoLibraryDirectly } from '@/session/photoLibraryPolicy';
 import {
   prefetchContextSheetMediaAssets,
   resolveContextSheetMediaAssetForUpload,
@@ -528,8 +544,13 @@ import {
 import { ChatFilePathContext, type ChatFilePathContextValue, type ChatFilePathTarget } from '@/session/chatFilePathContext';
 import { pathDisplayName } from '@/session/chatPathCandidate';
 import { fetchRemoteAbsFileToUrl } from '@/session/remoteAbsFileFetch';
+import { showActionMenu, usesSystemActionMenu } from '@/platform/chrome';
 import { ChatFileChipMenuSheet } from '@/session/ChatFileChipMenuSheet';
-import type { ChatFileChipMenuActionKey } from '@/session/chatFileChipMenuModel';
+import {
+  chatFileChipMenuRows,
+  chatFileChipMenuTitle,
+  type ChatFileChipMenuActionKey,
+} from '@/session/chatFileChipMenuModel';
 import { mergePathIntoComposerDraft, shareMimeForFileName } from '@/session/fileBrowserActions';
 import { exportRemoteFileToUrl } from '@/session/fileBrowserExport';
 import { normalizeRemoteOpDirEntries, parentRelPath } from '@/session/fileBrowserGrid';
@@ -610,6 +631,15 @@ const REOPEN_MESSAGE_WINDOW_LIMITS = [20, 10, 5, 1] as const;
 // 覆盖 settling 窗口上限(10s)之后仍无任何在途证据的场景。
 const TAIL_RETRY_HIDE_TIMEOUT_MS = 15_000;
 const SCREENSHOT_SHARE_ACTIVATION_DEBOUNCE_MS = 1_200;
+const nativeConversationShareAvailable = Platform.OS === 'ios';
+
+// 原生 WKWebView 只能稳定读取 data URI；SVG 兜底直接使用同一组 bundle asset。
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const shareCharacterAsset = require('../../assets/share/cindy-share-character.jpg');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const shareLogoLightAsset = require('../../assets/login/login-wordmark.png');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const shareLogoDarkAsset = require('../../assets/login/login-wordmark-dark.png');
 
 /**
  * 排队消息「复用 composer 编辑」的会话内状态:clientId 定位队列条目,
@@ -634,7 +664,7 @@ function buildComposerRuntimeSummary(
   runtime: MobileSessionRuntimeOptions,
 ): ComposerRuntimeSummary {
   const modelLabel = runtime.currentModel?.label ?? session.model;
-  const effortLabel = choiceLabel(runtime.effortOptions, session.effort);
+  const effortLabel = effortLabelFromRuntime(runtime, session.effort);
   return {
     modelSummary: [modelLabel, effortLabel].filter(Boolean).join(' · '),
     permissionLabel: choiceLabel(runtime.permissionOptions, session.permissionMode),
@@ -939,6 +969,7 @@ export default function SessionScreen() {
     getPresenceAvailability,
     invoke,
     openLink,
+    reopenLink,
     status,
     subscribe,
     unsubscribe,
@@ -1004,6 +1035,9 @@ export default function SessionScreen() {
   const shareOperationSeqRef = useRef(0);
   const [conversationShareBusy, setConversationShareBusy] = useState(false);
   const [shareSelectionTriggeredByScreenshot, setShareSelectionTriggeredByScreenshot] = useState(false);
+  const [shareCharacterSrc, setShareCharacterSrc] = useState<string | null>(null);
+  const [shareLogoSrc, setShareLogoSrc] = useState<string | null>(null);
+  const shareLogoModeRef = useRef<string | null>(null);
   // chat-text-quote:待随下一条消息发送的选中文字引用(全局 store,消息流选区
   // 按钮 / 文件预览页写入;发送时拼进正文,命中本地命令时保留)。
   const quotes = useSessionQuotes(sessionId);
@@ -1083,12 +1117,35 @@ export default function SessionScreen() {
       };
     }, [sessionId]),
   );
+  useEffect(() => {
+    if (!nativeConversationShareAvailable || !shareSelectionActive) return undefined;
+    let cancelled = false;
+    const logoNeedsLoad = shareLogoModeRef.current !== mode || !shareLogoSrc;
+    void Promise.all([
+      shareCharacterSrc
+        ? Promise.resolve(shareCharacterSrc)
+        : bundledAssetToDataUri(shareCharacterAsset, 'image/jpeg'),
+      logoNeedsLoad
+        ? bundledAssetToDataUri(
+            mode === 'dark' ? shareLogoDarkAsset : shareLogoLightAsset,
+            'image/png',
+          )
+        : Promise.resolve(shareLogoSrc),
+    ]).then(([character, logo]) => {
+      if (cancelled) return;
+      shareLogoModeRef.current = mode;
+      setShareCharacterSrc(character);
+      setShareLogoSrc(logo);
+    });
+    return () => { cancelled = true; };
+  }, [mode, shareCharacterSrc, shareLogoSrc, shareSelectionActive]);
   const [composerFocused, setComposerFocused] = useState(false);
   const [composerInputContentHeight, setComposerInputContentHeight] = useState(COMPOSER_INPUT_SINGLE_LINE_CONTENT_HEIGHT);
   const [voiceDraftCaretFrame, setVoiceDraftCaretFrame] = useState({ left: 0, top: 0 });
   // Context 面板(+ 号弹出的可拖动 sheet):open + 面板内子视图(主视图 / 截图列表 / 目标模式)。
   const [contextSheetOpen, setContextSheetOpen] = useState(false);
   const [contextSheetView, setContextSheetView] = useState<'main' | 'screenshots' | 'goal'>('main');
+  const contextSheetMediaLibraryEnabled = canBrowsePhotoLibraryDirectly(Platform.OS);
   // 模型 + 权限浮窗(ContextSheet 同款 Modal,含二级「模型选项 / 权限」叠层)。
   const [modelSheetOpen, setModelSheetOpen] = useState(false);
   // 权限模式独立浮窗(composer 左侧图标钮点开,与模型浮窗同属 composer 激活态)。
@@ -1582,8 +1639,25 @@ export default function SessionScreen() {
   // lastSyncedAt 不会归零,不能用来判断「当前会话本次连接已同步」。epoch 经 ref 读取,
   // 避免把 connectionEpoch 加进 syncSession deps 引发额外整窗重拉。
   const [readAckSyncedKey, setReadAckSyncedKey] = useState<string | null>(null);
+  // interrupted 只依赖 getSession 的权威时间戳；兄弟快照失败不能把这道门永久关住。
+  // 已读回执仍继续使用上面的整窗门槛，避免消息未同步就提前清 attention。
+  const [sessionMetadataSyncedKey, setSessionMetadataSyncedKey] = useState<string | null>(null);
   const readAckEpochRef = useRef(connectionEpoch);
   readAckEpochRef.current = connectionEpoch;
+  // 后台订阅重试不能越过任务/设备/连接代切换，也不能在页面卸载后把已清理的 owner
+  // 重新登记回来。render 阶段先发布最新 identity；旧 effect 的 cleanup 只清自己。
+  const sessionSubscriptionIdentity = JSON.stringify([deviceId, sessionId, connectionEpoch]);
+  const sessionSubscriptionIdentityRef = useRef<string | null>(sessionSubscriptionIdentity);
+  sessionSubscriptionIdentityRef.current = sessionSubscriptionIdentity;
+  useEffect(() => () => {
+    if (sessionSubscriptionIdentityRef.current === sessionSubscriptionIdentity) {
+      sessionSubscriptionIdentityRef.current = null;
+    }
+  }, [sessionSubscriptionIdentity]);
+  const sessionsSubscriptionCoordinatorRef = useRef<ReturnType<
+    typeof createTransientTopicSubscriptionCoordinator
+  > | null>(null);
+  sessionsSubscriptionCoordinatorRef.current ??= createTransientTopicSubscriptionCoordinator();
   // 门槛代号:每次「作废门槛」(原地切 session / liveAttention 上升沿)都递增。
   // sync 尾部只有代号与自己启动时一致才允许落 key——否则 A→B→A 场景下,visit-1
   // 的在途旧 load 会在重置之后用**相同的** `${sessionId}:${connectionEpoch}` 把门槛
@@ -1598,6 +1672,7 @@ export default function SessionScreen() {
   if (prevReadAckSessionId !== sessionId) {
     setPrevReadAckSessionId(sessionId);
     setReadAckSyncedKey(null);
+    setSessionMetadataSyncedKey(null);
     readAckGateGenRef.current += 1;
   }
   // 远程媒体取件队列:屏实例级缓存 + 同 url 去重 + 并发上限(每次取件都让桌面端
@@ -1793,6 +1868,7 @@ export default function SessionScreen() {
   const loadedRouteFocusKeyRef = useRef<string | null>(null);
   const appliedRouteFocusKeyRef = useRef<string | null>(null);
   const appliedRouteComposerFocusKeyRef = useRef<string | null>(null);
+  const handleChipMenuActionRef = useRef<(key: ChatFileChipMenuActionKey, target: ChatFilePathTarget) => void>(() => {});
   const targetAvailableRef = useRef<boolean | null>(null);
   const targetAvailableDeviceRef = useRef<string | null>(null);
   // 记录已为哪个连接 epoch 触发过 resync;初值 = 首渲染时的 epoch,使首开由 mount effect 单独负责,
@@ -2223,7 +2299,8 @@ export default function SessionScreen() {
     () => composerDisplaySession && composerDisplayRuntimeOptions
       ? buildComposerRuntimeSummary(composerDisplaySession, composerDisplayRuntimeOptions)
       : null,
-    [composerDisplayRuntimeOptions, composerDisplaySession],
+    // effort / 权限标签按 app 语言解析,切换语言时必须重算,否则停留在上一语言。
+    [composerDisplayRuntimeOptions, composerDisplaySession, i18nInstance.language],
   );
   // 被控端供应商目录 → provider-aware 模型分段(与新建会话页同逻辑;0 供应商回退扁平 modelOptions)。
   const composerDeviceProviders = useDeviceProviders(deviceId || undefined);
@@ -3637,9 +3714,33 @@ export default function SessionScreen() {
     // 旧连接代的 in-flight load 若在尾部读 ref 的最新值,会把旧窗口数据标成新代已同步,
     // 抢在排队的 resync 之前放行回执。开始时捕获则旧 load 落的是旧代 key,门槛不放行。
     const readAckEpochAtStart = readAckEpochRef.current;
+    const subscriptionIdentityAtStart = JSON.stringify([
+      deviceId,
+      sessionId,
+      readAckEpochAtStart,
+    ]);
+    const subscriptionRetryIsStale = () => (
+      syncRun.isStale()
+      || sessionSubscriptionIdentityRef.current !== subscriptionIdentityAtStart
+    );
+    const syncReopenCoordinator = createRemoteSyncReopenCoordinator(async () => {
+      await reopenLink(deviceId);
+    });
     // 门槛代号同理在开始时捕获:切会话 / attention 上升沿会递增代号,启动更早的
     // in-flight load 在尾部发现代号已变,放弃落 key(它的数据不含触发点之后的内容)。
     const readAckGateGenAtStart = readAckGateGenRef.current;
+    const fetchSessionMetadata = () => runConnectionScopedSessionMetadataRead(
+      () => maker.getSession(sessionId),
+      () => (
+        !subscriptionRetryIsStale()
+        && messageAuthorityCurrent()
+        && readAckGateGenRef.current === readAckGateGenAtStart
+      ),
+      (sessionMeta) => {
+        remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
+        setSessionMetadataSyncedKey(`${sessionId}:${readAckEpochAtStart}`);
+      },
+    );
     // 重开判定:store 已有该会话消息 + currentSession(返回再点进,内存没清)→ 走"廉价校验、按
     // updatedAt/_count/消息窗口同步标记决定是否重拉消息";首开(store 无消息)保持 A1 全量并行不回退;
     // replaceMessages(rewind 提交)强制整窗替换。imperative 读 store,避免给 syncSession 加 deps。
@@ -3648,10 +3749,42 @@ export default function SessionScreen() {
     const isReopen = !options.replaceMessages
       && storedMessagesAtStart.length > 0
       && storedSessionAtStart !== null;
-    const openAndSubscribe = async () => {
-      await openLink(deviceId);
-      // subscribe 只负责之后的实时推送,不该挡数据读;失败不影响 open,重连 rehydration 会补订阅。
-      void subscribe(`session:${sessionId}`, deviceId, ['sessions']).catch(() => undefined);
+    const prepareLinkAndSubscription = async () => {
+      await withTransientRemoteRetry(() => openLink(deviceId));
+      if (subscriptionRetryIsStale()) return;
+      let subscriptionAttemptVersion = syncReopenCoordinator.captureVersion();
+      // sessions topic 只负责之后的实时推送,不挡快照读。自己在后台
+      // 处理瞬时 route / ACK 失败;重试前重开 peer link,不再等未来 rehydrate 碰运气。
+      void sessionsSubscriptionCoordinatorRef.current?.start({
+        identity: subscriptionIdentityAtStart,
+        isStale: subscriptionRetryIsStale,
+        reopenLink: () => syncReopenCoordinator.reopenAfter(subscriptionAttemptVersion),
+        subscribe: () => {
+          subscriptionAttemptVersion = syncReopenCoordinator.captureVersion();
+          return subscribe(`session:${sessionId}`, deviceId, ['sessions']);
+        },
+      });
+    };
+    const retryRead = <T,>(read: () => Promise<T>): Promise<T> => {
+      let failedAtVersion: number | null = null;
+      return withTransientRemoteRetry(async () => {
+        // 首轮复用上面统一完成的 link-open。只有本项真的因瞬态错误重试时才
+        // 按失败请求开始时的恢复版本重开：同一旧代的错峰失败会合并；重开后
+        // 发出的请求若再次断链，则以新版本触发下一次真正 reopen。
+        if (failedAtVersion !== null) {
+          await syncReopenCoordinator.reopenAfter(failedAtVersion);
+        }
+        const attemptVersion = syncReopenCoordinator.captureVersion();
+        return read().catch((err) => {
+          failedAtVersion = attemptVersion;
+          throw err;
+        });
+      });
+    };
+    const snapshotScope = {
+      deviceId,
+      sessionId,
+      connectionEpoch: readAckEpochAtStart,
     };
     const fetchActiveSessionSnapshot = async () => {
       // Capture immediately before every request. Because this helper is invoked inside
@@ -3665,27 +3798,39 @@ export default function SessionScreen() {
       // withTransientRemoteRetry, each retry receives a fresh projection authority fence.
       const authorityEpochAtStart =
         remoteSessionStore.captureInputProjectionAuthorityEpoch(sessionId);
-      const projection = await maker.input.getProjection(sessionId);
+      const projection = await runSessionProjectionSnapshotSingleFlight(
+        snapshotScope,
+        authorityEpochAtStart,
+        () => maker.input.getProjection(sessionId),
+      );
       return { projection, authorityEpochAtStart };
     };
+    const fetchPendingInteractions = () => runSessionPendingInteractionsSnapshotSingleFlight(
+      snapshotScope,
+      remoteSessionStore.getPendingInteractions(sessionId),
+      () => maker.getPendingInteractions(sessionId),
+    );
     if (syncRun.isStale()) return;
     setLoading(true);
     setError(null);
     try {
+      await prepareLinkAndSubscription();
       if (!isReopen) {
-        // 首开 / 强制替换:A1 全量并行(含整窗 listMessages),不回退。
-        const [sessionMeta, history, pendingInteractions, projectionResult, activeSessionSnapshot] = await withTransientRemoteRetry(async () => {
-          await openAndSubscribe();
-          return Promise.all([
-            maker.getSession(sessionId),
-            listMessagesWithPayloadRetry((limit) => maker.listMessages(sessionId, { limit })),
-            maker.getPendingInteractions(sessionId),
-            fetchProjection(),
-            fetchActiveSessionSnapshot(),
-          ]);
-        });
+        // 首开 / 强制替换:A1 仍保持并行，但每一项独立重试。一个 ACK timeout
+        // 不再把已经成功的 meta / history / pending / projection / active 全部重发。
+        const [sessionMeta, history, pendingInteractions, projectionResult, activeSessionSnapshot] = await runIndependentSnapshotReads([
+          fetchSessionMetadata,
+          () => listMessagesWithPayloadRetry((limit) => runSessionMessagesSnapshotSingleFlight(
+            snapshotScope,
+            limit,
+            { kind: 'detail', generation: messageAuthority.generation },
+            () => maker.listMessages(sessionId, { limit }),
+          )),
+          fetchPendingInteractions,
+          fetchProjection,
+          () => fetchActiveSessionSnapshot(),
+        ] as const, retryRead);
         if (syncRun.isStale() || !messageAuthorityCurrent()) return;
-        remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setActiveSessionSnapshots(
           deviceId,
           Array.isArray(activeSessionSnapshot.activeSessions)
@@ -3716,15 +3861,12 @@ export default function SessionScreen() {
         );
       } else {
         // 重开:便宜并行(不含整窗 listMessages)拿 meta + pending + projection + active。
-        const [sessionMeta, pendingInteractions, projectionResult, activeSessionSnapshot] = await withTransientRemoteRetry(async () => {
-          await openAndSubscribe();
-          return Promise.all([
-            maker.getSession(sessionId),
-            maker.getPendingInteractions(sessionId),
-            fetchProjection(),
-            fetchActiveSessionSnapshot(),
-          ]);
-        });
+        const [sessionMeta, pendingInteractions, projectionResult, activeSessionSnapshot] = await runIndependentSnapshotReads([
+          fetchSessionMetadata,
+          fetchPendingInteractions,
+          fetchProjection,
+          () => fetchActiveSessionSnapshot(),
+        ] as const, retryRead);
         // 廉价对账:updatedAt 主信号(任何消息变化都会 bump),_count 仅在两侧都有时作辅助;
         // 另外要求消息窗口已被详情页同步到当前 meta,避免首页先刷新 session preview 后,
         // 详情页把旧消息缓存误判成最新。任一变化 → 拉取权威最新窗口并对账;
@@ -3744,9 +3886,14 @@ export default function SessionScreen() {
           activeSessionSnapshot.activityEpochAtFetchStart,
         );
         if (metaChanged) {
-          const history = await withTransientRemoteRetry(() =>
+          const history = await retryRead(() =>
             listMessagesWithPayloadRetry(
-              (limit) => maker.listMessages(sessionId, { limit }),
+              (limit) => runSessionMessagesSnapshotSingleFlight(
+                snapshotScope,
+                limit,
+                { kind: 'detail', generation: messageAuthority.generation },
+                () => maker.listMessages(sessionId, { limit }),
+              ),
               REOPEN_MESSAGE_WINDOW_LIMITS,
             ),
           );
@@ -3766,7 +3913,6 @@ export default function SessionScreen() {
           // 真实消息数推断(getSession 没给总数时退化为窗口启发式)。
           setHasOlderMessages(hasOlderMessagesAfterReopen(freshCount, remoteSessionStore.getMessages(sessionId)));
         }
-        remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setPendingInteractions(sessionId, Array.isArray(pendingInteractions) ? pendingInteractions : []);
         remoteSessionStore.setInputProjectionIfCurrent(
           sessionId,
@@ -3799,7 +3945,7 @@ export default function SessionScreen() {
     } finally {
       if (!syncRun.isStale() && messageAuthorityCurrent()) setLoading(false);
     }
-  }, [deviceId, deviceName, latchOutboxTransportHold, maker, openLink, sessionId, subscribe]);
+  }, [deviceId, deviceName, latchOutboxTransportHold, maker, openLink, reopenLink, sessionId, subscribe]);
   // 任一连接恢复身份变化都会让旧读取失去提交资格。否则断线前启动的同步可能在
   // 新 hold 锁存后迟到，并从成功尾误清恢复屏障。
   const remoteSyncContextKey = JSON.stringify([
@@ -4042,6 +4188,7 @@ export default function SessionScreen() {
     const prevSig = prevLiveActivitySigRef.current ?? liveActivitySig;
     if (liveAttention && liveActivitySig !== prevSig) {
       setReadAckSyncedKey(null);
+      setSessionMetadataSyncedKey(null);
       // 代号递增:变化点之前启动的 in-flight load / 在飞重试(数据不含本 turn 终帧)
       // 不得重新落 key / 不得继续发送。
       readAckGateGenRef.current += 1;
@@ -4490,7 +4637,7 @@ export default function SessionScreen() {
       const reconciled = reconcileMobileMessageRenderItems(previous, items);
       return reconciled;
     },
-    [errorTailClientId, forkOrigin, inputProjection.autoResumePending, isSessionStreaming, makerTurnRunning, messages, sessionId, taskUpdates],
+    [errorTailClientId, forkOrigin, i18nInstance.language, inputProjection.autoResumePending, isSessionStreaming, makerTurnRunning, messages, sessionId, taskUpdates],
   );
   // 只在本次 render 真正 commit 后更新 reconcile 基准。写入 useMemo/ref 会让
   // Concurrent Mode 下被丢弃的 render 泄漏成下一轮的 previous,破坏尾行 memo 的稳定性。
@@ -5999,6 +6146,30 @@ export default function SessionScreen() {
     textTertiary: colors.textTertiary,
     dark: mode === 'dark',
   }), [colors, mode]);
+  const conversationShareHtml = useMemo(() => {
+    if (
+      !nativeConversationShareAvailable
+      || !shareSelectionActive
+      || selectedShareMessages.length === 0
+    ) return '';
+    return buildConversationShareHtml({
+      allShareableIds,
+      characterSrc: shareCharacterSrc ?? undefined,
+      colors: conversationShareColors,
+      contentWidth: windowDimensions.width,
+      logoSrc: shareLogoModeRef.current === mode ? shareLogoSrc ?? undefined : undefined,
+      selectedMessages: selectedShareMessages,
+    });
+  }, [
+    allShareableIds,
+    conversationShareColors,
+    mode,
+    selectedShareMessages,
+    shareCharacterSrc,
+    shareLogoSrc,
+    shareSelectionActive,
+    windowDimensions.width,
+  ]);
   const enterShareSelection = useCallback((clientId: string) => {
     Keyboard.dismiss();
     setShareSelectionTriggeredByScreenshot(false);
@@ -6011,10 +6182,30 @@ export default function SessionScreen() {
     shareSelectionStore.exit();
   }, []);
   const exportConversationSharePng = useCallback(async () => {
+    const nativeShareAssetsReady = Boolean(
+      nativeConversationShareAvailable
+      && shareCharacterSrc
+      && shareLogoSrc
+      && shareLogoModeRef.current === mode,
+    );
+    if (conversationShareHtml && nativeShareAssetsReady) {
+      try {
+        const nativeBase64 = await renderConversationShareHtmlToPng({
+          html: conversationShareHtml,
+          width: windowDimensions.width,
+        });
+        if (nativeBase64) {
+          console.info('[conversation-share] native webview export succeeded');
+          return nativeBase64;
+        }
+      } catch (error) {
+        console.warn('[conversation-share] native webview export failed; falling back to svg', error);
+      }
+    }
     const svg = conversationShareSvgRef.current;
     if (!svg) throw new Error('conversation share svg renderer is unavailable');
     return svg.exportPng();
-  }, []);
+  }, [conversationShareHtml, mode, shareCharacterSrc, shareLogoSrc, windowDimensions.width]);
   const shareSelectedConversation = useCallback(async () => {
     if (
       conversationShareBusy
@@ -7355,9 +7546,10 @@ export default function SessionScreen() {
     projection: inputProjection,
     isSessionStreaming,
     continuationInFlight: tailContinuationInFlight,
+    sessionMetadataSyncedForConnection: sessionMetadataSyncedKey === `${sessionId}:${connectionEpoch}`,
     interruptAcked: tailInterruptAcked,
     hiddenErrorClientIds: tailHiddenForBanner,
-  }), [messages, currentSession, inputProjection, isSessionStreaming, tailContinuationInFlight, tailInterruptAcked, tailHiddenForBanner]);
+  }), [connectionEpoch, currentSession, i18nInstance.language, inputProjection, isSessionStreaming, messages, sessionId, sessionMetadataSyncedKey, tailContinuationInFlight, tailHiddenForBanner, tailInterruptAcked]);
 
   // 主按钮(重试 / 继续任务):发隐藏续跑指令(带 [UI_ACTION_TRIGGER] 前缀,消息流
   // 不渲染;排队区显示「继续未完成的任务(系统指令)」遮蔽气泡)。planMode 强制 false:
@@ -7748,10 +7940,12 @@ export default function SessionScreen() {
   useEffect(() => {
     if (!contextSheetOpen) setPendingMediaAssets([]);
   }, [contextSheetOpen]);
-  // 进页面就静默预取最近照片(仅已授权时),打开 + 面板即刻出图。
+  // iOS 进页面就静默预取最近照片(仅已授权时),打开 + 面板即刻出图;Android 统一走系统选择器。
   useEffect(() => {
-    void prefetchContextSheetMediaAssets('recent');
-  }, []);
+    if (contextSheetMediaLibraryEnabled) {
+      void prefetchContextSheetMediaAssets('recent');
+    }
+  }, [contextSheetMediaLibraryEnabled]);
 
   // 目标模式:面板打开时拉一次快照(push 只送变更);动作后再拉一次收敛,避免依赖单一 push。
   const goalStatus = useSessionGoalStatus(sessionId);
@@ -8202,7 +8396,21 @@ export default function SessionScreen() {
         }
       },
       onOpenPath: openChatPathTarget,
-      onLongPressPath: setChipMenuTarget,
+      onLongPressPath: (target) => {
+        if (usesSystemActionMenu()) {
+          const rows = chatFileChipMenuRows(target);
+          void showActionMenu({
+            cancelLabel: t('session.common.cancel'),
+            items: rows.map((row) => ({ key: row.key, label: row.label })),
+            title: chatFileChipMenuTitle(target),
+            userInterfaceStyle: mode,
+          }).then((result) => {
+            if (result.kind === 'action') handleChipMenuActionRef.current(result.key, target);
+          });
+          return;
+        }
+        setChipMenuTarget(target);
+      },
     };
   }, [
     connectionEpoch,
@@ -8210,9 +8418,11 @@ export default function SessionScreen() {
     currentSession?.workingDir,
     deviceId,
     maker,
+    mode,
     openChatPathTarget,
     openLink,
     sessionId,
+    t,
   ]);
 
   /** chip 菜单「导出 / 分享」:两段式导出 → 系统分享单(与文件浏览器同链路);
@@ -8316,6 +8526,7 @@ export default function SessionScreen() {
         return;
     }
   }, [applyComposerDocument, applyComposerDraft, deviceId, deviceName, openChatPathTarget, router, sessionId, shareChipFile]);
+  handleChipMenuActionRef.current = handleChipMenuAction;
 
   // 会话菜单元数据操作(重命名 / 置顶 / 归档 / 删除 / 恢复)乐观写:与首页
   // patchHomeSession 同一写序契约——守卫 / 队列 / 在途登记用 app 级单例
@@ -8884,15 +9095,17 @@ export default function SessionScreen() {
         >
           {contextSheetView === 'main' ? (
             <>
-              <RecentPhotosStrip
-                busyAssetIds={uploadingMediaAssetIds}
-                disabled={!canUseComposer}
-                enabled={contextSheetOpen}
-                onToggleAsset={toggleMediaAssetAttachment}
-                pendingOrder={pendingMediaOrder}
-                selectedAssetIds={selectedMediaAssetIds}
-                testID="session.contextSheetPhotos"
-              />
+              {contextSheetMediaLibraryEnabled ? (
+                <RecentPhotosStrip
+                  busyAssetIds={uploadingMediaAssetIds}
+                  disabled={!canUseComposer}
+                  enabled={contextSheetOpen}
+                  onToggleAsset={toggleMediaAssetAttachment}
+                  pendingOrder={pendingMediaOrder}
+                  selectedAssetIds={selectedMediaAssetIds}
+                  testID="session.contextSheetPhotos"
+                />
+              ) : null}
               <ContextSheetGroup label={t('session.common.groupMode')}>
                 {planModeSupported ? (
                   // 点击即切换计划模式并关面板(产品决策,不做开关);已开启时显示 ✓,再点退出。
@@ -8933,14 +9146,16 @@ export default function SessionScreen() {
                   onPress={() => void addLocalImageAttachments('library')}
                   testID="session.contextSheetPhotoRow"
                 />
-                <ContextSheetRow
-                  disabled={!canUseComposer}
-                  icon={<Scan color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                  label={t('session.common.screenshot')}
-                  onPress={() => setContextSheetView('screenshots')}
-                  testID="session.contextSheetScreenshotsRow"
-                  trailing="chevron"
-                />
+                {contextSheetMediaLibraryEnabled ? (
+                  <ContextSheetRow
+                    disabled={!canUseComposer}
+                    icon={<Scan color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
+                    label={t('session.common.screenshot')}
+                    onPress={() => setContextSheetView('screenshots')}
+                    testID="session.contextSheetScreenshotsRow"
+                    trailing="chevron"
+                  />
+                ) : null}
                 <ContextSheetRow
                   accessibilityHint={composerSendUnavailableReason ?? undefined}
                   disabled={!canUseComposer}
@@ -8964,7 +9179,7 @@ export default function SessionScreen() {
                 </Text>
               ) : null}
             </>
-          ) : contextSheetView === 'screenshots' ? (
+          ) : contextSheetView === 'screenshots' && contextSheetMediaLibraryEnabled ? (
             <ScreenshotsGrid
               busyAssetIds={uploadingMediaAssetIds}
               contentWidth={Math.min(windowDimensions.width, nativeShellLayout.contentMaxWidth) - 40}
