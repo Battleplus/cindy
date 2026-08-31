@@ -348,6 +348,7 @@ import {
   getRemoteCcStaleQuery,
 } from '../maker-host/remote-session-start-ensure.js';
 import {
+  clearSessionChatImageCapabilityState,
   getCodexProxyAuthInjection,
   getCodexProxyAuthInjectionState,
 } from '../maker-host/codex-proxy-host.js';
@@ -6169,6 +6170,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   );
   setSessionRuntimeCleanup((sessionId) => {
     clearSessionRuntimeControlState(sessionId);
+    clearSessionChatImageCapabilityState(sessionId);
     clearSessionProvider(sessionId);
     setSessionEffort(sessionId, null);
     setSessionFastMode(sessionId, false);

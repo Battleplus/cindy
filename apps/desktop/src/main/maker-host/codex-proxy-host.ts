@@ -3274,13 +3274,20 @@ export function registerChildThread(parentThreadId: string, childThreadId: strin
   return true;
 }
 
+/**
+ * Task archive/delete boundary for provider-confirmed image capability state.
+ * Ordinary Codex process closes intentionally keep this state across reconnects.
+ */
+export function clearSessionChatImageCapabilityState(sessionId: string): void {
+  chatImageUnsupportedRouteKeysBySession.delete(sessionId);
+  chatImageRouteGenerationBySession.delete(sessionId);
+}
+
 function clearSessionThreads(sessionId: string): string[] {
   const threadIds = Array.from(sessionToThreads.get(sessionId) ?? []);
   sessionToThreads.delete(sessionId);
   sessionToThread.delete(sessionId);
   reviewerModelBySession.delete(sessionId);
-  chatImageUnsupportedRouteKeysBySession.delete(sessionId);
-  chatImageRouteGenerationBySession.delete(sessionId);
   for (const threadId of threadIds) {
     if (threadToSession.get(threadId) === sessionId) {
       // Session 关闭既可能是普通释放，也可能是 OAuth ↔ 第三方模型的 route 切换。

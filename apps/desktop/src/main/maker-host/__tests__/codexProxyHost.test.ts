@@ -739,7 +739,7 @@ describe('chatBridgeCapabilitiesForRoute', () => {
     expect(chatBridgeCapabilitiesForRoute(upstream, model).imageInput).toBe('image_url');
   });
 
-  it('disables image replay only for the rejected session route and clears it on unregister', async () => {
+  it('keeps rejected route state across reconnects and clears it only at the task boundary', async () => {
     const host = await freshCodexProxyHost();
     const { buildUserProvider } = await import('@cindy/model-providers');
     const { setCustomProviders } = await import('../active-catalog.js');
@@ -831,6 +831,15 @@ describe('chatBridgeCapabilitiesForRoute', () => {
       expect(otherModelProvider?.capabilities?.imageInput).toBe('image_url');
 
       host.unregister('session-no-vision');
+      host.registerComposed('session-no-vision', 'thread-no-vision', 'PRODUCT_PROMPT');
+      await Promise.resolve(host.createModelRoutingTransform()(body, ctx));
+      const reconnectedProvider = (mockState.createResponsesChatHandler.mock.calls.at(-1) as unknown as
+        | [{ capabilities?: { imageInput?: string } }]
+        | undefined)?.[0];
+      expect(reconnectedProvider?.capabilities?.imageInput).toBeUndefined();
+
+      host.unregister('session-no-vision');
+      host.clearSessionChatImageCapabilityState('session-no-vision');
       afterServerErrorProvider?.onUpstreamError?.({
         status: 400,
         body: 'image_url content part is not supported by this model',
