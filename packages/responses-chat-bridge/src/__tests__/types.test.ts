@@ -168,6 +168,12 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
   });
 
   it('accepts a JSON error whose error value is a plain string (Ollama-style)', () => {
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        JSON.stringify({ error: 'this model does not support images' }),
+      ),
+    ).toBe(true);
+
     const payload = JSON.stringify({
       error: { code: 'upstream_error', message: JSON.stringify({ error: 'this model does not support images' }) },
     });

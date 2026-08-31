@@ -436,6 +436,7 @@ function imageRejectionKeywords(msg: string): boolean {
 function isUnsupportedResponsesImageErrorObject(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const error = (value as Record<string, unknown>).error;
+  if (typeof error === 'string') return imageRejectionKeywords(error);
   if (typeof error !== 'object' || error === null || Array.isArray(error)) return false;
   const { code, message } = error as Record<string, unknown>;
   if (typeof message !== 'string') return false;
