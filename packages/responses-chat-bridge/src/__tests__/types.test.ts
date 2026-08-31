@@ -98,6 +98,14 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     expect(isUnsupportedResponsesImageErrorPayload(payload)).toBe(true);
   });
 
+  it('accepts a raw plain-text upstream capability rejection', () => {
+    expect(
+      isUnsupportedResponsesImageErrorPayload(
+        'image_url content part is not supported by this model',
+      ),
+    ).toBe(true);
+  });
+
   it('accepts a Codex-extracted plain-text capability rejection', () => {
     // Codex extracts error.message from the wrapped upstream_error envelope, so
     // the coordinator sees the plain-text message after the unexpected-status

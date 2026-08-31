@@ -542,7 +542,7 @@ export function isUnsupportedResponsesImageErrorPayload(payload: string | null):
   if (isUnsupportedResponsesImageErrorObject(parseJson(payload))) return true;
 
   const codexPrefix = CODEX_UNEXPECTED_BAD_REQUEST_PREFIX.exec(payload);
-  if (!codexPrefix) return false;
+  if (!codexPrefix) return imageRejectionKeywords(payload);
   const renderedBody = payload.slice(codexPrefix[0].length);
   if (isUnsupportedResponsesImageErrorObject(parseCodexWrappedJson(renderedBody))) return true;
 
