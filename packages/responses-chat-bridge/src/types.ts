@@ -370,6 +370,7 @@ const UNSUPPORTED_RESPONSES_FEATURE_MESSAGE_PREFIX =
 const RESPONSES_IMAGE_CONTENT_PART_TYPES = new Set(['input_image', 'image_url', 'image']);
 const CODEX_UNEXPECTED_BAD_REQUEST_PREFIX =
   /^unexpected status (?:400(?: Bad Request)?|415(?: Unsupported Media Type)?|422(?: Unprocessable Entity)?): /;
+const CODEX_UNEXPECTED_STATUS_PREFIX = /^unexpected status \d{3}(?: [^:]+)?: /;
 const CODEX_ERROR_METADATA_MARKERS = [
   ', url: ',
   ', cf-ray: ',
@@ -542,7 +543,10 @@ export function isUnsupportedResponsesImageErrorPayload(payload: string | null):
   if (isUnsupportedResponsesImageErrorObject(parseJson(payload))) return true;
 
   const codexPrefix = CODEX_UNEXPECTED_BAD_REQUEST_PREFIX.exec(payload);
-  if (!codexPrefix) return imageRejectionKeywords(payload);
+  if (!codexPrefix) {
+    if (CODEX_UNEXPECTED_STATUS_PREFIX.test(payload)) return false;
+    return imageRejectionKeywords(payload);
+  }
   const renderedBody = payload.slice(codexPrefix[0].length);
   if (isUnsupportedResponsesImageErrorObject(parseCodexWrappedJson(renderedBody))) return true;
 

@@ -141,6 +141,17 @@ describe('isUnsupportedResponsesImageErrorPayload', () => {
     ).toBe(true);
   });
 
+  it.each([401, 429, 500, 503])(
+    'rejects Codex-rendered unrelated status %s even when the body mentions image capability',
+    (status) => {
+      expect(
+        isUnsupportedResponsesImageErrorPayload(
+          codexUnexpectedStatus(status, 'image_url content part is not supported by this model'),
+        ),
+      ).toBe(false);
+    },
+  );
+
   it('accepts Codex-rendered 422 with HTTP reason phrase', () => {
     // Codex includes the HTTP reason phrase, e.g.
     // 'unexpected status 422 Unprocessable Entity: ...'.
