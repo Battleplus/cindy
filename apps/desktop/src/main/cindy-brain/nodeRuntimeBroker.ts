@@ -1294,6 +1294,29 @@ export class GhostNodeRuntimeBroker {
     // PID 是启动期已经捕获的只读 fact；停止关键路径前不再调用诊断 getter/logger。
     const stopPid = entry.diagnosticPid;
     let sigtermKillReturned = false;
+    // 先订阅真实 exit，再发停止信号，避免进程同步退出时漏掉事件。超时只
+    // 能拒绝 replacement：旧进程仍可能持有 Windows 文件锁或端口，绝不能
+    // 把有界等待耗尽当成“已经退出”。
+    const draining = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const settle = (outcome: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) this.clearTimer(timer);
+        outcome();
+      };
+      entry.child.once('exit', () => settle(resolve));
+      timer = this.setTimer(
+        () => settle(() => reject(new Error(`插件 Node 进程停止超时(${entry.ghost.manifest.id})`))),
+        PROCESS_STOP_WAIT_TIMEOUT_MS,
+      );
+      timer.unref?.();
+    });
+    // 没有 replacement 请求消费该 Promise 时也不得产生未处理拒绝；原始
+    // Promise 仍保留在 map 中，ensureWorker await 时会收到同一拒绝。
+    draining.catch(() => undefined);
+    this.drainingExits.set(key, draining);
     try {
       sigtermKillReturned = entry.child.kill('SIGTERM');
       entry.hardKillTimer = this.setTimer(() => {
@@ -1326,26 +1349,6 @@ export class GhostNodeRuntimeBroker {
     } catch {
       // 已退出即视为停止成功。
     }
-    // Record draining exit so ensureWorker waits before forking a replacement.
-    // Resolves on real exit or after hardKill timeout as a safety net.
-    const draining = new Promise<void>((resolve) => {
-      let invoked = false;
-      const onExit = () => {
-        if (invoked) return;
-        invoked = true;
-        resolve();
-      };
-      entry.child.once("exit", onExit);
-      // Safety: resolve after hard-kill timeout even if exit never fires.
-      const fallback = this.setTimer(() => {
-        if (invoked) return;
-        invoked = true;
-        resolve();
-      }, PROCESS_STOP_GRACE_MS + 1000);
-      fallback.unref?.();
-    });
-    this.drainingExits.set(key, draining);
-
     this.sendStatus(entry.ghost, 'stopped', undefined, entry.entryRel);
     // 诊断计时从 HEAD 停止动作全部完成后开始；不得推迟 signal/grace timer/status。
     if (entry.stoppingStartedAt === undefined) entry.stoppingStartedAt = Date.now();
@@ -1404,43 +1407,21 @@ export class GhostNodeRuntimeBroker {
       this.assertOwnerScopeUsable(ghost.manifest.id, existing.ownerScopeSnapshot);
       return existing;
     }
-    // Reserve the start before awaiting a previous process drain. This closes
-    // the gap where concurrent callers all observe the same completed drain and
-    // then each begin a replacement.
-    let resolveStartReservation!: (promise: Promise<WorkerEntry>) => void;
-    let rejectStartReservation!: (reason: unknown) => void;
-    const startReservation = new Promise<WorkerEntry>((resolve, reject) => {
-      resolveStartReservation = resolve;
-      rejectStartReservation = reject;
-    });
-    // Attach the rejection handler immediately; callers that arrive during
-    // the drain wait must not create an unhandled rejection if the owner dies.
-    startReservation.catch(() => undefined);
-    this.startingWorkers.set(key, startReservation);
-
-    // Wait for any previous process for this key to fully exit before forking.
-    // On Windows, the old UtilityProcess may still hold file locks or ports
-    // that prevent the new bootstrap from succeeding (#3330).
     const draining = this.drainingExits.get(key);
-    if (draining) {
-      this.deps.log?.info("ghost node waiting for previous process exit", {
-        ghostId: ghost.manifest.id,
-        entry: entryRel,
-      });
-      try {
+    // 先把 drain + start 合成同一份在途 Promise，再让出执行权。并发调用者
+    // 只会 join 这份 Promise，不会在旧进程退出后各自 fork replacement。
+    const starting = (async () => {
+      if (draining) {
+        this.deps.log?.info('ghost node waiting for previous process exit', {
+          ghostId: ghost.manifest.id,
+          entry: entryRel,
+        });
         await draining;
-      } catch {
-        // Draining timed out — old process still alive. The rejection
-        // already prevented a premature fork.
       }
-      // Keep the completed drain marker until the replacement reservation is
-      // installed.  Deleting it before reserving a new start creates a window
-      // where concurrent callers can both pass the absence checks and fork
-      // duplicate replacements.
-    }
+      return this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
+    })();
     this.startingWorkerScopes.set(key, ownerScopeSnapshot);
-    const starting = this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
-    starting.then(resolveStartReservation, rejectStartReservation);
+    this.startingWorkers.set(key, starting);
     try {
       return await starting;
     } finally {

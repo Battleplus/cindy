@@ -1173,6 +1173,41 @@ describe('nodeRuntimeBroker · 进程生命周期', () => {
     await expect(b).resolves.toMatchObject({ ok: true });
     brokers.destroyAll();
   });
+
+  it('旧 worker 在强杀后仍不退出时拒绝 replacement，不并行启动新进程', async () => {
+    vi.useFakeTimers();
+    const ghost = fakeGhost({ lifecycle: 'on-demand' });
+    const children: FakeNodeProcess[] = [];
+    const broker = new GhostNodeRuntimeBroker({
+      getGhost: () => ghost,
+      spawnProcess: () => {
+        const child = makeAutoReplyProcess();
+        children.push(child);
+        return child as unknown as NodeWorkerProcess;
+      },
+    });
+
+    await expect(broker.handleRequest('node-ghost', rpcRequest())).resolves.toMatchObject({
+      ok: true,
+    });
+    const old = children[0];
+    old.removeAllListeners('exit');
+    old.kill = vi.fn(() => {
+      old.killed = true;
+      return true;
+    });
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    const replacement = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(2_501);
+
+    await expect(replacement).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'PROCESS_START_FAILED',
+      message: expect.stringContaining('停止超时'),
+    });
+    expect(children).toHaveLength(1);
+  });
 });
 
 describe('nodeRuntimeBroker · 启动瞬时失败重试(2026-07-24)', () => {
