@@ -834,12 +834,31 @@ describe('chatBridgeCapabilitiesForRoute', () => {
       host.registerComposed('session-no-vision', 'thread-no-vision', 'PRODUCT_PROMPT');
       await Promise.resolve(host.createModelRoutingTransform()(body, ctx));
       const reconnectedProvider = (mockState.createResponsesChatHandler.mock.calls.at(-1) as unknown as
-        | [{ capabilities?: { imageInput?: string } }]
+        | [{
+            capabilities?: { imageInput?: string };
+            onUpstreamError?: (args: { status: number; body: string }) => void;
+          }]
         | undefined)?.[0];
       expect(reconnectedProvider?.capabilities?.imageInput).toBeUndefined();
 
-      host.unregister('session-no-vision');
       host.clearSessionChatImageCapabilityState('session-no-vision');
+      await Promise.resolve(host.createModelRoutingTransform()(body, ctx));
+      const terminalWindowProvider = (mockState.createResponsesChatHandler.mock.calls.at(-1) as unknown as
+        | [{
+            capabilities?: { imageInput?: string };
+            onUpstreamError?: (args: { status: number; body: string }) => void;
+          }]
+        | undefined)?.[0];
+      expect(terminalWindowProvider?.capabilities?.imageInput).toBe('image_url');
+      terminalWindowProvider?.onUpstreamError?.({
+        status: 400,
+        body: 'image_url content part is not supported by this model',
+      });
+      reconnectedProvider?.onUpstreamError?.({
+        status: 400,
+        body: 'image_url content part is not supported by this model',
+      });
+      host.unregister('session-no-vision');
       afterServerErrorProvider?.onUpstreamError?.({
         status: 400,
         body: 'image_url content part is not supported by this model',
@@ -852,6 +871,7 @@ describe('chatBridgeCapabilitiesForRoute', () => {
       expect(restoredProvider?.capabilities?.imageInput).toBe('image_url');
     } finally {
       host.unregister('session-no-vision');
+      host.clearSessionChatImageCapabilityState('session-no-vision');
       clearSessionProvider('session-no-vision');
       host.clearCodexProxyAuthInjection();
       setCustomProviderKeyReader(() => null);

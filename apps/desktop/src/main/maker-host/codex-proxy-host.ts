@@ -115,7 +115,7 @@ const subagentRouteByThread = new Map<string, CodexSubagentRouteSnapshot>();
 const reviewerModelBySession = new Map<string, string>();
 const httpRecoveryReasonByThread = new Map<string, string>();
 const chatImageUnsupportedRouteKeysBySession = new Map<string, Set<string>>();
-const chatImageRouteGenerationBySession = new Map<string, number>();
+const chatImageRouteGenerationBySession = new Map<string, number | null>();
 let nextChatImageRouteGeneration = 0;
 
 const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review';
@@ -968,6 +968,8 @@ function createChatBridgeDecision(
     ? ({ status, body }: { status: number; body: string }): void => {
         if (
           sessionId
+          && imageRouteGeneration !== null
+          && imageRouteGeneration !== undefined
           && chatImageRouteGenerationBySession.get(sessionId) === imageRouteGeneration
           && (status === 400 || status === 415 || status === 422)
           && isUnsupportedResponsesImageErrorPayload(body)
@@ -3280,7 +3282,9 @@ export function registerChildThread(parentThreadId: string, childThreadId: strin
  */
 export function clearSessionChatImageCapabilityState(sessionId: string): void {
   chatImageUnsupportedRouteKeysBySession.delete(sessionId);
-  chatImageRouteGenerationBySession.delete(sessionId);
+  // Keep an invalid generation until the still-running process reaches unregister.
+  // This blocks both pre-cleanup callbacks and new callbacks created in that window.
+  chatImageRouteGenerationBySession.set(sessionId, null);
 }
 
 function clearSessionThreads(sessionId: string): string[] {
@@ -3288,6 +3292,9 @@ function clearSessionThreads(sessionId: string): string[] {
   sessionToThreads.delete(sessionId);
   sessionToThread.delete(sessionId);
   reviewerModelBySession.delete(sessionId);
+  if (chatImageRouteGenerationBySession.get(sessionId) === null) {
+    chatImageRouteGenerationBySession.delete(sessionId);
+  }
   for (const threadId of threadIds) {
     if (threadToSession.get(threadId) === sessionId) {
       // Session 关闭既可能是普通释放，也可能是 OAuth ↔ 第三方模型的 route 切换。
