@@ -1297,25 +1297,13 @@ export class GhostNodeRuntimeBroker {
     // 先订阅真实 exit，再发停止信号，避免进程同步退出时漏掉事件。超时只
     // 能拒绝 replacement：旧进程仍可能持有 Windows 文件锁或端口，绝不能
     // 把有界等待耗尽当成“已经退出”。
-    const draining = new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | null = null;
-      const settle = (outcome: () => void) => {
-        if (settled) return;
-        settled = true;
-        if (timer) this.clearTimer(timer);
-        outcome();
-      };
-      entry.child.once('exit', () => settle(resolve));
-      timer = this.setTimer(
-        () => settle(() => reject(new Error(`插件 Node 进程停止超时(${entry.ghost.manifest.id})`))),
-        PROCESS_STOP_WAIT_TIMEOUT_MS,
-      );
-      timer.unref?.();
+    // drain 本体只在真实 exit 时 resolve，**永不 reject**：停止超时的有界
+    // 语义由等待侧（ensureWorker 的 race）负责。这样 drain 被超时拒绝后
+    // 标记仍留在 map 里，后续请求继续等待同一退出事件，不会在旧进程仍
+    // 握着 Windows 文件锁/端口时 fork replacement（#3343 Codex P1）。
+    const draining = new Promise<void>((resolve) => {
+      entry.child.once('exit', () => resolve());
     });
-    // 没有 replacement 请求消费该 Promise 时也不得产生未处理拒绝；原始
-    // Promise 仍保留在 map 中，ensureWorker await 时会收到同一拒绝。
-    draining.catch(() => undefined);
     this.drainingExits.set(key, draining);
     try {
       sigtermKillReturned = entry.child.kill('SIGTERM');
@@ -1416,7 +1404,17 @@ export class GhostNodeRuntimeBroker {
           ghostId: ghost.manifest.id,
           entry: entryRel,
         });
-        await draining;
+        // drain 只在真实 exit 时 resolve；停止超时（旧进程仍存活）会拒绝。
+        // 等待侧这里做有界等待：超时后报 PROCESS_START_FAILED，但**不得**
+        // 删除 drain 标记——旧进程仍握着 Windows 文件锁/端口，下一个请求
+        // 必须继续等待同一退出事件，否则会在旧进程存活时 fork replacement
+        // 重新制造 #3330 的资源冲突。
+        await Promise.race([
+          draining,
+          this.delay(PROCESS_STOP_WAIT_TIMEOUT_MS).then(() => {
+            throw new Error(`插件 Node 进程停止超时(${ghost.manifest.id})`);
+          }),
+        ]);
       }
       return this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
     })();
@@ -1427,9 +1425,17 @@ export class GhostNodeRuntimeBroker {
     } finally {
       this.startingWorkers.delete(key);
       this.startingWorkerScopes.delete(key);
-      // A completed drain is consumed only after the replacement reservation
-      // has existed; clear it now so the next restart does not wait forever.
-      if (this.drainingExits.get(key) === draining) this.drainingExits.delete(key);
+      // drain 只能在真实 exit 后清理；等待侧超时失败时保留标记（drain 永不
+      // reject，未 resolve 即旧进程仍存活），让后续请求继续等待同一退出
+      // 事件，不在旧进程存活时 fork replacement。启动失败但 drain 已
+      // resolve（真实退出后启动仍失败）同样可安全清理。
+      if (draining && this.drainingExits.get(key) === draining) {
+        let resolved = false;
+        void draining.then(() => {
+          resolved = true;
+        });
+        if (resolved) this.drainingExits.delete(key);
+      }
     }
   }
 
