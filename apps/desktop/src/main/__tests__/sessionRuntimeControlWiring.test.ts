@@ -532,6 +532,13 @@ describe('session runtime control wiring', () => {
       'lookupVerifiedContextWindow(\n          resolveRouteWindow,\n          model,\n          targetRouteProviderId,',
     );
     expect(setModel).toContain('const targetProviderId =');
+    // 停用轴准入只依赖目标路由,源 provider 的 DB 查询失败不能跳过准入
+    // (只能放弃独占 pin 重裁决,#3996 review)。
+    expect(setModel).not.toContain('? await assertModelRouteUsable(');
+    const admission = setModel.indexOf('await assertModelRouteUsable(');
+    const rerouteApply = setModel.indexOf('resolveExclusiveSetModelReroute(');
+    expect(admission).toBeGreaterThan(-1);
+    expect(rerouteApply).toBeGreaterThan(admission);
   });
 
   it('projects rebuilt zero usage and the verified window after the runtime is closed', () => {

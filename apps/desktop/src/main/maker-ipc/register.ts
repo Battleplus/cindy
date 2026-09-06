@@ -13908,9 +13908,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if (routeExplicit) {
         const dbAgentKind = getSessionDbAgentKind(sessionId);
         if (dbAgentKind) {
-          const reroute = persistedProviderKnown
-            ? await assertModelRouteUsable(dbToMakerAgentKind(dbAgentKind), model, guardProviderId)
-            : undefined;
+          // 停用轴准入只依赖目标路由(guard = 显式目标 ?? 恢复出的源),与源 provider
+          // 的 DB 查询成败无关 —— 查询失败只能放弃独占 pin 重裁决,不能跳过准入。
+          const reroute = await assertModelRouteUsable(
+            dbToMakerAgentKind(dbAgentKind),
+            model,
+            guardProviderId,
+          );
           effectiveProviderId = resolveExclusiveSetModelReroute(
             requestedProviderId,
             currentProviderId,
