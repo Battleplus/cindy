@@ -7,6 +7,7 @@ import {
   type LiziMcpProvider,
   type LiziMcpSessionContext,
   type LspServerPool,
+  type SshHostSnapshotLike,
 } from '@cindy/mcps';
 import type { OrcaMcpDeps } from '@cindy/mcps';
 import { createCindyGhostsMcpServer } from 'cindy-tools';
@@ -17,6 +18,9 @@ import {
   type ToolResultImageDescription,
 } from './ghost.js';
 import { createGroupHistoryMcpServer } from './groupHistoryMcpServer.js';
+import { renderHtmlToPdf } from '../doc-tools/htmlPdfRenderer.js';
+import { writeDocsOutput } from '../doc-tools/docsOutputWriter.js';
+import { inspectPdf } from '../doc-tools/pdfInspector.js';
 import { getAndroidMcpDeps } from './android.js';
 import { getIOSSimulatorMcpDeps } from './ios-simulator.js';
 import { getBrowserMcpDeps } from './browser.js';
@@ -59,6 +63,8 @@ import {
 } from './remoteChatHistory.js';
 
 export interface DesktopMcpProvidersDeps {
+  /** 当前 Desktop 版本，供 Forge 为具体插件包生成默认 minCindyVersion。 */
+  getAppVersion?: () => string;
   getMakerMemoryManager: () => MakerMemoryManager;
   lspPool: LspServerPool;
   /** 按会话控制启用状态的 plugin registry。 */
@@ -89,6 +95,13 @@ export interface DesktopMcpProvidersDeps {
 
 export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMcpProvider[] {
   const { pluginRegistry } = deps;
+  let redactSshText: ((snapshot: SshHostSnapshotLike, text: string) => string) | undefined;
+  const loadRemoteSsh = async () => {
+    const remoteSsh = await import('../remote-ssh/index.js');
+    redactSshText = (snapshot, text) =>
+      remoteSsh.redactSshSensitiveText(snapshot.config, text);
+    return remoteSsh;
+  };
 
   // 辅助桥接 OrcaCollabService → OrcaMcpDeps / sendToSession，
   // 并在边界捕获 HOST_NOT_READY / INTERNAL。
@@ -271,9 +284,13 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       // hydrated accessor:冷启动时 pool 是空的(hydrate 只在用户访问设置或
       // connect 路径触发),ssh_list_hosts / resolveHost 读 pool.list() 前必须
       // 先从 ~/.ssh/config hydrate,否则已配置主机全部 HOST_NOT_FOUND。
-      getPool: async () => (await import('../remote-ssh/index.js')).getRemoteSshPoolHydrated(),
+      getPool: async () => (await loadRemoteSsh()).getRemoteSshPoolHydrated(),
       ensureReady: async (id: string) =>
-        (await import('../remote-ssh/index.js')).ensureRemoteHostReady(id),
+        (await loadRemoteSsh()).ensureRemoteHostReady(id),
+      redactSensitiveText: (snapshot, text) => {
+        if (!redactSshText) throw new Error('SSH redactor is not initialized');
+        return redactSshText(snapshot, text);
+      },
       // 普通工具策略在 Claude runtime / Codex thread 创建时冻结。不要在 tool-call
       // 时重新读取 registry，否则运行中的工具清单与执行权限会随 Settings 分叉。
       logger: createLogger('mcp/cindy_ssh'),
@@ -301,6 +318,17 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       logger: createLogger('mcp/cindy_lsp'),
       isUserEnabled: () => readLspModeSettings().enabled,
     },
+    // cindy_docs(文档工坊): docx / pptx / xlsx / csv 全在 @cindy/mcps 内用纯 JS 库实现,
+    // 这里只补上包里做不到的三件事 —— 都需要 electron:
+    //   writeDocsOutput: 最终落盘靠 cwd 绑定的单次 utility process;
+    //   renderHtmlToPdf: HTML → PDF 靠 Chromium printToPDF(隐藏窗即用即毁);
+    //   inspectPdf:     回读 PDF 结构靠一次性 utility process 里的 pdfjs。
+    docs: {
+      logger: createLogger('mcp/cindy_docs'),
+      writeDocsOutput,
+      renderHtmlToPdf,
+      inspectPdf,
+    },
     // xdt-helper: 自省 + history + send_to_session (essential 常开)。
     // send_to_session 是 skill(issue-bot 等)的会话路由原语, 放 essential 常开不断。
     // tryGetOrcaCollabService() 是延迟查找：createDesktopMcpProviders 在 app
@@ -319,6 +347,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         steerSession: wrap((service, params) => service.steerSession(params)),
         stopSessionTurn: wrap((service, params) => service.stopSessionTurn(params)),
         getSessionRuntime: wrap((service, params) => service.getSessionRuntime(params)),
+        setSessionRuntime: wrap((service, params) => service.setSessionRuntime(params)),
       },
       setCurrentSessionTitle: async ({ sessionId, title }) => {
         if (!tryGetDbClient()) {
@@ -447,9 +476,11 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       listWorkers: wrap((s, params) => s.listWorkers(params)),
       switchFocus: wrap((s, params) => s.switchFocus(params)),
       sendToWorker: wrap((s, params) => s.sendToWorker(params)),
+      interruptWorker: wrap((s, params) => s.interruptWorker(params)),
       listWorkerQueuedMessages: wrap((s, params) => s.listWorkerQueuedMessages(params)),
       updateWorkerQueuedMessage: wrap((s, params) => s.updateWorkerQueuedMessage(params)),
       cancelWorkerQueuedMessage: wrap((s, params) => s.cancelWorkerQueuedMessage(params)),
+      mergeWorkerQueuedMessages: wrap((s, params) => s.mergeWorkerQueuedMessages(params)),
       idleWorker: wrap((s, params) => s.idleWorker(params)),
       endTeam: wrap((s, params) => s.endTeam(params)),
       archiveWorker: wrap((s, params) => s.archiveWorker(params)),
@@ -531,6 +562,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       name: 'cindy',
       instance: createCindyGhostsMcpServer(
         getCindyGhostsMcpDeps(ctx, {
+          getAppVersion: deps.getAppVersion,
           getLiveSessionGrantState: deps.getLiveSessionGrantState,
           describeToolResultImage: deps.describeToolResultImage,
           onToolResultImagesFailed: deps.onToolResultImagesFailed,

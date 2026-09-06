@@ -7,11 +7,12 @@ import {
   MOBILE_ANCHOR_VERIFY_MAX_ATTEMPTS,
   MOBILE_ANCHOR_VERIFY_MAX_WAIT_ROUNDS,
   MOBILE_ANCHOR_VERIFY_TOLERANCE,
+  shouldPreserveMobileHistoryBrowseIntent,
 } from '@/session/messageScroll';
 
 // evaluateMessageWindowUpdate 是容器无关的纯函数,驱动「新消息红点 / 近底自动跟随」判定。
 // 迁移到 LegendList 后仍由它决定 hasNewMessages(贴底跟随交给 maintainScrollAtEnd,防跳交给
-// maintainVisibleContentPosition);容器 prop 契约见 messageListVirtualization.test.ts。
+// 应用层 key/offset 锚定);容器 prop 契约见 messageListVirtualization.test.ts。
 describe('scrollWindowModel', () => {
   it('auto-follows the initial visible window without showing a new-message chip', () => {
     expect(evaluateMessageWindowUpdate({
@@ -96,18 +97,35 @@ describe('scrollWindowModel', () => {
     });
   });
 
-  it('restores the load-earlier affordance after reopen even when no new content was fetched', () => {
-    const source = readFileSync(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8');
+  it.each(['\n', '\r\n'])('restores the load-earlier affordance after unchanged reopen with %j line endings', (lineEnding) => {
+    const source = readFileSync(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8').replace(/\r?\n/g, lineEnding);
     // 重开"无新内容"分支(metaChanged=false)也补设 hasOlderMessages,用服务端总数 vs in-store 推断。
-    expect(source).toContain('hasOlderMessagesAfterReopen(freshCount, remoteSessionStore.getMessages(sessionId))');
+    expect(source).toContain('hasOlderMessagesAfterReopen(sessionMeta._count?.messages, remoteSessionStore.getMessages(sessionId))');
     // 仍保留有新内容时的精确(page-based)判定。这个值现在同时喂给 store 的窗口连续性判据
     // (moreBeyondWindow,见 #1222):两者本就该同源 —— 「本页上沿之外还有历史」既决定是否点亮
     // 「加载更早」,也决定能不能信任早于本页的缓存段。
     expect(source).toContain('const moreBeyondWindow = shouldKeepOlderMessagesAffordance(history);');
-    expect(source).toContain('setHasOlderMessages(moreBeyondWindow);');
+    expect(source).toMatch(/setHasOlderMessages\(history !== null\s+\? shouldKeepOlderMessagesAffordance\(history\)/);
     expect(source).toMatch(
       /setLatestMessageWindow\(sessionId, historyPage, \{\s*authority: messageAuthority,\s*moreBeyondWindow,\s*\}\)/,
     );
+  });
+});
+
+describe('history browse intent', () => {
+  it('rejects passive anchor offsets but allows a real user-controlled return to latest', () => {
+    expect(shouldPreserveMobileHistoryBrowseIntent({
+      historyBrowseIntent: true,
+      userControllingScroll: false,
+    })).toBe(true);
+    expect(shouldPreserveMobileHistoryBrowseIntent({
+      historyBrowseIntent: true,
+      userControllingScroll: true,
+    })).toBe(false);
+    expect(shouldPreserveMobileHistoryBrowseIntent({
+      historyBrowseIntent: false,
+      userControllingScroll: false,
+    })).toBe(false);
   });
 });
 

@@ -21,6 +21,12 @@ import {
 } from '@cindy/maker-shared/brand-identity';
 import { stageMacIOSSimulatorHelper } from './forge-ios-simulator-helper';
 import { stagePackagedThirdPartyNotices } from './forge-third-party-notices';
+import { READ_SHEET_RUNTIME_PACKAGES } from '../../packages/lizi-mcps/src/cindy-docs/readSheetRuntimeDeps';
+import { reviewPdfRuntimePackages } from './src/main/reviewer/reviewPdfRuntimeDeps';
+import {
+  validateBundledWindowsUpdaterRuntime,
+  windowsUpdaterRuntimeExtraResourceForTarget,
+} from './src/main/windowsUpdaterPrerequisites';
 
 const _require = createRequire(__filename);
 const DESKTOP_PACKAGE_VERSION = (_require('./package.json') as { version: string }).version;
@@ -253,8 +259,12 @@ function resolveOptions(fromDirs?: string[]): { paths: string[] } | undefined {
 }
 
 function copyDiscordRuntimeDeps(destModules: string): void {
+  copyRuntimeDependencyTrees(DISCORD_RUNTIME_DEPS, destModules);
+}
+
+function copyRuntimeDependencyTrees(deps: readonly string[], destModules: string): void {
   const seen = new Set<string>();
-  for (const dep of DISCORD_RUNTIME_DEPS) {
+  for (const dep of deps) {
     copyDependencyTree(dep, destModules, undefined, seen);
   }
 }
@@ -324,6 +334,9 @@ function bundleNativeDeps(buildPath: string, targetPlatform: string, targetArch:
     ...NATIVE_RUNTIME_DEPS,
     parcelWatcherPlatformPkg(targetPlatform, targetArch),
     ...sharpPlatformPkgs(targetPlatform, targetArch),
+    // Reviewer PDF utility 的 canvas wrapper 由 Vite externalize；正式包必须
+    // 同时带 wrapper 与目标平台的预编译 binding，不能依赖 workspace hoist。
+    ...reviewPdfRuntimePackages(targetPlatform, targetArch),
     // loudness 只在 Windows 用 (录音时静音)。它的 Win 后端是个捆绑的 .exe,
     // 必须运行时按 __dirname 找 — 所以走 NATIVE_RUNTIME_DEPS 这条路, 不让 vite
     // bundle。Mac/Linux 完全不带, 避免拖入 execa 这条无用依赖链。
@@ -345,6 +358,7 @@ function bundleNativeDeps(buildPath: string, targetPlatform: string, targetArch:
     console.log(`[forge:afterCopy] bundled native dep: ${dep} <- ${src}`);
   }
   copyDiscordRuntimeDeps(destModules);
+  copyRuntimeDependencyTrees(READ_SHEET_RUNTIME_PACKAGES, destModules);
 }
 
 // 针对 packaged buildPath 的 node_modules 强制重建 better-sqlite3 —— force:true 确保
@@ -760,8 +774,13 @@ function extraResourcesForTarget(targetPlatform: string): string[] {
     'resources/THIRD-PARTY-RESTRICTED.txt',
   ];
 
-  if (targetPlatform === 'win32') {
-    base.unshift(`resources/${UPDATER_EXE}`);
+  const windowsUpdaterRuntimeResource =
+    windowsUpdaterRuntimeExtraResourceForTarget(targetPlatform);
+  if (windowsUpdaterRuntimeResource) {
+    base.unshift(
+      `resources/${UPDATER_EXE}`,
+      windowsUpdaterRuntimeResource,
+    );
   }
 
   if (targetPlatform === 'darwin' || targetPlatform === 'mas') {
@@ -965,6 +984,18 @@ function buildMacIOSSimulatorHelper(platform: ForgePlatform, arch: ForgeArch): v
   }
 }
 
+function compileCObjectForTarget(
+  src: string,
+  dest: string,
+  target: string,
+  extraArgs: string[],
+  label: string,
+): void {
+  const r = spawnSync('clang', ['-c', src, '-target', target, ...extraArgs, '-o', dest], { stdio: 'inherit' });
+  if (r.error) throw new Error(`[forge] clang spawn failed for ${label}: ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`[forge] clang failed for ${label} (${target}) with exit code ${r.status}`);
+}
+
 function runSwiftcForTarget(src: string, dest: string, target: string, extraArgs: string[], label: string): void {
   const r = spawnSync('swiftc', ['-target', target, src, ...extraArgs, '-o', dest], { stdio: 'inherit' });
   if (r.error) throw new Error(`[forge] swiftc spawn failed for ${label}: ${r.error.message}`);
@@ -1000,20 +1031,43 @@ function buildSwiftHelperForForgeArch(
 function buildMacXboxGamepadHelper(platform: ForgePlatform, arch: ForgeArch): void {
   if (process.platform !== 'darwin' || !isMacForgePlatform(platform)) return;
   const src = path.join(__dirname, 'native', 'xbox-gamepad', 'macos-xbox-gamepad-helper.swift');
+  const switch2UsbC = path.join(__dirname, 'native', 'xbox-gamepad', 'switch2_usb.c');
+  const switch2UsbH = path.join(__dirname, 'native', 'xbox-gamepad', 'switch2_usb.h');
   const destDir = path.join(__dirname, 'resources', 'tools', 'xbox-gamepad');
   const dest = path.join(destDir, 'cindy-macos-xbox-gamepad-helper');
   if (!fs.existsSync(src)) {
     throw new Error(`[forge] Xbox gamepad helper source missing at ${src}`);
   }
+  if (!fs.existsSync(switch2UsbC) || !fs.existsSync(switch2UsbH)) {
+    throw new Error(`[forge] Switch 2 USB helper source missing at ${switch2UsbC}`);
+  }
   fs.mkdirSync(destDir, { recursive: true });
-  buildSwiftHelperForForgeArch(
-    src,
-    dest,
-    arch,
-    MACOS_XBOX_GAMEPAD_HELPER_DEPLOYMENT_TARGET,
-    ['-framework', 'GameController', '-framework', 'IOKit'],
-    'Xbox gamepad helper',
-  );
+  const targets = swiftTargetTriplesForForgeArch(arch, MACOS_XBOX_GAMEPAD_HELPER_DEPLOYMENT_TARGET);
+  const compileOne = (output: string, target: string, objectDir: string): void => {
+    const object = path.join(objectDir, `switch2_usb-${target.split('-')[0]}.o`);
+    compileCObjectForTarget(switch2UsbC, object, target, [], 'Xbox gamepad helper C');
+    runSwiftcForTarget(
+      src,
+      output,
+      target,
+      [object, '-import-objc-header', switch2UsbH, '-framework', 'GameController', '-framework', 'IOKit'],
+      'Xbox gamepad helper',
+    );
+  };
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xdt-xbox-gamepad-helper-'));
+  try {
+    if (targets.length === 1) {
+      compileOne(dest, targets[0], tempDir);
+    } else {
+      const outputs = targets.map((target) => path.join(tempDir, `${path.basename(dest)}-${target.split('-')[0]}`));
+      targets.forEach((target, index) => compileOne(outputs[index], target, tempDir));
+      const r = spawnSync('lipo', ['-create', ...outputs, '-output', dest], { stdio: 'inherit' });
+      if (r.error) throw new Error(`[forge] lipo spawn failed for Xbox gamepad helper: ${r.error.message}`);
+      if (r.status !== 0) throw new Error(`[forge] lipo failed for Xbox gamepad helper with exit code ${r.status}`);
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
   fs.chmodSync(dest, 0o755);
 }
 
@@ -1477,6 +1531,17 @@ const config: ForgeConfig = {
       const targetArch = requestedTargetArch();
       ensureMacIOSSimulatorWdaArchive(platform);
       if (targetPlatform === 'win32') {
+        if (targetArch !== 'x64') {
+          throw new Error(
+            `[forge] Windows updater app-local Runtime is x64-only; unsupported target arch: ${targetArch}`,
+          );
+        }
+        const runtimeManifest = validateBundledWindowsUpdaterRuntime(
+          path.join(__dirname, 'resources'),
+        );
+        console.log(
+          `[forge:prePackage] verified Windows updater app-local Runtime ${runtimeManifest.version} x64`,
+        );
         buildCindyUpdater();
       }
       stageRipgrep(targetPlatform, targetArch);
@@ -1523,6 +1588,13 @@ const config: ForgeConfig = {
           target: 'preload',
         },
         {
+          entry: 'src/main/localDb/dbSlimmingMaintenanceProcess.ts',
+          config: 'vite.db-slimming-worker.config.ts',
+          // DELETE / VACUUM can run for minutes on a large database. An OS-killable
+          // utility process keeps Main responsive and lets users cancel before swap.
+          target: 'preload',
+        },
+        {
           entry: 'src/main/cindy-brain/libraryDbWorker.ts',
           config: 'vite.library-db-worker.config.ts',
           // 插件 Library SQLite 隔离在 per-plugin worker：恶意慢查询只饿死
@@ -1563,6 +1635,13 @@ const config: ForgeConfig = {
           target: 'preload',
         },
         {
+          entry: 'src/main/doc-tools/docsOutputWriterUtilityProcess.ts',
+          config: 'vite.preload.config.ts',
+          // 最终文档落盘绑定到已验证父目录的 cwd capability，避免 main 侧
+          // realpath 与 write/rename 之间被 symlink 替换。
+          target: 'preload',
+        },
+        {
           entry: 'src/main/watcher-host/watcherHostProcess.ts',
           config: 'vite.watcher-host.config.ts',
           // 同 dbWorker:借 preload target 出 CJS 单文件；运行时是 Electron
@@ -1581,6 +1660,13 @@ const config: ForgeConfig = {
           config: 'vite.preload.config.ts',
           // UNC/SMB stat 不可取消；独立 utility process 超时后可直接终止，
           // 避免把挂死 I/O 留在 Electron main 的 libuv 线程池。
+          target: 'preload',
+        },
+        {
+          entry: 'src/main/cindy-brain/piSubagentRunnerProcess.ts',
+          config: 'vite.preload.config.ts',
+          // 正式包关闭 RunAsNode；Pi Subagent 后台管理程序通过固定的
+          // utility-process 入口执行，开发版和正式包保持同一进程边界。
           target: 'preload',
         },
         {

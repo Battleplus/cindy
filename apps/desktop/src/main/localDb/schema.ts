@@ -192,6 +192,8 @@ export const sessions = sqliteTable(
      * 反序列化由 mapper 兜底 (失败 fallback []), 不抛错。
      */
     extraDirs: text('extra_dirs').notNull().default('[]'),
+    /** Session 附加可读写目录(JSON 字符串数组)。旧会话默认空，不从 extra_dirs 提权。 */
+    writableDirs: text('writable_dirs').notNull().default('[]'),
     /**
      * 远端目标 host id (`@cindy/maker-remote-ssh` ConnectionPool 里的 alias)。
      * 非空 = 这个 session 跑在远端机器上 (agent 在远端、workingDir 是远端路径)。
@@ -219,6 +221,17 @@ export const sessions = sqliteTable(
      * sessionActiveTurn.ts 文件头。
      */
     lastTurnEndedAt: integer('last_turn_ended_at'),
+    /**
+     * 侧栏列表投影：已提炼的 preview 纯文本（最多 140 字）。NULL = 尚未回填，
+     * sessions:list 回落到 messages 相关子查询。不在 migration 里扫历史库。
+     */
+    listPreview: text('list_preview'),
+    listPreviewRole: text('list_preview_role'),
+    /**
+     * 侧栏「N 条消息」缓存。口径与历史 count(*) 相同（不过滤 role/rewind/clear）。
+     * 存精确总数；UI 把 ≥1001 显示成 1000+。NULL = 尚未回填。
+     */
+    listMessageCount: integer('list_message_count'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
@@ -340,7 +353,8 @@ export const messages = sqliteTable(
       // 的 onTurnErrorEvent)。drizzle 的 text enum 只是 TS 类型约束,SQLite 列
       // 无 CHECK,扩枚举不产生 migration(db:generate 应为 no-op)。
       // 'agent_switch':session 内 agent 引擎切换边界行(session-agent-switch),
-      // content 存 { fromAgentKind, toAgentKind, fromModel, toModel, handoff }。
+      // content 存 { fromAgentKind, toAgentKind, fromModel, toModel,
+      // fromProviderId?, toProviderId?, handoff }。
       // handoff 交接文本只进这里(供 UI 展开查看/debug),不作为可见消息渲染正文,
       // 也不落 user 消息——wire 注入与显示分离。
       // 'context_rebuild':消息内容删除后的内部重建标记。rewind_at 固定非 NULL,
@@ -393,6 +407,27 @@ export const messages = sqliteTable(
     // 游标分页先用 createdAt 过滤；同毫秒次序在 IPC 层用 SQLite rowid 保持写入顺序。
     idxCreatedAtId: index('idx_messages_created_at').on(t.createdAt, t.id),
     idxRewindAt: index('idx_messages_rewind_at').on(t.rewindAt),
+    idxActiveErrorTail: index('idx_messages_active_error_tail')
+      .on(t.sessionId, t.createdAt)
+      .where(sql`${t.role} = 'error' AND ${t.rewindAt} IS NULL`),
+  }),
+);
+
+/**
+ * messages_fts 的稳定整数行号映射。
+ *
+ * messages 使用 TEXT 主键，其隐藏 rowid 可能在 VACUUM 后变化，不能直接作为 FTS 的
+ * 持久关联键。这里为曾进入全文索引的消息分配独立整数键，让触发器可以通过普通 B-tree
+ * 按 message_id 找到 FTS rowid，再做定点更新或删除。
+ */
+export const messagesFtsRows = sqliteTable(
+  'messages_fts_rows',
+  {
+    ftsRowid: integer('fts_rowid').primaryKey({ autoIncrement: true }),
+    messageId: text('message_id').notNull(),
+  },
+  (t) => ({
+    byMessageId: uniqueIndex('messages_fts_rows_message_id_idx').on(t.messageId),
   }),
 );
 
@@ -1066,6 +1101,39 @@ export const scheduleRuns = sqliteTable(
   },
   (t) => ({
     idxBySchedule: index('idx_schedule_runs_schedule').on(t.scheduleId, t.firedAt),
+    idxRunningSchedule: index('idx_schedule_runs_running_schedule')
+      .on(t.scheduleId)
+      .where(sql`${t.status} = 'running'`),
+    idxRunningHeartbeat: index('idx_schedule_runs_running_heartbeat')
+      .on(t.heartbeatAt)
+      .where(sql`${t.status} = 'running' AND ${t.heartbeatAt} IS NOT NULL`),
+    idxRunningLegacy: index('idx_schedule_runs_running_legacy')
+      .on(t.firedAt)
+      .where(sql`${t.status} = 'running' AND ${t.heartbeatAt} IS NULL`),
+    idxUnreadTerminal: index('idx_schedule_runs_unread_terminal')
+      .on(t.scheduleId, t.status, t.firedAt)
+      .where(
+        sql`${t.readAt} IS NULL AND ${t.status} IN ('success', 'failed', 'aborted', 'interrupted')`,
+      ),
+    idxSessionLatest: index('idx_schedule_runs_session_latest')
+      .on(t.sessionId, t.firedAt, t.id)
+      .where(sql`${t.sessionId} IS NOT NULL`),
+  }),
+);
+
+export const scheduleSessionLatestRuns = sqliteTable(
+  'schedule_session_latest_runs',
+  {
+    sessionId: text('session_id')
+      .primaryKey()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    runId: text('run_id')
+      .notNull()
+      .references(() => scheduleRuns.id, { onDelete: 'cascade' }),
+    firedAt: integer('fired_at').notNull(),
+  },
+  (t) => ({
+    idxRun: uniqueIndex('idx_schedule_session_latest_runs_run').on(t.runId),
   }),
 );
 
@@ -1317,6 +1385,20 @@ export const skillUsageExposures = sqliteTable(
       t.analyzerVersion,
       t.skillName,
       t.skillDocumentHash,
+    ),
+    bySkillRecent: index('idx_skill_usage_exposures_skill_recent').on(
+      t.skillName,
+      t.analyzerVersion,
+      t.seenAt,
+    ),
+    bySkillRecentAnyVersion: index('idx_skill_usage_exposures_skill_recent_any_version').on(
+      t.skillName,
+      t.seenAt,
+    ),
+    byAnalyzerRecentSource: index('idx_skill_usage_exposures_analyzer_recent_source').on(
+      t.analyzerVersion,
+      t.seenAt,
+      t.rawFilePath,
     ),
     bySession: index('idx_skill_usage_exposures_session').on(t.sessionId),
     byRawFile: index('idx_skill_usage_exposures_raw_file').on(t.rawFilePath),
