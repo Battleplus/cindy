@@ -1409,12 +1409,7 @@ export class GhostNodeRuntimeBroker {
         // 删除 drain 标记——旧进程仍握着 Windows 文件锁/端口，下一个请求
         // 必须继续等待同一退出事件，否则会在旧进程存活时 fork replacement
         // 重新制造 #3330 的资源冲突。
-        await Promise.race([
-          draining,
-          this.delay(PROCESS_STOP_WAIT_TIMEOUT_MS).then(() => {
-            throw new Error(`插件 Node 进程停止超时(${ghost.manifest.id})`);
-          }),
-        ]);
+        await this.waitForDrainExit(ghost.manifest.id, draining);
       }
       return this.startWorkerWithRetry(ghost, entryRel, key, ownerScopeSnapshot);
     })();
@@ -1429,14 +1424,41 @@ export class GhostNodeRuntimeBroker {
       // reject，未 resolve 即旧进程仍存活），让后续请求继续等待同一退出
       // 事件，不在旧进程存活时 fork replacement。启动失败但 drain 已
       // resolve（真实退出后启动仍失败）同样可安全清理。
+      // delete 放进 draining.then(...)：then 是 microtask，同步读标记恒为
+      // 未 resolve，同步 delete 是死代码。identity guard 防止旧 drain 已被
+      // 同 key 的新 drain（新一轮停止）替换时误删新标记。
       if (draining && this.drainingExits.get(key) === draining) {
-        let resolved = false;
         void draining.then(() => {
-          resolved = true;
+          if (this.drainingExits.get(key) === draining) this.drainingExits.delete(key);
         });
-        if (resolved) this.drainingExits.delete(key);
       }
     }
+  }
+
+  /**
+   * drain 的有界等待：真实 exit resolve，超时 reject。与 waitForProcessExit
+   * 同一套互斥收口——settled + clearTimer，真实退出后立即取消超时臂，超时
+   * 臂也只经 settle 触发一次。绝不能用 `race([draining, delay().then(throw)])`：
+   * 输掉 race 的超时分支不会被取消，成功 drain 后约 2.5s 仍会 throw 成
+   * main 的 unhandledRejection（#3343 独立审查 P1）。
+   */
+  private waitForDrainExit(ghostId: string, draining: Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const settle = (outcome: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) this.clearTimer(timer);
+        outcome();
+      };
+      timer = this.setTimer(
+        () => settle(() => reject(new Error(`插件 Node 进程停止超时(${ghostId})`))),
+        PROCESS_STOP_WAIT_TIMEOUT_MS,
+      );
+      timer.unref?.();
+      void draining.then(() => settle(resolve));
+    });
   }
 
   private async startWorkerWithRetry(

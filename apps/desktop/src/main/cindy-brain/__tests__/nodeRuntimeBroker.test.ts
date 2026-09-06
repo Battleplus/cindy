@@ -1136,6 +1136,107 @@ describe('nodeRuntimeBroker · 进程生命周期', () => {
     expect(broker.stateOf('node-ghost')).toBe('running');
   });
 
+  it('成功 drain 后超时臂已取消：推进 ≥ PROCESS_STOP_WAIT_TIMEOUT_MS 无 unhandledRejection（#3343 P1）', async () => {
+    vi.useFakeTimers();
+    const ghost = fakeGhost({ lifecycle: 'on-demand' });
+    const children: FakeNodeProcess[] = [];
+    const broker = new GhostNodeRuntimeBroker({
+      getGhost: () => ghost,
+      spawnProcess: () => {
+        const child = makeAutoReplyProcess();
+        children.push(child);
+        return child as unknown as NodeWorkerProcess;
+      },
+    });
+
+    const p1 = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p1).resolves.toMatchObject({ ok: true });
+    const firstChild = children[0];
+
+    // Windows 延迟退出模拟：kill 不触发 exit，真实退出由测试手动 emit。
+    firstChild.removeAllListeners('exit');
+    firstChild.kill = vi.fn(() => {
+      firstChild.killed = true;
+      return true;
+    });
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    const p2 = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(100);
+    // 真实 exit 到达，等待侧的 winner 是 drain，replacement 正常启动。
+    firstChild.emit('exit', null, 'SIGTERM');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(children).toHaveLength(2);
+    children[1].emit('spawn');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p2).resolves.toMatchObject({ ok: true });
+
+    // 回归点：旧实现 Promise.race([draining, delay().then(throw)]) 在 drain
+    // 赢下 race 后不会取消输掉的超时分支，~2500ms 后 throw 成 main 的
+    // unhandledRejection。互斥收口后超时臂已被 clearTimer 取消，这里必须
+    // 静默走完整个 PROCESS_STOP_WAIT_TIMEOUT_MS（2500ms）。
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await vi.advanceTimersByTimeAsync(2_600);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    broker.destroyAll();
+  });
+
+  it('replacement 成功后 drain 标记已从 drainingExits 删除（#3343 P1）', async () => {
+    vi.useFakeTimers();
+    const ghost = fakeGhost({ lifecycle: 'on-demand' });
+    const children: FakeNodeProcess[] = [];
+    const broker = new GhostNodeRuntimeBroker({
+      getGhost: () => ghost,
+      spawnProcess: () => {
+        const child = makeAutoReplyProcess();
+        children.push(child);
+        return child as unknown as NodeWorkerProcess;
+      },
+    });
+    const drainingExits = (
+      broker as unknown as { drainingExits: Map<string, Promise<void>> }
+    ).drainingExits;
+
+    const p1 = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p1).resolves.toMatchObject({ ok: true });
+    const firstChild = children[0];
+
+    firstChild.removeAllListeners('exit');
+    firstChild.kill = vi.fn(() => {
+      firstChild.killed = true;
+      return true;
+    });
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    const p2 = broker.handleRequest('node-ghost', rpcRequest());
+    await vi.advanceTimersByTimeAsync(100);
+    // 等待期间标记必须还在（后续请求要继续等同一退出事件）。
+    expect(drainingExits.size).toBe(1);
+
+    firstChild.emit('exit', null, 'SIGTERM');
+    await vi.advanceTimersByTimeAsync(0);
+    children[1].emit('spawn');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p2).resolves.toMatchObject({ ok: true });
+
+    // 回归点：旧实现在 finally 里同步读 `resolved`（then 是 microtask，恒为
+    // false），delete 是死代码，标记永远清不掉。现在 delete 在
+    // draining.then(...) 内带 identity guard 地执行，真实退出 + 启动成功后
+    // 标记必须真的消失。
+    expect(drainingExits.size).toBe(0);
+    broker.destroyAll();
+  });
+
   it('同一 key 的并发 replacement 请求只启动一个 worker', async () => {
     vi.useFakeTimers();
     const ghost = fakeGhost({ lifecycle: 'on-demand' });
