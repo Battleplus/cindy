@@ -1,4 +1,5 @@
 import { stripTrailingPathSeparators } from '@cindy/maker-shared/path-text';
+import { takeRefinementContextTail } from '@cindy/voice-input-core';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import Constants from 'expo-constants';
 import { MOBILE_VISUAL_MOCK_ENABLED } from '@/config/env';
@@ -26,7 +27,6 @@ import {
   useWindowDimensions,
   type StyleProp,
   type TextInputContentSizeChangeEvent,
-  type TextLayoutEvent,
   type ViewStyle,
 } from 'react-native';
 import { Text } from '@/components/AppText';
@@ -330,7 +330,6 @@ import { useTheme, useThemedStyles, type ThemeColors } from '@/theme';
 import { fontWeight, iconSize, iconStroke, lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
 
 const COMPOSER_INPUT_MULTILINE_CONTENT_THRESHOLD = 34;
-const COMPOSER_VOICE_CARET_GAP = 2;
 // composer 除输入区外的 chrome 高度估算（输入行上下 padding + 边框），
 // 只用于给拖拽调高的上限留余量，与会话页同量级。
 const COMPOSER_RESIZE_CHROME_HEIGHT = 34;
@@ -696,11 +695,8 @@ export default function NewRemoteSessionScreen() {
   const userTouchedDeviceRef = useRef(false);
   const userTouchedWorkspaceRef = useRef(false);
   const firstMessageRef = useRef(draft.firstMessage);
+  const firstMessageSelectionRef = useRef({ start: draft.firstMessage.length, end: draft.firstMessage.length });
   const firstMessageInputRef = useRef<NativeTextInput>(null);
-  const firstMessageCaretRef = useRef<{ start: number; end: number } | null>(null);
-  // 光标捕获时的草稿快照：onSelectionChange 同时存草稿文本，
-  // start() 用它检测「光标位置对应的是旧草稿」这种竞态。
-  const firstMessageCaretDraftRef = useRef<string | null>(null);
   const voiceDraftScrollRef = useRef<ScrollView>(null);
   const voiceRecordingActiveRef = useRef(false);
   const voicePermissionRequestInFlightRef = useRef(false);
@@ -715,10 +711,8 @@ export default function NewRemoteSessionScreen() {
   const [firstMessageInputContentHeight, setFirstMessageInputContentHeight] = useState(MOBILE_COMPOSER_INPUT_SINGLE_LINE_HEIGHT);
   const [firstMessageInputFocused, setFirstMessageInputFocused] = useState(false);
   const [voiceDraftCaretFrame, setVoiceDraftCaretFrame] = useState({ left: 0, top: 0 });
-  // 本次录音的实际落点行顶(relative to overlay content);无有效落点时为 0。
-  // 浮层滚动跟随它而不是永远 scrollToEnd,否则中部插入时波形光标在屏幕外。
-  // null = no valid caret position (use scrollToEnd); number = scroll to that y.
-  const voiceDraftCaretTopRef = useRef<number | null>(null);
+  const voiceDraftCaretRef = useRef<View>(null);
+  const voiceDraftMeasuredBlockRef = useRef<View>(null);
   // 自动默认运行配置(跟随最近会话 / 区域默认 / 列表最上面)的守卫:用户一旦手动选过模型,就不再自动覆盖;
   // 记录已自动应用过的设备,切设备时(未手动选过)按新设备重算。
   const userTouchedRuntimeRef = useRef(false);
@@ -1600,43 +1594,15 @@ export default function NewRemoteSessionScreen() {
     ));
   }, []);
 
-  const handleVoiceDraftTextLayout = useCallback((event: TextLayoutEvent) => {
-    const lines = event.nativeEvent.lines;
-    if (lines.length === 0) return;
-    // 波形光标跟随本次录音的实际落点(currentInsertionEnd)。音符的录音从
-    // 草稿中部开始、转写插回中部时,浮层若永远用最后一行,波形会落在屏幕外。
-    // end 为 null(落点已失效,回退文末追加)时退化为旧行为:最后一行。
-    const insertionEnd = voiceControllerSessionRef.current?.currentInsertionEnd();
-    let caretLine = lines[lines.length - 1];
-    let charOffsetInLine = caretLine.text.length; // default: end of line
-    if (insertionEnd != null) {
-      let accumulated = 0;
-      for (const line of lines) {
-        const lineLen = line.text.length;
-        if (accumulated + lineLen >= insertionEnd) {
-          caretLine = line;
-          charOffsetInLine = insertionEnd - accumulated;
-          break;
-        }
-        // React Native onTextLayout 的 line.text 已包含显式 \n，
-        // 软换行不会在 text 中插入额外字符，直接累加即可。
-        accumulated += lineLen;
-      }
-    }
-    // Use a measured prefix width for the waveform x-coordinate instead of the
-    // full line width, so the waveform sits at the actual insertion column.
-    const fraction = charOffsetInLine / Math.max(1, caretLine.text.length);
-    const measuredWidth = caretLine.width * fraction;
-    const nextFrame = {
-      left: Math.max(0, Math.round(caretLine.x + measuredWidth + COMPOSER_VOICE_CARET_GAP)),
-      top: Math.max(0, Math.round(caretLine.y + ((caretLine.height - MOBILE_COMPOSER_INPUT_LINE_HEIGHT) / 2))),
-    };
-    voiceDraftCaretTopRef.current = Math.round(caretLine.y);
-    setVoiceDraftCaretFrame((currentFrame) => (
-      currentFrame.left === nextFrame.left && currentFrame.top === nextFrame.top
-        ? currentFrame
-        : nextFrame
-    ));
+  const handleVoiceDraftTextLayout = useCallback(() => {
+    const block = voiceDraftMeasuredBlockRef.current;
+    const caret = voiceDraftCaretRef.current;
+    if (!block || !caret) return;
+    caret.measureLayout(block, (x, y) => {
+      if (caret !== voiceDraftCaretRef.current || block !== voiceDraftMeasuredBlockRef.current) return;
+      const nextFrame = { left: Math.max(0, Math.round(x)), top: Math.max(0, Math.round(y)) };
+      setVoiceDraftCaretFrame((current) => current.left === nextFrame.left && current.top === nextFrame.top ? current : nextFrame);
+    }, () => undefined);
   }, []);
 
   const cancelVoiceForDeviceSwitch = useCallback(() => {
@@ -3065,20 +3031,6 @@ export default function NewRemoteSessionScreen() {
     };
   }, [maker]);
 
-  // 失败收尾时 VoiceInputController 可能先把已识别文本 salvage 到 composer,
-  // 再通知 error。此时不能只显示错误:输入框原生 selection 仍停在旧位置,
-  // 用户继续编辑会把光标落回文末或旧落点。等草稿提交到 TextInput 后,
-  // 用 controller 的实际插入区间恢复到听写文本之后；插入已被用户改动时
-  // currentInsertionEnd() 返回 null,此时尊重用户当前编辑，不强行抢光标。
-  const restoreVoiceCaretAfterError = useCallback((controller: MobileVoiceControllerSession | null) => {
-    if (controller?.currentInsertionEnd() == null) return;
-    requestAnimationFrame(() => {
-      const end = controller.currentInsertionEnd();
-      if (end == null) return;
-      firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
-    });
-  }, []);
-
   const startVoiceRecording = useCallback(async () => {
     if (
       voicePermissionRequestInFlightRef.current
@@ -3166,6 +3118,8 @@ export default function NewRemoteSessionScreen() {
       // link (only submitting the composed message later does). Awaiting it here
       // used to add 0.6–4.4s before the mic could open.
       void openLink(selectedDeviceId).catch(() => undefined);
+      const currentDraft = firstMessageRef.current;
+      const initialSelection = { ...firstMessageSelectionRef.current };
       // Claim the connection prewarmed at pressIn (if any): its credential is
       // already resolved and its ASR WebSocket already connecting, so the
       // handshake overlaps the press gesture instead of following it.
@@ -3207,23 +3161,8 @@ export default function NewRemoteSessionScreen() {
         }
         return;
       }
-      // 润色上下文按录音起始光标/选区切分:光标前文 / 被替换文本 / 光标后文,
-      // 而不是无脑取全文末尾——光标在中间或选中一段再录音时，前文/后文才有真实语境。
-      // 在 await(历史/词典加载)之后重新读草稿快照:期间用户可能已继续编辑，旧
-      // currentDraft 会与最新光标不同步，导致润色语境来自错误文本。
-      const draftAtStartup = firstMessageRef.current;
-      const caretAtStart = firstMessageCaretRef.current;
-      const clampedCaretStart = caretAtStart ? Math.max(0, Math.min(draftAtStartup.length, caretAtStart.start)) : null;
-      const clampedCaretEnd = caretAtStart && clampedCaretStart != null
-        ? Math.max(clampedCaretStart, Math.min(draftAtStartup.length, caretAtStart.end))
-        : null;
-      const refinementContext = caretAtStart && clampedCaretStart != null && clampedCaretEnd != null
-        ? {
-          selectionBefore: draftAtStartup.slice(0, clampedCaretStart).slice(-1200),
-          selectedText: draftAtStartup.slice(clampedCaretStart, clampedCaretEnd).slice(0, 1200),
-          selectionAfter: draftAtStartup.slice(clampedCaretEnd).slice(0, 1200),
-        }
-        : (draftAtStartup.trim() ? { selectionBefore: draftAtStartup.slice(-1200) } : undefined);
+      const selectionBefore = takeRefinementContextTail(currentDraft.slice(0, initialSelection.start));
+      const selectionAfter = currentDraft.slice(initialSelection.end, initialSelection.end + 1200);
       const controller = createMobileVoiceControllerSession({
         credential,
         ...(prewarmedVoice ? { asr: prewarmedVoice.asr } : {}),
@@ -3232,18 +3171,21 @@ export default function NewRemoteSessionScreen() {
           voiceContext.createRefinerTarget(providerId, options),
         warmRefiner: (input: { system: string; user: unknown; promptCacheKey: string }) =>
           voiceContext.warmRefiner(input),
-        initialDraft: draftAtStartup,
-        refinementContext,
+        initialDraft: currentDraft,
+        initialSelection,
+        refinementContext: {
+          selectionBefore: selectionBefore || undefined,
+          selectedText: currentDraft.slice(initialSelection.start, initialSelection.end).slice(0, 1200) || undefined,
+          selectionAfter: selectionAfter || undefined,
+        },
         localVoiceInputHistory,
         readCurrentDraft: () => firstMessageRef.current,
-        readCaret: () => firstMessageCaretRef.current,
-        readCaretDraft: () => firstMessageCaretDraftRef.current,
-        onDraftChanged: setFirstMessageDraft,
+        onDraftChanged: (text, selection) => {
+          if (selection) firstMessageSelectionRef.current = selection;
+          setFirstMessageDraft(text);
+        },
         onStateChanged: setVoiceState,
         onError: (message) => {
-          // VoiceInputController.fail() 先 salvage 已识别文本、再触发此回调。
-          // 在同一帧恢复落点，避免错误提示出现后光标漂到文末/旧位置。
-          restoreVoiceCaretAfterError(createdController);
           setVoiceState('error');
           setVoiceError(message);
         },
@@ -3311,7 +3253,6 @@ export default function NewRemoteSessionScreen() {
       }
       const controller = voiceControllerSessionRef.current;
       voiceControllerSessionRef.current = null;
-      restoreVoiceCaretAfterError(controller);
       await controller?.cancel().catch(() => undefined);
       voiceStartupInFlightRef.current = false;
       voiceStopInFlightRef.current = false;
@@ -3320,7 +3261,7 @@ export default function NewRemoteSessionScreen() {
       setVoiceError(formatRemoteError(err));
       await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
     }
-  }, [openLink, restoreVoiceCaretAfterError, selectedDeviceId, setFirstMessageDraft, voiceIsProcessing, voiceState]);
+  }, [openLink, selectedDeviceId, setFirstMessageDraft, voiceIsProcessing, voiceState]);
 
   const finishVoiceRecording = useCallback(async (): Promise<string | null> => {
     if (voiceStopInFlightRef.current) return null;
@@ -3339,13 +3280,7 @@ export default function NewRemoteSessionScreen() {
       await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
       setVoiceState('done');
       requestAnimationFrame(() => {
-        // 录音结束后光标应停在刚插入的听写文本之后，而不是全文末尾。
-        // currentInsertionEnd() 返回 null 时（无 transcript 或落点已失效），
-        // 不移动光标——尊重用户当前编辑位置，避免把中间光标抢到文末。
-        const end = controller.currentInsertionEnd();
-        if (end != null) {
-          firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
-        }
+        firstMessageInputRef.current?.setNativeProps({ selection: firstMessageSelectionRef.current });
       });
       return latestDraft;
     } catch (err) {
@@ -3428,12 +3363,11 @@ export default function NewRemoteSessionScreen() {
   useEffect(() => {
     if (!voiceIsListening) return undefined;
     const frame = requestAnimationFrame(() => {
-      const end = firstMessageRef.current.length;
-      firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
-      voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
+      firstMessageInputRef.current?.setNativeProps({ selection: firstMessageSelectionRef.current });
+      voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
     });
     return () => cancelAnimationFrame(frame);
-  }, [composerInputContentHeight, draft.firstMessage, voiceIsListening]);
+  }, [composerInputContentHeight, draft.firstMessage, voiceDraftCaretFrame.top, voiceIsListening]);
 
   useEffect(() => {
     if (voiceIsListening && draft.firstMessage.length > 0) return;
@@ -3600,23 +3534,12 @@ export default function NewRemoteSessionScreen() {
       ]}
       onContentSizeChange={() => {
         requestAnimationFrame(() => {
-          // 跟随实际落点(scrollToEnd 会让中部插入的转写滚出屏幕)。
-          const targetTop = voiceDraftCaretTopRef.current;
-          if (targetTop != null) {
-            voiceDraftScrollRef.current?.scrollTo({ y: targetTop, animated: false });
-          } else {
-            voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
-          }
+          voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
         });
       }}
       onLayout={() => {
         requestAnimationFrame(() => {
-          const targetTop = voiceDraftCaretTopRef.current;
-          if (targetTop != null) {
-            voiceDraftScrollRef.current?.scrollTo({ y: targetTop, animated: false });
-          } else {
-            voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
-          }
+          voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
         });
       }}
       pointerEvents="none"
@@ -3630,25 +3553,12 @@ export default function NewRemoteSessionScreen() {
           <Text style={styles.voiceDraftListeningText}>{composerListeningPlaceholder}</Text>
         </View>
       ) : (
-        <View style={styles.voiceDraftMeasuredBlock}>
-          <Text
-            onTextLayout={handleVoiceDraftTextLayout}
-            style={styles.voiceDraftText}
-          >
-            {draft.firstMessage}
+        <View ref={voiceDraftMeasuredBlockRef} collapsable={false} style={styles.voiceDraftMeasuredBlock}>
+          <Text onTextLayout={handleVoiceDraftTextLayout} style={styles.voiceDraftText}>
+            {draft.firstMessage.slice(0, firstMessageSelectionRef.current.end)}
+            <VoiceMicWaveCaret color={colors.textPrimary} testID="newSession.voiceMicCaret" viewRef={voiceDraftCaretRef} />
+            {draft.firstMessage.slice(firstMessageSelectionRef.current.end)}
           </Text>
-          <View
-            pointerEvents="none"
-            style={[
-              styles.voiceDraftCaretOverlay,
-              {
-                left: voiceDraftCaretFrame.left,
-                top: voiceDraftCaretFrame.top,
-              },
-            ]}
-          >
-            <VoiceMicWaveCaret color={colors.textPrimary} testID="newSession.voiceMicCaret" />
-          </View>
         </View>
       )}
     </ScrollView>
@@ -5910,13 +5820,13 @@ export default function NewRemoteSessionScreen() {
                     setComposerVoiceHoldArmed(false);
                   }}
                   onChangeText={setFirstMessageDraft}
+                  onSelectionChange={(event) => {
+                    if (!voiceRecordingActiveRef.current && !voiceStopInFlightRef.current) {
+                      firstMessageSelectionRef.current = event.nativeEvent.selection;
+                    }
+                  }}
                   onContentSizeChange={handleFirstMessageInputContentSizeChange}
                   onFocus={() => setFirstMessageInputFocused(true)}
-                  onSelectionChange={(event) => {
-                    const { start, end } = event.nativeEvent.selection;
-                    firstMessageCaretRef.current = { start, end };
-                    firstMessageCaretDraftRef.current = firstMessageRef.current;
-                  }}
                   onPasteImages={(uris) => void addPastedImageAttachments(uris)}
                   onPasteImagesLoading={beginPastePlaceholders}
                   onPasteImagesLoadFailed={failPastePlaceholders}
@@ -6121,6 +6031,7 @@ export default function NewRemoteSessionScreen() {
         disabled={creating}
         emptyHint={selectedDeviceId ? t('session.new.noModelsAvailable') : t('session.new.selectDeviceFirst')}
         flatOptions={runtimeOptions.modelOptions}
+        providersReady={deviceProviders.ready}
         modelVisibilityOverrides={deviceProviders.modelVisibilityOverrides}
         keyboardAvoidingBehavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         loading={deviceProviders.loading || capabilitiesLoading}
@@ -6845,9 +6756,6 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   voiceDraftMeasuredBlock: {
     minHeight: MOBILE_COMPOSER_INPUT_LINE_HEIGHT,
     position: 'relative',
-  },
-  voiceDraftCaretOverlay: {
-    position: 'absolute',
   },
   // 草稿层的文本档必须与真实 TextInput 完全一致,否则换行位置错开、超出的行被裁在
   // 框外(见 MOBILE_COMPOSER_DRAFT_TEXT_STYLE)。

@@ -74,6 +74,26 @@ export interface MobileVoiceDraftInsertion {
   text: string;
 }
 
+export interface MobileVoiceSelection {
+  start: number;
+  end: number;
+}
+
+export function insertVoiceTranscriptDraftWithRange(
+  current: string,
+  transcript: string,
+  selection: MobileVoiceSelection,
+): { draft: string; insertion: MobileVoiceDraftInsertion | null } {
+  const text = transcript.trim();
+  if (!text) return { draft: current, insertion: null };
+  const start = Math.max(0, Math.min(current.length, selection.start));
+  const end = Math.max(start, Math.min(current.length, selection.end));
+  return {
+    draft: current.slice(0, start) + text + current.slice(end),
+    insertion: { start, end: start + text.length, text },
+  };
+}
+
 /**
  * 录音开始时输入框的光标/选区(plain-text 偏移)。start === end 表示插入点,
  * start < end 表示要替换的选区。
