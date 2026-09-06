@@ -439,6 +439,7 @@ import {
   flushOrphanToolResults,
   getLastAssistantTranscriptUuid,
   getSessionDbAgentKind,
+  getSessionTextSnapshot,
   markAssistantTurnFailed,
   noteSessionAgentKind,
   noteSessionClearBoundary,
@@ -734,6 +735,11 @@ import {
 import { getActiveCatalog, setDiscoveredProviderModels } from '../maker-host/active-catalog.js';
 import { readCompactionPct } from '../maker-host/compaction-settings-store.js';
 import { resolveVerifiedContextWindow } from '../maker-host/catalog-to-descriptors.js';
+import {
+  isModelContextLimitCustomized,
+  readModelContextLimit,
+  writeModelContextLimits,
+} from '../maker-host/model-context-limit-store.js';
 import { refreshXaiMediaModels } from '../maker-host/model-discovery/xai-media.js';
 import { testProviderConnection } from '../maker-host/provider-diagnostics.js';
 import { fetchProviderModels } from '../maker-host/provider-model-fetch.js';
@@ -912,6 +918,7 @@ import { emitSessionCreated } from '../localDb/ipc/sessionCreatedBroadcast.js';
 import { setBusyProbe as setDeviceLinkBusyProbe } from '../device-link/index.js';
 import {
   markRemoteSettingPersistedInsideHandler,
+  setSessionTextSnapshotReader,
   setRemoteReviewInputGuard as setDeviceLinkRemoteReviewInputGuard,
   setRemoteWorkingDirGuard as setDeviceLinkRemoteWorkingDirGuard,
   setRemoteSettingsPersist as setDeviceLinkRemoteSettingsPersist,
@@ -4411,6 +4418,7 @@ export function registerModelVisibilitySyncIpc(): void {
 }
 
 export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions): void {
+  setSessionTextSnapshotReader(getSessionTextSnapshot);
   log.info('registering maker:* IPC handlers');
   const broadcastSessionRuntimeProjection = async (
     sessionId: string,
@@ -5181,6 +5189,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     clearModelPriceOverride,
     stageClearProviderModelPriceOverrides: stageProviderModelPriceOverridesClear,
     broadcastPricingChanged: broadcastReferenceModelPricing,
+    // 上下文上限:不广播 —— 它不改任何已展示的目录字段,只影响**下一次**窗口评估
+    // (resolveVerifiedContextWindow 每次调用现读 store)。写完 renderer 用返回值就地更新。
+    readModelContextLimit: (target) => ({
+      limit: readModelContextLimit(target.agent, target.providerId, target.modelId),
+      isCustomized: isModelContextLimitCustomized(
+        target.agent,
+        target.providerId,
+        target.modelId,
+      ),
+    }),
+    writeModelContextLimit: (targets, limit) => {
+      writeModelContextLimits(targets, limit);
+    },
     // 通用 OAuth（目录 auth.oauth 描述符驱动）：login 成功后 best-effort 拉动态模型发现
     // (additions-only merge 进 active-catalog) 并广播 PROVIDER_CHANGED 让 UI 刷新连接态。
     oauthLogin: async (providerId, isCurrent) => {
