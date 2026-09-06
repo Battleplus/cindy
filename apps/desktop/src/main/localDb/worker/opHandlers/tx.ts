@@ -4,6 +4,7 @@
 import type Database from 'better-sqlite3';
 
 import type { DbTxName } from '../../client/tx/types.js';
+import { computeForkSourceMessagesDigest, type ForkSourceMessage } from '../../forkRecoverySnapshot.js';
 import { normalizeWorkingDirForStorage } from '../../../../shared/workingDir.js';
 import { capImportedToolResultContent } from '../../../../shared/toolResultPersistCap.js';
 import {
@@ -96,6 +97,8 @@ export function tx(db: Database.Database, args: unknown): unknown {
       return imDeleteBindings(db, txArgs);
     case 'im.replaceBinding':
       return imReplaceBinding(db, txArgs);
+    case 'im.rotateSession':
+      return imRotateSession(db, txArgs);
     case 'wechatActivateBindingEpoch':
       return wechatActivateBindingEpoch(db, txArgs);
     case 'wechatCommitPollBatch':
@@ -130,11 +133,153 @@ export function tx(db: Database.Database, args: unknown): unknown {
       return wechatRefreshOutboxContexts(db, txArgs);
     case 'wechatUnbindCleanup':
       return wechatUnbindCleanup(db, txArgs);
+    case 'skillUsage.applyMutation':
+      return skillUsageApplyMutation(db, txArgs);
     case 'session.importShare':
       return sessionImportShare(db, txArgs);
     default:
       throw Object.assign(new Error(`unknown tx: ${name}`), { code: 'UNKNOWN_TX' });
   }
+}
+
+function skillUsageApplyMutation(db: Database.Database, args: unknown): void {
+  const payload = asRecord(args, 'skillUsage.applyMutation args');
+  const kind = expectString(payload.kind, 'kind');
+
+  if (kind === 'persist') {
+    const rawSource = asRecord(payload.source, 'source');
+    const source = {
+      rawFilePath: expectString(rawSource.rawFilePath, 'source.rawFilePath'),
+      analyzerVersion: expectString(rawSource.analyzerVersion, 'source.analyzerVersion'),
+      agentKind: expectString(rawSource.agentKind, 'source.agentKind'),
+      sessionId: expectString(rawSource.sessionId, 'source.sessionId'),
+      sdkSessionId: expectString(rawSource.sdkSessionId, 'source.sdkSessionId'),
+      mtimeMs: expectNumber(rawSource.mtimeMs, 'source.mtimeMs'),
+      sizeBytes: expectNumber(rawSource.sizeBytes, 'source.sizeBytes'),
+      scannedAt: expectNumber(rawSource.scannedAt, 'source.scannedAt'),
+    };
+    const exposures = expectArray(payload.exposures, 'exposures').map((raw, index) => {
+      const row = asRecord(raw, `exposures.${index}`);
+      return {
+        id: expectString(row.id, `exposures.${index}.id`),
+        rawFilePath: expectString(row.rawFilePath, `exposures.${index}.rawFilePath`),
+        rawLineNo: expectNumber(row.rawLineNo, `exposures.${index}.rawLineNo`),
+        sessionId: expectString(row.sessionId, `exposures.${index}.sessionId`),
+        sdkSessionId: expectString(row.sdkSessionId, `exposures.${index}.sdkSessionId`),
+        agentKind: expectString(row.agentKind, `exposures.${index}.agentKind`),
+        skillName: expectString(row.skillName, `exposures.${index}.skillName`),
+        skillPath: nullableString(row.skillPath),
+        skillDocumentHash: nullableString(row.skillDocumentHash),
+        exposureContentHash: expectString(row.exposureContentHash, `exposures.${index}.exposureContentHash`),
+        documentHashSource: expectString(row.documentHashSource, `exposures.${index}.documentHashSource`),
+        source: expectString(row.source, `exposures.${index}.source`),
+        toolUseId: nullableString(row.toolUseId),
+        seenAt: expectNumber(row.seenAt, `exposures.${index}.seenAt`),
+        toolCallCount: expectNumber(row.toolCallCount, `exposures.${index}.toolCallCount`),
+        repeatedToolCallCount: expectNumber(row.repeatedToolCallCount, `exposures.${index}.repeatedToolCallCount`),
+        toolErrorCount: expectNumber(row.toolErrorCount, `exposures.${index}.toolErrorCount`),
+        commandCallCount: expectNumber(row.commandCallCount, `exposures.${index}.commandCallCount`),
+        commandFailureCount: expectNumber(row.commandFailureCount, `exposures.${index}.commandFailureCount`),
+      };
+    });
+
+    const upsertSource = db.prepare(`
+      INSERT INTO skill_usage_sources (
+        raw_file_path, analyzer_version, agent_kind, session_id, sdk_session_id,
+        mtime_ms, size_bytes, last_scanned_at, status, error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL)
+      ON CONFLICT(raw_file_path) DO UPDATE SET
+        analyzer_version = excluded.analyzer_version,
+        agent_kind = excluded.agent_kind,
+        session_id = excluded.session_id,
+        sdk_session_id = excluded.sdk_session_id,
+        mtime_ms = excluded.mtime_ms,
+        size_bytes = excluded.size_bytes,
+        last_scanned_at = excluded.last_scanned_at,
+        status = 'ok',
+        error = NULL
+    `);
+    const deleteExposure = db.prepare(
+      'DELETE FROM skill_usage_exposures WHERE raw_file_path = ? AND analyzer_version = ?',
+    );
+    const insertExposure = db.prepare(`
+      INSERT INTO skill_usage_exposures (
+        id, analyzer_version, raw_file_path, raw_line_no, session_id, sdk_session_id, agent_kind,
+        skill_name, skill_path, skill_document_hash, exposure_content_hash, document_hash_source,
+        source, tool_use_id, seen_at, tool_call_count, repeated_tool_call_count,
+        tool_error_count, command_call_count, command_failure_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    db.transaction(() => {
+      upsertSource.run(
+        source.rawFilePath,
+        source.analyzerVersion,
+        source.agentKind,
+        source.sessionId,
+        source.sdkSessionId,
+        source.mtimeMs,
+        source.sizeBytes,
+        source.scannedAt,
+      );
+      deleteExposure.run(source.rawFilePath, source.analyzerVersion);
+      for (const exposure of exposures) {
+        insertExposure.run(
+          `${source.analyzerVersion}:${exposure.id}`,
+          source.analyzerVersion,
+          exposure.rawFilePath,
+          exposure.rawLineNo,
+          exposure.sessionId,
+          exposure.sdkSessionId,
+          exposure.agentKind,
+          exposure.skillName,
+          exposure.skillPath,
+          exposure.skillDocumentHash,
+          exposure.exposureContentHash,
+          exposure.documentHashSource,
+          exposure.source,
+          exposure.toolUseId,
+          exposure.seenAt,
+          exposure.toolCallCount,
+          exposure.repeatedToolCallCount,
+          exposure.toolErrorCount,
+          exposure.commandCallCount,
+          exposure.commandFailureCount,
+        );
+      }
+    })();
+    return;
+  }
+
+  if (kind === 'deleteBefore') {
+    const analyzerVersion = expectString(payload.analyzerVersion, 'analyzerVersion');
+    const recentSince = expectNumber(payload.recentSince, 'recentSince');
+    db.transaction(() => {
+      db.prepare(
+        'DELETE FROM skill_usage_exposures WHERE analyzer_version = ? AND seen_at < ?',
+      ).run(analyzerVersion, recentSince);
+      db.prepare(`
+        DELETE FROM skill_usage_sources
+        WHERE analyzer_version = ? AND mtime_ms < ?
+          AND raw_file_path NOT IN (SELECT raw_file_path FROM skill_usage_exposures)
+      `).run(analyzerVersion, recentSince);
+    })();
+    return;
+  }
+
+  if (kind === 'promote') {
+    const analyzerVersion = expectString(payload.analyzerVersion, 'analyzerVersion');
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO migration_meta (key, value)
+        VALUES ('skill_usage_analyzer_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(analyzerVersion);
+      db.prepare('DELETE FROM skill_usage_exposures WHERE analyzer_version <> ?').run(analyzerVersion);
+    })();
+    return;
+  }
+
+  throw invalidArgs(`unknown skill usage mutation: ${kind}`);
 }
 
 /** Remove every stale startup binding as one all-or-nothing repair. */
@@ -230,7 +375,7 @@ function sessionAgentSwitchFallback(db: Database.Database, args: unknown): void 
   transaction();
 }
 
-/** 同一任务换干净原生会话：清 sdk_session_id + 追加隐藏 context_rebuild，不改可见消息。 */
+/** 同一任务换干净原生会话：清 SDK/旧用量 + 追加隐藏 context_rebuild，不改可见消息。 */
 function contextRebuild(db: Database.Database, args: unknown): void {
   const payload = asRecord(args, 'context.rebuild args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
@@ -244,11 +389,18 @@ function contextRebuild(db: Database.Database, args: unknown): void {
       ? null
       : expectNumber(payload.expectedClearedAt, 'expectedClearedAt');
   const transaction = db.transaction(() => {
-    const sessionResult = db
-      .prepare(
-        'UPDATE sessions SET sdk_session_id = NULL, updated_at = ?, list_message_count = NULL WHERE id = ? AND ifnull(cleared_at, -1) = ifnull(?, -1)',
-      )
-      .run(updatedAt, sessionId, expectedClearedAt);
+    const replacement = payload.replacementRoute === undefined
+      ? null : asRecord(payload.replacementRoute, 'replacementRoute');
+    const sessionResult = replacement
+      ? db.prepare(
+          'UPDATE sessions SET sdk_session_id = NULL, context_tokens = 0, updated_at = ?, list_message_count = NULL, model = ?, provider_id = ?, effort = COALESCE(?, effort), fast_mode = ? WHERE id = ? AND ifnull(cleared_at, -1) = ifnull(?, -1) AND sdk_session_id = ? AND status != ?',
+        ).run(updatedAt, expectString(replacement.model, 'replacementRoute.model'),
+          nullableString(replacement.providerId), nullableString(replacement.effort),
+          replacement.fastMode === true ? 1 : 0, sessionId, expectedClearedAt,
+          expectString(replacement.expectedSdkSessionId, 'replacementRoute.expectedSdkSessionId'), 'deleted')
+      : db.prepare(
+          'UPDATE sessions SET sdk_session_id = NULL, context_tokens = 0, updated_at = ?, list_message_count = NULL WHERE id = ? AND ifnull(cleared_at, -1) = ifnull(?, -1)',
+        ).run(updatedAt, sessionId, expectedClearedAt);
     if (sessionResult.changes !== 1) {
       throw Object.assign(new Error(`Session missing or clear-boundary changed: ${sessionId}`), {
         code: 'PRECONDITION_FAILED',
@@ -852,6 +1004,77 @@ function compactSessionToolResults(
   })();
 }
 
+function imRotateSession(
+  db: Database.Database,
+  args: unknown,
+): { previousStatus: 'active' | 'archived' | 'deleted' | null } {
+  const payload = asRecord(args, 'im.rotateSession args');
+  const session = asRecord(payload.session, 'im.rotateSession session');
+  const previousSessionId = nullableString(payload.previousSessionId);
+  const detachBinding = payload.detachBinding === null
+    ? null
+    : asRecord(payload.detachBinding, 'im.rotateSession detachBinding');
+  const now = expectNumber(payload.now, 'now');
+  const readPrevious = db.prepare('SELECT status FROM sessions WHERE id = ? LIMIT 1');
+  const insertCurrent = db.prepare(
+    `INSERT INTO sessions (
+      id, title, working_dir, workspace_kind, model, effort, permission_mode,
+      fast_mode, status, agent_kind, provider_id, source, im_bot_context_id,
+      im_user_id, created_at, updated_at, user_send_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const retirePrevious = db.prepare(
+    `UPDATE sessions
+     SET status = CASE WHEN status = 'deleted' THEN 'deleted' ELSE 'archived' END,
+         im_bot_context_id = NULL,
+         im_user_id = NULL,
+         updated_at = ?
+     WHERE id = ?`,
+  );
+  const deleteBinding = db.prepare(
+    `DELETE FROM im_bindings
+     WHERE channel = ? AND bot_context_id = ? AND user_id = ? AND scope_key = ?
+       AND target_session_id = ?`,
+  );
+  return db.transaction(() => {
+    const previous = previousSessionId === null
+      ? undefined
+      : readPrevious.get(previousSessionId) as { status: string } | undefined;
+    insertCurrent.run(
+      expectString(session.id, 'session.id'),
+      expectString(session.title, 'session.title'),
+      expectString(session.workingDir, 'session.workingDir'),
+      expectString(session.workspaceKind, 'session.workspaceKind'),
+      expectString(session.model, 'session.model'),
+      expectString(session.effort, 'session.effort'),
+      expectString(session.permissionMode, 'session.permissionMode'),
+      session.fastMode === true ? 1 : 0,
+      expectString(session.agentKind, 'session.agentKind'),
+      nullableString(session.providerId),
+      expectString(session.source, 'session.source'),
+      expectString(session.imBotContextId, 'session.imBotContextId'),
+      expectString(session.imUserId, 'session.imUserId'),
+      now,
+      now,
+      now,
+    );
+    if (previousSessionId !== null) retirePrevious.run(now, previousSessionId);
+    if (detachBinding !== null) {
+      deleteBinding.run(
+        expectString(detachBinding.channel, 'detachBinding.channel'),
+        expectString(detachBinding.botContextId, 'detachBinding.botContextId'),
+        expectString(detachBinding.userId, 'detachBinding.userId'),
+        expectString(detachBinding.scopeKey, 'detachBinding.scopeKey'),
+        expectString(detachBinding.targetSessionId, 'detachBinding.targetSessionId'),
+      );
+    }
+    const status = previous?.status;
+    const previousStatus: 'active' | 'archived' | 'deleted' | null =
+      status === 'active' || status === 'archived' || status === 'deleted' ? status : null;
+    return { previousStatus };
+  })();
+}
+
 function codexImportMessages(db: Database.Database, args: unknown): { changed: number } {
   const payload = asRecord(args, 'codex.importMessages args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
@@ -1366,6 +1589,9 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
   const targetRowid = nullableNumber(payload.targetRowid);
   const newSession = asRecord(payload.newSession, 'newSession');
   const uuidMap = normalizeUuidMap(payload.uuidMap);
+  const nativeForkAnchorSessionMap = normalizeNativeForkAnchorSessionMap(
+    payload.nativeForkAnchorSessionMap,
+  );
   const legacyTranscriptParentUuids = normalizeStringSet(
     payload.legacyTranscriptParentUuids,
     'legacyTranscriptParentUuids',
@@ -1374,46 +1600,39 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
   const detachAgentSwitchSessions = payload.detachAgentSwitchSessions === true;
   const resetHandoffBoundaryClientId = nullableString(payload.resetHandoffBoundaryClientId);
   const newMessageIds = normalizeNewMessageIds(payload.newMessageIds);
-  const sourceMessages = db
-    .prepare(
-      `SELECT client_id, role, content, tool_use_id, agent_meta, agent_kind, created_at
-       FROM messages
-      WHERE session_id = ?
-        AND (? IS NULL OR created_at > ?)
-        AND (
-          created_at < ?
-          OR (? IS NOT NULL AND created_at = ? AND rowid < ?)
-        )
-        AND rewind_at IS NULL
-      ORDER BY created_at ASC, rowid ASC`,
-  ).all(
-    sourceSessionId,
-    sourceClearedAt,
-    sourceClearedAt,
-    targetCreatedAt,
-    targetRowid,
-    targetCreatedAt,
-    targetRowid,
-  ) as Array<{
-    client_id: string;
-    role: string;
-    content: string;
-    tool_use_id: string | null;
-    agent_meta: string | null;
-    agent_kind: string | null;
-    created_at: number;
-  }>;
-  if (newMessageIds.length !== sourceMessages.length) {
-    throw invalidArgs(
-      `newMessageIds length mismatch: expected ${sourceMessages.length}, got ${newMessageIds.length}`,
-    );
-  }
   const insertMessage = db.prepare(
     `INSERT INTO messages
       (id, client_id, session_id, role, content, tool_use_id, agent_meta, agent_kind, created_at, rewind_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
   );
   const transaction = db.transaction(() => {
+    if (payload.recoveryMarker != null && !db.prepare(
+      'SELECT 1 FROM sessions WHERE id = ? AND cleared_at IS ?',
+    ).get(sourceSessionId, sourceClearedAt)) {
+      throw invalidArgs('Source history changed while preparing recovery fork');
+    }
+    const sourceMessages = db.prepare(
+      `SELECT client_id, role, content, tool_use_id, agent_meta, agent_kind, created_at
+       FROM messages
+       WHERE session_id = ?
+         AND (? IS NULL OR created_at > ?)
+         AND (created_at < ? OR (? IS NOT NULL AND created_at = ? AND rowid < ?))
+         AND rewind_at IS NULL
+       ORDER BY created_at ASC, rowid ASC`,
+    ).all(sourceSessionId, sourceClearedAt, sourceClearedAt, targetCreatedAt,
+      targetRowid, targetCreatedAt, targetRowid) as ForkSourceMessage[];
+    if (payload.recoveryMarker != null) {
+      const marker = asRecord(payload.recoveryMarker, 'recoveryMarker');
+      if (computeForkSourceMessagesDigest(sourceMessages)
+        !== expectString(marker.sourceMessagesDigest, 'recoveryMarker.sourceMessagesDigest')) {
+        throw invalidArgs('Source history changed while preparing recovery fork');
+      }
+    }
+    if (newMessageIds.length !== sourceMessages.length) {
+      throw invalidArgs(
+        `newMessageIds length mismatch: expected ${sourceMessages.length}, got ${newMessageIds.length}`,
+      );
+    }
     db.prepare(
       `INSERT INTO sessions (
         id, title, working_dir, model, provider_id, effort, permission_mode, status,
@@ -1466,19 +1685,44 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
           resetHandoffBoundaryClientId,
         }),
         message.tool_use_id,
-        remapAgentMetaUuid(
+        remapForkedAgentMeta(
           message.agent_meta,
           uuidMap,
           legacyTranscriptParentUuids,
           toolParentUuids,
+          nativeForkAnchorSessionMap,
         ),
         message.agent_kind,
         message.created_at,
       );
     }
+    if (payload.recoveryMarker != null) {
+      const marker = asRecord(payload.recoveryMarker, 'recoveryMarker');
+      db.prepare(
+        "INSERT INTO messages (id, client_id, session_id, role, content, agent_kind, created_at, rewind_at) VALUES (?, ?, ?, 'context_rebuild', ?, ?, ?, ?)",
+      ).run(
+        expectString(marker.id, 'recoveryMarker.id'),
+        expectString(marker.clientId, 'recoveryMarker.clientId'),
+        expectString(newSession.id, 'newSession.id'),
+        expectString(marker.content, 'recoveryMarker.content'),
+        expectString(newSession.agentKind, 'newSession.agentKind'),
+        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
+        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
+      );
+      const content = asRecord(JSON.parse(expectString(marker.content, 'recoveryMarker.content')), 'recoveryMarker content');
+      insertMessage.run(
+        expectString(marker.id, 'recoveryMarker.id') + ':card',
+        expectString(marker.clientId, 'recoveryMarker.clientId') + ':card',
+        expectString(newSession.id, 'newSession.id'),
+        'assistant', '', null,
+        JSON.stringify({ contextRebuild: { reason: content.reason, handoff: content.handoff } }),
+        expectString(newSession.agentKind, 'newSession.agentKind'),
+        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
+      );
+    }
+    return { messageCount: sourceMessages.length };
   });
-  transaction();
-  return { messageCount: sourceMessages.length };
+  return transaction();
 }
 
 /** 复制边界只保留可见语义；vendor session 绑定必须属于父分支。 */
@@ -1729,6 +1973,9 @@ function embeddingRecordFailures(db: Database.Database, args: unknown): { failCo
   const jobs = expectArray(payload.jobs, 'jobs');
   const errMsg = truncate(expectString(payload.errMsg, 'errMsg'), 2000);
   const now = expectNumber(payload.now, 'now');
+  // #3416:确定性失败(如 INVALID_MODEL)重试永远不可能成功,terminal=true 时
+  // 整批直接进 'failed' 终态,不再烧 5 次退避尝试。缺省 false 保持旧语义。
+  const terminal = payload.terminal === true;
   const updReschedule = db.prepare(
     `UPDATE embedding_jobs
         SET attempts = ?, last_error = ?, scheduled_at = ?
@@ -1745,7 +1992,7 @@ function embeddingRecordFailures(db: Database.Database, args: unknown): { failCo
       const job = asRecord(rawJob, 'failure job');
       const rowid = expectNumber(job.rowid, 'job.rowid');
       const nextAttempts = expectNumber(job.attempts, 'job.attempts') + 1;
-      if (nextAttempts >= MAX_ATTEMPTS) {
+      if (terminal || nextAttempts >= MAX_ATTEMPTS) {
         updFail.run(nextAttempts, errMsg, rowid);
         failCount++;
       } else {
@@ -2200,11 +2447,12 @@ function extractContentText(content: unknown): string {
   return parts.join('\n\n');
 }
 
-function remapAgentMetaUuid(
+function remapForkedAgentMeta(
   raw: string | null,
   map: Map<string, string>,
   legacyTranscriptParentUuids: Set<string> = new Set(),
   toolParentUuids: Set<string> = new Set(),
+  nativeForkAnchorSessionMap: Map<string, string> = new Map(),
 ): string | null {
   if (!raw || raw === 'null') return raw;
   let parsed: Record<string, unknown>;
@@ -2238,6 +2486,19 @@ function remapAgentMetaUuid(
     if (mapped) next.transcriptParentUuid = mapped;
     else delete next.transcriptParentUuid;
   }
+  const nativeForkAnchor = next.nativeForkAnchor;
+  if (
+    next.turnCompleted === true &&
+    isRecord(nativeForkAnchor) &&
+    nativeForkAnchor.agentKind === 'codex' &&
+    nativeForkAnchor.kind === 'turn' &&
+    typeof nativeForkAnchor.id === 'string' &&
+    nativeForkAnchor.id &&
+    typeof nativeForkAnchor.sdkSessionId === 'string'
+  ) {
+    const mapped = nativeForkAnchorSessionMap.get(nativeForkAnchor.sdkSessionId);
+    if (mapped) next.nativeForkAnchor = { ...nativeForkAnchor, sdkSessionId: mapped };
+  }
   return JSON.stringify(next);
 }
 
@@ -2247,17 +2508,32 @@ function normalizeStringSet(value: unknown, label: string): Set<string> {
 }
 
 function normalizeUuidMap(value: unknown): Map<string, string> {
+  return normalizeStringMap(value, 'uuidMap');
+}
+
+function normalizeNativeForkAnchorSessionMap(value: unknown): Map<string, string> {
+  return value === undefined
+    ? new Map()
+    : normalizeStringMap(value, 'nativeForkAnchorSessionMap');
+}
+
+function normalizeStringMap(value: unknown, label: string): Map<string, string> {
   if (Array.isArray(value)) {
     return new Map(
       value.map((entry) => {
-        if (!Array.isArray(entry) || entry.length !== 2) throw invalidArgs('uuidMap entries must be pairs');
-        return [expectString(entry[0], 'uuidMap.key'), expectString(entry[1], 'uuidMap.value')];
+        if (!Array.isArray(entry) || entry.length !== 2) {
+          throw invalidArgs(`${label} entries must be pairs`);
+        }
+        return [
+          expectString(entry[0], `${label}.key`),
+          expectString(entry[1], `${label}.value`),
+        ];
       }),
     );
   }
-  const record = asRecord(value, 'uuidMap');
+  const record = asRecord(value, label);
   return new Map(
-    Object.entries(record).map(([key, mapped]) => [key, expectString(mapped, `uuidMap.${key}`)]),
+    Object.entries(record).map(([key, mapped]) => [key, expectString(mapped, `${label}.${key}`)]),
   );
 }
 

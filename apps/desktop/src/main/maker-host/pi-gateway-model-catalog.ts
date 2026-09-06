@@ -37,6 +37,8 @@ const gatewayModelIdsByApi: Record<PiModelApi, ReadonlySet<string>> = {
     'anthropic/claude-opus-5',
   ]),
   'openai-responses': new Set([
+    'gpt-6-astra',
+    'codex/gpt-6-astra',
     'gpt-5.4',
     'gpt-5.4-mini',
     'gpt-5.4-nano',
@@ -72,6 +74,7 @@ const gatewayModelIdsByApi: Record<PiModelApi, ReadonlySet<string>> = {
     'z-ai/glm-5.2',
     'z-ai/glm-5.3',
     'z-ai/glm-5.3-flash',
+    'z-ai/glm-5.3-highspeed',
   ]),
   'google-generative-ai': new Set([
     'gemini-3-flash-preview',
@@ -194,6 +197,7 @@ const gatewayCatalogIdentityOverrides = new Map<string, { provider: string; mode
     'gpt-5.6-luna',
     'gpt-5.6-sol',
     'gpt-5.6-terra',
+    'gpt-6-astra',
   ].flatMap((id) => [
     [id, { provider: 'openai', modelId: id }] as const,
     [`codex/${id}`, { provider: 'openai', modelId: id }] as const,
@@ -216,7 +220,7 @@ const gatewayCatalogIdentityOverrides = new Map<string, { provider: string; mode
   ...['qwen3.7-max', 'qwen3.8-27b', 'qwen3.8-flash', 'qwen3.8-max'].map(
     (id) => [`qwen/${id}`, { provider: 'qwen-token-plan-cn', modelId: id }] as const,
   ),
-  ...['glm-5.1', 'glm-5.2', 'glm-5.3', 'glm-5.3-flash'].map(
+  ...['glm-5.1', 'glm-5.2', 'glm-5.3', 'glm-5.3-flash', 'glm-5.3-highspeed'].map(
     (id) => [`z-ai/${id}`, { provider: 'zai', modelId: id }] as const,
   ),
   ...['grok-4.5', 'grok-4.6'].flatMap((id) => [

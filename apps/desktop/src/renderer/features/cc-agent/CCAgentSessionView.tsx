@@ -30,7 +30,11 @@ import {
   isCodexResumeNotReadyProjectionError,
   type AgentInputReference,
 } from '@cindy/maker-shared/agent-input-projection';
-import { connectedProvidersForAgent, providerOffersModel } from '@cindy/model-providers';
+import {
+  connectedProvidersForAgent,
+  EFFORT_VALUES,
+  providerOffersModel,
+} from '@cindy/model-providers';
 import type { SubagentRunsListResponse } from '@cindy/maker-shared/subagent-workspace';
 import { useProportionalWidth } from '@/hooks/useProportionalWidth';
 import {
@@ -60,6 +64,7 @@ import { useStopOrcaCollab } from './hooks/useStopOrcaCollab';
 import { useWorkerProjection, useWorkerProjectionOwner } from './hooks/workerProjectionStore';
 import { CreateWorkerPopover, type CreateWorkerForm } from './CreateWorkerPopover';
 import { createWorkerLabel } from './workerLabel';
+import { setModelWithWindowConfirmation } from './lib/modelWindowConfirmation';
 import { TakeoverMask } from '@/components/new-chat/TakeoverMask';
 import { WorktreeCreatingOverlay } from '@/components/new-chat/WorktreeCreatingOverlay';
 import { PermissionPrompt } from '@/components/new-chat/PermissionPrompt';
@@ -90,8 +95,9 @@ import { ErrorBanner } from '@/components/chat/ErrorBanner';
 import {
   ErrorTailErrorBanner,
   InterruptedTurnBanner,
-  UnreadFailedScheduleBanner,
 } from '@/components/chat/InterruptedTurnBanner';
+import { UnreadFailedScheduleBanner } from '@/components/chat/UnreadFailedScheduleBanner';
+import { useReadFailedScheduleRuns } from '@/features/scheduler/hooks/useReadFailedScheduleRuns';
 import { useAutomationScheduleSessionInfo } from './hooks/useAutomationScheduleSessionIndex';
 import { markScheduleRunsReadAndSync } from '../scheduler/lib/scheduleRunReadSync';
 import { useBackgroundBashTasks } from '@/hooks/useBackgroundBashTasks';
@@ -214,6 +220,7 @@ import { useSessionHardwareTaskActions } from './lib/sessionHardwareTaskActions'
 import { isRemoteSessionWriteBlocked } from './lib/remoteSessionWriteGuard';
 import { getModelById, getDefaultModelForVendor, getModelsForVendor } from '@/lib/modelDefinitions';
 import { resolveDisplayContextWindow } from '@/lib/contextWindow';
+import { resolveSessionContextWindow } from '../../../shared/sessionContextWindow';
 import { formatRunningTokenCount, resolveRunningUsageMeta } from './lib/runningTokenUsage';
 import { matchNavigationCommandName, tryHandleNavigationCommand } from '@/lib/navigationCommands';
 import { extractIpcError } from '@/utils/ipcError';
@@ -569,7 +576,8 @@ function summarizeRunningWorkflow(taskUpdates: ReadonlyMap<string, AgentTaskUpda
   let latestTs = Number.NEGATIVE_INFINITY;
   const seen = new Set<AgentTaskUpdate>();
   for (const update of taskUpdates.values()) {
-    if (update.taskType !== 'local_workflow' || update.status !== 'running' || seen.has(update)) continue;
+    if (update.taskType !== 'local_workflow' || update.status !== 'running' || seen.has(update))
+      continue;
     seen.add(update);
     const timestamp = Date.parse(update.updatedAt ?? update.createdAt ?? '');
     if ((Number.isFinite(timestamp) ? timestamp : 0) >= latestTs) {
@@ -578,7 +586,9 @@ function summarizeRunningWorkflow(taskUpdates: ReadonlyMap<string, AgentTaskUpda
     }
   }
   if (!workflow) return null;
-  const agents = (workflow.workflowProgress ?? []).filter((entry) => entry.type === 'workflow_agent');
+  const agents = (workflow.workflowProgress ?? []).filter(
+    (entry) => entry.type === 'workflow_agent',
+  );
   if (agents.length === 0) return { done: 0, total: 0 };
   return {
     done: agents.filter((entry) => {
@@ -1726,10 +1736,7 @@ export function CCAgentSessionView({
     return subscribeWorkLouderCodexAction((action) => {
       if (action.type !== 'command') return false;
       if (!sessionId || !ownsHardwareTaskActions) return false;
-      if (
-        action.commandId === 'approval.approve' ||
-        action.commandId === 'composer.submit'
-      ) {
+      if (action.commandId === 'approval.approve' || action.commandId === 'composer.submit') {
         if (pendingPermission) {
           respondToPermission({ behavior: 'allow' });
           return true;
@@ -1740,10 +1747,7 @@ export function CCAgentSessionView({
         }
         return false;
       }
-      if (
-        action.commandId === 'approval.decline' ||
-        action.commandId === 'navigateBack'
-      ) {
+      if (action.commandId === 'approval.decline' || action.commandId === 'navigateBack') {
         if (pendingPermission) {
           respondToPermission({
             behavior: 'deny',
@@ -1899,12 +1903,11 @@ export function CCAgentSessionView({
     () => (isRemoteSession || remoteDeviceId ? null : summarizeRunningWorkflow(taskUpdates)),
     [isRemoteSession, remoteDeviceId, taskUpdates],
   );
-  const composerStatus =
-    runningWorkflow
-      ? runningWorkflow.total > 0
-        ? t('ccAgent.agentStatus.waitingWorkflowProgress', runningWorkflow)
-        : t('ccAgent.agentStatus.waitingWorkflow')
-      : agentStatus.status;
+  const composerStatus = runningWorkflow
+    ? runningWorkflow.total > 0
+      ? t('ccAgent.agentStatus.waitingWorkflowProgress', runningWorkflow)
+      : t('ccAgent.agentStatus.waitingWorkflow')
+    : agentStatus.status;
 
   // error-tail-banner:会话尾部停在未忽略的 role='error' 行 → 输入框上方显示
   // 可操作红条(与 live ErrorBanner 同风格;2026-07-05 产品决策统一——所有尾部
@@ -1917,6 +1920,7 @@ export function CCAgentSessionView({
   const scheduleSessionInfo = useAutomationScheduleSessionInfo(sessionId);
   const unreadFailedScheduleRunIds =
     scheduleSessionInfo?.unreadFailedRunIds ?? EMPTY_UNREAD_FAILED_RUN_IDS;
+  useReadFailedScheduleRuns(unreadFailedScheduleRunIds, viewVisible && historyLoaded);
   const currentUnreadFailedRunId =
     scheduleSessionInfo?.latestUnreadFailedRunId ?? unreadFailedScheduleRunIds[0];
   const markCurrentUnreadFailedScheduleRun = useCallback(async (): Promise<boolean> => {
@@ -1930,9 +1934,6 @@ export function CCAgentSessionView({
     );
     return false;
   }, [currentUnreadFailedRunId, t]);
-  const handleUnreadFailedScheduleDismiss = useCallback(() => {
-    void markCurrentUnreadFailedScheduleRun();
-  }, [markCurrentUnreadFailedScheduleRun]);
   const errorTailMsg = useMemo(() => {
     const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
     return last &&
@@ -2053,8 +2054,9 @@ export function CCAgentSessionView({
       // (main 侧 merge dismissed:true,不丢 sdkError 等原字段)。落库失败会回滚乐观态。
       // 必须**等落库完成**再重算:dismiss 落库无广播,而告警查询是纯 DB 读,
       // 抢在写入前读会仍判定告警存在 —— 横幅已熄灭、红点却卡住。
-      return makerChatStore.dismissErrorTailMessage(sessionId, errorTailMsg.clientId).then(
-        (persisted) => {
+      return makerChatStore
+        .dismissErrorTailMessage(sessionId, errorTailMsg.clientId)
+        .then((persisted) => {
           // device-link 远程会话:dismiss 经隧道写到**被控端** DB,控制端本机库里没有
           // 这个会话的行,派生腿查不到、也从未认领它 —— 必须显式 ack(explicit 清本机
           // 角标 + 隧道回执清被控端未读)。删掉展示型 ack 后这是唯一的清除路径。
@@ -2063,8 +2065,7 @@ export function CCAgentSessionView({
           // 本机会话由下面的重算收敛,不重复 ack。
           if (persisted && remoteDeviceId) ackErrorAlertHandled(sessionId);
           return refreshPendingAlerts();
-        },
-      );
+        });
     });
   }, [errorTailMsg, markCurrentUnreadFailedScheduleRun, remoteDeviceId, sessionId]);
   // interrupted-turn-resume(简化版):「疑似中断」由 session 行的双时间戳驱动
@@ -2883,11 +2884,11 @@ export function CCAgentSessionView({
     [sessionId, session?.writableDirs, refreshServerSession, t],
   );
 
-  const writableDirRemovalQueueRef = useRef<ReturnType<typeof createWritableDirRemovalQueue> | null>(
-    null,
-  );
-  const writableDirRemovalQueue =
-    (writableDirRemovalQueueRef.current ??= createWritableDirRemovalQueue());
+  const writableDirRemovalQueueRef = useRef<ReturnType<
+    typeof createWritableDirRemovalQueue
+  > | null>(null);
+  const writableDirRemovalQueue = (writableDirRemovalQueueRef.current ??=
+    createWritableDirRemovalQueue());
   const handleWritableDirRemove = useCallback(
     async (path: string) => {
       if (!sessionId) return;
@@ -3599,6 +3600,7 @@ export function CCAgentSessionView({
     try {
       const contextWindow = resolveDisplayContextWindow({
         sdkContextWindow: agentStatus.contextWindow,
+        verifiedContextWindow: resolveSessionContextWindow({ providers }, sourceSession),
         modelContextWindow: getModelContextWindow(
           sourceSession.model,
           sourceSession.agentKind ?? 'cc',
@@ -3680,6 +3682,7 @@ export function CCAgentSessionView({
     compactRequestGuard,
     compactSession,
     confirmDialog,
+    providers,
     remoteDeviceId,
     session,
     t,
@@ -3714,27 +3717,74 @@ export function CCAgentSessionView({
     if (!sessionId || !session || !canSwitchToClaudeSubscription) return;
     const model = session.model;
     const previousProviderId = session.providerId ?? null;
+    const retryEffort =
+      typeof session.effort === 'string' &&
+      (EFFORT_VALUES as readonly string[]).includes(session.effort)
+        ? session.effort
+        : null;
+    const fmtTokens = (value: number): string =>
+      value >= 1_000_000
+        ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+        : `${Math.round(value / 1000)}K`;
 
-    await window.electronAPI.maker.setModel(sessionId, model, 'anthropic');
-    try {
-      await sessionService.update(sessionId, {
-        model,
-        providerId: 'anthropic',
-      });
-    } catch (error) {
-      // runtime route 已先切换；若持久化失败就回滚，避免当前进程与 DB 对同一会话
-      // 产生两个 provider 真源。
-      await window.electronAPI.maker
-        .setModel(sessionId, model, previousProviderId)
-        .catch((rollbackError) => {
-          log.warn('Claude subscription recovery rollback failed', rollbackError);
+    const switched = await setModelWithWindowConfirmation({
+      invoke: (confirmedContextWindow) =>
+        window.electronAPI.maker.setModel(
+          sessionId,
+          model,
+          'anthropic',
+          undefined,
+          confirmedContextWindow
+            ? ({
+                effort: retryEffort,
+                fastMode,
+                confirmedContextWindow,
+              } as { effort: string; fastMode: boolean })
+            : undefined,
+        ),
+      confirm: ({ contextWindow, contextTokens }) =>
+        confirmDialog({
+          title: t('newChat.chatInput.modelSwitchContextGuard.title'),
+          description: t('newChat.chatInput.modelSwitchContextGuard.overflowDescription', {
+            used: fmtTokens(contextTokens),
+            total: fmtTokens(contextWindow),
+            pct: Math.round((contextTokens / contextWindow) * 100),
+          }),
+          confirmText: t('newChat.chatInput.modelSwitchContextGuard.confirmSwitch'),
+          cancelText: t('newChat.chatInput.modelSwitchContextGuard.cancelSwitch'),
+        }),
+    });
+    if (!switched) return;
+    if (switched === 'applied') {
+      try {
+        await sessionService.update(sessionId, {
+          model,
+          providerId: 'anthropic',
         });
-      throw error;
+      } catch (error) {
+        // runtime route 已先切换；若持久化失败就回滚，避免当前进程与 DB 对同一会话
+        // 产生两个 provider 真源。确认后的原子重试已由 Main 持久化，不走此分支。
+        await window.electronAPI.maker
+          .setModel(sessionId, model, previousProviderId)
+          .catch((rollbackError) => {
+            log.warn('Claude subscription recovery rollback failed', rollbackError);
+          });
+        throw error;
+      }
     }
 
     await refreshServerSession();
     await retryLastError();
-  }, [canSwitchToClaudeSubscription, refreshServerSession, retryLastError, session, sessionId]);
+  }, [
+    canSwitchToClaudeSubscription,
+    confirmDialog,
+    fastMode,
+    refreshServerSession,
+    retryLastError,
+    session,
+    sessionId,
+    t,
+  ]);
 
   const handleSilentStopContinue = useCallback(() => {
     continueAfterSilentStop();
@@ -4469,6 +4519,11 @@ export function CCAgentSessionView({
             issue={remoteLinkIssue}
             onResync={remoteSync.resync}
           />
+        ) : remoteConn === 'connected' ? (
+          <RemoteSessionBanner
+            status={remoteSync.contentState === 'ready' ? 'recovered' : 'syncing'}
+            onResync={remoteSync.resync}
+          />
         ) : null}
 
         {/* 远程会话首屏:等被控端经隧道返回历史/元数据期间的 loading(仅远程、延迟防闪)。 */}
@@ -4708,7 +4763,7 @@ export function CCAgentSessionView({
 
             {!errorTailMsg &&
               !interruptedFromSession &&
-              unreadFailedScheduleRunIds.length > 0 &&
+              scheduleSessionInfo?.hasFailedRun &&
               !syntheticContinuationPending &&
               !error &&
               !credentialSwitchWait &&
@@ -4716,7 +4771,7 @@ export function CCAgentSessionView({
               !agentStatus.isRunning &&
               sessionId && (
                 <UnreadFailedScheduleBanner
-                  onDismiss={handleUnreadFailedScheduleDismiss}
+                  key={sessionId}
                   style={{ width: inputWidth }}
                   className="py-1"
                 />
@@ -4925,6 +4980,8 @@ export function CCAgentSessionView({
                   // session=null 是冷启动 / 直链 GET 尚未回流的合法首帧；显式传 null，
                   // 让 ChatInput 暂不显示 Agent 身份，不能跟随 displayAgentKind 的 cc 回退。
                   runtimeAgentKind={session ? dbToMakerAgentKind(session.agentKind) : null}
+                  runtimeEffective={session?.runtimeEffective}
+                  runtimePending={session?.runtimePending}
                   // 协同会话不参与跨引擎切换；session 未加载时保留 undefined 未知态，
                   // 仅在完整元数据确认非 Orca 后传 null 开放入口。
                   sessionOrcaRole={session ? (session.orcaRole ?? null) : undefined}
@@ -5163,6 +5220,16 @@ export function CCAgentSessionView({
                     model={agentSwitchIntent?.model ?? session?.model ?? ''}
                     vendorKey={normalizeDbAgentKind(displayAgentKind)}
                     sdkContextWindow={agentStatus.contextWindow}
+                    verifiedContextWindow={resolveSessionContextWindow(
+                      { providers },
+                      {
+                        agentKind: normalizeDbAgentKind(displayAgentKind),
+                        model: agentSwitchIntent?.model ?? session?.model,
+                        providerId: agentSwitchIntent
+                          ? agentSwitchIntent.providerId
+                          : session?.providerId,
+                      },
+                    )}
                     deviceId={remoteDeviceId}
                     onCompact={
                       // 按 agent 能力分流(#1927/#1933 review):claude-code 走 inputCoordinator,
@@ -5282,7 +5349,7 @@ function HandoffSourcePill({
     <div
       className={cn(
         'flex h-10 w-full items-center rounded-[12px] border border-[var(--cmd-palette-border)] bg-[hsl(var(--content-area))]',
-        'text-13 leading-none text-[#595959]',
+        'text-13 leading-none text-muted-foreground',
       )}
     >
       <button
@@ -5304,7 +5371,7 @@ function HandoffSourcePill({
         aria-label={t('ccAgent.handoff.pill.dismissAria')}
         className={cn(
           'mr-2 flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px]',
-          'text-[#595959] transition-colors hover:bg-[var(--cmd-palette-bg)] hover:text-foreground',
+          'text-muted-foreground transition-colors hover:bg-[var(--cmd-palette-bg)] hover:text-foreground',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foreground',
         )}
       >
@@ -5430,11 +5497,13 @@ function RunningStatusBar({
   // 后台子任务模式的左段文案:上一轮残留的 status(多半是 "Done")在此语义下是
   // 误导信息,整体替换为后台运行提示。仅后台 Bash 时用带数量的专属文案 ——
   // 「模型用量仍在消耗」对不调模型的 bash 任务是错误陈述。
-  const displayStatus = workflowStatus ?? (backgroundTasksRunning
-    ? backgroundBashOnlyCount > 0
-      ? t('chat.backgroundActivity.bashStatus', { count: backgroundBashOnlyCount })
-      : t('chat.backgroundActivity.status')
-    : localizeAgentStatus(status, t));
+  const displayStatus =
+    workflowStatus ??
+    (backgroundTasksRunning
+      ? backgroundBashOnlyCount > 0
+        ? t('chat.backgroundActivity.bashStatus', { count: backgroundBashOnlyCount })
+        : t('chat.backgroundActivity.status')
+      : localizeAgentStatus(status, t));
   // F-COMPACT-1: when SDK is auto-summarizing the conversation, give the
   // status bar a distinct icon so the user can tell "Compacting..." apart
   // from "Thinking..." — both share the shimmer animation by design, but
@@ -5478,7 +5547,15 @@ function RunningStatusBar({
     }
     shimmerPlayingRef.current = true;
     setShimmerCycle((n) => n + 1);
-  }, [visible, suppressContent, reducedMotion, status, tokenUsage, outputTokens, generationDurationMs]);
+  }, [
+    visible,
+    suppressContent,
+    reducedMotion,
+    status,
+    tokenUsage,
+    outputTokens,
+    generationDurationMs,
+  ]);
 
   // Animate the token counter so live mid-turn updates feel like a smoothly-
   // incrementing number. Rate does not use this: locally ticking the
@@ -5498,6 +5575,10 @@ function RunningStatusBar({
   });
   const rateText =
     usageMeta.kind === 'rate' ? t('chat.runningStatus.tokenRate', { rate: usageMeta.rate }) : null;
+  const rateTipText = [
+    t('chat.runningStatus.tokenRateDescription'),
+    ...(tokenUsage > 0 ? [tokenCountTipText] : []),
+  ].join('\n');
 
   // 淡入淡出/隐藏占位样式 —— 同时作用于左(状态)、右(elapsed/tokens)两段。
   // visibility:hidden 只隐藏不收高,让 linger / fade 阶段稳定;淡出结束后整个
@@ -5610,17 +5691,11 @@ function RunningStatusBar({
                       &middot;
                     </span>
                     {rateText ? (
-                      tokenUsage > 0 ? (
-                        <Tip text={tokenCountTipText} side="top">
-                          <span className="text-13 font-medium text-[var(--status-bar-meta)]">
-                            {rateText}
-                          </span>
-                        </Tip>
-                      ) : (
+                      <Tip text={rateTipText} side="top" contentClassName="whitespace-pre-line">
                         <span className="text-13 font-medium text-[var(--status-bar-meta)]">
                           {rateText}
                         </span>
-                      )
+                      </Tip>
                     ) : (
                       <>
                         <ArrowDown size={13} className="shrink-0 text-[var(--status-bar-meta)]" />
@@ -5675,6 +5750,7 @@ function ContextCapacityRing({
   model,
   vendorKey,
   sdkContextWindow,
+  verifiedContextWindow,
   deviceId,
   onCompact,
 }: {
@@ -5683,6 +5759,7 @@ function ContextCapacityRing({
   vendorKey: 'cc' | 'codex' | 'pi';
   /** SDK-reported context window; 0 = not yet known → use hardcoded fallback. */
   sdkContextWindow: number;
+  verifiedContextWindow?: number | null;
   /** device-link 远程会话所属被控端 id;按被控端能力查 contextWindow(本机会话 undefined,行为不变)。 */
   deviceId?: string;
   /** 提供时圆环可点击 — 点击后(经用户确认)向 agent 发送 /compact 压缩上下文。 */
@@ -5691,6 +5768,7 @@ function ContextCapacityRing({
   const { t } = useTranslation();
   const contextWindow = resolveDisplayContextWindow({
     sdkContextWindow,
+    verifiedContextWindow,
     modelContextWindow: getModelContextWindow(model, vendorKey, deviceId),
   });
   const pct =
@@ -5706,7 +5784,12 @@ function ContextCapacityRing({
   const dashOffset = circumference - (circumference * pct) / 100;
 
   // Color thresholds per spec
-  const fillColor = pct > 90 ? '#EF4444' : pct > 70 ? '#F59E0B' : 'var(--msg-tool-card-chevron)';
+  const fillColor =
+    pct > 90
+      ? 'var(--error-flat)'
+      : pct > 70
+        ? 'var(--warning-fg)'
+        : 'var(--msg-tool-card-chevron)';
 
   const usedTokens = Math.min(contextTokens, contextWindow || Infinity);
   const tooltipText =

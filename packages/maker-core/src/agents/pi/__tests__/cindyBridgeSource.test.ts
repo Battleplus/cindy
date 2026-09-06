@@ -342,6 +342,32 @@ function loadBashTimeoutHelpers(): {
 }
 
 describe('cindy-bridge extension source', () => {
+  it('adapts Astra API payloads without changing other models or subscription requests', () => {
+    const start = CINDY_BRIDGE_EXTENSION_SOURCE.indexOf('function astraResponsesPayload(');
+    const end = CINDY_BRIDGE_EXTENSION_SOURCE.indexOf('export default async function cindyBridge');
+    const adapt = new Function(`${CINDY_BRIDGE_EXTENSION_SOURCE.slice(start, end)}; return astraResponsesPayload;`)();
+    const original = {
+      prompt_cache_retention: '24h',
+      prompt_cache_options: { mode: 'explicit' },
+      temperature: 0.5, top_p: 1, top_logprobs: 2,
+      include: ['reasoning.encrypted_content', 'message.output_text.logprobs'],
+      reasoning: { effort: 'none', summary: 'auto' },
+      input: [{ role: 'user', content: 'hello' }],
+    };
+    const model = { id: 'gpt-6-astra', api: 'openai-responses' };
+    expect(adapt(original, model)).toEqual({
+      prompt_cache_options: { ttl: '30m', mode: 'explicit' },
+      include: ['reasoning.encrypted_content'],
+      reasoning: { effort: 'low', summary: 'auto' },
+      input: original.input,
+    });
+    expect(original.reasoning.effort).toBe('none');
+    expect(original.prompt_cache_retention).toBe('24h');
+    expect(adapt({ reasoning: { effort: 'max' } }, model).reasoning.effort).toBe('max');
+    expect(adapt(original, { ...model, id: 'gpt-5.5' })).toBeUndefined();
+    expect(adapt(original, { ...model, api: 'openai-codex-responses' })).toBeUndefined();
+  });
+
   it('is valid standalone TypeScript for the Pi runtime to load', () => {
     const result = ts.transpileModule(CINDY_BRIDGE_EXTENSION_SOURCE, {
       compilerOptions: {
@@ -487,9 +513,10 @@ describe('cindy-bridge extension source', () => {
       expect(CINDY_BRIDGE_EXTENSION_SOURCE).toContain(
         'isCindyShellTool(event.toolName) && (bashReadEvidence.unresolved || touchesCredentialPath(bashReadTargets))',
       );
-      expect(CINDY_BRIDGE_EXTENSION_SOURCE).toContain(
+      expect(CINDY_BRIDGE_EXTENSION_SOURCE).not.toContain(
         "if (credentialRead && permission.mode === 'bypassPermissions')",
       );
+      expect(CINDY_BRIDGE_EXTENSION_SOURCE).toContain("if (permission.mode === 'bypassPermissions') return;");
       expect(CINDY_BRIDGE_EXTENSION_SOURCE).toContain('await ctx.ui.input(');
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
@@ -547,7 +574,7 @@ describe('cindy-bridge extension source', () => {
     () => {
       const source = CINDY_BRIDGE_EXTENSION_SOURCE;
       const helperStart = source.indexOf('const CREDENTIAL_PATH_PATTERNS');
-      const helperEnd = source.indexOf('// 从 bash 子进程读取任意进程的初始环境');
+      const helperEnd = source.indexOf('const PROC_ENVIRON_READ_RE');
       expect(helperStart).toBeGreaterThan(-1);
       expect(helperEnd).toBeGreaterThan(helperStart);
 
@@ -1544,10 +1571,12 @@ describe('cindy-bridge extension source', () => {
   it('hard-blocks writes only in read-only reference roots, not external writable roots', () => {
     const source = CINDY_BRIDGE_EXTENSION_SOURCE;
     const readOnlyGate = source.indexOf('permission.readOnlyRoots.some((root) =>');
-    const credentialGate = source.indexOf('if (isCindyShellTool(event.toolName) && commandReadsProcessEnviron', readOnlyGate);
+    const credentialGate = source.indexOf('const environRead = isCindyShellTool(event.toolName)', readOnlyGate);
     expect(readOnlyGate).toBeGreaterThan(-1);
     expect(credentialGate).toBeGreaterThan(readOnlyGate);
     expect(source.slice(readOnlyGate, credentialGate)).not.toContain('permission.writableRoots');
+    expect(source).not.toContain('Cindy blocks reading credential or key paths, even with Full access.');
+    expect(source).not.toContain('Cindy blocks reading process environment (/proc/*/environ), even with Full access.');
     expect(source).toContain('resolvedWritePath: writeTargetResolved');
     expect(source).toContain(
       'resolvedWritableRoots: resolveWritableRootsForHost(permission.writableRoots)',
