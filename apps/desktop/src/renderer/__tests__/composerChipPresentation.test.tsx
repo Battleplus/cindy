@@ -16,6 +16,22 @@ import { PastedTextChipNode } from '@/components/new-chat/PastedTextChipNode';
 
 const globalsSource = readFileSync(resolve(__dirname, '..', 'styles', 'globals.css'), 'utf8');
 
+// jsdom 不实现 Range 上的几何方法，而 ProseMirror 在 focus/scrollIntoView 的
+// coordsAtPos 路径上会按内部时序（requestAnimationFrame 刷新）调用它们——CI 上
+// 曾因此出现 `target.getClientRects/getBoundingClientRect is not a function`
+// 的闪红。给单零矩形的最小实现，让滚动定位走兜底路径，行为与真实浏览器的
+// 空视口一致。
+if (typeof Range !== 'undefined') {
+  const zeroRect = { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0, x: 0, y: 0 };
+  const rangeProto = Range.prototype as unknown as Record<string, unknown>;
+  if (!rangeProto.getClientRects) {
+    rangeProto.getClientRects = () => ({ 0: zeroRect, length: 1, item: () => zeroRect });
+  }
+  if (!rangeProto.getBoundingClientRect) {
+    rangeProto.getBoundingClientRect = () => zeroRect;
+  }
+}
+
 afterEach(() => {
   cleanup();
 });
