@@ -87,6 +87,13 @@ function indexExists(db: Database.Database, indexName: string): boolean {
   );
 }
 
+function triggerExists(db: Database.Database, triggerName: string): boolean {
+  return (
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?").get(triggerName) !==
+    undefined
+  );
+}
+
 function columnNames(db: Database.Database, tableName: string): string[] {
   return db
     .prepare(`PRAGMA table_info('${tableName}')`)
@@ -118,6 +125,14 @@ describeMigrationReplay('migration replay', () => {
         )
         .pluck()
         .all();
+      const unreadRunPlan = db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT count(*) FROM schedule_runs
+           WHERE read_at IS NULL
+             AND status IN ('success', 'failed', 'aborted', 'interrupted')`,
+        )
+        .all() as Array<{ detail: string }>;
 
       expect(result.applied.map((migration) => migration.seq)).toEqual(
         listMigrations(drizzleDir()).map((migration) => migration.seq),
@@ -134,6 +149,37 @@ describeMigrationReplay('migration replay', () => {
       expect(tableExists(db, 'wechat_inbox')).toBe(true);
       expect(tableExists(db, 'wechat_outbox')).toBe(true);
       expect(tableExists(db, 'wechat_file_attachments')).toBe(true);
+      expect(tableExists(db, 'schedule_session_latest_runs')).toBe(true);
+      expect(indexExists(db, 'idx_messages_active_error_tail')).toBe(true);
+      expect(indexExists(db, 'idx_schedule_runs_running_schedule')).toBe(true);
+      expect(indexExists(db, 'idx_schedule_runs_running_heartbeat')).toBe(true);
+      expect(indexExists(db, 'idx_schedule_runs_running_legacy')).toBe(true);
+      expect(indexExists(db, 'idx_schedule_runs_unread_terminal')).toBe(true);
+      expect(indexExists(db, 'idx_schedule_runs_session_latest')).toBe(true);
+      expect(indexExists(db, 'idx_skill_usage_exposures_skill_recent')).toBe(true);
+      expect(indexExists(db, 'idx_skill_usage_exposures_skill_recent_any_version')).toBe(true);
+      expect(indexExists(db, 'idx_skill_usage_exposures_analyzer_recent_source')).toBe(true);
+      expect(triggerExists(db, 'schedule_session_latest_run_insert')).toBe(true);
+      expect(triggerExists(db, 'schedule_session_latest_run_delete')).toBe(true);
+      expect(triggerExists(db, 'schedule_session_latest_run_update')).toBe(true);
+      expect(unreadRunPlan.some((row) => row.detail.includes('idx_schedule_runs_unread_terminal')))
+        .toBe(true);
+
+      db.prepare("INSERT INTO sessions (id, created_at, updated_at) VALUES ('s-cjk', 1, 1)").run();
+      db.prepare(
+        `INSERT INTO messages (id, client_id, session_id, role, content, created_at)
+         VALUES ('m-cjk', 'c-cjk', 's-cjk', 'user', '登录报错了', 1)`,
+      ).run();
+      const indexed = db
+        .prepare('SELECT content FROM messages_fts WHERE message_id = ?')
+        .get('m-cjk') as { content: string };
+      expect(indexed.content).toBe('登 录 报 错 了');
+      expect(
+        db
+          .prepare("SELECT message_id FROM messages_fts WHERE messages_fts MATCH '\"登 录\"'")
+          .pluck()
+          .all(),
+      ).toEqual(['m-cjk']);
     } finally {
       cleanup();
     }

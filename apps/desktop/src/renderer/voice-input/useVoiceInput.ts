@@ -34,10 +34,7 @@ import {
 import {
   VOICE_INPUT_REFINEMENT_CACHE_SCOPE,
   buildReplyToMessageFromChatMessages,
-  MAX_REFINEMENT_SIDE_CONTEXT_CHARS,
-  takeContextHead,
-  takeContextTail,
-  truncateContextText,
+  buildEditorSelectionContext,
   type VoiceInputChatMessage,
 } from './refinementContext';
 import {
@@ -796,9 +793,7 @@ export function useVoiceInput(
       ...baseContext,
       // DictationRefiner.getContext re-imposes cache-friendly ordering when
       // serializing the request body.
-      selectionBefore: takeContextTail(doc.textBetween(0, range.from, '\n', '\n'), MAX_REFINEMENT_SIDE_CONTEXT_CHARS),
-      selectedText: truncateContextText(doc.textBetween(range.from, range.to, '\n', '\n'), MAX_REFINEMENT_SIDE_CONTEXT_CHARS),
-      selectionAfter: takeContextHead(doc.textBetween(range.to, doc.content.size, '\n', '\n'), MAX_REFINEMENT_SIDE_CONTEXT_CHARS),
+      ...buildEditorSelectionContext(doc, range),
       replyToMessage,
     };
   }, [
@@ -1280,7 +1275,7 @@ export function useVoiceInput(
     //    microphone PCM is gated so system audio playing during the mute delay
     //    cannot enter ASR.
     const guards = await resolveVoiceInputStartGuards();
-    log.debug('voice input start guards checked', {
+    log.info('voice input start guards checked', {
       ok: guards.ok,
       failed: guards.ok ? undefined : guards.failed,
       permissionSource: guards.permissionSource,
@@ -1406,7 +1401,14 @@ export function useVoiceInput(
       draftDisplayRangeRef.current = null;
       insertionRangeRef.current = null;
       setVoiceState('error');
-      reportVoiceInputError(captureStart.error);
+      // Permission revoked after the start guard trusted a positive cache:
+      // route to the same recovery prompt as a guard-time denial instead of
+      // making the user retry before they see how to fix it.
+      if (captureStart.permissionDenied && options?.onMicrophonePermissionRequired) {
+        void options.onMicrophonePermissionRequired(captureStart.error);
+      } else {
+        reportVoiceInputError(captureStart.error);
+      }
       restoreEditorFocusAfterVoiceInput();
       return;
     }

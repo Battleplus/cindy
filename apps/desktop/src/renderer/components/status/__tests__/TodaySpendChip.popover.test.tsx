@@ -4,11 +4,14 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ClaudeSubscriptionUsageSnapshot } from '../../../../shared/claudeSubscriptionUsage';
+import type { RateLimitSnapshot } from '@/hooks/useAccountUsage';
 import type { RegionalMoney } from '../../../../shared/regionalMoney';
 import type { SessionUsageMoney } from '@/hooks/useSessionUsageMoney';
 
 const mocks = vi.hoisted(() => ({
   claudeSnapshot: null as ClaudeSubscriptionUsageSnapshot | null,
+  codexSnapshot: null as RateLimitSnapshot | null,
+  codexAuthInjection: null as string | null,
   displaySnapshot: {
     messages: [] as Array<Record<string, unknown>>,
   },
@@ -27,8 +30,14 @@ vi.mock('react-i18next', () => ({
     t: (key: string, options: Record<string, string | number> = {}) => {
       const templates: Record<string, string> = {
         'todaySpend.openClaudeUsage': '打开 Claude 用量页面',
+        'todaySpend.openCodexUsage': '打开 Codex 用量页面',
         'todaySpend.claude.weeklyLabel': '周限',
+        'todaySpend.claude.modelWeeklyLabel': '{{model}} 周限',
         'todaySpend.claude.windowSegment': '{{label}} 剩余 {{remaining}}',
+        'todaySpend.codex.weekWindow': '周限',
+        'todaySpend.codex.limitWindow': '限额',
+        'todaySpend.codex.daysWindow': '{{days}}天',
+        'todaySpend.codex.windowSegment': '{{label}} 剩余 {{remaining}}',
         'todaySpend.sessionCostLabel': '本任务 {{cost}}',
         'todaySpend.tooltip.sessionUsed': '本任务已用 {{cost}}',
         'todaySpend.codex.sessionValueLabel': '本任务价值 {{cost}}',
@@ -85,7 +94,7 @@ vi.mock('@/hooks/useSessionUsageMoney', () => ({
 vi.mock('@/hooks/useSessionTokens', () => ({ useSessionTokens: () => null }));
 vi.mock('@/hooks/useAccountUsage', () => ({
   requestCodexAccountRefresh: vi.fn(),
-  useAccountUsage: () => null,
+  useAccountUsage: () => mocks.codexSnapshot,
 }));
 vi.mock('@/hooks/useClaudeAccountUsage', () => ({ useClaudeAccountUsage: () => null }));
 vi.mock('@/hooks/useModelAccessCreditUsage', () => ({ useModelAccessCreditUsage: () => null }));
@@ -94,7 +103,7 @@ vi.mock('@/hooks/useClaudeSubscriptionUsage', () => ({
   useClaudeSubscriptionUsage: () => mocks.claudeSnapshot,
 }));
 vi.mock('@/hooks/useCodexRuntimeRoute', () => ({
-  useCodexRuntimeRoute: () => ({ authInjection: null }),
+  useCodexRuntimeRoute: () => ({ authInjection: mocks.codexAuthInjection }),
 }));
 vi.mock('@/hooks/useCodexRateLimits', () => ({
   useCodexRateLimits: () => ({
@@ -103,6 +112,9 @@ vi.mock('@/hooks/useCodexRateLimits', () => ({
   }),
 }));
 vi.mock('@/hooks/useXaiRateLimit', () => ({ useXaiRateLimit: () => null }));
+vi.mock('../QuotaResetConfetti', () => ({
+  QuotaResetConfetti: () => <span data-testid="quota-reset-confetti" />,
+}));
 vi.mock('@/components/chat/ChatDisplaySnapshotContext', () => ({
   useChatDisplaySnapshot: () => mocks.displaySnapshot,
 }));
@@ -183,6 +195,8 @@ beforeEach(() => {
     subscriptionType: 'max',
     sevenDay: { utilization: 34, resetsAt: Date.now() / 1000 + 86_400 },
   };
+  mocks.codexSnapshot = null;
+  mocks.codexAuthInjection = null;
   Object.defineProperty(window, 'electronAPI', {
     configurable: true,
     value: { openExternal: mocks.openExternal },
@@ -197,6 +211,82 @@ afterEach(() => {
 });
 
 describe('TodaySpendChip Claude subscription popover', () => {
+  it.each(['accountId', 'source', 'limitId'] as const)(
+    'does not celebrate a Codex %s switch as a reset',
+    (field) => {
+      mocks.codexAuthInjection = 'oauth-bearer';
+      mocks.codexSnapshot = {
+        accountId: 'account-a', source: 'codex-app-server', limitId: 'codex',
+        primary: { usedPercent: 40, windowMinutes: 300, resetsAt: Date.now() / 1000 - 1 },
+      };
+      const chip = <TodaySpendChip vendorKey="codex" providerId="openai" sessionId="codex" />;
+      const view = render(chip);
+      mocks.codexSnapshot = {
+        ...mocks.codexSnapshot,
+        [field]: 'another-quota',
+        primary: { usedPercent: 2, windowMinutes: 300, resetsAt: Date.now() / 1000 + 18_000 },
+      };
+      view.rerender(<TodaySpendChip vendorKey="codex" providerId="openai" sessionId="codex" />);
+      expect(screen.getByRole('button', { name: '打开 Codex 用量页面' }).textContent).toContain('98%');
+      expect(screen.queryByTestId('quota-reset-confetti')).toBeNull();
+    },
+  );
+
+  it.each([false, true])('only celebrates a Claude reset for the same account (changed: %s)', (changed) => {
+    mocks.claudeSnapshot = {
+      accountFingerprint: 'account-a', source: 'unified-headers',
+      fiveHour: { utilization: 40, resetsAt: Date.now() / 1000 - 1 },
+    };
+    const view = renderClaudeSubscriptionChip();
+    mocks.claudeSnapshot = {
+      accountFingerprint: changed ? 'account-b' : 'account-a', source: 'oauth-endpoint',
+      fiveHour: { utilization: 2, resetsAt: Date.now() / 1000 + 18_000 },
+    };
+    view.rerender(<TodaySpendChip vendorKey="cc" providerId="anthropic" modelId="claude-opus-5[1m]" sessionId="session-1" />);
+    expect(screen.queryByTestId('quota-reset-confetti') !== null).toBe(!changed);
+    if (changed) {
+      expect(screen.getByRole('button', { name: '打开 Claude 用量页面' }).textContent).toContain('98%');
+    }
+  });
+
+  it('完整渲染 Claude 的 5h 与当前模型周窗口', () => {
+    mocks.claudeSnapshot = {
+      source: 'oauth-endpoint',
+      fiveHour: { utilization: 12 },
+      sevenDay: { utilization: 25 },
+      scoped: [{ modelDisplayName: 'Opus', utilization: 34 }],
+    };
+
+    renderClaudeSubscriptionChip();
+
+    const trigger = screen.getByRole('button', { name: '打开 Claude 用量页面' });
+    expect(trigger.textContent).toContain('5h 剩余 88%');
+    expect(trigger.textContent).toContain('Opus 周限 剩余 66%');
+  });
+
+  it('完整渲染 Codex app-server 的两个权威窗口', () => {
+    mocks.codexAuthInjection = 'oauth-bearer';
+    mocks.codexSnapshot = {
+      source: 'codex-app-server',
+      limitId: 'codex',
+      primary: { usedPercent: 12, windowMinutes: 300 },
+      secondary: { usedPercent: 34, windowMinutes: 10_080 },
+    };
+
+    render(
+      <TodaySpendChip
+        vendorKey="codex"
+        providerId="openai"
+        modelId="gpt-5.6-sol"
+        sessionId="session-codex"
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: '打开 Codex 用量页面' });
+    expect(trigger.textContent).toContain('5h 剩余 88%');
+    expect(trigger.textContent).toContain('7天 剩余 66%');
+  });
+
   it('悬停约 300ms 后显示额度卡片', () => {
     renderClaudeSubscriptionChip();
     const trigger = screen.getByRole('button', { name: '打开 Claude 用量页面' });

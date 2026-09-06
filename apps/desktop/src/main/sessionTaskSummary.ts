@@ -27,13 +27,22 @@ import { and, count, desc, eq, gt, isNotNull, isNull, lt, or, sql } from 'drizzl
 
 import { getMaker } from './maker-host/index.js';
 import { isAgentOneShotRouteDisabled } from './maker-host/model-route-guard-live.js';
+import { activeOwnerScopeKey, isAppSessionBoundaryPending } from './appSessionState.js';
 import { agentSupportsOneShot, requestUtilityText } from './utility-model/oneShotCandidates.js';
+import {
+  getEffectiveAuxiliaryModelChain,
+  getEffectiveAuxiliaryModelChainSnapshot,
+} from './utility-model/resolveAuxiliaryModelChain.js';
 import { getDbClient } from './localDb/client/current.js';
-import { latestMessageText } from './localDb/latestMessageText.js';
-import { extractMessagePreview } from './localDb/mapper.js';
+import { latestMessageText, latestVisiblePreview } from './localDb/latestMessageText.js';
 import { messages, sessions } from './localDb/schema.js';
 import { createLogger } from './logger.js';
-import { tapWindowBroadcast } from './device-link/broadcast-tap.js';
+import {
+  captureDataOwnerBroadcastScope,
+  isDataOwnerBroadcastScopeCurrent,
+  tapWindowBroadcast,
+  type DataOwnerBroadcastScope,
+} from './device-link/broadcast-tap.js';
 import {
   STALE_SHORT_MS,
   SUMMARY_STALE_MAX_CHARS,
@@ -46,6 +55,7 @@ import {
   shouldGeneratePinnedCardSummary,
   shouldVoidSummaryAfterGenerationAttempt,
   nonCardTurnDisplayPatch,
+  sessionListPreviewPatch,
   shouldForceGenerateOnClear,
   shouldScheduleForceGenerateAfterInFlight,
 } from './sessionTaskSummary.logic.js';
@@ -64,50 +74,97 @@ let backfillDone = false;
 const inFlight = new Map<string, Promise<void>>();
 const lastGeneratedAt = new Map<string, number>();
 
+function captureOwnerScope(): DataOwnerBroadcastScope | null {
+  try {
+    return captureDataOwnerBroadcastScope();
+  } catch {
+    return null;
+  }
+}
+
+function isOwnerScopeCurrent(scope: DataOwnerBroadcastScope | null): boolean {
+  if (scope === null) return true;
+  try {
+    return isDataOwnerBroadcastScopeCurrent(scope);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Utility-model requests are owner-bound even though they do not write to the
+ * local DB themselves. Keep the request tied to the session that started it;
+ * an account switch or teardown must fail closed before the paid dispatch.
+ */
+function isAuxiliaryOwnerScopeCurrent(scopeKey: string, chainSnapshot?: string): boolean {
+  try {
+    return !isAppSessionBoundaryPending()
+      && activeOwnerScopeKey() === scopeKey
+      && (chainSnapshot === undefined || getEffectiveAuxiliaryModelChainSnapshot() === chainSnapshot);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 广播 sessions:patched 到本机所有窗口 + device-link tap。tap 让该 patch 经 topic 路由
  * 转发给订阅了 `sessions` 的控制端(push 驱动:控制端 applyPatch 即时镜像 summary,无需
  * 等下一次全量 reseed)——与 localDb/ipc/sessions.ts broadcastSessionPatched 同口径。
+ * 异步路径必须传入查询前捕获的 ownerScope:切账号后不得把旧账号 preview 打到新界面。
  */
-function broadcastPatched(sessionId: string, patch: Record<string, unknown>): void {
-  tapWindowBroadcast('local-db:sessions:patched', { sessionId, patch });
+function broadcastPatched(
+  sessionId: string,
+  patch: Record<string, unknown>,
+  ownerScope?: DataOwnerBroadcastScope | null,
+): void {
+  if (ownerScope !== undefined && !isOwnerScopeCurrent(ownerScope)) return;
+  const hasCapturedScope = ownerScope !== undefined && ownerScope !== null;
+  const ownerStamp = hasCapturedScope ? ownerScope.ownerStamp : undefined;
+  if (hasCapturedScope) {
+    tapWindowBroadcast('local-db:sessions:patched', { sessionId, patch }, ownerStamp);
+  } else {
+    tapWindowBroadcast('local-db:sessions:patched', { sessionId, patch });
+  }
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
     try {
-      win.webContents.send('local-db:sessions:patched', { sessionId, patch });
+      if (hasCapturedScope) {
+        win.webContents.send('local-db:sessions:patched', { sessionId, patch }, ownerStamp);
+      } else {
+        win.webContents.send('local-db:sessions:patched', { sessionId, patch });
+      }
     } catch {
       /* swallow */
     }
   }
 }
 
-const messageRowid = sql<number>`rowid`;
+/** 把已知的列表预览立刻推给侧栏。不 bump updatedAt,也不碰 summary。 */
+export function broadcastSessionListPreview(
+  sessionId: string,
+  preview: string | null,
+  ownerScope?: DataOwnerBroadcastScope | null,
+): void {
+  broadcastPatched(sessionId, sessionListPreviewPatch(preview), ownerScope);
+}
 
-/** 与 sessions:list / 删除消息同一口径的最近可见消息 preview。 */
-async function latestVisiblePreview(sessionId: string): Promise<string | null> {
-  const db = getDbClient().drizzle;
-  const [sessionRow] = await db
-    .select({ clearedAt: sessions.clearedAt })
-    .from(sessions)
-    .where(eq(sessions.id, sessionId))
-    .limit(1);
-  const visibleAfterClear =
-    sessionRow?.clearedAt == null ? undefined : gt(messages.createdAt, sessionRow.clearedAt);
-  const [latestRow] = await db
-    .select({ content: messages.content, role: messages.role })
-    .from(messages)
-    .where(
-      and(
-        eq(messages.sessionId, sessionId),
-        sql`${messages.role} IN ('user', 'assistant')`,
-        isNull(messages.rewindAt),
-        sql`(${messages.agentMeta} IS NULL OR json_extract(${messages.agentMeta}, '$.autoResume') IS NOT 1)`,
-        visibleAfterClear,
-      ),
-    )
-    .orderBy(desc(messages.createdAt), desc(messageRowid))
-    .limit(1);
-  return extractMessagePreview(latestRow?.content, latestRow?.role);
+/**
+ * 列表预览的权威刷新:读最近一条可见 user/assistant,广播 session.preview。
+ * 与置顶卡片摘要无关——无论置顶区是不是卡片、这条有没有置顶,都要更新。
+ * 失败 swallow,不能挡住 turn-done 收尾。
+ */
+export async function refreshSessionListPreview(sessionId: string): Promise<void> {
+  const ownerScope = captureOwnerScope();
+  try {
+    const preview = await latestVisiblePreview(sessionId);
+    if (!isOwnerScopeCurrent(ownerScope)) return;
+    broadcastSessionListPreview(sessionId, preview, ownerScope);
+  } catch (err) {
+    log.warn('refresh session list preview failed (swallowed)', {
+      sessionId,
+      error: String(err),
+    });
+  }
 }
 
 /** 已切回卡片:绝不继续写 null。没有生成在飞才 force 再生成;在飞则交给那次结算,避免自等待。 */
@@ -226,6 +283,11 @@ export async function maybeGenerateSessionTaskSummary(
 async function generateSummaryOnce(sessionId: string): Promise<void> {
   let wroteFresh = false;
   try {
+    // Capture before any async DB/model work. The fallback chain must not be
+    // allowed to dispatch under a different account after an owner switch.
+    const ownerScopeKey = activeOwnerScopeKey();
+    const auxiliaryChain = getEffectiveAuxiliaryModelChain();
+    const auxiliaryChainSnapshot = getEffectiveAuxiliaryModelChainSnapshot();
     const db = getDbClient().drizzle;
     const [session] = await db
       .select({
@@ -290,7 +352,14 @@ async function generateSummaryOnce(sessionId: string): Promise<void> {
     const utility = await requestUtilityText(getMaker(), prompt, {
       maxTokens: 120,
       timeoutMs: 30_000,
+      beforeDispatch: async () => isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot),
     });
+    if (!isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot)) return;
+    const beforeSessionAgentDispatch = async () => {
+      if (!isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot)) return false;
+      if (await isAgentOneShotRouteDisabled(agentKind)) return false;
+      return isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot);
+    };
     // 停用轴:agent one-shot 兜底是新的付费调用,该 agent 的默认路由被停用时不派发
     // (摘要 best-effort,直接放弃本轮,PR #744 review)。
     // oneShot 能力轴:Pi 未实现 oneShot(继承 BaseAgent 的 not-implemented),对 Pi 会话
@@ -298,11 +367,17 @@ async function generateSummaryOnce(sessionId: string): Promise<void> {
     // 那样跨 agent 兜底 —— 会话 agent 不支持 oneShot 时直接跳过兜底(仅靠 utility-model)。
     const text = utility.ok
       ? utility.text
-      : !agentSupportsOneShot(agentKind) || (await isAgentOneShotRouteDisabled(agentKind))
+      : auxiliaryChain.source !== 'auto' ||
+          !agentSupportsOneShot(agentKind) ||
+          !(await beforeSessionAgentDispatch())
         ? ''
-        : await getMaker().oneShot(agentKind, prompt, { maxTokens: 120 });
+        : await getMaker().oneShot(agentKind, prompt, {
+            maxTokens: 120,
+            beforeDispatch: beforeSessionAgentDispatch,
+          });
     const summary = sanitize(text, maxCharsForTier(tier));
     if (!summary) return;
+    if (!isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot)) return;
 
     // 写回前重查会话状态:oneShot 是异步的(数秒),in-flight 期间会话可能已变化,无条件写回
     // 会写入一份已过时的摘要(codex review)。任一不符即跳过:
@@ -332,6 +407,7 @@ async function generateSummaryOnce(sessionId: string): Promise<void> {
     ) {
       return;
     }
+    if (!isAuxiliaryOwnerScopeCurrent(ownerScopeKey, auxiliaryChainSnapshot)) return;
 
     // 直写 summary,不 bump updatedAt——摘要刷新不应引起 sidebar 重排
     await db.update(sessions).set({ summary }).where(eq(sessions.id, sessionId));

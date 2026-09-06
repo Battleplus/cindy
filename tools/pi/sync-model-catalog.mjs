@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { applyKnownXaiCorrections, preferredDefaultEffort } from './xai-catalog-corrections.mjs';
+import { applyAstraCatalogAdditions } from './openai-catalog-corrections.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CATALOG_PATH = path.join(ROOT, 'packages/model-providers/catalog/providers.json');
@@ -31,6 +32,12 @@ const PRESET_PROVIDER_MAP = {
 
 const PROVIDER_IDS = [...new Set([
   ...Object.values(PRESET_PROVIDER_MAP).map(({ providerId }) => providerId),
+  // Subscription providers are native Pi sources. Their membership and capabilities must not
+  // be copied from Cindy's separately discovered Claude Code or Codex catalogs.
+  'anthropic',
+  'openai-codex',
+  // Read public API metadata too, so Astra additions yield to native upstream entries.
+  'openai',
   'xai',
 ])].sort();
 
@@ -118,11 +125,19 @@ function runtimeWireProtocol(providerId, models) {
 
 function xaiCatalogModel(model, index) {
   const efforts = supportedEfforts(model);
+  const piApi = model.api === 'openai-completions'
+    ? 'openai-completions'
+    : model.api === 'openai-responses'
+      ? 'openai-responses'
+      : model.api === 'anthropic-messages'
+        ? 'anthropic-messages'
+        : undefined;
   return {
     // Pi uses provider provenance, so its xAI model ids stay identical to Pi's official catalog.
     // Claude/Codex keep the historical xai/ namespace in their own per-agent lists.
     id: model.id,
     name: model.name ?? model.id,
+    ...(piApi ? { piApi } : {}),
     group: 'grok',
     sortOrder: 49 + index,
     contextWindow: model.contextWindow,
@@ -160,6 +175,7 @@ async function main() {
     }
   }
   if (providers.xai) providers.xai = applyKnownXaiCorrections(providers.xai);
+  applyAstraCatalogAdditions(providers);
 
   const catalog = JSON.parse(await fs.readFile(CATALOG_PATH, 'utf8'));
   for (const preset of catalog.presets ?? []) {
@@ -187,6 +203,10 @@ async function main() {
   if (!xai.agents.includes('pi')) xai.agents.push('pi');
   xai.routing.pi = {
     upstream: 'https://api.x.ai/v1',
+    // The sync currently requires one provider-wide Pi protocol and fails closed on mixed
+    // model.api values. Per-model piApi records the exact model protocol, but supporting a
+    // mixed-protocol xAI catalog requires a separate sync-script change first.
+    wireProtocol: runtimeWireProtocol('xai', providers.xai),
     authStrategy: 'provider-oauth-header',
     headerDelete: ['chatgpt-account-id', 'openai-beta', 'originator', 'session_id'],
   };

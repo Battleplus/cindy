@@ -44,6 +44,7 @@ import {
   DeviceLinkError,
   parseFsWatchTopic,
   type Envelope,
+  type DeviceLinkPeerRouteStateChanged,
   type InvokePayload,
   type InvokeResultPayload,
   type LinkClosePayload,
@@ -73,7 +74,7 @@ import { fetchLocalMediaToOss } from './mediaFetch';
 import { transcribeRemoteVoiceInput } from './voiceTranscribe';
 import { readTelegramRemoteStatus, setTelegramRemoteOnline } from './telegramRemoteControl';
 import { adviseAndRecordVoiceInputDictionaryLearning } from '../voice-input/index.js';
-import { readDictionaryProjectionForMobile } from '../voice-input/dictionarySyncDriver.js';
+import { buildMobileDictionarySnapshot } from '../voice-input/dictionarySyncDriver.js';
 import {
   setBroadcastTapListener,
 } from './broadcast-tap';
@@ -83,7 +84,10 @@ import * as subscriptions from './subscriptions';
 import { LEGACY_TOPIC, type ActiveController } from './subscriptions';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
 import { RECOVERY_CHECKPOINT_MARKER } from '../maker-ipc/recoveryCoordinator.js';
-import { projectInteractionRequestForRemote } from '../cindy-brain/ghostSetupInteractionBridge.js';
+import {
+  projectInteractionDismissedForRemote,
+  projectInteractionRequestForRemote,
+} from '../cindy-brain/ghostSetupInteractionBridge.js';
 import {
   remoteWorkingDirRejectionToIpcError,
   type RemoteWorkingDirCheckResult,
@@ -269,13 +273,14 @@ export function setRemoteSettingsPersist(fn: RemoteSettingsPersist | null): void
 }
 
 /** set-* channel → 持久化的 session 字段名(args[0]=sessionId, args[1]=value)。 */
-const SET_CHANNEL_FIELD: Record<string, 'model' | 'effort' | 'permissionMode' | 'fastMode' | 'planModeEnabled' | 'extraDirs'> = {
+const SET_CHANNEL_FIELD: Record<string, 'model' | 'effort' | 'permissionMode' | 'fastMode' | 'planModeEnabled' | 'extraDirs' | 'writableDirs'> = {
   'maker:set-model': 'model',
   'maker:set-effort': 'effort',
   'maker:set-permission-mode': 'permissionMode',
   'maker:set-fast-mode': 'fastMode',
   'maker:set-plan-mode': 'planModeEnabled',
   'maker:set-extra-dirs': 'extraDirs',
+  'maker:set-writable-dirs': 'writableDirs',
 };
 
 async function persistRemoteSetting(channel: string, args: unknown[], result: unknown): Promise<void> {
@@ -299,11 +304,27 @@ async function persistRemoteSetting(channel: string, args: unknown[], result: un
     await settingsPersist(sessionId, { extraDirs: result });
     return;
   }
+  if (channel === 'maker:set-writable-dirs') {
+    if (!Array.isArray(result)) return;
+    await settingsPersist(sessionId, { writableDirs: result });
+    return;
+  }
   // set-model 特例:可携带第 3 参 providerId(per-session 来源选择,见 register.ts SET_MODEL handler)。
   // 必须把它一并持久化进被控端 DB.provider_id,否则远程切来源只进了 runtime store、跨重启/resume 丢
   // (G2)。与被控端 handler 同语义:args[2]===undefined(老 2 参调用)不动 provider_id;string→写;
   // null/''→清除(回落默认路由)。写进 DB 后 mapper 自动带进 sessions:patched → 回流控制端镜像。
   if (channel === 'maker:set-model') {
+    // 最终 Pi 窗口首次触发压力时，handler 返回结构化确认请求而非接受选择。
+    // 此时 runtime 已回滚；通用回流也不得抢先把请求参数写进 DB。
+    if (
+      result !== null &&
+      typeof result === 'object' &&
+      !Array.isArray(result) &&
+      ('contextWindowConfirmationRequired' in result ||
+        'contextTokensForConfirmation' in result)
+    ) {
+      return;
+    }
     // 同引擎重选的第二段带 host revision CAS。handler 返回 superseded 表示
     // 另一控制端已在两段之间更新过意图：runtime 未应用，DB 也必须同样不落
     // 这次请求参数，否则 sessions:patched 会把过期选择反向盖回控制端。
@@ -357,6 +378,27 @@ function projectRoutingForDisplay(
 }
 
 /**
+ * Mobile consumes the device-link provider catalog as an executable model list. Paid-only rows are
+ * a Desktop upsell projection, not a cross-device model state: omit them and strip the v5-only
+ * availability marker so both current and independently-updated legacy Mobile clients keep the
+ * published provider model shape.
+ */
+function projectModelsForController(models: unknown): unknown {
+  if (!models || typeof models !== 'object' || Array.isArray(models)) return models;
+  return Object.fromEntries(
+    Object.entries(models as Record<string, unknown>).map(([agent, value]) => {
+      if (!Array.isArray(value)) return [agent, value];
+      const projected = value.flatMap((model) => {
+        if (!model || typeof model !== 'object' || Array.isArray(model)) return [model];
+        const { availability, ...legacyModel } = model as Record<string, unknown>;
+        return availability === 'requires_payment' ? [] : [legacyModel];
+      });
+      return [agent, projected];
+    }),
+  );
+}
+
+/**
  * 隧道返回投影:`maker:provider:list` 只回「显示用」字段——先从 provider id / upstream
  * 解析非敏感 `logoKind`,再剥掉每个 provider 的 `routing` 执行字段(upstream /
  * authStrategy / 密钥策略 / 自定义供应商 endpoint 等)。执行细节(路由 / 密钥)不出被控端
@@ -386,6 +428,7 @@ function projectInvokeResultForTunnel(
     ) {
       rest.logoKind = logoKind;
     }
+    rest.models = projectModelsForController(p.models);
     rest.routing = projectRoutingForDisplay(p.routing);
     return rest;
   });
@@ -556,6 +599,13 @@ const topicSubscriptionControllers = new Set<string>();
 /** 已成功 accept、尚未显式 close 的控制端；可无 active topic(现代重连等待 subscribe)。 */
 const acceptedLinkControllers = new Set<string>();
 /**
+ * 当前 active controller 所属的 relay connection generation。
+ * DEVICE_OFFLINE 事件带 generation，旧 socket 的迟到事实不能清掉新链路。
+ */
+const controllerConnectionEpochByDevice = new Map<string, number>();
+/** 同一 relay connection 内最近一次成功接受的 controller link 代次。 */
+const controllerLinkGenerationByDevice = new Map<string, number>();
+/**
  * relay presence 按 server 盖章的 deviceId 提供设备数据库展示名。它比控制端在
  * link-open / subscribe 里自报的主机名更权威，用于让被控提示与设备列表一致。
  * 仅作展示，不参与任何授权判断；账号 / 链路边界由 host 显式清空。
@@ -600,6 +650,25 @@ function resolveControllerName(deviceId: string, reportedName: unknown): string 
 
 function clearReportedControllerName(deviceId: string): void {
   reportedControllerNameByDevice.delete(deviceId);
+}
+
+function readConnectionEpoch(client: DeviceLinkClient): number | undefined {
+  const candidate = client as DeviceLinkClient & {
+    getConnectionEpoch?: () => number;
+  };
+  return candidate.getConnectionEpoch?.();
+}
+
+function markControllerLinkActive(client: DeviceLinkClient, deviceId: string): void {
+  const epoch = readConnectionEpoch(client);
+  if (epoch !== undefined) controllerConnectionEpochByDevice.set(deviceId, epoch);
+  const candidate = client as DeviceLinkClient & {
+    getPeerLinkGeneration?: (peerDeviceId: string) => number;
+  };
+  const linkGeneration = candidate.getPeerLinkGeneration?.(deviceId);
+  if (linkGeneration !== undefined) {
+    controllerLinkGenerationByDevice.set(deviceId, linkGeneration);
+  }
 }
 
 /**
@@ -1278,6 +1347,9 @@ function forwardPush(channel: string, payload: unknown, ownerStamp?: PushOwnerSt
     if (request === null) return;
     remotePayload = { ...payload, request };
   }
+  if (channel === MAKER_PUSH.INTERACTION_DISMISSED) {
+    remotePayload = projectInteractionDismissedForRemote(remotePayload);
+  }
   const dsts = subscriptions.getControllersForTopic(topic);
   // The active registry describes peer topic intent, not whether this host can
   // currently write to the relay. During host-side reconnects sendPush is a
@@ -1515,6 +1587,8 @@ export function dropAllControllers(
   subscriptions.clearAll();
   topicSubscriptionControllers.clear();
   acceptedLinkControllers.clear();
+  controllerConnectionEpochByDevice.clear();
+  controllerLinkGenerationByDevice.clear();
   reportedControllerNameByDevice.clear();
   offlinePushQueue.clear();
   clearAllSessionActivityStages();
@@ -1523,21 +1597,102 @@ export function dropAllControllers(
   syncForwarding();
 }
 
-/**
- * host 收到对等控制端 presence-changed(online:false)→ 清其全部订阅。
- * server 把 presence-changed 广播给同账号所有连接(含本机),这是控制端崩溃 / 拔网
- * 后回收僵尸订阅的兜底信号(正常路径是控制端显式 unsubscribe / link-close)。
- * 不清 invoke result/outbox：presence offline 可能只是弱网重连，控制端可靠请求仍在等回包。
- */
-export function handleControllerOffline(deviceId: string): void {
-  acceptedLinkControllers.delete(deviceId);
+function deactivateControllerState(
+  deviceId: string,
+  observedConnectionEpoch?: number,
+  observedLinkGeneration?: number,
+): boolean {
+  const activeEpoch = controllerConnectionEpochByDevice.get(deviceId);
+  const activeLinkGeneration = controllerLinkGenerationByDevice.get(deviceId);
+  if (
+    observedConnectionEpoch !== undefined
+    && activeEpoch !== undefined
+    && (
+      observedConnectionEpoch < activeEpoch
+      || (
+        observedConnectionEpoch === activeEpoch
+        && observedLinkGeneration !== undefined
+        && activeLinkGeneration !== undefined
+        && observedLinkGeneration < activeLinkGeneration
+      )
+    )
+  ) {
+    log.debug(
+      `ignoring stale controller offline event for ${shortId(deviceId)}`
+      + ` (connection=${observedConnectionEpoch}/${activeEpoch}`
+      + ` link=${observedLinkGeneration ?? 'unknown'}/${activeLinkGeneration ?? 'unknown'})`,
+    );
+    return false;
+  }
+  let changed = false;
+  changed = acceptedLinkControllers.delete(deviceId) || changed;
+  changed = controllerConnectionEpochByDevice.delete(deviceId) || changed;
+  changed = controllerLinkGenerationByDevice.delete(deviceId) || changed;
+  changed = reportedControllerNameByDevice.has(deviceId) || changed;
+  changed = subscriptions.getControllerIds().includes(deviceId) || changed;
   clearReportedControllerName(deviceId);
   clearSessionActivityStage(deviceId);
   clearMakerEventBatchStage(deviceId);
   cancelLinkAcceptRetry(deviceId);
-  if (subscriptions.clearController(deviceId)) {
+  return subscriptions.clearController(deviceId) || changed;
+}
+
+/**
+ * Active → inactive 的唯一单 peer 状态转换。
+ *
+ * 清 accepted link、active topics、横幅/更新重启 busy 与短期发送 stage；保留
+ * remembered topics/capabilities、可靠 pending、invoke-result outbox 和离线队列，
+ * 让控制端回来后按既有 link-open + subscribe 路径恢复。
+ */
+export function deactivateController(
+  deviceId: string,
+  reason: string,
+  observedConnectionEpoch?: number,
+  observedLinkGeneration?: number,
+): boolean {
+  const changed = deactivateControllerState(
+    deviceId,
+    observedConnectionEpoch,
+    observedLinkGeneration,
+  );
+  if (changed) {
+    log.info(`controller ${shortId(deviceId)} deactivated (${reason})`);
     syncForwarding();
   }
+  return changed;
+}
+
+/** Relay 连接离开 online：清本连接代所有 active controller，但保留恢复意图。 */
+export function deactivateAllControllers(reason: string): void {
+  const controllerIds = new Set([
+    ...subscriptions.getControllerIds(),
+    ...topicSubscriptionControllers,
+    ...acceptedLinkControllers,
+    ...controllerConnectionEpochByDevice.keys(),
+    ...controllerLinkGenerationByDevice.keys(),
+    ...reportedControllerNameByDevice.keys(),
+  ]);
+  let changed = false;
+  for (const deviceId of controllerIds) {
+    changed = deactivateControllerState(deviceId) || changed;
+  }
+  if (changed) {
+    log.info(`all active controllers deactivated (${reason}, count=${controllerIds.size})`);
+    syncForwarding();
+  }
+}
+
+/** presence offline remains an authoritative single-peer deactivation edge. */
+export function handleControllerOffline(
+  deviceId: string,
+  routeChange?: DeviceLinkPeerRouteStateChanged,
+): void {
+  deactivateController(
+    deviceId,
+    routeChange ? 'relay-device-offline' : 'presence-offline',
+    routeChange?.connectionEpoch,
+    routeChange?.linkGeneration,
+  );
 }
 
 /** 显式解链/撤权才丢弃该控制端的去重缓存与待发送结果。 */
@@ -1547,15 +1702,15 @@ export function forgetControllerInvokeState(deviceId: string): void {
 
 /** 显式撤销时清理短时离线队列与 remembered topic，避免恢复后重放撤权期间数据。 */
 export function purgeRevokedController(deviceId: string): void {
-  clearReportedControllerName(deviceId);
-  offlinePushQueue.clear(deviceId);
-  clearSessionActivityStage(deviceId);
-  clearMakerEventBatchStage(deviceId);
-  cancelLinkAcceptRetry(deviceId);
-  subscriptions.forgetKnownController(deviceId);
+  const changed = deactivateControllerState(deviceId);
   topicSubscriptionControllers.delete(deviceId);
-  acceptedLinkControllers.delete(deviceId);
-  syncForwarding();
+  offlinePushQueue.clear(deviceId);
+  const wasKnown = subscriptions.getKnownControllerIds().includes(deviceId);
+  subscriptions.forgetKnownController(deviceId);
+  if (changed || wasKnown) {
+    log.info(`controller ${shortId(deviceId)} deactivated (revoked)`);
+    syncForwarding();
+  }
 }
 
 /**
@@ -1596,17 +1751,13 @@ async function handleFrame(client: DeviceLinkClient, env: Envelope): Promise<voi
       }
       clearRemoteInvokeStateFor(src);
       offlinePushQueue.clear(src);
-      clearSessionActivityStage(src);
-      clearMakerEventBatchStage(src);
-      cancelLinkAcceptRetry(src);
-      acceptedLinkControllers.delete(src);
-      clearReportedControllerName(src);
+      const deactivated = deactivateControllerState(src);
       // Keep the protocol-capability marker, but discard all remembered routing.
       // A modern controller must reconnect and explicitly subscribe; restoring the
       // legacy wildcard here would silently re-enable broad delivery.
-      subscriptions.clearController(src);
+      const wasKnown = subscriptions.getKnownControllerIds().includes(src);
       subscriptions.forgetKnownController(src);
-      syncForwarding();
+      if (deactivated || wasKnown) syncForwarding();
       log.info(`control link closed by ${shortId(src)}`);
       return;
     case 'invoke':
@@ -1731,6 +1882,7 @@ function handleLinkOpen(
     scheduleLinkAcceptRetry(client, src, requestId, payload, acceptAttempt + 1);
     return;
   }
+  markControllerLinkActive(client, src);
   acceptedLinkControllers.add(src);
   if (knownModernController) {
     subscriptions.updateControllerMetadata(src, name, capabilities);
@@ -2808,7 +2960,7 @@ export async function runInvoke(
   // 不参与合并,避免移动端维护一份会分叉的词典。
   if (payload.channel === DL_VOICE_DICTIONARY_GET_CHANNEL) {
     try {
-      return { ok: true, result: { ok: true, ...readDictionaryProjectionForMobile() } };
+      return { ok: true, result: buildMobileDictionarySnapshot() };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log.warn(`voice:dictionary:get failed from ${shortId(src)}: ${message}`);
@@ -2979,6 +3131,8 @@ export const __testing = {
     remoteInvokeLinkEpoch.clear();
     topicSubscriptionControllers.clear();
     acceptedLinkControllers.clear();
+    controllerConnectionEpochByDevice.clear();
+    controllerLinkGenerationByDevice.clear();
     controllerDisplayNameByDevice.clear();
     reportedControllerNameByDevice.clear();
     onSessionsSubscribed = null;

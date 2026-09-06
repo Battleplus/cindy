@@ -48,6 +48,28 @@ const VALID_AGENTS: readonly AgentKind[] = ['claude-code', 'codex', 'pi'];
 const MAX_ID_LEN = 40;
 const MAX_NAME_LEN = 60;
 
+/**
+ * SQLite's INTEGER affinity still permits legacy text values in a non-STRICT
+ * table. Keep the write boundary numeric so a malformed stored timestamp cannot
+ * turn `updatedAt + 1` into NaN and poison the NOT NULL column.
+ */
+function nextUpdatedAt(now: number, stored: unknown): number {
+  const current = Number.isSafeInteger(now) ? now : Date.now();
+  const previous =
+    typeof stored === 'number'
+      ? stored
+      : typeof stored === 'string' && stored.trim().length > 0
+        ? Number(stored)
+        : Number.NaN;
+  if (!Number.isSafeInteger(previous)) return current;
+  // CAS contract: every successful write must produce a strictly different
+  // updated_at. When previous is at MAX_SAFE_INTEGER, incrementing is
+  // impossible; return current (a real timestamp) which is guaranteed to
+  // differ from the stale MAX_SAFE_INTEGER snapshot.
+  if (previous >= Number.MAX_SAFE_INTEGER) return current;
+  return Math.max(current, previous + 1);
+}
+
 /** 验证结果：ok 或带 code + message（供 handler 映射成 throwIpcError）。 */
 export type ValidationResult =
   { ok: true } | { ok: false; code: 'INVALID_PARAMS'; message: string };
@@ -189,6 +211,12 @@ function validateRuntime(agent: string, rt: unknown): ValidationResult {
   if (r.requestPath !== undefined && !isProviderRequestPath(r.requestPath)) {
     return invalid(`runtime '${agent}' requestPath invalid`);
   }
+  if (r.supportsImageGeneration !== undefined && typeof r.supportsImageGeneration !== 'boolean') {
+    return invalid(`runtime '${agent}' supportsImageGeneration must be a boolean`);
+  }
+  if (r.supportsImageGeneration === true && agent !== 'codex') {
+    return invalid(`runtime '${agent}' supportsImageGeneration requires Codex`);
+  }
   if (!Array.isArray(r.models)) return invalid(`runtime '${agent}' models must be an array`);
   for (const m of r.models) {
     if (!m || typeof m !== 'object') return invalid(`runtime '${agent}' model must be an object`);
@@ -282,6 +310,20 @@ function validateRuntime(agent: string, rt: unknown): ValidationResult {
       return invalid(`runtime '${agent}' wireProtocol invalid`);
     }
   }
+  const defaultWireProtocol =
+    r.wireProtocol ?? (agent === 'codex' ? 'openai-responses' : undefined);
+  const hasResponsesRoute =
+    defaultWireProtocol === 'openai-responses' ||
+    r.models.some((model) => {
+      if (!model || typeof model !== 'object') return false;
+      const route = (model as Record<string, unknown>).route;
+      return route && typeof route === 'object' && !Array.isArray(route)
+        ? (route as Record<string, unknown>).wireProtocol === 'openai-responses'
+        : false;
+    });
+  if (r.supportsImageGeneration === true && !hasResponsesRoute) {
+    return invalid(`runtime '${agent}' supportsImageGeneration requires OpenAI Responses`);
+  }
   if (r.headers !== undefined) {
     if (!r.headers || typeof r.headers !== 'object' || Array.isArray(r.headers)) {
       return invalid(`runtime '${agent}' headers must be an object`);
@@ -300,6 +342,9 @@ function validateRuntime(agent: string, rt: unknown): ValidationResult {
       const u = new URL(r.modelsUrl);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') {
         return invalid(`runtime '${agent}' modelsUrl must be http(s)`);
+      }
+      if (u.username || u.password) {
+        return invalid(`runtime '${agent}' modelsUrl must not contain embedded credentials`);
       }
     } catch {
       return invalid(`runtime '${agent}' modelsUrl is not a valid URL`);
@@ -522,6 +567,9 @@ function normalizeRuntime(
     });
   const out: CustomProviderRuntimeConfig = { baseUrl: rt.baseUrl.trim(), models };
   if (rt.wireProtocol) out.wireProtocol = rt.wireProtocol;
+  if (agent === 'codex' && rt.supportsImageGeneration === true) {
+    out.supportsImageGeneration = true;
+  }
   if (agent !== 'pi' && rt.requestPath && rt.requestPath.trim()) {
     out.requestPath = rt.requestPath.trim();
   }
@@ -665,14 +713,6 @@ function parseAuth(raw: string | null): CustomProviderConfig['auth'] {
  * 必须先转数值再 +1：`updated_at` 列声明为 INTEGER，但 SQLite 非 STRICT 表允许存入文本，
  * 而 `rowToConfig` 只读 id/name/runtimes/auth、不校验该列。一旦某行存的是字符串，
  * `existing.updatedAt + 1` 会退化成字符串拼接，`Math.max` 得到 NaN，写入 NOT NULL 整数列
- * 触发 SQLITE_CONSTRAINT_NOTNULL —— 该供应商此后永久无法保存，且错误对用户不可诉。
- */
-function nextUpdatedAt(existingUpdatedAt: unknown, now: number): number {
-  const previous = Number(existingUpdatedAt);
-  if (!Number.isFinite(previous)) return now;
-  return Math.max(now, previous + 1);
-}
-
 /** 安全解析 runtimes JSON（坏数据兜底为 {}，逐字段防御）。 */
 function parseRuntimes(raw: string): Partial<Record<AgentKind, CustomProviderRuntimeConfig>> {
   let v: unknown;
@@ -729,6 +769,9 @@ function parseRuntimes(raw: string): Partial<Record<AgentKind, CustomProviderRun
       // 旧版把 Pi 的缺省协议解释为 Chat。新写入口已要求显式 wireProtocol；仅在读取
       // 历史持久化记录时把旧语义物化，避免运行时重新猜测或按供应商穷举兼容。
       entry.wireProtocol = 'openai-chat';
+    }
+    if (agent === 'codex' && r.supportsImageGeneration === true) {
+      entry.supportsImageGeneration = true;
     }
     if (agent !== 'pi' && isProviderRequestPath(r.requestPath)) {
       entry.requestPath = r.requestPath;
@@ -831,7 +874,7 @@ export async function updateCustomProvider(
       name: c.name,
       runtimes: JSON.stringify(c.runtimes),
       auth: c.auth ? JSON.stringify(c.auth) : null,
-      updatedAt: nextUpdatedAt(existing.updatedAt, now),
+      updatedAt: nextUpdatedAt(now, existing.updatedAt),
     })
     .where(eq(customProviders.id, id));
   return c;
@@ -869,7 +912,7 @@ export async function updateCustomProviderIfUnchanged(
       name: nextConfig.name,
       runtimes: JSON.stringify(nextConfig.runtimes),
       auth: nextConfig.auth ? JSON.stringify(nextConfig.auth) : null,
-      updatedAt: nextUpdatedAt(existing.updatedAt, now),
+      updatedAt: nextUpdatedAt(now, existing.updatedAt),
     })
     .where(and(eq(customProviders.id, id), eq(customProviders.updatedAt, existing.updatedAt)));
   return result.changes === 1;

@@ -32,6 +32,8 @@ export const DEFAULT_CUSTOM_CONTEXT_WINDOW = 200_000;
  * source. Preserve the stored id, but project that legacy row under a collision-free runtime id.
  */
 export const LEGACY_XAI_CUSTOM_PROVIDER_RUNTIME_ID = "custom:xai";
+/** Official API-key preset for xAI; distinct from the built-in SuperGrok OAuth provider. */
+export const XAI_API_CUSTOM_PROVIDER_ID = "xai-api";
 
 export function runtimeCustomProviderId(providerId: string): string {
   return providerId === "xai"
@@ -43,6 +45,71 @@ export function storedCustomProviderId(providerId: string): string {
   return providerId === LEGACY_XAI_CUSTOM_PROVIDER_RUNTIME_ID
     ? "xai"
     : providerId;
+}
+
+function isOfficialXaiApiUpstream(upstream: string | undefined): boolean {
+  try {
+    const url = new URL(upstream ?? "");
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "api.x.ai" &&
+      (url.pathname === "/v1" || url.pathname === "/v1/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The chat-only xAI API preset uses the same public Imagine endpoints as the built-in
+ * OAuth source. Project those catalog entries onto the API-key source only after the
+ * official endpoint has been confirmed by the saved runtime routing.
+ */
+export function projectXaiApiImageModels(
+  providers: readonly Provider[],
+): readonly Provider[] {
+  const xaiSource = providers.find((provider) => provider.id === "xai");
+  if (
+    !xaiSource?.imageModels?.length ||
+    !providers.some((provider) => provider.id === XAI_API_CUSTOM_PROVIDER_ID)
+  ) {
+    return providers;
+  }
+  // 属性收窄无法跨越 map 回调边界，这里显式捕获非空清单。
+  const sourceImageModels = xaiSource.imageModels;
+  let changed = false;
+  const projected = providers.map((provider) => {
+    if (
+      provider.id !== XAI_API_CUSTOM_PROVIDER_ID ||
+      provider.source !== "user" ||
+      provider.auth.method !== "apiKey" ||
+      provider.imageModels?.length ||
+      !Object.values(provider.routing).some((routing) =>
+        isOfficialXaiApiUpstream(routing?.upstream),
+      )
+    ) {
+      return provider;
+    }
+    changed = true;
+    return { ...provider, imageModels: [...sourceImageModels] };
+  });
+  return changed ? projected : providers;
+}
+
+/**
+ * Official-API image credentials may only come from runtimes whose saved routing
+ * targets the official endpoint. Binding key reads to these agents prevents a
+ * proxy-configured runtime's key from being disclosed to api.x.ai. Agents are
+ * returned in fixed AGENT_ORDER so key selection stays deterministic when
+ * several runtimes are official.
+ */
+export function xaiApiOfficialRuntimeAgents(
+  provider: Provider | undefined,
+): readonly AgentKind[] {
+  if (!provider) return [];
+  return AGENT_ORDER.filter((agent) =>
+    isOfficialXaiApiUpstream(provider.routing[agent]?.upstream),
+  );
 }
 
 /**
@@ -68,34 +135,10 @@ interface RegistryEffortMetadata {
   defaultEffort: Effort | null;
 }
 
-/**
- * 仅在模型能由当前 agent 的 Registry route 唯一识别时复用 effort 元数据。
- * 自定义 provider 的 id、model id 与路由保持原值；Pi 能力继续只认逐模型显式配置。
- */
-function registryEffortMetadata(
-  registry: ModelRegistry | null | undefined,
-  modelId: string,
+function toRegistryEffortMetadata(
+  entry: { efforts?: readonly Effort[]; defaultEffort?: Effort | null; perAgent?: Partial<Record<string, { efforts?: readonly Effort[]; defaultEffort?: Effort | null }>> },
   agent: AgentKind,
 ): RegistryEffortMetadata | undefined {
-  if (agent === "pi" || !registry) return undefined;
-
-  const candidates = new Set([modelId]);
-  if (modelId.startsWith("chatgpt/")) {
-    candidates.add(modelId.slice("chatgpt/".length));
-  }
-  const matches = registry.models.filter((entry) =>
-    entry.routes.some(
-      (route) =>
-        route.agents.includes(agent) &&
-        (candidates.has(entry.id) || candidates.has(route.modelId)),
-    ),
-  );
-  const uniqueEntries = [
-    ...new Map(matches.map((entry) => [entry.id, entry])).values(),
-  ];
-  if (uniqueEntries.length !== 1) return undefined;
-
-  const entry = uniqueEntries[0]!;
   const perAgent = entry.perAgent?.[agent];
   const efforts = perAgent?.efforts ?? entry.efforts;
   if (!efforts) return undefined;
@@ -107,6 +150,103 @@ function registryEffortMetadata(
         ? DEFAULT_CUSTOM_EFFORT
         : (efforts[efforts.length - 1] ?? null);
   return { efforts: [...efforts], defaultEffort };
+}
+
+function consensusRegistryEffortMetadata(
+  entries: readonly ModelRegistry["models"][number][],
+  agent: AgentKind,
+): RegistryEffortMetadata | undefined {
+  const uniqueEntries = [
+    ...new Map(entries.map((entry) => [entry.id, entry])).values(),
+  ];
+  const metadata = uniqueEntries.map((entry) =>
+    toRegistryEffortMetadata(entry, agent),
+  );
+  const first = metadata[0];
+  if (
+    !first ||
+    metadata.some(
+      (value) =>
+        !value ||
+        value.defaultEffort !== first.defaultEffort ||
+        value.efforts.length !== first.efforts.length ||
+        value.efforts.some((effort, index) => effort !== first.efforts[index]),
+    )
+  ) {
+    return undefined;
+  }
+  return first;
+}
+
+/**
+ * 仅在模型能由当前 agent 的 Registry route 唯一识别，或所有匹配
+ * 条目的 effort 元数据完全一致时复用该能力。
+ * 自定义 provider 的 id、model id 与路由保持原值；Pi 能力继续只认逐模型显式配置。
+ */
+function registryEffortMetadata(
+  registry: ModelRegistry | null | undefined,
+  modelId: string,
+  agent: AgentKind,
+): RegistryEffortMetadata | undefined {
+  if (agent === "pi" || !registry) return undefined;
+
+  // Stage 1 — exact lookup: only the original modelId.
+  const exactMatches = registry.models.filter((entry) =>
+    entry.routes.some(
+      (route) =>
+        route.agents.includes(agent) &&
+        (entry.id === modelId || route.modelId === modelId),
+    ),
+  );
+  if (exactMatches.length > 0) {
+    return consensusRegistryEffortMetadata(exactMatches, agent);
+  }
+
+  // Stage 2 — prefix fallback: only when Stage 1 found nothing.
+  // Strip common provider prefixes so third-party custom API models
+  // (e.g. "openai/gpt-5.6-sol") can match registry entries whose
+  // route.modelId is just "gpt-5.6-sol".
+  const stripped = new Set<string>();
+  for (const prefix of ['openai/', 'xd/', 'chatgpt/']) {
+    if (modelId.startsWith(prefix)) stripped.add(modelId.slice(prefix.length));
+  }
+  if (stripped.size === 0) return undefined;
+  const fallbackMatches = registry.models.filter((entry) =>
+    entry.routes.some(
+      (route) =>
+        route.agents.includes(agent) &&
+        (stripped.has(entry.id) || stripped.has(route.modelId)),
+    ),
+  );
+  return consensusRegistryEffortMetadata(fallbackMatches, agent);
+}
+
+/**
+ * Fast mode is a Codex service-tier capability, so a user provider may inherit it only when the
+ * configured model id exactly matches a Registry route for Codex. Prefix fallback is intentionally
+ * excluded: aliases can point at gateways with different billing or service-tier behavior.
+ */
+function registrySupportsFastMode(
+  registry: ModelRegistry | null | undefined,
+  modelId: string,
+  agent: AgentKind,
+): boolean {
+  if (agent !== "codex" || !registry) return false;
+
+  const matches = registry.models.filter((entry) =>
+    entry.routes.some(
+      (route) =>
+        route.agents.includes(agent) && route.modelId === modelId,
+    ),
+  );
+  return (
+    matches.length > 0 &&
+    matches.every(
+      (entry) =>
+        (entry.perAgent?.[agent]?.supportsFastMode ??
+          entry.supportsFastMode) === true,
+    )
+  );
 }
 
 /** 固定 agent 顺序：保证派生出的 provider.agents / routing / models 顺序稳定。 */
@@ -133,6 +273,11 @@ function toCatalogModel(
     m.reasoning !== undefined
       ? undefined
       : registryEffortMetadata(modelRegistry, m.id, agent);
+  const supportsFastMode = registrySupportsFastMode(
+    modelRegistry,
+    m.id,
+    agent,
+  );
   const effectiveEfforts = registryEfforts?.efforts ?? efforts;
   const defaultEffort =
     registryEfforts?.defaultEffort ??
@@ -164,6 +309,7 @@ function toCatalogModel(
     // 图片能力必须由用户/预设明确确认；缺省不猜，防止 Pi 静默把截图降级成占位文本。
     ...(m.supportsImageInput === true ? { supportsImageInput: true } : {}),
     ...(m.thinkingToggle === true ? { thinkingToggle: true } : {}),
+    ...(supportsFastMode ? { supportsFastMode: true } : {}),
   };
 }
 
@@ -187,10 +333,18 @@ function toRouting(
   modelsUrl?: string,
   wireProtocol?: "anthropic-messages" | "openai-responses" | "openai-chat",
   piCatalogProviderId?: string,
+  supportsImageGeneration?: boolean,
 ): RoutingDescriptor {
   const r: RoutingDescriptor = {
     upstream: baseUrl,
     authStrategy: strategy,
+    ...(agent === 'codex'
+      && (wireProtocol ?? defaultWireProtocol(agent)) === 'openai-responses'
+      ? { supportsResponsesCustomTools: false }
+      : {}),
+    ...(agent === 'codex' && supportsImageGeneration === true
+      ? { supportsImageGeneration: true }
+      : {}),
     ...(strategy === "none" &&
     (!isLoopbackProviderUrl(baseUrl) ||
       (modelsUrl !== undefined && !isLoopbackProviderUrl(modelsUrl)))
@@ -249,6 +403,7 @@ export function buildUserProvider(
       rt.modelsUrl,
       rt.wireProtocol,
       rt.piCatalogProviderId,
+      rt.supportsImageGeneration,
     );
     models[agent] = rt.models.map((m) =>
       toCatalogModel(m, config.id, agent, options.modelRegistry),

@@ -72,6 +72,25 @@ afterEach(() => {
 });
 
 describe('validateCustomProviderConfig (per-runtime)', () => {
+  it.each(['user@', ':secret@', 'user:secret@', 'us%65r:s%65cret@'])(
+    'rejects credentials in modelsUrl without exposing them: %s',
+    (userinfo) => {
+      expect(validateCustomProviderConfig({
+        ...valid,
+        runtimes: {
+          codex: {
+            ...valid.runtimes.codex!,
+            modelsUrl: `https://${userinfo}openrouter.ai/api/v1/models`,
+          },
+        },
+      })).toEqual({
+        ok: false,
+        code: 'INVALID_PARAMS',
+        message: "runtime 'codex' modelsUrl must not contain embedded credentials",
+      });
+    },
+  );
+
   it('accepts a valid single-runtime config', () => {
     expect(validateCustomProviderConfig(valid)).toEqual({ ok: true });
   });
@@ -370,6 +389,74 @@ describe('validateCustomProviderConfig (per-runtime)', () => {
 });
 
 describe('custom-provider-store CRUD (per-runtime)', () => {
+  it('accepts image generation only for a Codex runtime with an OpenAI Responses route', () => {
+    const model = { id: 'image-chat', name: 'Image Chat' };
+    expect(
+      validateCustomProviderConfig({
+        id: 'image-provider',
+        name: 'Image Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://example.com/v1',
+            wireProtocol: 'openai-responses',
+            supportsImageGeneration: true,
+            models: [model],
+          },
+        },
+      }),
+    ).toEqual({ ok: true });
+    expect(
+      validateCustomProviderConfig({
+        id: 'chat-provider',
+        name: 'Chat Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://example.com/v1',
+            wireProtocol: 'openai-chat',
+            supportsImageGeneration: true,
+            models: [model],
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validateCustomProviderConfig({
+        id: 'pi-provider',
+        name: 'Pi Provider',
+        runtimes: {
+          pi: {
+            baseUrl: 'https://example.com/v1',
+            wireProtocol: 'openai-responses',
+            supportsImageGeneration: true,
+            models: [model],
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validateCustomProviderConfig({
+        id: 'mixed-provider',
+        name: 'Mixed Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://example.com/v1',
+            wireProtocol: 'openai-chat',
+            supportsImageGeneration: true,
+            models: [
+              {
+                ...model,
+                route: {
+                  baseUrl: 'https://example.com/responses',
+                  wireProtocol: 'openai-responses',
+                },
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual({ ok: true });
+  });
+
   it('creates, lists, gets, updates, deletes', async () => {
     mountDb();
     expect(await listCustomProviders()).toEqual([]);
@@ -438,6 +525,58 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     expect((await getCustomProvider('openrouter'))?.name).toBe('Edited in another window');
   });
 
+  it('recovers malformed stored updated_at values in both update paths', async () => {
+    mountDb();
+    const rows = [
+      ['iso-update', '2026-08-19T01:45:07Z'],
+      ['invalid-update', 'not-a-timestamp'],
+      ['numeric-discovery', '1234'],
+      ['iso-discovery', '2026-08-19T01:45:07Z'],
+    ] as const;
+    const insert = raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const [id, updatedAt] of rows) {
+      insert.run(id, id, JSON.stringify(valid.runtimes), null, 0, 1, updatedAt);
+    }
+
+    await updateCustomProvider('iso-update', { ...valid, id: 'iso-update' }, 2_000);
+    await updateCustomProvider('invalid-update', { ...valid, id: 'invalid-update' }, 3_000);
+    const numericSnapshot = await getCustomProvider('numeric-discovery');
+    expect(numericSnapshot).not.toBeNull();
+    expect(
+      await updateCustomProviderIfUnchanged(
+        'numeric-discovery',
+        numericSnapshot!,
+        { ...numericSnapshot!, name: 'numeric-discovery-updated' },
+        1_000,
+      ),
+    ).toBe(true);
+    const isoSnapshot = await getCustomProvider('iso-discovery');
+    expect(isoSnapshot).not.toBeNull();
+    expect(
+      await updateCustomProviderIfUnchanged(
+        'iso-discovery',
+        isoSnapshot!,
+        { ...isoSnapshot!, name: 'iso-discovery-updated' },
+        4_000,
+      ),
+    ).toBe(true);
+
+    const updated = raw!.prepare('SELECT id, updated_at FROM custom_providers ORDER BY id').all() as Array<{
+      id: string;
+      updated_at: unknown;
+    }>;
+    expect(updated).toEqual([
+      { id: 'invalid-update', updated_at: 3_000 },
+      { id: 'iso-discovery', updated_at: 4_000 },
+      { id: 'iso-update', updated_at: 2_000 },
+      { id: 'numeric-discovery', updated_at: 1_235 },
+    ]);
+  });
+
   it('never persists headers and still dedupes models on normalize', async () => {
     mountDb();
     await createCustomProvider({
@@ -484,6 +623,26 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
       { id: 'legacy', name: 'Legacy' },
       { id: 'explicit-text', name: 'Explicit text' },
     ]);
+  });
+
+  it('round-trips only an explicitly enabled Codex image-generation capability', async () => {
+    mountDb();
+    await createCustomProvider({
+      id: 'imagegen-provider',
+      name: 'Imagegen Provider',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://example.com/v1',
+          wireProtocol: 'openai-responses',
+          supportsImageGeneration: true,
+          models: [{ id: 'enabled', name: 'Enabled' }, { id: 'legacy', name: 'Legacy' }],
+        },
+      },
+    });
+    expect((await getCustomProvider('imagegen-provider'))?.runtimes.codex).toMatchObject({
+      supportsImageGeneration: true,
+      models: [{ id: 'enabled', name: 'Enabled' }, { id: 'legacy', name: 'Legacy' }],
+    });
   });
 
   it('round-trips the Pi official catalog provider id without adding it to other runtimes', async () => {
@@ -1047,4 +1206,113 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     mountDb();
     expect(await listCustomProviders()).toEqual([]);
   });
+
+  it('CAS: MAX_SAFE_INTEGER seed — writer B succeeds, stale reader A is rejected', async () => {
+    mountDb();
+
+    // Seed a provider with updated_at = MAX_SAFE_INTEGER (corrupted/legacy data)
+    raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('max-cas', 'MaxCAS', JSON.stringify(valid.runtimes), null, 0, 1, Number.MAX_SAFE_INTEGER);
+
+    // Read raw updated_at to snapshot version
+    const versionA = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('max-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionA).toBe(Number.MAX_SAFE_INTEGER);
+
+    // Reader A reads the config snapshot
+    const readerA = await getCustomProvider('max-cas');
+    expect(readerA).not.toBeNull();
+
+    // Writer B performs a normal edit
+    await updateCustomProvider('max-cas', {
+      ...valid,
+      id: 'max-cas',
+      name: 'MaxCAS Edited by B',
+    }, 1_700_000_000_000);
+
+    // B's write must produce a different updated_at
+    const versionB = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('max-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionB).not.toBe(Number.MAX_SAFE_INTEGER);
+    expect(versionB).not.toBe(versionA);
+
+    // Verify B's content is correct
+    const afterB = await getCustomProvider('max-cas');
+    expect(afterB).not.toBeNull();
+    expect(afterB!.name).toBe('MaxCAS Edited by B');
+
+    // Reader A tries a stale CAS update — config equality check fails
+    // because writer B changed the name. This证明生产路径在 B 修改后
+    // 拒绝 A 的过时写入。注意：此处 name 不一致导致 equality check
+    // 先于 CAS timestamp 检查返回 false，因此不单独证明 CAS 失败。
+    // 真正的 CAS-only 拦截需要 config equality 通过但 timestamp 过时，
+    // 这在单线程测试中难以自然构造（需要 hook SELECT 和 UPDATE 之间）。
+    const staleResult = await updateCustomProviderIfUnchanged(
+      'max-cas',
+      readerA!,
+      { ...readerA!, name: 'Stale A overwrite' },
+      1_700_000_010_000,
+    );
+    expect(staleResult).toBe(false);
+
+    // Verify B's content was NOT overwritten by A
+    const final_ = await getCustomProvider('max-cas');
+    expect(final_).not.toBeNull();
+    expect(final_!.name).toBe('MaxCAS Edited by B');
+  });
+
+  it('CAS: normal seed — writer B succeeds, stale reader A is rejected', async () => {
+    mountDb();
+
+    // Seed with normal updated_at
+    raw!.prepare(
+      `INSERT INTO custom_providers
+        (id, name, runtimes, auth, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('normal-cas', 'NormalCAS', JSON.stringify(valid.runtimes), null, 0, 1, 1000);
+
+    // Reader A snapshots the version
+    const versionA = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('normal-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionA).toBe(1000);
+
+    // Reader A reads config snapshot
+    const readerA = await getCustomProvider('normal-cas');
+    expect(readerA).not.toBeNull();
+
+    // Writer B edits
+    await updateCustomProvider('normal-cas', {
+      ...valid,
+      id: 'normal-cas',
+      name: 'NormalCAS Edited by B',
+    }, 2000);
+
+    // B's updated_at changed
+    const versionB = (
+      raw!.prepare('SELECT updated_at AS updatedAt FROM custom_providers WHERE id = ?').get('normal-cas') as { updatedAt: number }
+    ).updatedAt;
+    expect(versionB).not.toBe(versionA);
+
+    // Reader A stale CAS update — name mismatch causes config equality
+    // check to fail before CAS timestamp check.
+    const staleResult = await updateCustomProviderIfUnchanged(
+      'normal-cas',
+      readerA!,
+      { ...readerA!, name: 'Stale A overwrite' },
+      3000,
+    );
+    expect(staleResult).toBe(false);
+
+    // B's content preserved
+    const final_ = await getCustomProvider('normal-cas');
+    expect(final_).not.toBeNull();
+    expect(final_!.name).toBe('NormalCAS Edited by B');
+  });
+
 });

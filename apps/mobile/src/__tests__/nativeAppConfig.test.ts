@@ -14,6 +14,7 @@ const managedEnvKeys = [
   'EXPO_PUBLIC_APP_VARIANT',
   'EXPO_PUBLIC_BETA_DEV',
   'EXPO_PUBLIC_CINDY_AUTH_REGION',
+  'EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL',
   'EXPO_PUBLIC_ENDPOINT_MANIFEST_BASE_URL',
   'EXPO_PUBLIC_ENDPOINT_MANIFEST_PEER_BASE_URL',
   'EXPO_PUBLIC_XDT_OTA_SELFHOST',
@@ -99,6 +100,48 @@ describe('mobile native app config', () => {
     );
   });
 
+  it('keeps the CN Release manifest injection CindyDev-only and outside Expo config', () => {
+    const appJson = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'app.json'), 'utf8'),
+    );
+    const buildConfig = require(resolve(process.cwd(), 'app.config.js'));
+    const appConfigSource = readFileSync(
+      resolve(process.cwd(), 'app.config.js'),
+      'utf8',
+    );
+
+    expect(appConfigSource).toContain("...(region === 'dev'");
+    expect(appConfigSource).toContain(
+      'EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL:',
+    );
+    expect(appConfigSource).toContain("resolveManifestBaseUrl('cn')");
+    expect(appConfigSource).not.toContain(
+      'xdtProductionEnv: mobileBundleEnv',
+    );
+
+    process.env.EXPO_PUBLIC_CINDY_AUTH_REGION = 'cn';
+    process.env.EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL =
+      'https://stale-release.example.invalid/app';
+    const cn = buildConfig({ config: appJson.expo });
+    expect(
+      process.env.EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL,
+    ).toBeUndefined();
+    expect(JSON.stringify(cn)).not.toContain(
+      'EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL',
+    );
+
+    process.env.EXPO_PUBLIC_CINDY_AUTH_REGION = 'global';
+    process.env.EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL =
+      'https://stale-release.example.invalid/app';
+    const global = buildConfig({ config: appJson.expo });
+    expect(
+      process.env.EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL,
+    ).toBeUndefined();
+    expect(JSON.stringify(global)).not.toContain(
+      'EXPO_PUBLIC_CINDY_DEV_RELEASE_ENDPOINT_MANIFEST_BASE_URL',
+    );
+  });
+
   it('injects EAS owner / projectId / updates from env and omits them when unset', () => {
     const appJson = JSON.parse(
       readFileSync(resolve(process.cwd(), 'app.json'), 'utf8'),
@@ -174,6 +217,8 @@ describe('mobile native app config', () => {
       checkAutomatically: 'NEVER',
       disableAntiBrickingMeasures: true,
     });
+    // 共享 EAS-Client-ID 只能由 JS 事务式覆盖；写入原生 requestHeaders 会改变 fingerprint。
+    expect(selfHosted.updates).not.toHaveProperty('requestHeaders');
     expect(JSON.stringify(selfHosted)).not.toContain('must-not-be-baked.example.com');
     // 自建 app 身份按 region 从 self-host-regions.json(.example 回落)取,而非写死。
     expect(selfHosted.ios.bundleIdentifier).toBe('com.xd.cindycn');
@@ -475,6 +520,31 @@ describe('mobile native app config', () => {
     expect(foregroundOnlyPluginIndex).toBeGreaterThanOrEqual(0);
     expect(foregroundOnlyPluginIndex).toBeLessThan(audioPluginIndex);
     expect(appJson.expo.ios.infoPlist.UIBackgroundModes ?? []).not.toContain('audio');
+  });
+
+  it('uses the Android system photo picker without broad media permissions', () => {
+    const appJson = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'app.json'), 'utf8'),
+    );
+    const mediaLibraryPlugin = appJson.expo.plugins.find(
+      (plugin: unknown) =>
+        Array.isArray(plugin) && plugin[0] === 'expo-media-library',
+    );
+
+    expect(mediaLibraryPlugin).toEqual([
+      'expo-media-library',
+      expect.objectContaining({ granularPermissions: [] }),
+    ]);
+    expect(appJson.expo.android.blockedPermissions).toEqual(
+      expect.arrayContaining([
+        'android.permission.READ_EXTERNAL_STORAGE',
+        'android.permission.WRITE_EXTERNAL_STORAGE',
+        'android.permission.READ_MEDIA_AUDIO',
+        'android.permission.READ_MEDIA_IMAGES',
+        'android.permission.READ_MEDIA_VIDEO',
+        'android.permission.READ_MEDIA_VISUAL_USER_SELECTED',
+      ]),
+    );
   });
 
   it('keeps Metro React resolution on the mobile app dependency', () => {

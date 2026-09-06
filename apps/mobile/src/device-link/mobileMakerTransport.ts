@@ -1,4 +1,8 @@
 import type {
+  ConversationSearchRequest,
+  ConversationSearchResponse,
+} from '@cindy/maker-shared/conversation-search';
+import type {
   InputProjection,
   PendingInteraction,
   QueuedRemoteMessage,
@@ -124,6 +128,7 @@ export interface MobileLearnStartRequest {
   input: string;
   sourceKind: 'freetext' | 'session' | 'hub';
   hubSlug?: string;
+  hubCatalogScope?: 'market' | 'team';
   originSessionId?: string;
 }
 
@@ -274,6 +279,8 @@ export interface MobileActiveSessionSnapshot {
 export interface MobileModelPrice {
   inputUsdPerMtok: number;
   outputUsdPerMtok: number;
+  /** Gateway 折扣比例 0..1;旧被控端不下发。计费金额 = 原价 × (1 - costDiscount)。 */
+  costDiscount?: number;
 }
 
 export type MobileModelPricingMap = Record<string, MobileModelPrice>;
@@ -389,6 +396,7 @@ export interface MobileMakerTransport {
     modelVisibilityOverrides?: Record<string, boolean>;
   }>;
   getSession(sessionId: string): Promise<RemoteSession>;
+  searchConversations(request: ConversationSearchRequest): Promise<ConversationSearchResponse>;
   patchSessionMeta(sessionId: string, patch: SessionMetaPatch): Promise<RemoteSession>;
   /**
    * error-tail「忽略」:被控端把该 role='error' 行的 content merge dismissed:true
@@ -420,7 +428,12 @@ export interface MobileMakerTransport {
    * 切模型。可选第 3 参 providerId = 同时切来源(被控端按其路由 + 持久化 provider_id)。
    * 不传 providerId = 老 2 参语义,不动会话当前来源选择。
    */
-  setModel(sessionId: string, model: string, providerId?: string): Promise<void>;
+  setModel(
+    sessionId: string,
+    model: string,
+    providerId?: string,
+    selection?: { effort: string | null; fastMode: boolean },
+  ): Promise<{ deferred?: boolean; superseded?: boolean } | undefined>;
   /** 登记跨 Agent 切换意图；真正切换在下一条消息发送时由 desktop main 执行。 */
   switchSessionAgent(
     sessionId: string,
@@ -660,6 +673,7 @@ export function createMobileMakerTransport({
       capabilities: [CONTROLLER_CAPABILITY_PROVIDER_LOGO_KINDS_V2],
     }]),
     getSession: (sessionId) => call('local-db:sessions:get', [sessionId]),
+    searchConversations: (request) => call('local-db:conversations:search', [request]),
     patchSessionMeta: (sessionId, patch) => call('local-db:sessions:patch-meta', [sessionId, patch]),
     dismissErrorMessage: (sessionId, clientId) =>
       call('local-db:messages:dismiss-error', [sessionId, clientId]),
@@ -673,8 +687,31 @@ export function createMobileMakerTransport({
     send: (sessionId, message, createOpts, sendOpts) =>
       call('maker:send', [sessionId, message, createOpts, sendOpts]),
     listActiveSessions: () => call('maker:list-active'),
-    setModel: (sessionId, model, providerId) =>
-      call('maker:set-model', providerId ? [sessionId, model, providerId] : [sessionId, model]),
+    setModel: async (sessionId, model, providerId, selection) => {
+      const wireArgs = selection
+        ? [sessionId, model, providerId ?? null, null, selection]
+        : providerId
+          ? [sessionId, model, providerId]
+          : [sessionId, model];
+      const result = await call<{ deferred?: boolean; superseded?: boolean } | undefined>(
+        'maker:set-model',
+        wireArgs,
+      );
+      if (
+        result !== null &&
+        typeof result === 'object' &&
+        ('contextWindowConfirmationRequired' in result ||
+          'contextTokensForConfirmation' in result)
+      ) {
+        throw Object.assign(
+          new Error(
+            'remote model-window confirmation is unsupported; runtime selection was not changed',
+          ),
+          { code: 'PRECONDITION_FAILED' },
+        );
+      }
+      return result;
+    },
     switchSessionAgent: (
       sessionId,
       targetAgentKind,

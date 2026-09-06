@@ -15,10 +15,12 @@ import {
   AGENT_ISLAND_MESSAGE_PREVIEW_MIN_DWELL_MS,
   AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS,
   buildAgentIslandDisplayState,
+  buildAllSessionActivitySnapshots,
   closeAgentIslandSessionPreservingUnread,
   createAgentIslandState,
   dismissAgentIslandActiveReveal,
   getNextAgentIslandTimerAt,
+  isAgentIslandPendingFocusAck,
   markAgentIslandSessionAttention,
   requestAgentIslandManualCollapse,
   requestAgentIslandManualExpand,
@@ -288,6 +290,30 @@ describe('Agent Island display state', () => {
     expect(display.sessions.map((session) => session.sessionId)).toEqual(['ask', 'err', 'done']);
   });
 
+  it('localizes tool-loop terminal details in the Agent Island projection', () => {
+    const state = createAgentIslandState();
+    setAgentIslandStrings(state, {
+      ...DEFAULT_AGENT_ISLAND_STRINGS,
+      error: 'Localized error',
+    });
+
+    applyAgentIslandEvent(
+      state,
+      { sessionId: 'tool-loop', title: 'Tool loop', agentKind: 'claude-code' },
+      terminalErrorEvent(
+        '上游模型 claude 连续 3 次 Edit 调用因同类参数错误(missing_required_field)被拒',
+        'tool_use_loop_detected',
+      ),
+      1_000,
+    );
+
+    const session = buildAgentIslandDisplayState(state, 1_001).sessions[0];
+    expect(session?.detail).toBe('Localized error');
+    expect(session?.activityLines).toContainEqual(
+      expect.objectContaining({ kind: 'status', text: 'Localized error' }),
+    );
+  });
+
   it('builds a CodeIsland-style recent activity preview per session', () => {
     const state = createAgentIslandState();
 
@@ -372,7 +398,10 @@ describe('Agent Island display state', () => {
       },
     }, start + 200);
     expect(state.sessions.get('s1')).toMatchObject({
-      assistantStreamRawText: '我会先',
+      assistantStream: {
+        mode: 'plain',
+        rawPreview: '我会先',
+      },
       reconnectStatus: '（1/5）正在重连…',
     });
     expect(buildAgentIslandDisplayState(state, start + 200).sessions[0]).toMatchObject({
@@ -421,7 +450,10 @@ describe('Agent Island display state', () => {
       running: true,
       phase: 'running',
       assistantStreamLineId: null,
-      assistantStreamRawText: '',
+      assistantStream: {
+        mode: 'pending',
+        rawPreview: '',
+      },
     });
     expect(session?.activityLines.map((line) => `${line.kind}:${line.text}`)).toEqual([
       'user:run tests',
@@ -429,21 +461,29 @@ describe('Agent Island display state', () => {
     ]);
   });
 
-  it('keeps whitespace-only assistant deltas in the raw stream accumulator', () => {
+  it('keeps whitespace-only assistant deltas pending for the next visible delta', () => {
     const state = createAgentIslandState();
     const start = 1_000;
 
     applyAgentIslandUserPrompt(state, { sessionId: 's1', title: 'Task', agentKind: 'codex' }, 'run tests', start);
     applyAgentIslandEvent(state, { sessionId: 's1' }, textDeltaEvent('\n'), start + 100);
 
-    expect(state.sessions.get('s1')?.assistantStreamRawText).toBe('\n');
+    expect(state.sessions.get('s1')?.assistantStream).toMatchObject({
+      mode: 'pending',
+      rawChunks: ['\n'],
+      rawPreview: '',
+    });
     expect(state.sessions.get('s1')?.activityLines.map((line) => `${line.kind}:${line.text}`)).toEqual([
       'user:run tests',
     ]);
 
     applyAgentIslandEvent(state, { sessionId: 's1' }, textDeltaEvent('我会继续处理'), start + 200);
 
-    expect(state.sessions.get('s1')?.assistantStreamRawText).toBe('\n我会继续处理');
+    expect(state.sessions.get('s1')?.assistantStream).toMatchObject({
+      mode: 'plain',
+      rawChunks: [],
+      rawPreview: '我会继续处理',
+    });
     expect(state.sessions.get('s1')?.activityLines.map((line) => `${line.kind}:${line.text}`)).toEqual([
       'user:run tests',
       'assistant:我会继续处理',
@@ -1164,6 +1204,35 @@ describe('Agent Island display state', () => {
     });
   });
 
+  it('keeps ask_user waiting after a successful done instead of completing', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'ask', title: 'Ask' }, statusEvent(true, 'Running'), 1_000);
+    applyAgentIslandInteractionRequest(state, { sessionId: 'ask', title: 'Ask' }, askUserQuestionRequest('r1'), 1_100);
+    applyAgentIslandEvent(state, { sessionId: 'ask', title: 'Ask' }, doneEvent(), 1_200);
+
+    const display = buildAgentIslandDisplayState(state, 1_300);
+    expect(display.sessions[0]).toMatchObject({
+      sessionId: 'ask',
+      phase: 'needs-interaction',
+      interactionKind: 'ask_user_question',
+    });
+    expect(display.pillSnapshot.pendingInteractionCount).toBe(1);
+  });
+
+  it('still completes the island on done when only a permission card was pending', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'ask', title: 'Ask' }, statusEvent(true, 'Running'), 1_000);
+    applyAgentIslandInteractionRequest(state, { sessionId: 'ask', title: 'Ask' }, permissionRequest('r1'), 1_100);
+    applyAgentIslandEvent(state, { sessionId: 'ask', title: 'Ask' }, doneEvent(), 1_200);
+
+    const display = buildAgentIslandDisplayState(state, 1_300);
+    expect(display.sessions[0]).toMatchObject({
+      sessionId: 'ask',
+      phase: 'completed',
+    });
+    expect(display.pillSnapshot.pendingInteractionCount).toBe(0);
+  });
+
   it('expands visible-session permission prompts so users can approve in the island', () => {
     const state = createAgentIslandState();
     setAgentIslandVisibleSession(state, 'ask', 900);
@@ -1561,6 +1630,59 @@ describe('Agent Island display state', () => {
     expect(collapsed.mode).toBe('compact');
     expect(collapsed.displaySurface).toBe('collapsed');
     expect(getNextAgentIslandTimerAt(state, 1_900)).toBeNull();
+  });
+
+  it('collapses after slow navigation without extending the background-window ack grace', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'done' }, doneEvent(), 1_000);
+    requestAgentIslandManualExpand(state);
+    expect(buildAgentIslandDisplayState(state, 1_100).mode).toBe('expanded');
+    requestAgentIslandSessionFocus(state, 'done', 1_200);
+    expect(isAgentIslandPendingFocusAck(state, 'done', 1_250)).toBe(true);
+
+    expect(buildAgentIslandDisplayState(state, 3_200).mode).toBe('expanded');
+    expect(isAgentIslandPendingFocusAck(state, 'done', 3_200)).toBe(false);
+    setAgentIslandAppFocused(state, true, 3_250);
+    setAgentIslandVisibleSession(state, 'done', 3_300);
+    acknowledgeAgentIslandSessionRead(state, 'done', 3_300);
+    expect(buildAgentIslandDisplayState(state, 3_350).mode).toBe('compact');
+  });
+
+  it('keeps the newest click when an earlier navigation finishes late', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'a' }, statusEvent(true, 'Running'), 1_000);
+    applyAgentIslandEvent(state, { sessionId: 'b' }, statusEvent(true, 'Running'), 1_000);
+    requestAgentIslandManualExpand(state);
+    requestAgentIslandSessionFocus(state, 'a', 1_200);
+    requestAgentIslandSessionFocus(state, 'b', 1_300);
+    buildAgentIslandDisplayState(state, 3_200);
+
+    setAgentIslandVisibleSession(state, 'a', 3_250);
+    expect(buildAgentIslandDisplayState(state, 3_250).mode).toBe('expanded');
+    setAgentIslandVisibleSession(state, 'b', 3_300);
+    expect(buildAgentIslandDisplayState(state, 3_350).mode).toBe('compact');
+  });
+
+  it.each([false, true])('expires abandoned navigation before an ordinary visit (timer ran: %s)', (timerRan) => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'a' }, statusEvent(true, 'Running'), 1_000);
+    requestAgentIslandManualExpand(state);
+    buildAgentIslandDisplayState(state, 1_100);
+    requestAgentIslandSessionFocus(state, 'a', 1_200);
+    buildAgentIslandDisplayState(state, 3_200);
+
+    // The grace is over, but the slow-navigation target still has a finite
+    // cleanup deadline. It must expire even if a route ack beats that timer.
+    expect(isAgentIslandPendingFocusAck(state, 'a', 3_200)).toBe(false);
+    expect(getNextAgentIslandTimerAt(state, 3_200)).toBe(61_200);
+    if (timerRan) buildAgentIslandDisplayState(state, 61_200);
+    setAgentIslandAppFocused(state, true, 61_200);
+    setAgentIslandVisibleSession(state, 'a', 61_200);
+
+    expect(buildAgentIslandDisplayState(state, 61_200).mode).toBe('expanded');
+    expect(state.pendingFocusSessionId).toBeNull();
+    expect(state.pendingFocusUntil).toBeNull();
+    expect(getNextAgentIslandTimerAt(state, 61_200)).toBeNull();
   });
 
   it('dismisses the first permission approval card after the clicked session becomes visible', () => {
@@ -2080,6 +2202,50 @@ describe('Agent Island error read semantics (已读以 App 内真实展示为准
     expect(display.totalCount).toBe(0);
   });
 
+  it('keeps a prior unread error immune to passive ack after a new running turn starts', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'err', title: 'Err' }, terminalErrorEvent('boom'), 2_000);
+    applyAgentIslandUserPrompt(state, { sessionId: 'err', title: 'Err' }, 'retry', 3_000);
+
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', 3_100, { source: 'passive' })).toBe('error-immune');
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+    expect(state.sessions.get('err')?.phase).toBe('running');
+    // 远程侧栏同一 session 只能挂一帧:新一轮 running 是当前活档,绿/红点让位给转圈。
+    // 账本仍在,所以 passive 清不掉旧 error;下一轮终态或 explicit ack 再收敛。
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'err', phase: 'running' }),
+    ]);
+
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', 3_200, { source: 'explicit' })).toBe('cleared');
+    expect(state.remoteUnreadTerminals.has('err')).toBe(false);
+    expect(state.sessions.get('err')?.unread).toBe(false);
+  });
+
+  it('keeps a ledger-only unread error through a fresh running turn and App badge mirror', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'err', title: 'Err' }, terminalErrorEvent('boom'), 2_000);
+    const afterExpiryAt = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000;
+    buildAgentIslandDisplayState(state, afterExpiryAt);
+    expect(state.sessions.has('err')).toBe(false);
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+
+    applyAgentIslandUserPrompt(state, { sessionId: 'err', title: 'Err' }, 'retry', afterExpiryAt + 10);
+    expect(markAgentIslandSessionAttention(state, 'err')).toBe(true);
+    expect(state.sessions.get('err')?.phase).toBe('running');
+    expect(state.sessions.get('err')?.unread).toBe(true);
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'err', phase: 'running' }),
+    ]);
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', afterExpiryAt + 20, { source: 'passive' })).toBe('error-immune');
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', afterExpiryAt + 30, { source: 'explicit' })).toBe('cleared');
+    expect(state.remoteUnreadTerminals.has('err')).toBe(false);
+    expect(state.sessions.get('err')?.unread).toBe(false);
+  });
+
   it('preserves error unread when a pending interaction is dismissed after the terminal error', () => {
     const state = createAgentIslandState();
     applyAgentIslandInteractionRequest(state, { sessionId: 'err', title: 'Err' }, permissionRequest('r1'), 1_000);
@@ -2202,25 +2368,37 @@ describe('Agent Island 未读驻留 TTL(避免几小时前完成的任务无限�
     const beforeExpiry = buildAgentIslandDisplayState(state, 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS - 1_000);
     expect(beforeExpiry.totalCount).toBe(1);
     expect(beforeExpiry.sessions[0]).toMatchObject({ sessionId: 'done', phase: 'completed' });
+    // dwell / reveal 走完后,下一次 publish 必须排到岛面 TTL,否则 4h 到点不会自己隐藏。
+    const afterDwell = 2_000 + AGENT_ISLAND_COMPLETION_REVEAL_DWELL_MS + 1;
+    expect(getNextAgentIslandTimerAt(state, afterDwell)).toBe(2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS);
   });
 
-  it('unread completed 条目超过 TTL 后从灵动岛列表 prune 掉', () => {
+  it('unread completed 超过 TTL 后离开岛面,独立账本仍在,远程快照继续带 attention', () => {
     const state = createAgentIslandState();
     applyAgentIslandEvent(state, { sessionId: 'done', title: 'Schedule' }, doneEvent(), 2_000);
 
-    // TTL 边界后 1 秒:即使还没被 ack,也不再让它占展开列表。
-    const afterExpiry = buildAgentIslandDisplayState(state, 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000);
+    const afterExpiryAt = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000;
+    const afterExpiry = buildAgentIslandDisplayState(state, afterExpiryAt);
     expect(afterExpiry.totalCount).toBe(0);
+    expect(state.sessions.has('done')).toBe(false);
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'done', phase: 'completed', attention: true, activityLines: [] }),
+    ]);
+    expect(acknowledgeAgentIslandSessionRead(state, 'done', afterExpiryAt, { source: 'passive' })).toBe('cleared');
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([]);
   });
 
-  it('unread error 条目超过 TTL 后也从灵动岛列表 prune 掉', () => {
+  it('unread error 超过 TTL 后也离开岛面,账本仍在且 passive 仍免疫', () => {
     const state = createAgentIslandState();
     applyAgentIslandEvent(state, { sessionId: 'err', title: 'Err' }, terminalErrorEvent('boom'), 2_000);
 
-    // TTL 边界前:未读 error 仍然驻留(既有 60s 后仍可见的用例覆盖了 TTL 内区间,这里
-    // 只再验证 TTL 边界后被 prune 掉,防止长时间遗留报错霸占展开视图)。
-    const afterExpiry = buildAgentIslandDisplayState(state, 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000);
+    const afterExpiryAt = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000;
+    const afterExpiry = buildAgentIslandDisplayState(state, afterExpiryAt);
     expect(afterExpiry.totalCount).toBe(0);
+    expect(state.sessions.has('err')).toBe(false);
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', afterExpiryAt, { source: 'passive' })).toBe('error-immune');
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', afterExpiryAt, { source: 'explicit' })).toBe('cleared');
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([]);
   });
 
   it('TTL 过期后悬停展开也不应复活 unread completed 条目(preserveExpiredTransient 不绕过 TTL)', () => {
@@ -2231,9 +2409,13 @@ describe('Agent Island 未读驻留 TTL(避免几小时前完成的任务无限�
     const afterExpiry = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 5_000;
     setAgentIslandHovered(state, true, afterExpiry);
 
-    // preserveExpiredTransient=true 时也不应把 TTL 过期的 unread 条目捞回来
+    // preserveExpiredTransient=true 时也不应把 TTL 过期的 unread 条目捞回岛面
     const display = buildAgentIslandDisplayState(state, afterExpiry);
     expect(display.totalCount).toBe(0);
+    expect(state.sessions.has('done')).toBe(false);
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'done', phase: 'completed', attention: true, activityLines: [] }),
+    ]);
   });
 
   it('TTL 过期后悬停展开也不应复活 unread error 条目', () => {
@@ -2245,6 +2427,39 @@ describe('Agent Island 未读驻留 TTL(避免几小时前完成的任务无限�
 
     const display = buildAgentIslandDisplayState(state, afterExpiry);
     expect(display.totalCount).toBe(0);
+    expect(state.sessions.has('err')).toBe(false);
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'err', phase: 'error', attention: true, activityLines: [] }),
+    ]);
+  });
+
+  it('TTL prune 后再 process-close 不得清掉独立未读账本', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'done', title: 'Schedule' }, doneEvent(), 2_000);
+    const afterExpiryAt = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000;
+    buildAgentIslandDisplayState(state, afterExpiryAt);
+    expect(state.sessions.has('done')).toBe(false);
+
+    closeAgentIslandSessionPreservingUnread(state, 'done', afterExpiryAt + 10);
+
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'done', phase: 'completed', attention: true, activityLines: [] }),
+    ]);
+  });
+
+  it('仅 ledger 存在时 process-close 也不得清掉未读账本', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'err', title: 'Err' }, terminalErrorEvent('boom'), 2_000);
+    const afterExpiryAt = 2_000 + AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS + 1_000;
+    buildAgentIslandDisplayState(state, afterExpiryAt);
+    expect(state.sessions.has('err')).toBe(false);
+
+    closeAgentIslandSessionPreservingUnread(state, 'err', afterExpiryAt + 10);
+
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', afterExpiryAt + 20, { source: 'passive' })).toBe('error-immune');
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'err', phase: 'error', attention: true, activityLines: [] }),
+    ]);
   });
 });
 
@@ -2298,6 +2513,33 @@ describe('会话进程关闭不该抹掉正在展示的通知', () => {
     closeAgentIslandSessionPreservingUnread(state, 'perm', 1_200);
 
     expect(buildAgentIslandDisplayState(state, 1_300).totalCount).toBe(0);
+  });
+
+  it('进程关闭丢掉失效审批卡时,仍保留尚未看过的旧 error 账本', () => {
+    const state = createAgentIslandState();
+    applyAgentIslandEvent(state, { sessionId: 'err', title: 'Err' }, terminalErrorEvent('boom'), 1_000);
+    applyAgentIslandUserPrompt(state, { sessionId: 'err', title: 'Err' }, 'retry', 2_000);
+    applyAgentIslandInteractionRequest(
+      state,
+      { sessionId: 'err', title: 'Err' },
+      {
+        kind: 'permission',
+        requestId: 'r1',
+        toolName: 'Bash',
+        input: { command: 'rm -rf dist' },
+      },
+      2_100,
+    );
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+
+    closeAgentIslandSessionPreservingUnread(state, 'err', 2_200);
+
+    expect(state.sessions.has('err')).toBe(false);
+    expect(state.remoteUnreadTerminals.get('err')).toMatchObject({ phase: 'error' });
+    expect(acknowledgeAgentIslandSessionRead(state, 'err', 2_300, { source: 'passive' })).toBe('error-immune');
+    expect(buildAllSessionActivitySnapshots(state)).toEqual([
+      expect.objectContaining({ sessionId: 'err', phase: 'error', attention: true, activityLines: [] }),
+    ]);
   });
 
   it('已经没有展示需求的会话,进程关闭时照常删除', () => {
