@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   DeviceLinkError,
+  DEVICE_LINK_CAPABILITY_COMPACT_MESSAGE_HISTORY_V1,
   CONTROLLER_CAPABILITY_SET_MODEL_EXPLICIT_PROVIDER_NULL_V1,
   DL_SUBSCRIBE_CHANNEL,
   MAX_FRAME_BYTES,
@@ -77,6 +78,46 @@ beforeEach(() => {
     revokedControllers: [],
   };
   __testing.reset();
+});
+
+describe('negotiated mobile tool projection', () => {
+  const input = { command: 'echo ' + 'x'.repeat(40_000) };
+  const row = { id: 'row', clientId: 'persist', sessionId: 's1', role: 'tool_use',
+    content: { toolUseId: 'use', toolName: 'Bash', input } };
+  function subscribe() {
+    subscriptions.subscribe('mobile', ['session:s1'], 'mobile', [DEVICE_LINK_CAPABILITY_COMPACT_MESSAGE_HISTORY_V1]);
+    subscriptions.subscribe('legacy', ['session:s1'], 'legacy', []);
+  }
+
+  it('projects new Mobile list reads but leaves old clients and radius-0 details intact', () => {
+    subscribe();
+    const client = mkClient();
+    for (const [dst, channel] of [['mobile', 'local-db:messages:list'], ['legacy', 'local-db:messages:list'],
+      ['mobile', 'local-db:messages:around']]) {
+      __testing.sendInvokeResultSafe(client as never, dst, channel, { ok: true, result: [row] }, channel);
+    }
+    expect(client.sendInvokeResult.mock.calls[0][2].result[0]).toHaveProperty('mobileToolInputProjection');
+    expect(client.sendInvokeResult.mock.calls[1][2].result[0]).toEqual(row);
+    expect(client.sendInvokeResult.mock.calls[2][2].result[0]).toEqual(row);
+  });
+
+  it('projects single live/created pushes per peer without changing the host broadcast', () => {
+    subscribe();
+    const client = mkClient();
+    __testing.setActiveClient(client as never);
+    const text = 'result'.repeat(30_000);
+    const payload = { sessionId: 's1', persistId: 'p', resolvedContent: text,
+      event: { type: 'tool_result_full', data: { toolUseId: 'use', fullText: text, isError: false } } };
+    __testing.forwardPush('maker:event', payload);
+    const calls = client.sendPush.mock.calls;
+    expect(calls.find((c) => c[0] === 'mobile')![2]).not.toHaveProperty('resolvedContent');
+    expect(calls.find((c) => c[0] === 'legacy')![2]).toEqual(payload);
+    __testing.forwardPush('local-db:messages:created', { sessionId: 's1', message: row });
+    expect(client.sendPush.mock.calls.find((c) => c[0] === 'mobile' && c[1] === 'local-db:messages:created')![2].message)
+      .toHaveProperty('mobileToolInputProjection');
+    expect(payload.resolvedContent).toBe(text);
+    expect(row.content.input).toBe(input);
+  });
 });
 
 describe('[14] sendInvokeResultSafe — 结果超限兜底', () => {
@@ -620,6 +661,38 @@ describe('remote companion Session visibility at the device-link boundary', () =
     setRemoteBotSessionLookup(async (id) => id === 's1' ? 'hidden' : 'ordinary');
     expect(await runInvoke('ctrl-1', { channel, args } as never)).toMatchObject({ ok: false, error: { message: expect.stringContaining('[NOT_FOUND]') } });
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each(['hidden', 'missing'] as const)('rejects a private thread when the viewer Bot is %s, using Bot identity rather than the opaque thread ID', async (access) => {
+    const handler = vi.fn(() => ({ ok: true, thread: { messages: [{ content: 'private' }] } }));
+    registry.register('maker:bot-direct-message-thread:get', handler);
+    const lookup = vi.fn(async (id: string, kind?: 'session' | 'bot') =>
+      kind === 'bot' && id === 'viewer-bot' ? access : 'ordinary' as const);
+    setRemoteBotSessionLookup(lookup);
+    expect(await runInvoke('ctrl-1', { channel: 'maker:bot-direct-message-thread:get', args: ['opaque-thread', 'viewer-bot'] }))
+      .toMatchObject({ ok: false, error: { message: expect.stringContaining('[NOT_FOUND]') } });
+    expect(handler).not.toHaveBeenCalled();
+    expect(lookup).toHaveBeenCalledWith('viewer-bot', 'bot');
+  });
+
+  it('allows a visible private-thread viewer and rechecks that viewer before cached delivery', async () => {
+    let hidden = false;
+    setRemoteBotSessionLookup(async (id, kind) => kind === 'bot' && id === 'viewer-bot'
+      ? hidden ? 'hidden' : 'visible' : 'ordinary');
+    const handler = vi.fn(() => ({ ok: true, thread: { id: 'opaque-thread', messages: [{ content: 'private' }] } }));
+    registry.register('maker:bot-direct-message-thread:get', handler);
+    const client = mkClient();
+    wireInboundDispatch(client as never);
+    const frame = client.onFrame.mock.calls[0][0];
+    const request = { v: PROTOCOL_VERSION, kind: 'invoke', src: 'ctrl-1', id: 'cached-thread', payload: { channel: 'maker:bot-direct-message-thread:get', args: ['opaque-thread', 'viewer-bot'] } };
+    frame(request);
+    await vi.waitFor(() => expect(client.sendInvokeResult).toHaveBeenCalledTimes(1));
+    expect(client.sendInvokeResult.mock.calls[0][2]).toMatchObject({ ok: true, result: { ok: true } });
+    hidden = true;
+    frame(request);
+    await vi.waitFor(() => expect(client.sendInvokeResult).toHaveBeenCalledTimes(2));
+    expect(client.sendInvokeResult.mock.calls[1][2]).toMatchObject({ ok: false, error: { message: expect.stringContaining('[NOT_FOUND]') } });
+    expect(handler).toHaveBeenCalledTimes(1);
   });
 
   it('rechecks visibility after an in-flight read and filters active task discovery', async () => {
