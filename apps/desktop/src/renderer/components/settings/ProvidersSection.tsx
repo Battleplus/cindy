@@ -125,6 +125,7 @@ function providerHasModels(provider: ProviderView): boolean {
     provider.agents.some((a) => (provider.models[a]?.length ?? 0) > 0) ||
     (provider.imageModels?.length ?? 0) > 0 ||
     (provider.videoModels?.length ?? 0) > 0 ||
+    (provider.audioModels?.length ?? 0) > 0 ||
     (provider.embeddingModels?.length ?? 0) > 0
   );
 }
@@ -2446,6 +2447,7 @@ export function ProvidersSection() {
   const handleDelete = useCallback(
     async (p: ProviderView) => {
       const ok = await confirm({
+        presentation: 'standard',
         title: t('settings.providers.custom.deleteConfirm.title'),
         description: t('settings.providers.custom.deleteConfirm.description', { name: p.name }),
         confirmText: t('settings.providers.custom.deleteConfirm.confirm'),
@@ -2517,8 +2519,8 @@ export function ProvidersSection() {
           toast.error(t('settings.providers.models.refreshFailed'));
           return;
         }
+        await updateCustomProvider(config, {});
         if (added > 0) {
-          await updateCustomProvider(config, {});
           toast.success(t('settings.providers.models.refreshAdded', { count: added }));
         } else {
           toast.success(t('settings.providers.models.refreshNoNew'));

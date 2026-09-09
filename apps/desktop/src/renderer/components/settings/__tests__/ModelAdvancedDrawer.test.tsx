@@ -38,14 +38,14 @@ vi.mock('@/state/modelVisibilityPrefs', () => ({
 }));
 vi.mock('@/state/providerModelMemory', () => ({
   useProviderModelMemoryVersion: () => 0,
-  getProviderModelEffort: () => undefined,
+  getProviderModelEffort: vi.fn(() => undefined),
   setProviderModelEffort: vi.fn(),
   clearProviderModelEffort: vi.fn(),
 }));
 vi.mock('../ModelPriceOverrideDialog', () => ({ ModelPriceOverrideDialog: () => null }));
 import { ModelAdvancedDrawer } from '../ModelAdvancedDrawer';
 import { setModelVisibility } from '@/state/modelVisibilityPrefs';
-import { setProviderModelEffort } from '@/state/providerModelMemory';
+import { setProviderModelEffort, getProviderModelEffort, clearProviderModelEffort } from '@/state/providerModelMemory';
 
 const model: CatalogModel = {
   id: 'gpt-6',
@@ -95,6 +95,7 @@ afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.limit = null;
+  vi.mocked(getProviderModelEffort).mockReset();
 });
 
 describe('model advanced editor', () => {
@@ -404,4 +405,56 @@ describe('model advanced editor', () => {
     expect(screen.getByText('settings.providers.models.advanced.vision.vision')).toBeTruthy();
     expect(screen.getByText('settings.providers.models.advanced.inputModalities')).toBeTruthy();
   });
+});
+
+
+it('shows closed Gateway tiers disabled and re-enables them on catalog refresh', () => {
+  const restricted: CatalogModel = {
+    ...model, efforts: ['high'], defaultEffort: 'high', displayEfforts: ['low', 'high', 'max'],
+  };
+  const view = render(drawer(restricted));
+  const low = screen.getByRole('button', { name: 'effortLevels.low' }) as HTMLButtonElement;
+  expect(low.disabled).toBe(true);
+  fireEvent.click(low);
+  expect(setProviderModelEffort).not.toHaveBeenCalled();
+  view.rerender(drawer({ ...restricted, efforts: ['low', 'high'] }));
+  const enabledLow = screen.getByRole('button', { name: 'effortLevels.low' }) as HTMLButtonElement;
+  expect(enabledLow.disabled).toBe(false);
+  fireEvent.click(enabledLow);
+  expect(setProviderModelEffort).toHaveBeenCalledWith('codex', 'openai', model.id, 'low');
+  expect((screen.getByRole('button', { name: 'effortLevels.max' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it('keeps the tier row visible when Gateway closes every tier', () => {
+  draw({ ...model, efforts: [], defaultEffort: null, displayEfforts: ['low', 'high'] });
+  for (const effort of ['low', 'high']) {
+    const button = screen.getByRole('button', { name: `effortLevels.${effort}` }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+  }
+});
+
+it('limits context and effort reads, writes and resets to the chat runtime', () => {
+  vi.mocked(getProviderModelEffort).mockImplementation((agent) => agent === 'codex' ? 'high' : 'low');
+  const mixedProvider = { ...provider, id: 'private', source: 'user' as const };
+  const row = {
+    id: 'shared', name: 'Shared', avail: ['claude-code', 'codex'] as const,
+    byAgent: {
+      'claude-code': { ...model, id: 'shared', mode: 'image_generation', efforts: ['low'] as typeof model.efforts },
+      codex: { ...model, id: 'shared', mode: 'chat' },
+    },
+  };
+  render(<ModelAdvancedDrawer provider={mixedProvider} row={{ ...row, avail: [...row.avail] }} open onOpenChange={vi.fn()} pricePresentationOf={() => null} onDisable={vi.fn()} disabled={false} paymentRequired={false} />);
+  expect(mocks.target).toHaveBeenLastCalledWith(expect.objectContaining({ agent: 'codex', relatedTargets: [] }));
+  expect(screen.queryByText('settings.providers.models.advanced.effortMixed')).toBeNull();
+  expect(vi.mocked(getProviderModelEffort).mock.calls.every(([agent]) => agent === 'codex')).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'effortLevels.low' }));
+  expect(setProviderModelEffort).toHaveBeenCalledExactlyOnceWith('codex', 'private', 'shared', 'low');
+  fireEvent.click(screen.getByRole('button', { name: 'settings.providers.models.advanced.restoreDefault' }));
+  expect(clearProviderModelEffort).toHaveBeenCalledExactlyOnceWith('codex', 'private', 'shared');
+  const input = screen.getByRole('textbox');
+  fireEvent.change(input, { target: { value: '128' } });
+  fireEvent.blur(input);
+  expect(mocks.setLimit).toHaveBeenCalledWith(128_000);
+  expect(mocks.target).toHaveBeenLastCalledWith(expect.objectContaining({ agent: 'codex', relatedTargets: [] }));
 });

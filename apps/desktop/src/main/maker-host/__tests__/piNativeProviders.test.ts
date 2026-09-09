@@ -41,7 +41,8 @@ import {
   resolvePiCindyGatewayModelSpec,
   type PiBundledModelInfo,
 } from '../pi-host.js';
-import { setActiveCatalog, setXdGatewayModels } from '../active-catalog.js';
+import { getActiveCatalog, setActiveCatalog, setDiscoveredCodexModels, setXdGatewayModels } from '../active-catalog.js';
+import { deriveAvailableModels } from '../catalog-to-descriptors.js';
 
 type Cfg = Parameters<typeof buildPiNativeProvidersFromConfigs>[0][number];
 
@@ -80,7 +81,49 @@ const piBundledModel = (
 
 afterEach(() => {
   setActiveCatalog(BUNDLED_CATALOG);
+  setDiscoveredCodexModels([]);
   setXdGatewayModels([]);
+});
+
+describe('ChatGPT image capability authority (#2674)', () => {
+  it.each(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'])(
+    'keeps %s visual through the independent Pi catalog despite text-only Codex discovery',
+    (id) => {
+      setActiveCatalog(BUNDLED_CATALOG);
+      setDiscoveredCodexModels([{
+        id, name: id, contextWindow: 272_000, efforts: [], defaultEffort: null,
+        supportsImageInput: false,
+      }]);
+      const catalog = getActiveCatalog();
+      expect(deriveAvailableModels(catalog, 'pi').find((model) => model.id === `chatgpt/${id}`))
+        .toMatchObject({ supportsImageInput: true });
+      const native = piBundledModel(id, 'openai-codex-responses', { input: ['text', 'image'] });
+      for (const probe of [undefined, new Map([['openai-codex', new Map([[id, native]])]])]) {
+        const provider = buildPiSubscriptionNativeProviders(catalog, 'http://127.0.0.1:4567/', probe)
+          .providers.find((candidate) => candidate.id === 'openai-codex');
+        expect(provider?.models.find((model) => model.id === `chatgpt/${id}`))
+          .toMatchObject({ wireId: id, api: 'openai-codex-responses', input: ['text', 'image'] });
+      }
+    },
+  );
+
+  it.each([true, false, undefined])(
+    'preserves explicit image capability %s with and without a native probe',
+    (supportsImageInput) => {
+      const catalog = structuredClone(BUNDLED_CATALOG);
+      const id = 'gpt-5.6-sol';
+      catalog.providers.find((provider) => provider.id === 'openai')!.models.pi = [{
+        id: `chatgpt/${id}`, name: id, contextWindow: 272_000, efforts: [], defaultEffort: null,
+        supportsImageInput,
+      }];
+      const native = piBundledModel(id, 'openai-codex-responses', { input: ['text', 'image'] });
+      for (const probe of [undefined, new Map([['openai-codex', new Map([[id, native]])]])]) {
+        const model = buildPiSubscriptionNativeProviders(catalog, 'http://127.0.0.1:4567/', probe)
+          .providers.find((provider) => provider.id === 'openai-codex')?.models[0];
+        expect(model?.input).toEqual(supportsImageInput === false ? ['text'] : ['text', 'image']);
+      }
+    },
+  );
 });
 
 describe('resolvePiCindyGatewayModelApi', () => {
@@ -853,8 +896,12 @@ describe('buildPiNativeProvidersFromConfigs', () => {
       sourceProviderId: 'anthropic',
       baseUrl: 'http://127.0.0.1:4567/',
       inheritModels: true,
+      apiKeyEnvVar: 'CINDY_PI_ANTHROPIC_PROXY_KEY',
       models: [{ id: 'claude-opus-5', wireId: 'claude-opus-5' }],
     });
+    // Pi 按 `sk-ant-oat` 前缀识别 OAuth 形态,才会自己拼 claude-code/oauth/server-side-fallback
+    // 等 beta 头与 Claude Code 身份;占位值不能是真 token 形态之外的普通字串。
+    expect(env.CINDY_PI_ANTHROPIC_PROXY_KEY).toContain('sk-ant-oat');
     expect(providers[1]).toMatchObject({
       sourceProviderId: 'openai',
       baseUrl: 'http://127.0.0.1:4567/',

@@ -1,3 +1,4 @@
+import { expandedRegistryEntries, providerMediaField } from '@cindy/model-providers';
 /**
  * modelPlanePolicy —— 内置供应商模型平面的**表驱动 policy**(纯逻辑,零 IO)。
  *
@@ -227,8 +228,8 @@ function effectiveRouteFields(
         ? candidateDefaultEffort !== undefined && VALID_EFFORTS.has(candidateDefaultEffort)
           ? (candidateDefaultEffort as Effort)
           : undefined
-        : (clampEffortToSupported(candidateDefaultEffort, validatedEfforts)
-          ?? defaultEffortForCapabilities(validatedEfforts)) as Effort | null;
+        : ((clampEffortToSupported(candidateDefaultEffort, validatedEfforts) ??
+            defaultEffortForCapabilities(validatedEfforts)) as Effort | null);
   return {
     name: entry.name,
     ...(entry.group !== undefined ? { group: entry.group } : {}),
@@ -273,11 +274,13 @@ export function planRegistryRoots(registry: ModelRegistry | undefined): ModelPla
   };
   if (!registry) return plan;
   const claimedRootRoutes = new Set<string>();
-  for (const entry of registry.models) {
+  for (const entry of expandedRegistryEntries(registry)) {
     const status = materializableStatus(entry.status);
     for (const route of entry.routes) {
       const policy = MODEL_PLANE_POLICIES.get(route.providerId);
       if (!policy) continue;
+      // V4 media routes belong to media projections, not the chat root plane.
+      if (route.agents.length === 0 && providerMediaField(entry.mode)) continue;
       const routeAgents = route.agents as readonly RootAgentKind[];
       const memberRoots = policy.roots.filter((agent) => routeAgents.includes(agent));
       const canonicalPrefix = `${route.providerId}/`;
@@ -519,10 +522,11 @@ function toMaterializedModel(
   if (fields.efforts === undefined) {
     return 'materializable route has no explicit efforts';
   }
-  const defaultEffort: Effort | null = fields.defaultEffort === null || fields.efforts.length === 0
-    ? null
-    : (clampEffortToSupported(fields.defaultEffort, fields.efforts)
-      ?? defaultEffortForCapabilities(fields.efforts)) as Effort | null;
+  const defaultEffort: Effort | null =
+    fields.defaultEffort === null || fields.efforts.length === 0
+      ? null
+      : ((clampEffortToSupported(fields.defaultEffort, fields.efforts) ??
+          defaultEffortForCapabilities(fields.efforts)) as Effort | null);
   return {
     id: modelId,
     name: fields.name,

@@ -31,7 +31,7 @@ import {
   sanitizeModelCatalogOverrides,
   type ModelCatalogOverrides,
 } from '../model-plane/localCatalogOverrides.js';
-import { isRegistryTombstoneForConsumer } from '../model-plane/modelPlanePolicy.js';
+import { isRegistryTombstoneForConsumer, planRegistryRoots } from '../model-plane/modelPlanePolicy.js';
 
 type RegistryEntries = NonNullable<Catalog['modelRegistry']>['models'];
 
@@ -89,13 +89,24 @@ function withNativeMetadataAndDefaults(
   const defaults: Record<string, readonly string[]> = {
     xai: ['grok-4.6'],
     anthropic: ['claude-fable-5-1', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'],
-    openai: ['chatgpt/gpt-6-astra', 'chatgpt/gpt-5.6-sol', 'chatgpt/gpt-5.6-terra', 'chatgpt/gpt-5.6-luna'],
+    openai: [
+      'chatgpt/gpt-6-astra',
+      'chatgpt/gpt-5.6-sol',
+      'chatgpt/gpt-5.6-terra',
+      'chatgpt/gpt-5.6-luna',
+    ],
   };
   return models.map((model) => {
     const nativeApi = resolveModelNativeApi(BUNDLED_CATALOG.modelRegistry, providerId, model.id);
     return {
       ...model,
-      ...(nativeApi === undefined ? {} : { nativeApi }),
+      ...(nativeApi === null ||
+      nativeApi === 'anthropic-messages' ||
+      nativeApi === 'openai-responses' ||
+      nativeApi === 'openai-completions' ||
+      nativeApi === 'google-generative-ai'
+        ? { nativeApi }
+        : {}),
       ...(defaults[providerId]?.includes(model.id) ? {} : { defaultEnabled: false }),
     };
   });
@@ -115,10 +126,12 @@ afterEach(() => {
 });
 
 describe('registry presence 实体化', () => {
-  it('uses one model default across Codex, Claude and native Pi, including catalog refresh', () => {
+  it('inherits defaults per harness and refreshes public defaults for Pi', () => {
     for (const effort of ['medium', 'high'] as const) {
       const catalog = structuredClone(BUNDLED_CATALOG);
-      const terra = catalog.modelRegistry!.models.find((entry) => entry.id === 'openai/gpt-5.6-terra')!;
+      const terra = catalog.modelRegistry!.models.find(
+        (entry) => entry.id === 'openai/gpt-5.6-terra',
+      )!;
       terra.defaultEffort = effort;
       terra.perAgent = {
         ...terra.perAgent,
@@ -128,7 +141,9 @@ describe('registry presence 实体化', () => {
       setActiveCatalog(catalog);
       for (const agent of ['codex', 'claude-code', 'pi'] as const) {
         const id = agent === 'codex' ? 'gpt-5.6-terra' : 'chatgpt/gpt-5.6-terra';
-        expect(models('openai', agent).find((m) => m.id === id)?.defaultEffort).toBe(effort);
+        expect(models('openai', agent).find((m) => m.id === id)?.defaultEffort).toBe(
+          agent === 'codex' ? 'xhigh' : agent === 'claude-code' ? 'low' : effort,
+        );
       }
     }
   });
@@ -344,7 +359,9 @@ describe('registry presence 实体化', () => {
       }),
     );
     expect(models('openai', 'pi').find((m) => m.id === 'chatgpt/gpt-6[1m]')).toBeUndefined();
-    expect(models('openai', 'claude-code').find(m => m.id === 'chatgpt/gpt-6[1m]')?.contextWindow).toBe(900_000);
+    expect(
+      models('openai', 'claude-code').find((m) => m.id === 'chatgpt/gpt-6[1m]')?.contextWindow,
+    ).toBe(900_000);
     expect(getModelPlaneWarnings()).toEqual([]);
   });
 
@@ -1005,4 +1022,110 @@ it('preserves the upstream maximum separately from per-harness recommended windo
     contextWindow: 272_000,
     contextWindowMax: 1_050_000,
   });
+});
+
+it.each([{ agents: undefined }, { agents: ['codex', 'pi'] }])(
+  'keeps Pi working defaults when a root addition declares agents $agents',
+  ({ agents }) => {
+    const catalog = baseCatalog([gpt6Entry()]);
+    catalog.providers.find((provider) => provider.id === 'openai')!.models.pi = [
+      {
+        id: 'gpt-6',
+        name: 'Pi authority',
+        contextWindow: 1_000_000,
+        efforts: ['medium'],
+        defaultEffort: 'medium',
+      },
+    ];
+    setActiveCatalog(catalog, { authorityCatalog: catalog });
+    const additions = {
+      'openai:gpt-6': {
+        ...(agents ? { agents } : {}),
+        base: {
+          name: 'Root addition',
+          contextWindow: 450_000,
+          efforts: ['medium'],
+          defaultEffort: 'medium',
+        },
+      },
+    };
+    setLocalCatalogOverrides(overridesOf({ additions }));
+    expect(models('openai', 'codex').find((model) => model.id === 'gpt-6')).toMatchObject({
+      name: 'Root addition',
+      contextWindow: 450_000,
+    });
+    expect(models('openai', 'pi').find((model) => model.id === 'chatgpt/gpt-6')).toMatchObject({
+      name: 'Pi authority',
+      contextWindow: 272_000,
+      contextWindowMax: 1_000_000,
+    });
+    setLocalCatalogOverrides(
+      overridesOf({
+        additions,
+        patches: {
+          'openai:chatgpt/gpt-6': { agents: ['pi'], base: { contextWindow: 550_000 } },
+        },
+      }),
+    );
+    expect(models('openai', 'pi').find((model) => model.id === 'chatgpt/gpt-6')).toMatchObject({
+      contextWindow: 550_000,
+      contextWindowMax: 1_000_000,
+    });
+  },
+);
+
+it('honors local working defaults and separate maximums in all three GPT harnesses', () => {
+  setActiveCatalog(BUNDLED_CATALOG);
+  for (const maximum of [900_000, 1_000_000]) {
+    setXdGatewayModels([
+      {
+        id: 'gpt-context-default-test',
+        name: 'Context test',
+        agents: ['claude-code', 'codex', 'pi'],
+        contextWindow: maximum,
+      },
+    ]);
+    setLocalCatalogOverrides(
+      overridesOf({
+        patches: {
+          'xd:gpt-context-default-test': {
+            perAgent: {
+              'claude-code': { contextWindow: 350_000 },
+              codex: { contextWindow: 450_000 },
+              pi: { contextWindow: 550_000 },
+            },
+          },
+        },
+      }),
+    );
+    for (const [agent, window] of [
+      ['claude-code', 350_000],
+      ['codex', 450_000],
+      ['pi', 550_000],
+    ] as const) {
+      expect(models('xd', agent)[0]).toMatchObject({
+        contextWindow: window,
+        contextWindowMax: maximum,
+      });
+    }
+  }
+  setLocalCatalogOverrides(EMPTY_MODEL_CATALOG_OVERRIDES);
+  for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+    expect(models('xd', agent)[0]).toMatchObject({
+      contextWindow: 272_000,
+      contextWindowMax: 1_000_000,
+    });
+  }
+});
+
+it('keeps V4 media routes out of chat root warnings without hiding invalid chat routes', () => {
+  const plan = planRegistryRoots({ schemaVersion: 4, updatedAt: '2026-09-09T00:00:00.000Z', models: [
+    ...['image_generation', 'video_generation', 'audio_generation', 'audio_speech', 'audio_transcription', 'realtime', 'embedding'].map((mode) => ({
+      id: `openai/${mode}`, name: mode, mode, status: 'active' as const,
+      routes: [{ providerId: 'openai', modelId: mode, agents: [] }],
+    })),
+    { id: 'openai/broken-chat', name: 'Broken Chat', mode: 'chat', status: 'active', routes: [{ providerId: 'openai', modelId: 'broken-chat', agents: [] }] },
+  ] });
+  expect(plan.roots.size).toBe(0);
+  expect(plan.warnings).toEqual([expect.objectContaining({ modelId: 'broken-chat', reason: 'route has no canonical root agent membership' })]);
 });
