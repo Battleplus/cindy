@@ -28,6 +28,7 @@ import { isSecondaryWindow } from '@/lib/secondaryWindow';
 import { CHROME_ACTIONS_GEOMETRY } from '@/components/layout/chromeActionsGeometry';
 import { SidebarTopNav } from './SidebarTopNav';
 import { UpdateBanner } from './UpdateBanner';
+import { DatabaseSizeWarningBanner } from './DatabaseSizeWarningBanner';
 import { UserInfoSection } from './UserInfoSection';
 
 /** 折叠态 rail 宽度（px）——78px 与 ContentHeader 的红绿灯让位(pl-[78px])对齐:
@@ -59,6 +60,8 @@ interface SidebarProps {
    * `onOpenUpdateNotice`'s history range (`<= appVersion`) cannot reach.
    */
   onOpenVersionNotice?: (version: string) => void;
+  /** Open the About > Storage section for the database-size reminder. */
+  onOpenStorage?: () => void;
   /**
    * 完全隐藏态 hover 临时浮出(peek)——非 null 时以 fixed overlay 抽屉渲染
    * (useSidebarPeek 驱动,MainLayout 只在 peek 可见期传入):
@@ -80,6 +83,7 @@ export function Sidebar({
   onResetWidth,
   onOpenUpdateNotice,
   onOpenVersionNotice,
+  onOpenStorage,
   peekState = null,
   peekDrawerProps,
 }: SidebarProps) {
@@ -238,10 +242,16 @@ export function Sidebar({
         )}
 
         {/* Update banner: shown only when a verified update is ready
-          peek 抽屉视同展开(否则横幅在抽屉里消失,与「预览完整列表」语义相悖)。 */}
+          peek 抽屉视同展开(否则横幅在抽屉里消失,与「预览完整列表」语义相悖)。
+          最小化入口互斥:展开态 busy 让路时本组件不渲染、头像行火焰涂黑;rail 时
+          UserInfoSection 只回头像,折叠火焰就是那条提醒。 */}
         <UpdateBanner
           isCollapsed={(isCollapsed && !isPeek) || isRail}
           onOpenVersionNotice={onOpenVersionNotice}
+        />
+        <DatabaseSizeWarningBanner
+          isCollapsed={(isCollapsed && !isPeek) || isRail}
+          onOpenStorage={onOpenStorage}
         />
 
         {/* Bottom: User info (Shell-level, shared across all features)
