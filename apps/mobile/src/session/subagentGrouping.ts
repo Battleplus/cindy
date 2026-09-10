@@ -28,7 +28,7 @@ export interface SubagentResultMeta {
   isError?: boolean;
 }
 
-/** 从原始 tool_result 行抽文本(与共享 messageContentToPreview 同形态:字符串 / block 数组 / {text} 对象)。 */
+/** 从原始 tool_result 行抽文本(与共享 messageContentToPreview 同形态:字符串 / block 数组 / {text} / {content} 对象)。 */
 function resultTextOf(content: unknown): string | undefined {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -42,7 +42,9 @@ function resultTextOf(content: unknown): string | undefined {
     return joined || undefined;
   }
   const record = readRecord(content);
-  return typeof record?.text === 'string' ? record.text : undefined;
+  return typeof record?.text === 'string'
+    ? record.text
+    : typeof record?.content === 'string' ? record.content : undefined;
 }
 
 /** 从原始消息建 `toolUseId → tool_result.createdAt(ms)` 映射(归一化层会丢弃 tool_result,故从 raw 取)。 */
@@ -54,10 +56,10 @@ export function buildSubagentResultMeta(messages: readonly RemoteMessage[]): Map
     if (!id) continue;
     const ms = Date.parse(message.createdAt);
     if (!Number.isFinite(ms)) continue;
-    // 同一 toolUseId 多行时保留首条(与历史行为一致),协议错误判定与共享 deriveAgentTaskStatus 同口径。
-    if (!map.has(id)) {
-      map.set(id, { createdAtMs: ms, isError: isSubagentResultError(resultTextOf(message.content)) });
-    }
+    // 同一 toolUseId 多行时保留最后一条(与共享 buildMessageToolResultPairing 的
+    // 覆盖语义一致),避免回放多条结果时取到旧的中间态;协议错误判定与共享
+    // deriveAgentTaskStatus 同口径。
+    map.set(id, { createdAtMs: ms, isError: isSubagentResultError(resultTextOf(message.content)) });
   }
   return map;
 }
