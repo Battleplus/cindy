@@ -13,7 +13,7 @@
  *   Esc         → Deny
  */
 
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { cn } from '@/lib/utils';
@@ -139,6 +139,12 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
     } as CCAgentPermissionResult);
   }, [onRespond]);
 
+  // 平台级双击识别:MouseEvent.detail 是浏览器按 OS 双击间隔(用户可配置,任意时长)
+  // 统计的连续点击计数,第二击 detail>1。双击第二击落在推广后的新卡上时,必须当作
+  // 同一手势的一部分忽略 —— 事件驱动,不依赖固定的 renderer 计时器作为权限边界。
+  // 注意:detail 按点击位置+间隔判定,不受组件 remount(key)影响,覆盖任何配置。
+  const ignoreRepeatedClick = (e: ReactMouseEvent) => e.detail > 1;
+
   // ── Keyboard shortcuts ──
 
   useEffect(() => {
@@ -212,7 +218,10 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
         {/* Deny */}
         <button
           type="button"
-          onClick={handleDeny}
+          onClick={(e) => {
+            if (ignoreRepeatedClick(e)) return;
+            handleDeny();
+          }}
           className={cn(
             'flex items-center gap-2 rounded-[8px] border px-3 py-[7px]',
             'border-[var(--chat-input-border)] bg-transparent',
@@ -243,7 +252,10 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
           >
             <button
               type="button"
-              onClick={handleAlwaysAllow}
+              onClick={(e) => {
+                if (ignoreRepeatedClick(e)) return;
+                handleAlwaysAllow();
+              }}
               className={cn(
                 // max-w:规则可能很长(完整命令串),截断后完整内容看 tooltip。
                 'flex min-w-0 max-w-[460px] items-center gap-2 rounded-[8px] border px-3 py-[7px]',
@@ -270,7 +282,10 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
         {/* Allow once (primary) */}
         <button
           type="button"
-          onClick={handleAllowOnce}
+          onClick={(e) => {
+            if (ignoreRepeatedClick(e)) return;
+            handleAllowOnce();
+          }}
           className={cn(
             'flex items-center gap-2 rounded-[8px] border px-3 py-[7px]',
             'border-[var(--chat-input-border)]',

@@ -217,4 +217,19 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
     fireEvent.keyDown(window, { key: 'Escape', code: 'Escape', repeat: true });
     expect(onRespond).toHaveBeenCalledTimes(1);
   });
+
+  // 平台级双击识别:MouseEvent.detail 由浏览器按 OS 双击间隔(任意配置)统计,第二击
+  // detail>1。双击第二击落在推广后的新卡上时不得当作新决定 —— 不依赖固定 renderer
+  // 计时器,因此覆盖用户配置的超长双击间隔。
+  it('双击第二击(MouseEvent.detail>1)不触发授权', () => {
+    const onRespond = vi.fn();
+    render(<PermissionPrompt permission={permission([bashRule])} onRespond={onRespond} />);
+
+    fireEvent.click(screen.getByText('agentIsland.native.allowOnce'), { detail: 1 });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByText('agentIsland.native.allowOnce'), { detail: 2 });
+    fireEvent.click(screen.getByText('agentIsland.native.allowOnce'), { detail: 3 });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+  });
 });
