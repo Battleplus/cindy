@@ -276,9 +276,9 @@ export function listSessionTasks(input: {
     if (m.role !== 'tool_result') continue;
     if (typeof m.toolUseId === 'string' && m.toolUseId.length > 0) {
       settledToolUseIds.add(m.toolUseId);
-      if (!resultContentByToolUseId.has(m.toolUseId)) {
-        resultContentByToolUseId.set(m.toolUseId, m.content);
-      }
+      // 同一 toolUseId 多行结果按「末条胜出」覆盖(与共享 buildMessageToolResultPairing
+      // 及聊天流一致):先写中间 <tool_use_error>、后写最终成功结果时,不得因首条误判 failed。
+      resultContentByToolUseId.set(m.toolUseId, m.content);
     }
   }
 
