@@ -135,6 +135,31 @@ describe('subagent grouping (buildMobileMessageRenderItems)', () => {
     expect(groups[0].status).toBe('completed');
   });
 
+  it('历史 Agent 缺 toolUseId 时,从已配对的 secondaryBody 恢复 failed 终态', () => {
+    // buildSubagentResultMeta 对无 toolUseId 的结果没有条目;归一化层经 adjacency
+    // 把 tool_result 配对进 secondaryBody。若这里不读 secondaryBody,重连后同一失败
+    // 会被显示成 completed(streaming 时为 running)而不是承诺的 failed。
+    const items = buildMobileMessageRenderItems([
+      msg({
+        id: 'legacy-agent',
+        role: 'tool_use',
+        content: { toolUseId: null, toolName: 'Agent', input: { description: 'legacy' } },
+        toolUseId: null,
+        createdAt: '2026-01-01T00:00:01.000Z',
+      }),
+      msg({
+        id: 'legacy-result',
+        role: 'tool_result',
+        content: '<tool_use_error>legacy boom</tool_use_error>',
+        toolUseId: null,
+        createdAt: '2026-01-01T00:00:02.000Z',
+      }),
+    ]);
+    const groups = subagentGroups(items);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].status).toBe('failed');
+  });
+
   it('marks status running when no closing tool_result and session is streaming', () => {
     const items = buildMobileMessageRenderItems([
       agentToolUse('A1', { subagentType: 'Explore', createdAt: '2026-01-01T00:00:01.000Z' }),

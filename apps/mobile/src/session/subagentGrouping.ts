@@ -166,11 +166,18 @@ function buildSubagentGroup(
   const subagentType = readString(input?.subagent_type);
   const summary = agent.secondaryBody && agent.secondaryBody.trim() ? agent.secondaryBody : null;
   const result = id ? resultMeta.get(id) : undefined;
+  // 历史 Agent 缺 toolUseId 时 buildSubagentResultMeta 无条目,但归一化层已通过
+  // adjacency 把配对 tool_result 放进 secondaryBody —— 直接用这份已配对文本判定
+  // 协议错误,避免重连后把同一失败显示成 completed(与共享 isSubagentResultError 同口径)。
+  const hasResult = !!result || !!summary;
+  const resultIsError =
+    result?.isError === true
+    || (result === undefined && isSubagentResultError(agent.secondaryBody ?? undefined));
   const status = computeStatus(
     agent.agentTaskStatus,
-    !!result,
+    hasResult,
     options.isSessionStreaming === true,
-    result?.isError === true,
+    resultIsError,
   );
   const startMs = Date.parse(agent.createdAt);
   const durationMs = result && Number.isFinite(startMs) && result.createdAtMs >= startMs
