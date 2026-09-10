@@ -352,12 +352,13 @@ export function listSessionTasks(input: {
         : (settled
           // 无 live update 的历史回放:settled 即终态。也走 deriveAgentTaskStatus:
           // 持久化终态优先;错误结果收口为 failed;普通结果 completed。未 settled
-          // 沿用下方 running/stopped 的死任务语义。
+          // 时持久化终态仍优先(启动失败只写 agentTaskStatus、无 tool result 的
+          // 场景),否则沿用 running/stopped 的死任务语义 —— 与聊天卡同口径。
           ? deriveAgentTaskStatus(resultIsError ? undefined : 'completed', resultText, {
               persistedStatus,
               resultIsError,
             })
-          : isSessionStreaming ? 'running' : 'stopped');
+          : (persistedStatus ?? (isSessionStreaming ? 'running' : 'stopped')));
     const provider: SessionTaskItem['provider'] =
       update?.provider ?? (toolName.startsWith('collab:') ? 'codex' : 'claude-code');
 
