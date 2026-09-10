@@ -146,6 +146,16 @@ describe('deriveAgentTaskStatus', () => {
       resultIsError: true,
     })).toBe('running');
   });
+
+  it('explicit stopped / failed terminal status survives a paired error result', () => {
+    // live 用户中断 + SDK <tool_use_error> 回执:显式 stopped 不得被降级成 failed。
+    expect(deriveAgentTaskStatus('stopped', '<tool_use_error>Interrupted</tool_use_error>', {
+      resultIsError: true,
+    })).toBe('stopped');
+    expect(deriveAgentTaskStatus('failed', '<tool_use_error>crash</tool_use_error>', {
+      resultIsError: true,
+    })).toBe('failed');
+  });
 });
 
 describe('mergeAgentTaskUpdate', () => {

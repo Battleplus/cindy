@@ -335,17 +335,28 @@ export function listSessionTasks(input: {
     // 的死任务(同步 Task 没有启动回执,永远不会有结果),断言 running 会让它
     // 永久转圈且无任何收口路径,按 stopped(被中断)呈现。
     const resultText = typeof resultContent === 'string' ? resultContent : undefined;
+    // 重载后与聊天卡(AgentTaskCard)共用 deriveAgentTaskStatus:持久化终态
+    // (agentMeta.agentTaskStatus)必须传入,否则列表与卡片会对同一任务给出不同终态。
+    const persistedStatus = msg.agentMeta?.agentTaskStatus;
+    const resultIsError = isSubagentResultError(resultText);
     const status: AgentTaskStatus = isWorkflowTool
       ? update?.status ?? (settled ? 'completed' : isSessionStreaming ? 'running' : 'stopped')
       : update
         ? deriveAgentTaskStatus(update.status, resultText, {
+            persistedStatus,
             resultIsLaunchReceipt:
               subagentSpawnReceiptName(toolName, toolInput, resultText) !== undefined
               || subagentSpawnResultIndicatesRunning(toolName, resultText),
-            resultIsError: isSubagentResultError(resultText),
+            resultIsError,
           })
         : (settled
-          ? (isSubagentResultError(resultText) ? 'failed' : 'completed')
+          // 无 live update 的历史回放:settled 即终态。也走 deriveAgentTaskStatus:
+          // 持久化终态优先;错误结果收口为 failed;普通结果 completed。未 settled
+          // 沿用下方 running/stopped 的死任务语义。
+          ? deriveAgentTaskStatus(resultIsError ? undefined : 'completed', resultText, {
+              persistedStatus,
+              resultIsError,
+            })
           : isSessionStreaming ? 'running' : 'stopped');
     const provider: SessionTaskItem['provider'] =
       update?.provider ?? (toolName.startsWith('collab:') ? 'codex' : 'claude-code');

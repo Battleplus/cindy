@@ -180,7 +180,16 @@ export function deriveAgentTaskStatus(
   const persistedStatus = normalizeAgentTaskTerminalStatus(options?.persistedStatus);
   if (persistedStatus) return persistedStatus;
   const hasResult = typeof result === 'string' && result.trim().length > 0;
-  if (options?.resultIsError && hasResult) return 'failed';
+  // resultIsError 只应收口 stale `running` / 缺失 live update 的历史回放;显式
+  // failed / stopped 是用户或系统声明的终态,不得被配对的 tool result 覆盖 ——
+  // live `stopped`(用户中断)配上 SDK 的 <tool_use_error> 回执会被误显示为失败。
+  if (
+    options?.resultIsError
+    && hasResult
+    && (updateStatus === undefined || updateStatus === 'running')
+  ) {
+    return 'failed';
+  }
   if (updateStatus === 'running' && hasResult && !options?.resultIsLaunchReceipt) return 'completed';
   return updateStatus ?? (hasResult ? 'completed' : 'running');
 }
