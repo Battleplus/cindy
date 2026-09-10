@@ -4604,6 +4604,11 @@ export function CCAgentSessionView({
                   </>
                 ) : pendingPermission ? (
                   <PermissionPrompt
+                    // P1 security: remount per permission card so the instance
+                    // (and its frozen capturedRequestId / keyboard listeners)
+                    // dies with card A when FIFO promotes B. A reused instance
+                    // would carry A's stale identity onto B's buttons.
+                    key={pendingPermission.requestId}
                     permission={pendingPermission}
                     onRespond={respondToPermission}
                   />

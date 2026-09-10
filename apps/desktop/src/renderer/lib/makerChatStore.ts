@@ -2896,8 +2896,12 @@ const sessions = new Map<string, SessionChatState>();
  */
 /** Maps sessionId → requestId of the in-flight permission response. */
 const permissionResponseInFlight = new Map<string, string>();
-/** Gesture dedupe window: prevents double-click from approving the newly promoted card. */
-const PERMISSION_RESPONSE_GUARD_WINDOW_MS = 300;
+/**
+ * Gesture dedupe window: prevents double-click from approving the newly promoted card.
+ * Must cover the platform double-click interval — Windows defaults to 500ms, so a
+ * second click of a double-click (350–500ms) after A resolves must not land on B.
+ */
+const PERMISSION_RESPONSE_GUARD_WINDOW_MS = 500;
 /** Timer per session for gesture dedupe release (purge / dismissal cleanup). */
 const permissionResponseGuardTimers = new Map<string, ReturnType<typeof setTimeout>>();
 

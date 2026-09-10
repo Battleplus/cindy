@@ -188,7 +188,10 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
     expect(onRespond).toHaveBeenCalledTimes(1);
   });
 
-  it('刷新到队列下一张卡后使用新的 requestId', () => {
+  // 身份必须在 mount 时冻结:父组件用 key={requestId} remount 每张卡,复用旧实例
+  // 只可能是异常路径。若真被复用,迟到手势必须继续带 A 的 id,由 store 的队首校验
+  // 拒绝(而不是把新卡的 id 当成新的用户决定) —— #4005「A 的迟到响应不得作用于 B」。
+  it('复用旧实例时冻结手势身份,不把 requestId 改写为下一张卡', () => {
     const onRespond = vi.fn();
     const first = permission();
     const second = { ...permission(), requestId: 'req-2', input: { command: 'git status' } };
@@ -197,7 +200,8 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
     rerender(<PermissionPrompt permission={second} onRespond={onRespond} />);
     fireEvent.click(screen.getByText('agentIsland.native.allowOnce'));
 
-    expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow', requestId: 'req-2' });
+    // 仍带着 mount 时的 req-1,不会变成 req-2。
+    expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow', requestId: 'req-1' });
   });
 
   it('Escape repeat is also ignored', () => {

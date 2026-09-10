@@ -101,14 +101,14 @@ export function PermissionPrompt({ permission, onRespond }: PermissionPromptProp
 
   // ── Action handlers ──
 
-  // P1 security: keep the requestId in a ref so callbacks created for the
-  // current card always carry the identity the user actually acted on. React
-  // may reuse this instance when the FIFO promotes the next card, so update
-  // synchronously during render rather than waiting for an effect.
+  // P1 security: freeze the requestId this instance was mounted for. The parent
+  // remounts PermissionPrompt per card via key={permission.requestId}, so this
+  // ref always equals the card the user is looking at; callbacks created below
+  // carry the identity the user actually acted on. Never rewrite it during
+  // render: if a stale instance were ever reused for the promoted card, a late
+  // click must keep A's id and be rejected by the store's head-of-queue check
+  // instead of silently approving B (review #4005).
   const capturedRequestId = useRef(permission.requestId);
-  if (capturedRequestId.current !== permission.requestId) {
-    capturedRequestId.current = permission.requestId;
-  }
 
   const handleAllowOnce = useCallback(() => {
     onRespond({
