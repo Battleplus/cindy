@@ -160,6 +160,20 @@ describe('subagent grouping (buildMobileMessageRenderItems)', () => {
     expect(groups[0].status).toBe('failed');
   });
 
+  it('带 toolUseId 的在跑 Agent 即使有邻接 secondaryBody 也不提前收口', () => {
+    // 带 ID 的 Agent 尚无自身 result,归一化层可能把下一行其他工具的 result 经
+    // adjacency 临时借进 secondaryBody —— 该借用非权威,不得让任务提前 completed/
+    // failed(尤其邻接文本以 <tool_use_error> 开头时不能误判 failed)。
+    const items = buildMobileMessageRenderItems([
+      agentToolUse('A1', { subagentType: 'Explore', createdAt: '2026-01-01T00:00:01.000Z' }),
+      childTool('Bash', 'A1', '2026-01-01T00:00:02.000Z'),
+      toolResult('other-1', 'tu-other', '<tool_use_error>not the agent result</tool_use_error>'),
+    ], { isSessionStreaming: true });
+    const groups = subagentGroups(items);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].status).toBe('running');
+  });
+
   it('marks status running when no closing tool_result and session is streaming', () => {
     const items = buildMobileMessageRenderItems([
       agentToolUse('A1', { subagentType: 'Explore', createdAt: '2026-01-01T00:00:01.000Z' }),

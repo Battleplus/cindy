@@ -169,12 +169,14 @@ function buildSubagentGroup(
   const summary = agent.secondaryBody && agent.secondaryBody.trim() ? agent.secondaryBody : null;
   const result = id ? resultMeta.get(id) : undefined;
   // 历史 Agent 缺 toolUseId 时 buildSubagentResultMeta 无条目,但归一化层已通过
-  // adjacency 把配对 tool_result 放进 secondaryBody —— 直接用这份已配对文本判定
-  // 协议错误,避免重连后把同一失败显示成 completed(与共享 isSubagentResultError 同口径)。
-  const hasResult = !!result || !!summary;
+  // adjacency 把配对 tool_result 放进 secondaryBody —— 这份兜底只对无 ID 的旧任务
+  // 生效:带 ID 的任务必须等待精确配对结果,否则邻接借用(可能是另一工具的 result)
+  // 会在真正结果到达前把任务误判为 completed/failed。
+  const legacyAdjacencyFallback = !id;
+  const hasResult = !!result || (legacyAdjacencyFallback && !!summary);
   const resultIsError =
     result?.isError === true
-    || (result === undefined && isSubagentResultError(agent.secondaryBody ?? undefined));
+    || (legacyAdjacencyFallback && isSubagentResultError(agent.secondaryBody ?? undefined));
   const status = computeStatus(
     agent.agentTaskStatus,
     hasResult,
