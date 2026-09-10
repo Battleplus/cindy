@@ -10,7 +10,7 @@
  * preserving the composer chip presentation invariant.
  */
 import { X } from 'lucide-react';
-import i18n from '../../i18n';
+import { useTranslation } from 'react-i18next';
 import { Node, mergeAttributes } from '@tiptap/core';
 import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from '@tiptap/react';
 import {
@@ -31,7 +31,11 @@ function parsePositiveLineAttribute(element: HTMLElement, name: string): number 
 
 function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps) {
   const quote = composerQuoteAttrsToChatQuote(node.attrs as ComposerQuoteAttrs);
-  const removeLabel = i18n.t('chat.quote.remove');
+  // 用 useTranslation 的 t 而不是直接 i18n.t:NodeView 会随运行时语言切换
+  // 重新渲染,删除按钮的 aria-label 与可见 Tip 文案同步刷新(不订阅 languageChanged
+  // 只读一次当前值的话,切换语言后文案会留在旧语言直到节点因其他原因更新)。
+  const { t } = useTranslation();
+  const removeLabel = t('chat.quote.remove');
 
   const handleRemove = () => {
     // 编辑器被锁定（发送预检 / 语音处理 / 远程只读等 editor.setEditable(false)）
@@ -74,6 +78,10 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
             'opacity-0 transition-opacity group-hover/quote:opacity-100',
             'hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]',
             'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--focus-ring)]',
+            // 点击目标 ≥24×24(DESIGN.md §5:hit-testing 与可见几何是独立职责,
+            // 命中区可扩大但不得改变可见几何)。透明 ::after 把命中框扩展到
+            // 14px 可见圆四周各 5px,视觉保持 10px 图标 + 14px 圆不变。
+            'after:absolute after:inset-[-5px] after:rounded-full after:content-[""]',
           )}
           onClick={(e) => {
             e.stopPropagation();
