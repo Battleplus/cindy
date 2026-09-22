@@ -62,6 +62,8 @@ interface UseCCSessionsReturn {
     remoteHostId?: string;
     /** per-session 来源(供应商)显式选择; null/undefined = 跟随默认路由。透传到 sessionService.create。 */
     providerId?: string | null;
+    /** Only the Cindy Make purpose may be requested from the renderer; Main validates it. */
+    source?: 'cindy-make';
   }) => Promise<Session | null>;
   refreshSessions: () => Promise<Session[]>;
   patchLocal: (id: string, patch: Partial<Session>) => void;
@@ -123,8 +125,11 @@ export function useCCSessions(options?: UseCCSessionsOptions): UseCCSessionsRetu
       }
       // 只在新桶有确切数据时才覆盖, 否则其它桶的变化不应擦掉当前视图。
       if (next !== null) {
-        setSnapshotState({ data: next, filter });
+        setSnapshotState((previous) =>
+          previous.data === next && previous.filter === filter ? previous : { data: next, filter },
+        );
         setIsLoading(false);
+        setError(null);
       }
     });
 
@@ -160,6 +165,7 @@ export function useCCSessions(options?: UseCCSessionsOptions): UseCCSessionsRetu
       remoteHostId?: string;
       /** per-session 来源(供应商)显式选择; null/undefined = 跟随默认路由。透传到 sessionService.create → mapper 落盘。 */
       providerId?: string | null;
+      source?: 'cindy-make';
     }): Promise<Session | null> => {
       try {
         const newSession = await sessionService.create({
@@ -179,10 +185,7 @@ export function useCCSessions(options?: UseCCSessionsOptions): UseCCSessionsRetu
     [],
   );
 
-  const refreshSessions = useCallback(
-    () => sessionsStore.forceRefresh(filter),
-    [filter],
-  );
+  const refreshSessions = useCallback(() => sessionsStore.forceRefresh(filter), [filter]);
 
   /** Update a session's fields without re-fetching. Preserves list order — useful
    *  for renames that shouldn't re-sort. 实际转发给 store 让所有 subscriber 同步。 */

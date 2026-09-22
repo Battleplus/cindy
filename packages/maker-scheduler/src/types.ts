@@ -166,6 +166,8 @@ export type PreRunHookDecision = 'run' | 'skip' | 'block';
  * 之前就失败，也可能通过后继续得到正常的 agent 结果。
  */
 export interface PreRunHookRunResult {
+  /** Explicit successful check, including a healthy no-work skip. Optional for old hooks. */
+  checkSucceeded?: true;
   status: PreRunHookRunStatus;
   decision: PreRunHookDecision;
   exitCode: number | null;
@@ -190,7 +192,7 @@ export interface Schedule {
   jobType?: JobType;
   /** Release-compat tombstone：老 issue-triage 的 JSON 配置；新代码不读不写。 */
   jobConfig?: string;
-  source?: 'user' | 'project';
+  source?: 'user' | 'project' | 'bot';
   projectConfigId?: string;
   kind: ScheduleKind;
   cronExpr: string;
@@ -213,6 +215,8 @@ export interface Schedule {
    */
   intervalMs?: number;
   agentKind: AgentKind;
+  /** Explicit model-picker Harness. Absent on legacy schedules: bound tasks keep their live Harness. */
+  modelAgentKind?: AgentKind;
   model?: string;
   /**
    * 显式选定的供应商(来源)id。undefined / 空 → 回落该 agent 原生默认来源
@@ -237,6 +241,7 @@ export interface Schedule {
   workspaceKind: ScheduleWorkspaceKind;
   workingDir?: string;
   useWorktree: boolean;
+  /** Script mode: lifecycle owner and sole dispatch target; no agent turn is started by the runner. */
   targetSessionId?: string;
   /**
    * 持续会话模式：true → runner 在第一次 fire 成功创建 session 后自动把 sessionId
@@ -345,6 +350,8 @@ export interface CreateScheduleInput {
   /** Interval 语义间隔（毫秒）。详见 Schedule.intervalMs。 */
   intervalMs?: number;
   agentKind: AgentKind;
+  /** Explicit model-picker Harness. Absent on legacy schedules: bound tasks keep their live Harness. */
+  modelAgentKind?: AgentKind;
   model?: string;
   /**
    * 显式选定的供应商(来源)id。undefined / 空 → 回落该 agent 原生默认来源

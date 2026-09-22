@@ -1,6 +1,9 @@
+import { isRemoteTaskSuggestionId } from '@/session/remoteTaskSuggestionsModel';
 import { stripTrailingPathSeparators } from '@cindy/maker-shared/path-text';
 import { takeRefinementContextTail } from '@cindy/voice-input-core';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { Stack, useIsFocused, useLocalSearchParams, useRouter } from 'expo-router';
+import { NewTaskSelectionSheet } from '@/session/NewTaskSelectionSheet';
+import { simpleScreenSafeAreaEdges } from '@/platform/chrome/SimpleStackHeader';
 import Constants from 'expo-constants';
 import { MOBILE_VISUAL_MOCK_ENABLED } from '@/config/env';
 import { formatMobileBuildLabel, normalizeBuildInfo } from '@/config/buildInfo';
@@ -27,7 +30,6 @@ import {
   useWindowDimensions,
   type StyleProp,
   type TextInputContentSizeChangeEvent,
-  type TextLayoutEvent,
   type ViewStyle,
 } from 'react-native';
 import { Text } from '@/components/AppText';
@@ -47,7 +49,6 @@ import {
   MessageCircle,
   Mic,
   Plus,
-  Scan,
   Settings,
   Target,
   X,
@@ -56,7 +57,6 @@ import {
 import {
   getRecordingPermissionsAsync,
   requestRecordingPermissionsAsync,
-  setAudioModeAsync,
 } from 'expo-audio';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ScreenBackButton } from '@/components/MobilePrimitives';
@@ -67,7 +67,7 @@ import type {
   MobileSlashCommand,
   RemoteDirectoryEntry,
 } from '@/device-link/mobileMakerTransport';
-import { describeAgentAuthError, formatRemoteError } from '@/device-link/remoteStatus';
+import { describeAgentAuthError, formatRemoteError, humanizeRemoteError } from '@/device-link/remoteStatus';
 import { agentAuthGateHint, agentAuthGateVerdict } from '@/session/agentAuthGate';
 import { connectedProvidersForAgent, getModel } from '@cindy/model-providers/registry';
 import { withTransientRemoteRetry } from '@/device-link/remoteRetry';
@@ -89,9 +89,16 @@ import {
 } from '@/session/attachments';
 import { useAuth } from '@/auth/AuthContext';
 import { discardMobileUploadedAttachment } from '@/session/mobileAttachmentUpload';
+import { discardNewSessionUploadedAttachments } from '@/session/newSessionAttachmentCleanup';
 import { goBackGuarded } from '@/utils/backGuard';
 import { buildMobileImageAttachmentCandidate } from '@/session/mobileImageAttachment';
 import { useMobileLocalAttachments } from '@/session/useMobileLocalAttachments';
+import {
+  consumeIncomingShareBatch,
+  deleteIncomingSharedFiles,
+  selectIncomingShareUploadCandidates,
+  useIncomingShareBatch,
+} from '@/session/incomingShare';
 import {
   AT_RESOURCE_QUERY_DEBOUNCE_MS,
   buildComposerPaletteCacheKey,
@@ -111,11 +118,11 @@ import {
 } from '@/session/agentCapabilitiesCache';
 import {
   ContextSheet,
-  ContextSheetFooterButton,
+
   ContextSheetGroup,
   ContextSheetRow,
 } from '@/session/ContextSheet';
-import { RecentPhotosStrip, ScreenshotsGrid } from '@/session/ContextSheetMediaViews';
+import { RecentPhotosStrip } from '@/session/ContextSheetMediaViews';
 import { ContextSheetGoalCreateForm } from '@/session/ContextSheetGoalView';
 import type { MobileGoalLimitsInput } from '@cindy/maker-shared/device-link-contract';
 import { ComposerAttachmentCollapsedBadge, ComposerAttachmentTray } from '@/session/ComposerAttachmentTray';
@@ -174,6 +181,7 @@ import { i18n } from '@/i18n';
 import {
   getMobileAuthOwner,
   isMobileAuthOwnerCurrent,
+  subscribeMobileAuthOwner,
 } from '@/auth/authOwnerGeneration';
 import { useTranslation } from 'react-i18next';
 import {
@@ -297,8 +305,10 @@ import {
   resolveRowSelection,
   type ProviderModelRow,
 } from '@/session/providerModelSections';
+import type { MobileModelConfiguration } from '@/session/unifiedMobileModels';
 import { ModelPickerSheet } from '@/session/ModelPickerSheet';
 import { MobileChoicePickerList } from '@/session/MobileChoicePickerList';
+import { NativePermissionSheet } from '@/session/NativePermissionSheet';
 import { MobilePermissionPickerList } from '@/session/MobilePermissionPickerList';
 import { SheetModal } from '@/session/SheetModal';
 import { SheetSurface } from '@/session/SheetSurface';
@@ -312,6 +322,7 @@ import {
   isValidWorktreeBranchPreferenceSnapshot,
   isWorktreeChannelNotAllowedError,
   parseWorktreeCreateResult,
+  initialWorktreeProbeEligibility,
   resolveWorktreeEligibility,
   shouldAcceptWorktreeBranchListResult,
   shouldBlockNewSessionCreateForWorktree,
@@ -331,7 +342,6 @@ import { useTheme, useThemedStyles, type ThemeColors } from '@/theme';
 import { fontWeight, iconSize, iconStroke, lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
 
 const COMPOSER_INPUT_MULTILINE_CONTENT_THRESHOLD = 34;
-const COMPOSER_VOICE_CARET_GAP = 2;
 // composer 除输入区外的 chrome 高度估算（输入行上下 padding + 边框），
 // 只用于给拖拽调高的上限留余量，与会话页同量级。
 const COMPOSER_RESIZE_CHROME_HEIGHT = 34;
@@ -390,7 +400,6 @@ interface WorktreeCreateIntentSnapshot {
   target: { deviceId: string; workingDir: string };
   eligibility: NewSessionWorktreeEligibility;
   sourceBranch: string;
-  preferenceSyncKey: string;
   branchPreferenceKey: string;
   branchPreferenceSyncKey: string;
 }
@@ -418,6 +427,7 @@ export default function NewRemoteSessionScreen() {
     deviceExplicit?: string;
     visualFocusComposer?: string;
     visualDraft?: string;
+    suggestion?: string;
   }>();
   const routeDeviceId = String(params.deviceId ?? '');
   const routeDeviceName = String(params.deviceName ?? routeDeviceId);
@@ -425,6 +435,7 @@ export default function NewRemoteSessionScreen() {
   const visualFocusComposer = MOBILE_VISUAL_MOCK_ENABLED && readRouteString(params.visualFocusComposer) === '1';
   const visualInitialDraft = MOBILE_VISUAL_MOCK_ENABLED ? readRouteString(params.visualDraft) : null;
   const router = useRouter();
+  const nativeSelectionSheet = Platform.OS === 'ios';
   const auth = useAuth();
   const {
     getPresenceAvailability,
@@ -454,6 +465,7 @@ export default function NewRemoteSessionScreen() {
   const [selectedDeviceId, setSelectedDeviceId] = useState(routeDeviceId);
   const [selectedDeviceName, setSelectedDeviceName] = useState(routeDeviceName);
   const [newSessionPreferences, setNewSessionPreferences] = useState<NewSessionStoredPreferences | null>(null);
+  const workingDirPreferenceOverridesRef = useRef<Record<string, string>>({});
   const [newSessionPreferencesLoaded, setNewSessionPreferencesLoaded] = useState(false);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const preferredDefaultDevice = useMemo(
@@ -472,7 +484,14 @@ export default function NewRemoteSessionScreen() {
   const selectedDeviceLabel = selectedDeviceOption?.name || selectedDeviceName || selectedDeviceId || t('session.new.selectDevice');
   const maker = useMobileMakerTransport(selectedDeviceId);
   const worktreePreference = useRemoteNewMakerWorktreePreference(selectedDeviceId);
-  const worktreeEnabled = worktreePreference.enabled;
+  // Defaults are advisory. A choice made in this draft wins over later host pushes.
+  const worktreeChoicesRef = useRef(new Map<string, boolean>());
+  const [, setWorktreeChoiceVersion] = useState(0);
+  const worktreeEnabled = (selectedDeviceId
+    ? worktreeChoicesRef.current.get(selectedDeviceId)
+    : undefined) ?? worktreePreference.enabled;
+  const worktreeEnabledRef = useRef(worktreeEnabled);
+  worktreeEnabledRef.current = worktreeEnabled;
   const sessions = useRemoteSessions();
   const recentWorkspaces = useMemo(
     () => buildRecentWorkspaceOptions(
@@ -483,11 +502,16 @@ export default function NewRemoteSessionScreen() {
   );
   const [draft, setDraft] = useState<NewSessionDraft>({
     ...DEFAULT_NEW_SESSION_DRAFT,
-    firstMessage: visualInitialDraft ?? DEFAULT_NEW_SESSION_DRAFT.firstMessage,
+    firstMessage: visualInitialDraft ?? (isRemoteTaskSuggestionId(params.suggestion)
+      ? t(`devices.list.taskSuggestions.items.${params.suggestion}.prompt`)
+      : DEFAULT_NEW_SESSION_DRAFT.firstMessage),
     // 无记忆时默认对话；偏好加载后恢复上次选择，显式项目入口优先。
     workspaceKind: initialWorkingDir ? 'project' : 'dialogue',
     workingDir: initialWorkingDir ?? '',
   });
+  const firstMessageRef = useRef(draft.firstMessage);
+  const firstMessageSelectionRef = useRef({ start: draft.firstMessage.length, end: draft.firstMessage.length });
+  const [firstMessageSelection, setFirstMessageSelection] = useState(firstMessageSelectionRef.current);
   const [creating, setCreating] = useState(false);
   const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
   const [createPhase, setCreatePhase] = useState<SlowSendPhase>('preparing');
@@ -504,7 +528,7 @@ export default function NewRemoteSessionScreen() {
   const [showHiddenDirectories, setShowHiddenDirectories] = useState(false);
   // Context 面板(+ 号弹出的可拖动 sheet):open + 子视图(主视图 / 截图列表 / 目标草稿)。
   const [contextSheetOpen, setContextSheetOpen] = useState(false);
-  const [contextSheetView, setContextSheetView] = useState<'main' | 'screenshots' | 'goal'>('main');
+  const [contextSheetView, setContextSheetView] = useState<'main' | 'goal'>('main');
   const contextSheetMediaLibraryEnabled = canBrowsePhotoLibraryDirectly(Platform.OS);
   // 目标模式(对齐桌面 NewMakerDraftRoute.handleCreateGoal):填完表单直接建会话 + setGoal,
   // 被控端落目标消息并自动开跑第一轮,成功后跳转会话页。
@@ -567,15 +591,9 @@ export default function NewRemoteSessionScreen() {
   const worktreeSourceBranchRef = useRef('HEAD');
   const worktreeSeedSeqRef = useRef(0);
   const [worktreeSeedRetryNonce, setWorktreeSeedRetryNonce] = useState(0);
-  const [worktreePreferenceReadyKey, setWorktreePreferenceReadyKey] = useState<string | null>(null);
-  const worktreePreferenceReadyKeyRef = useRef<string | null>(null);
   const worktreePreferenceSyncKeyRef = useRef('');
-  const worktreePreferenceAuthorityReadRef = useRef<{ syncKey: string; revision: number } | null>(
-    null,
-  );
   const worktreePreferenceWriteSeqRef = useRef(0);
-  // State updates are batched; this synchronous target fence closes the
-  // OFF→ON/ON→OFF then immediate Create gap before React renders the spinner.
+  // Serialize writes of the next default independently of the current draft.
   const worktreePreferenceWriteTargetRef = useRef<string | null>(null);
   const [worktreePreferenceSavingDeviceId, setWorktreePreferenceSavingDeviceId] =
     useState<string | null>(null);
@@ -596,7 +614,7 @@ export default function NewRemoteSessionScreen() {
   // 相册资产 → 已上传附件 id 的映射(缩略图勾选态真相)。
   const [mediaAssetAttachments, setMediaAssetAttachments] = useState<Record<string, string>>({});
   // 待选相册资产(按选中顺序;Cursor 式两段提交,底部「加入对话」统一上传)。
-  const [pendingMediaAssets, setPendingMediaAssets] = useState<ContextSheetMediaAsset[]>([]);
+  const mediaTapAcceptedRef = useRef(false);
   // 本机图片附件的本地预览 uri(attachmentId → file://),composer 托盘缩略图 / 全图查看用。
   const [attachmentPreviews, setAttachmentPreviews] = useState<Record<string, string>>({});
   // composer 托盘里正被全屏查看的图片附件 id(null = 关闭)。
@@ -611,6 +629,13 @@ export default function NewRemoteSessionScreen() {
     if (!stashed) return;
     // 返回编辑沿用草稿的工作区，不能被随后加载的全局默认覆盖。
     userTouchedWorkspaceRef.current = true;
+    firstMessageRef.current = stashed.draft.firstMessage;
+    const restoredSelection = {
+      start: stashed.draft.firstMessage.length,
+      end: stashed.draft.firstMessage.length,
+    };
+    firstMessageSelectionRef.current = restoredSelection;
+    setFirstMessageSelection(restoredSelection);
     setDraft(stashed.draft);
     setAttachments([...stashed.attachments]);
     if (stashed.notice) setAttachmentError(stashed.notice);
@@ -662,6 +687,61 @@ export default function NewRemoteSessionScreen() {
     onError: setAttachmentError,
     onPicked: () => setContextSheetOpen(false),
   });
+  useEffect(() => subscribeMobileAuthOwner(() => {
+    // Switching accounts invalidates both queued uploads and already received
+    // attachments, synchronously, before a new account can send this draft.
+    discardNewSessionUploadedAttachments(attachmentsRef.current, auth.getAccessToken);
+    discardAllPendingUploads();
+    attachmentsRef.current = [];
+    setAttachments([]);
+    setAttachmentPreviews({});
+    setMediaAssetAttachments({});
+    setAttachmentError(null);
+  }), [auth.getAccessToken, discardAllPendingUploads]);
+  const incomingShareBatch = useIncomingShareBatch();
+  const isShareTargetFocused = useIsFocused();
+  useEffect(() => {
+    if (!isShareTargetFocused || !auth.isAuthenticated || !incomingShareBatch
+      || getMobileAuthOwner().accountId !== auth.user?.id
+      || !consumeIncomingShareBatch(incomingShareBatch.id)) return;
+    const selection = selectIncomingShareUploadCandidates(incomingShareBatch.payloads);
+    const remainingSlots = Math.max(
+      0,
+      MOBILE_MAX_ATTACHMENTS
+        - attachmentsRef.current.length
+        - getPendingUploadCount(),
+    );
+    const accepted = selection.candidates.slice(0, remainingSlots);
+    const dropped = selection.candidates.slice(remainingSlots);
+    const cleanupUris = [
+      ...selection.rejectedUris,
+      ...dropped.map((candidate) => candidate.uri),
+    ];
+    if (cleanupUris.length > 0) {
+      void deleteIncomingSharedFiles(cleanupUris).catch(() => undefined);
+    }
+    if (accepted.length > 0) {
+      enqueueUploads(accepted.map((candidate) => ({
+        ...candidate,
+        cleanupLocalUris: deleteIncomingSharedFiles,
+      })), { token: auth.getAccessToken() });
+    }
+    if (dropped.length > 0) {
+      setAttachmentError(i18n.t('composer.upload.maxAttachments', {
+        count: MOBILE_MAX_ATTACHMENTS,
+      }));
+    } else if (selection.rejectedUris.length > 0) {
+      setAttachmentError(i18n.t('composer.upload.fileTypeUnsupported'));
+    } else {
+      setAttachmentError(null);
+    }
+  }, [
+    auth,
+    enqueueUploads,
+    getPendingUploadCount,
+    incomingShareBatch,
+    isShareTargetFocused,
+  ]);
   const [slashCommands, setSlashCommands] = useState<MobileSlashCommand[]>([]);
   const [slashPaletteLoading, setSlashPaletteLoading] = useState(false);
   const [slashPaletteError, setSlashPaletteError] = useState<string | null>(null);
@@ -696,7 +776,6 @@ export default function NewRemoteSessionScreen() {
   const appliedPermissionMemoryRef = useRef(false);
   const userTouchedDeviceRef = useRef(false);
   const userTouchedWorkspaceRef = useRef(false);
-  const firstMessageRef = useRef(draft.firstMessage);
   const firstMessageInputRef = useRef<NativeTextInput>(null);
   const voiceDraftScrollRef = useRef<ScrollView>(null);
   const voiceRecordingActiveRef = useRef(false);
@@ -705,6 +784,11 @@ export default function NewRemoteSessionScreen() {
   const voicePermissionRequestAbortRef = useRef<AbortController | null>(null);
   const voiceStartupInFlightRef = useRef(false);
   const voiceStopInFlightRef = useRef(false);
+  const voiceSelectionUserOwnedRef = useRef(false);
+  const voicePendingSelectionEchoesRef = useRef<Array<{ start: number; end: number }>>([]);
+  // The press that stops dictation can emit one native selection event of its
+  // own. Consume that event before allowing a real user move to claim control.
+  const voiceStopGestureSelectionGuardRef = useRef(false);
   const voiceStartupSeqRef = useRef(0);
   const voiceControllerSessionRef = useRef<MobileVoiceControllerSession | null>(null);
   const voiceDictionaryLearningTrackerRef = useRef<MobileVoiceDictionaryLearningTracker | null>(null);
@@ -712,6 +796,8 @@ export default function NewRemoteSessionScreen() {
   const [firstMessageInputContentHeight, setFirstMessageInputContentHeight] = useState(MOBILE_COMPOSER_INPUT_SINGLE_LINE_HEIGHT);
   const [firstMessageInputFocused, setFirstMessageInputFocused] = useState(false);
   const [voiceDraftCaretFrame, setVoiceDraftCaretFrame] = useState({ left: 0, top: 0 });
+  const voiceDraftCaretRef = useRef<View>(null);
+  const voiceDraftMeasuredBlockRef = useRef<View>(null);
   // 自动默认运行配置(跟随最近会话 / 区域默认 / 列表最上面)的守卫:用户一旦手动选过模型,就不再自动覆盖;
   // 记录已自动应用过的设备,切设备时(未手动选过)按新设备重算。
   const userTouchedRuntimeRef = useRef(false);
@@ -733,7 +819,7 @@ export default function NewRemoteSessionScreen() {
     [capabilities, draft.model],
   );
   // 被控端供应商目录 → provider-aware 模型分段(对齐桌面)。0 供应商 / 旧被控端 → 回退扁平列表。
-  const deviceProviders = useDeviceProviders(selectedDeviceId || undefined);
+  const deviceProviders = useDeviceProviders(selectedDeviceId || undefined, modelSheetOpen);
   // 模型列表元信息(单价 / 折扣版 key presence)+ 草稿 per-(agent,来源,模型) 记忆(对齐桌面)。
   const deviceModelPricing = useDeviceModelPricing(selectedDeviceId || undefined);
   const deviceApiKeyStatus = useDeviceApiKeyStatus(selectedDeviceId || undefined);
@@ -836,7 +922,11 @@ export default function NewRemoteSessionScreen() {
     void readNewSessionPreferences()
       .then((preferences) => {
         if (cancelled) return;
-        setNewSessionPreferences(preferences);
+        // A late initial read must not replace directories explicitly chosen while it was pending.
+        setNewSessionPreferences({
+          ...preferences,
+          workingDirByDevice: { ...preferences.workingDirByDevice, ...workingDirPreferenceOverridesRef.current },
+        });
         const workspaceKind = preferences.workspaceKind;
         if (!initialWorkingDir && workspaceKind) {
           setDraft((current) => userTouchedWorkspaceRef.current
@@ -997,12 +1087,10 @@ export default function NewRemoteSessionScreen() {
       // modelRows 按当前 draft.agentKind 构建;最近会话若是另一个 agent,纯函数内不做来源校验。
       rowsAgentKind: draft.agentKind,
       catalogReady: deviceProviders.ready,
-      // 目录明确不可用(error 非空,旧被控端无 provider:list 通道等)→ 放行扁平回退
-      // (codex review P2);加载中/切设备间隙 error 为空,维持既有「不动等重算」语义。
-      providersUnavailable: deviceProviders.error != null,
+      providersUnsupported: deviceProviders.unsupported,
       // provider-aware 模式只用经过可见性过滤的 rows;目录确实不可用时才回退
       // capabilities(上游 main 移植,merge 2026-08-07)。
-      availableModels: !deviceProviders.loading && modelSections.connected.length === 0
+      availableModels: deviceProviders.unsupported
         ? capabilities?.availableModels
         : undefined,
       currentEffort: draft.effort,
@@ -1049,7 +1137,7 @@ export default function NewRemoteSessionScreen() {
     return () => {
       cancelled = true;
     };
-  }, [capabilities?.availableModels, deviceProviders.loading, draft.effort, draft.permissionMode, draft.agentKind, modelRows, deviceProviders.ready, modelSections.connected.length, newSessionPreferences, newSessionPreferencesLoaded, selectedDeviceId, sessions]);
+  }, [capabilities?.availableModels, deviceProviders.loading, draft.effort, draft.permissionMode, draft.agentKind, modelRows, deviceProviders.ready, deviceProviders.unsupported, modelSections.connected.length, newSessionPreferences, newSessionPreferencesLoaded, selectedDeviceId, sessions]);
 
   // 目录就绪后的来源终检(codex review P1):自动默认/恢复在目录加载期信任的来源可能已失效
   // (provider 被删/断开/模型下架),就绪后必须复核——联合回退整对 (model, providerId)
@@ -1165,27 +1253,16 @@ export default function NewRemoteSessionScreen() {
       worktreePreferenceSavingDeviceId === selectedDeviceId
       || worktreePreferenceWriteTargetRef.current === selectedDeviceId
     );
+  const worktreePreferenceAwaitingEcho =
+    worktreePreferenceTransactionRef.current?.status === 'reconciling';
   const worktreePreferenceSyncKey = selectedDeviceId
     ? `${selectedDeviceId}\u0000${connectionEpoch}\u0000${presenceVersion}`
     : '';
   worktreePreferenceSyncKeyRef.current = worktreePreferenceSyncKey;
-  const worktreePreferenceReady = worktreePreferenceSyncKey.length > 0
-    && worktreePreferenceReadyKey === worktreePreferenceSyncKey
-    && worktreePreferenceReadyKeyRef.current === worktreePreferenceSyncKey;
   const worktreePreferenceAuthorityUnknown = selectedDeviceId != null
     && worktreePreferenceAuthorityUnknownByDeviceRef.current.has(selectedDeviceId);
   const worktreeApplicable = draft.workspaceKind === 'project'
     && draft.workingDir.trim().length > 0;
-  // ineligible(2026-08-07 裁决):确认目录不合格时无需等偏好就绪——反正不会
-  // 创建 worktree,GET 在途不应卡住普通会话创建。
-  const worktreePreferenceCreateBlocked = worktreeApplicable
-    && selectedDeviceId != null
-    && worktreeEligibility.status !== 'ineligible'
-    && (
-      worktreePreferenceSaving
-      || worktreePreferenceAuthorityUnknown
-      || !worktreePreferenceReady
-    );
   // host preference 虽然持久化，连接代次仍属于权威读取 identity：桌面重启/重连后
   // 即使 deviceId/repo 没变，也重新 GET，不能只相信手机内存里的旧快照。
   const worktreeBranchPreferenceSyncKey = worktreeBranchPreferenceKey
@@ -1205,7 +1282,6 @@ export default function NewRemoteSessionScreen() {
   const worktreeToggleDisabled =
     creating
     || worktreePreferenceSaving
-    || (!worktreePreferenceReady && !worktreePreferenceAuthorityUnknown)
     || (worktreeEligibility.status !== 'eligible' && !worktreeEnabled);
   // 分支区与 checkbox 是两条独立轴：OFF 时也可先选源分支；保存 checkbox 偏好在途
   // 同样不影响只读的分支枚举。只有目标尚不具备 worktree 资格或创建在途时禁用。
@@ -1216,31 +1292,33 @@ export default function NewRemoteSessionScreen() {
   const worktreeBranchSheetVisible = worktreeBranchSheetOpen
     && worktreeEligibility.status === 'eligible'
     && worktreeBranchListMatchesTarget;
-  // 勾选展示 = 工作端记忆**原样直出**(2026-07-29 用户裁决:状态只属于用户,系统不做
-  // 视觉折叠);项目目标资格不满足时显示 caption 并阻止创建，不能静默降级普通目录。
+  // 2026-09-11: show this draft's explicit choice, otherwise the last host mirror.
+  // Eligibility failures still cannot silently downgrade an enabled worktree.
   const worktreeChecked = worktreeEnabled;
   const worktreeCaptionKey = worktreeEligibilityCaptionKey(worktreeEligibility);
   const worktreeCreateBlocked = shouldBlockNewSessionCreateForWorktree({
     applicable: worktreeApplicable,
     enabled: worktreeEnabled,
     eligibility: worktreeEligibility,
-    preferenceSaving: worktreePreferenceSaving,
+    // Saving a default does not change the explicit parameters of this request.
+    preferenceSaving: false,
   })
-    || worktreePreferenceCreateBlocked
-    || (worktreeEnabled && worktreeBranchPreferenceSaving)
-    || (worktreeEnabled
-      && worktreeEligibility.status === 'eligible'
-      && (!worktreeBranchPreferenceReady || worktreeBranchPreferenceError));
+    || (worktreeEnabled && (
+      worktreeBranchPreferenceSaving
+      || (worktreeEligibility.status === 'eligible' && !worktreeBranchPreferenceReady)
+      || (worktreeBranchPreferenceTransactionRef.current?.key === worktreeBranchPreferenceKey
+        && worktreeBranchPreferenceTransactionRef.current.status === 'unknown')
+    ));
   const worktreeControlCaptionKey = worktreeCaptionKey
     ?? (worktreePreferenceAuthorityUnknown ? 'session.new.worktreeSettingsSyncFailed' : null)
-    ?? (worktreePreferenceCreateBlocked ? 'session.new.worktreeSettingsSaving' : null)
+    ?? (worktreePreferenceSaving ? 'session.new.worktreeSettingsSaving' : null)
     ?? (worktreeBranchPreferenceError ? 'session.new.worktreeBranchSyncFailed' : null);
-  const resolveWorktreePreferenceGateErrorKey = useCallback(() => (
-    selectedDeviceId != null
-      && worktreePreferenceAuthorityUnknownByDeviceRef.current.has(selectedDeviceId)
-      ? 'session.new.worktreeSettingsSyncFailed'
-      : 'session.new.worktreeSettingsSaving'
-  ), [selectedDeviceId]);
+  const resolveWorktreeCreateErrorKey = useCallback(() => (
+    worktreeEligibilityCaptionKey(worktreeEligibilityRef.current)
+      ?? (worktreeBranchPreferenceError
+        ? 'session.new.worktreeBranchSyncFailed'
+        : 'session.new.worktreeBranchSaving')
+  ), [worktreeBranchPreferenceError]);
 
   useLayoutEffect(() => {
     worktreePreferenceRenderedRef.current = {
@@ -1261,7 +1339,7 @@ export default function NewRemoteSessionScreen() {
       worktreePreferenceWriteTargetRef.current = null;
     }
     setWorktreePreferenceSavingDeviceId(null);
-  }, [selectedDeviceId, worktreePreference.enabled, worktreePreference.revision]);
+  }, [selectedDeviceId, worktreePreference.enabled, worktreePreference.revision, worktreePreferenceAwaitingEcho]);
 
   useEffect(() => {
     if (!selectedDeviceId) return;
@@ -1294,7 +1372,7 @@ export default function NewRemoteSessionScreen() {
     ) return;
     worktreePreferenceAuthorityUnknownByDeviceRef.current.delete(selectedDeviceId);
     setWorktreePreferenceAuthorityVersion((value) => value + 1);
-  }, [selectedDeviceId, worktreePreference.enabled, worktreePreference.revision]);
+  }, [selectedDeviceId, worktreePreference.enabled, worktreePreference.revision, worktreePreferenceAwaitingEcho]);
 
   const settleRenderedWorktreeBranchTransaction = useCallback((
     key: string,
@@ -1344,13 +1422,10 @@ export default function NewRemoteSessionScreen() {
       : '';
     return {
       applicable: target.deviceId.length > 0 && target.workingDir.trim().length > 0,
-      enabled: target.deviceId
-        ? remoteSessionStore.getNewMakerWorktreePreference(target.deviceId).enabled
-        : false,
+      enabled: worktreeEnabledRef.current,
       target,
       eligibility,
       sourceBranch: worktreeSourceBranchRef.current,
-      preferenceSyncKey: worktreePreferenceSyncKeyRef.current,
       branchPreferenceKey,
       branchPreferenceSyncKey: worktreeBranchPreferenceSyncKeyRef.current,
     };
@@ -1371,19 +1446,12 @@ export default function NewRemoteSessionScreen() {
     // 但快照不能替代实时状态:await 期间同目标可能被重探回 probing/eligible/
     // detect-failed,旧 ineligible 快照必须复核 live ref 仍为 ineligible 才放行,
     // 否则回到 fail closed(探测未定不等于确认不合格)。
+    if (!intent.enabled) return true;
     if (intent.eligibility.status === 'ineligible') {
       return worktreeEligibilityRef.current.status === 'ineligible';
     }
-    if (
-      worktreePreferenceSyncKeyRef.current !== intent.preferenceSyncKey
-      || worktreePreferenceReadyKeyRef.current !== intent.preferenceSyncKey
-      || worktreePreferenceWriteTargetRef.current === intent.target.deviceId
-      || worktreePreferenceAuthorityUnknownByDeviceRef.current.has(intent.target.deviceId)
-    ) return false;
-    const currentEnabled = remoteSessionStore
-      .getNewMakerWorktreePreference(intent.target.deviceId).enabled;
-    if (currentEnabled !== intent.enabled) return false;
-    if (!intent.enabled) return true;
+    // The click captures the displayed choice. Background defaults and persistence
+    // ACKs cannot invalidate an already submitted request.
     // ineligible 已在前面提前返回,此处只可能是 eligible(2026-08-07 裁决)。
     if (intent.eligibility.status !== 'eligible') return false;
     // 与 ineligible 快照同理:eligible 快照也必须复核 live 资格仍是同一 repo 的
@@ -1393,20 +1461,11 @@ export default function NewRemoteSessionScreen() {
       currentEligibility.status !== 'eligible'
       || currentEligibility.baseRepo !== intent.eligibility.baseRepo
     ) return false;
-    const currentStoredBranch = remoteSessionStore.getNewMakerWorktreeBranchPreference(
-      intent.target.deviceId,
-      currentEligibility.baseRepo,
-    );
-    const currentSourceBranch = isValidWorktreeBranchPreferenceSnapshot(
-      currentStoredBranch,
-      currentEligibility.baseRepo,
-    )
-      ? currentStoredBranch.sourceBranch
-      : worktreeSourceBranchRef.current;
-    if (currentSourceBranch !== intent.sourceBranch) return false;
     const branchTransaction = worktreeBranchPreferenceTransactionRef.current;
-    return worktreeBranchPreferenceSyncKeyRef.current === intent.branchPreferenceSyncKey
-      && worktreeBranchPreferenceReadyKeyRef.current === intent.branchPreferenceSyncKey
+    // A missing branch snapshot may only be a pending read, not host consent
+    // to use the detected branch. Checkbox defaults remain independent.
+    return worktreeBranchPreferenceReadyKeyRef.current === intent.branchPreferenceSyncKey
+      && worktreeBranchPreferenceSyncKeyRef.current === intent.branchPreferenceSyncKey
       && worktreeBranchPreferenceWriteTargetRef.current !== intent.branchPreferenceKey
       && !(
         branchTransaction?.key === intent.branchPreferenceKey
@@ -1593,19 +1652,15 @@ export default function NewRemoteSessionScreen() {
     ));
   }, []);
 
-  const handleVoiceDraftTextLayout = useCallback((event: TextLayoutEvent) => {
-    const lines = event.nativeEvent.lines;
-    const lastLine = lines[lines.length - 1];
-    if (!lastLine) return;
-    const nextFrame = {
-      left: Math.max(0, Math.round(lastLine.x + lastLine.width + COMPOSER_VOICE_CARET_GAP)),
-      top: Math.max(0, Math.round(lastLine.y + ((lastLine.height - MOBILE_COMPOSER_INPUT_LINE_HEIGHT) / 2))),
-    };
-    setVoiceDraftCaretFrame((currentFrame) => (
-      currentFrame.left === nextFrame.left && currentFrame.top === nextFrame.top
-        ? currentFrame
-        : nextFrame
-    ));
+  const handleVoiceDraftTextLayout = useCallback(() => {
+    const block = voiceDraftMeasuredBlockRef.current;
+    const caret = voiceDraftCaretRef.current;
+    if (!block || !caret) return;
+    caret.measureLayout(block, (x, y) => {
+      if (caret !== voiceDraftCaretRef.current || block !== voiceDraftMeasuredBlockRef.current) return;
+      const nextFrame = { left: Math.max(0, Math.round(x)), top: Math.max(0, Math.round(y)) };
+      setVoiceDraftCaretFrame((current) => current.left === nextFrame.left && current.top === nextFrame.top ? current : nextFrame);
+    }, () => undefined);
   }, []);
 
   const cancelVoiceForDeviceSwitch = useCallback(() => {
@@ -1624,7 +1679,6 @@ export default function NewRemoteSessionScreen() {
     setVoiceError(null);
     discardPendingPrewarm();
     if (controller) void controller.cancel().catch(() => undefined);
-    void setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
   }, [setVoiceState]);
 
   useEffect(() => {
@@ -2150,6 +2204,26 @@ export default function NewRemoteSessionScreen() {
     setShowHiddenDirectories(false);
   }, [patchDraft]);
 
+  // 用户显式选定目录 → 该设备的目录记忆(#4103):同步进本地 state(本页内切走再切回
+  // 也拿最新值,落盘不回写 state,对齐 selectPermissionMode)并返回落盘 patch 片段。
+  // 路径原样保存,只用 trim 判空(首尾空格可能是路径的一部分)。设备未定时不记。
+  const rememberWorkingDirForDevice = useCallback((workingDir: string) => {
+    if (!selectedDeviceId || !workingDir.trim()) return undefined;
+    workingDirPreferenceOverridesRef.current[selectedDeviceId] = workingDir;
+    setNewSessionPreferences((prev) => prev
+      ? { ...prev, workingDirByDevice: { ...prev.workingDirByDevice, [selectedDeviceId]: workingDir } }
+      : prev);
+    return { deviceId: selectedDeviceId, workingDir };
+  }, [selectedDeviceId]);
+
+  // 用户显式选定目录(快捷选择 / 目录浏览器确认):按设备记住,下次空白新建先恢复它(#4103)。
+  // 自动取最近项目首项走上面的 selectWorkingDir,不算显式选择,不写记忆。
+  const chooseWorkingDir = useCallback((workingDir: string) => {
+    const remembered = rememberWorkingDirForDevice(workingDir);
+    if (remembered) void saveNewSessionPreferences({ workingDirForDevice: remembered });
+    selectWorkingDir(workingDir);
+  }, [rememberWorkingDirForDevice, selectWorkingDir]);
+
   const selectDialogueWorkspace = useCallback(() => {
     userTouchedWorkspaceRef.current = true;
     void saveNewSessionPreferences({ workspaceKind: 'dialogue' });
@@ -2161,12 +2235,17 @@ export default function NewRemoteSessionScreen() {
 
   const selectRecentProject = useCallback((workingDir: string) => {
     userTouchedWorkspaceRef.current = true;
-    void saveNewSessionPreferences({ workspaceKind: 'project' });
+    // 显式点选最近项目 = 该设备的目录记忆(#4103);设备未定时只记模式。
+    const remembered = rememberWorkingDirForDevice(workingDir);
+    void saveNewSessionPreferences({
+      workspaceKind: 'project',
+      ...(remembered ? { workingDirForDevice: remembered } : {}),
+    });
     patchDraft({ workspaceKind: 'project', workingDir });
     setWorkspacePickerOpen(false);
     setBrowseOpen(false);
     setShowHiddenDirectories(false);
-  }, [patchDraft]);
+  }, [patchDraft, rememberWorkingDirForDevice]);
 
   const openProjectBrowse = useCallback(() => {
     userTouchedWorkspaceRef.current = true;
@@ -2208,6 +2287,28 @@ export default function NewRemoteSessionScreen() {
     });
     setModelSheetOpen(false);
   }, [capabilities, draftMemory]);
+
+  const selectUnifiedModel = useCallback(async (config: MobileModelConfiguration): Promise<boolean> => {
+    if (creating || !selectedDeviceId) return false;
+    const deviceAtStart = selectedDeviceId;
+    const sequence = ++runtimeActionSeqRef.current;
+    const targetCapabilities = normalizeMobileAgentCapabilities(await maker.getCapabilities(config.agent));
+    if (!targetCapabilities) return false;
+    const storedPermission = newSessionPreferences?.permissionModeByAgent[config.agent];
+    const permission = config.agent === draft.agentKind ? draft.permissionMode
+      : storedPermission ?? defaultPermissionModeForNewSessionAgent(config.agent);
+    if (config.agent !== draft.agentKind && !await confirmFullAccessChange(draft.permissionMode, permission, {
+      restoringRememberedChoice: storedPermission !== undefined,
+    })) return false;
+    if (deviceAtStart !== selectedDeviceRef.current || sequence !== runtimeActionSeqRef.current) return false;
+    userTouchedRuntimeRef.current = true;
+    explicitProviderModelSelectionRef.current = config.modelId;
+    const fastMode = targetCapabilities.hasFastMode === true && config.fast;
+    setDraft(current => ({ ...current, agentKind: config.agent, model: config.modelId,
+      providerId: config.providerId, effort: config.effort, fastMode, permissionMode: permission }));
+    void saveNewSessionPreferences({ agentKind: config.agent });
+    return true;
+  }, [creating, selectedDeviceId, maker, newSessionPreferences, draft.agentKind, draft.permissionMode]);
 
   // 扁平回退(被控端 0 供应商):只落 model、清来源(默认路由),effort 跟随 capabilities reconcile。
   const selectFlatModel = useCallback((option: MobileModelOption) => {
@@ -2289,9 +2390,16 @@ export default function NewRemoteSessionScreen() {
     };
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    const probingEligibility: NewSessionWorktreeEligibility = { status: 'probing' };
-    worktreeEligibilityRef.current = probingEligibility;
-    setWorktreeProbe({ target, eligibility: probingEligibility });
+    // 起始状态由纯函数决定(#4046):设备与目录都已选、但链路不在 online(如完全断网)
+    // 时直接进 recovering 而不是停在 probing —— 下面的提前返回不会进 catch,停在
+    // probing 就是永久的「检测环境中…」。
+    const initialEligibility: NewSessionWorktreeEligibility = initialWorktreeProbeEligibility({
+      hasDevice: Boolean(selectedDeviceId),
+      hasWorkingDir: cwd.length > 0,
+      online: deviceLinkStatus === 'online',
+    });
+    worktreeEligibilityRef.current = initialEligibility;
+    setWorktreeProbe({ target, eligibility: initialEligibility });
     // Relay 离线时不把预期的 NOT_CONNECTED 固化成 detect-failed；online /
     // connectionEpoch / presenceVersion 变化后自动重探，覆盖手机重连和工作端
     // 重新上线两种路径。
@@ -2779,32 +2887,18 @@ export default function NewRemoteSessionScreen() {
   // 全新设备在 store 中没有镜像时本来就是默认未勾选,无需失败路径代替宿主写值。
   const worktreeSeedAgentKindRef = useRef(draft.agentKind);
   worktreeSeedAgentKindRef.current = draft.agentKind;
-  // 资格探测完成后才有这个标记。它只用于「缺字段时能不能把老被控端当 ready」,
-  // 不能进本 effect 依赖:选目录会让探测结果换代,cleanup 会把还在飞的 GET 取消掉,
-  // 合格目录上偏好门一直不放行,发送按钮就灰着还没提示。
+  // Read the host capability through a ref: probing a different directory must
+  // not cancel a device-wide defaults request. Old hosts need no missing-field retry.
   const worktreeHostSupportsRecoveryKeyDiscardRef = useRef(worktreeHostSupportsRecoveryKeyDiscard);
   worktreeHostSupportsRecoveryKeyDiscardRef.current = worktreeHostSupportsRecoveryKeyDiscard;
   useEffect(() => {
     const seq = ++worktreeSeedSeqRef.current;
     const syncKey = worktreePreferenceSyncKey;
-    const previousRead = worktreePreferenceAuthorityReadRef.current;
-    if (previousRead?.syncKey !== syncKey) {
-      worktreePreferenceReadyKeyRef.current = null;
-      setWorktreePreferenceReadyKey(null);
-    }
     if (!selectedDeviceId || !syncKey || deviceLinkStatus !== 'online') return undefined;
     const preferenceRevisionAtStart =
       remoteSessionStore.getNewMakerWorktreePreference(selectedDeviceId).revision;
-    worktreePreferenceAuthorityReadRef.current = {
-      syncKey,
-      revision: preferenceRevisionAtStart,
-    };
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    const markReady = () => {
-      worktreePreferenceReadyKeyRef.current = syncKey;
-      setWorktreePreferenceReadyKey(syncKey);
-    };
     const scheduleRetry = () => {
       if (retryTimer) return;
       retryTimer = setTimeout(() => {
@@ -2830,8 +2924,7 @@ export default function NewRemoteSessionScreen() {
         ) return;
         const classification = classifyWorktreePreferenceSeed(defaults);
         if (classification.status === 'ready') {
-          // Store revision + committed render jointly release the ready gate via
-          // the observer below; do not expose the old checkbox value in-between.
+          // Update only the host mirror. Explicit draft choices remain separate.
           remoteSessionStore.setNewMakerWorktreePreference(
             selectedDeviceId,
             classification.enabled,
@@ -2844,8 +2937,7 @@ export default function NewRemoteSessionScreen() {
         ) {
           // Old hosts cannot persist this preference and also lack the recovery
           // capability marker. A new host can transiently return `{}` before its
-          // renderer cache arrives, so missing alone must never authorize OFF.
-          markReady();
+          // renderer cache arrives; keep the last mirror and retry in that case.
           return;
         }
         scheduleRetry();
@@ -2857,11 +2949,9 @@ export default function NewRemoteSessionScreen() {
           || worktreePreferenceSyncKeyRef.current !== syncKey
         ) return;
         if (isWorktreeChannelNotAllowedError(error)) {
-          markReady();
           return;
         }
-        // Timeout/offline/unknown failures cannot authorize the default OFF.
-        // Keep both Create and Goal fail-closed and retry on this same link.
+        // A failed defaults read leaves the displayed value usable for creation.
         scheduleRetry();
       });
     return () => {
@@ -2879,41 +2969,40 @@ export default function NewRemoteSessionScreen() {
     openLink,
   ]);
 
-  // A same-value push is still authoritative: the store deliberately advances
-  // revision for it. Only an observation newer than this connection/read start
-  // may release the initial checkbox authority gate.
+  // Saving the next default is independent of using this draft's explicit choice.
+  // An accepted write may never echo back; release the control after 10 seconds.
   useEffect(() => {
-    const read = worktreePreferenceAuthorityReadRef.current;
-    if (
-      !read
-      || !worktreePreferenceSyncKey
-      || read.syncKey !== worktreePreferenceSyncKey
-      || worktreePreference.revision <= read.revision
-    ) return;
-    worktreePreferenceReadyKeyRef.current = worktreePreferenceSyncKey;
-    setWorktreePreferenceReadyKey(worktreePreferenceSyncKey);
-  }, [worktreePreference.revision, worktreePreferenceSyncKey]);
+    if (!worktreePreferenceSavingDeviceId || !worktreePreferenceAwaitingEcho) return;
+    const transaction = worktreePreferenceTransactionRef.current;
+    const timer = setTimeout(() => {
+      if (!transaction || worktreePreferenceTransactionRef.current !== transaction) return;
+      worktreePreferenceAuthorityUnknownByDeviceRef.current.set(transaction.deviceId, {
+        enabled: transaction.enabled,
+        revisionAtStart: transaction.revisionAtStart,
+      });
+      worktreePreferenceTransactionRef.current = null;
+      worktreePreferenceWriteTargetRef.current = null;
+      setWorktreePreferenceSavingDeviceId(null);
+      setWorktreePreferenceAuthorityVersion((value) => value + 1);
+    }, 10_000);
+    return () => clearTimeout(timer);
+  }, [worktreePreferenceSavingDeviceId, worktreePreferenceAwaitingEcho]);
 
   // 用户显式点击开关:先写工作端,工作端接受后才更新手机内存镜像。
   // 资格不满足导致的禁用不会走到这里 —— 环境因素不抹掉用户偏好;
   // 写入失败也不在手机上制造一份假的持久状态。
   const toggleWorktree = useCallback(() => {
-    const pendingAuthority = selectedDeviceId
-      ? worktreePreferenceAuthorityUnknownByDeviceRef.current.get(selectedDeviceId)
-      : undefined;
     if (
       creatingRef.current
       || !selectedDeviceId
       || worktreePreferenceSaving
       || worktreePreferenceWriteTargetRef.current === selectedDeviceId
-      || (
-        worktreePreferenceReadyKeyRef.current !== worktreePreferenceSyncKeyRef.current
-        && !pendingAuthority
-      )
     ) return;
     const targetDeviceId = selectedDeviceId;
-    const next = pendingAuthority?.enabled
-      ?? !remoteSessionStore.getNewMakerWorktreePreference(targetDeviceId).enabled;
+    const next = !worktreeEnabledRef.current;
+    worktreeChoicesRef.current.set(targetDeviceId, next);
+    worktreeEnabledRef.current = next;
+    setWorktreeChoiceVersion((value) => value + 1);
     // 播种在途回包不得覆盖用户显式选择(seq 作废旧回包)。
     worktreeSeedSeqRef.current += 1;
     const preferenceRevisionAtStart =
@@ -2930,9 +3019,18 @@ export default function NewRemoteSessionScreen() {
       revisionAtStart: preferenceRevisionAtStart,
       status: 'writing',
     };
+    // Switching devices may replace a write that is still awaiting ACK/echo.
+    // Preserve its uncertainty in the existing per-device reconciliation map.
+    const previousTransaction = worktreePreferenceTransactionRef.current;
+    if (previousTransaction && previousTransaction.deviceId !== targetDeviceId) {
+      worktreePreferenceAuthorityUnknownByDeviceRef.current.set(previousTransaction.deviceId, {
+        enabled: previousTransaction.enabled,
+        revisionAtStart: previousTransaction.revisionAtStart,
+      });
+      setWorktreePreferenceAuthorityVersion((value) => value + 1);
+    }
     worktreePreferenceTransactionRef.current = transaction;
-    // Set before the first await so an immediate Create/Goal press cannot read
-    // the previous checkbox state from a stale render closure.
+    // Serialize preference writes; Create/Goal use the synchronous draft choice above.
     worktreePreferenceWriteTargetRef.current = targetDeviceId;
     setWorktreePreferenceSavingDeviceId(targetDeviceId);
     const releaseWrite = () => {
@@ -2994,8 +3092,7 @@ export default function NewRemoteSessionScreen() {
         });
         if (worktreePreferenceWriteSeqRef.current !== writeSeq) return;
         if (outcome === 'accepted') {
-          // Main only acknowledged the broadcast. Keep both Create paths
-          // closed until renderer persistence returns through push or GET.
+          // Main acknowledged the broadcast; track persistence separately from creation.
           transaction.status = 'reconciling';
           setWorktreeSeedRetryNonce((value) => value + 1);
         }
@@ -3007,9 +3104,8 @@ export default function NewRemoteSessionScreen() {
           releaseWrite();
           return;
         }
-        // Lost ACK / disconnect may have committed remotely. Reconcile via
-        // push/GET; both Create and Goal remain blocked, while checkbox retry
-        // stays available once the active write spinner is released.
+        // Lost ACK / disconnect may have committed remotely. Reconcile the default
+        // via push/GET, while the explicit draft choice remains usable.
         markAuthorityUnknown();
       }
     })();
@@ -3048,7 +3144,6 @@ export default function NewRemoteSessionScreen() {
     let permissionRequestAbortController: AbortController | null = null;
     let startupSeq: number | null = null;
     let claimedPrewarm: PrewarmedMobileVoiceAsr | null = null;
-    let audioModeEnabled = false;
     let createdController: MobileVoiceControllerSession | null = null;
     try {
       if (!selectedDeviceId) {
@@ -3111,17 +3206,15 @@ export default function NewRemoteSessionScreen() {
       startupSeq = voiceStartupSeqRef.current + 1;
       voiceStartupSeqRef.current = startupSeq;
       voiceStartupInFlightRef.current = true;
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
-      });
-      audioModeEnabled = true;
+      // The capture backend owns audio-session configuration and teardown.
+      // Screen-level Expo mode changes also affect remote desktop PiP.
       // Open the device link in the background: voice dictation writes into the
       // local composer via the cloud ASR proxy and does not need the mobile↔desktop
       // link (only submitting the composed message later does). Awaiting it here
       // used to add 0.6–4.4s before the mic could open.
       void openLink(selectedDeviceId).catch(() => undefined);
       const currentDraft = firstMessageRef.current;
+      const initialSelection = { ...firstMessageSelectionRef.current };
       // Claim the connection prewarmed at pressIn (if any): its credential is
       // already resolved and its ASR WebSocket already connecting, so the
       // handshake overlaps the press gesture instead of following it.
@@ -3149,21 +3242,15 @@ export default function NewRemoteSessionScreen() {
           CINDY_MANAGED_REFINER_PROVIDER,
         );
       if (voiceStartupSeqRef.current !== startupSeq) {
-        // Superseded while we awaited: close the claimed connection, and undo
-        // the recording audio mode this startup enabled — but audio mode is
-        // app-global, so leave it alone if a newer voice run (possibly on
-        // another screen after this one unmounted) is already starting/live.
+        // This run never opened the microphone; release only its claimed ASR.
         void prewarmedVoice?.asr.stop().catch(() => undefined);
-        if (
-          !voiceControllerSessionRef.current
-          && !voiceStartupInFlightRef.current
-          && !voiceRecordingActiveRef.current
-        ) {
-          await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
-        }
         return;
       }
-      const selectionBefore = takeRefinementContextTail(currentDraft) || undefined;
+      const selectionBefore = takeRefinementContextTail(currentDraft.slice(0, initialSelection.start));
+      const selectionAfter = currentDraft.slice(initialSelection.end, initialSelection.end + 1200);
+      voiceStopGestureSelectionGuardRef.current = false;
+      voiceSelectionUserOwnedRef.current = false;
+      voicePendingSelectionEchoesRef.current = [];
       const controller = createMobileVoiceControllerSession({
         credential,
         ...(prewarmedVoice ? { asr: prewarmedVoice.asr } : {}),
@@ -3173,10 +3260,38 @@ export default function NewRemoteSessionScreen() {
         warmRefiner: (input: { system: string; user: unknown; promptCacheKey: string }) =>
           voiceContext.warmRefiner(input),
         initialDraft: currentDraft,
-        refinementContext: selectionBefore ? { selectionBefore } : undefined,
+        initialSelection,
+        refinementContext: {
+          selectionBefore: selectionBefore || undefined,
+          selectedText: currentDraft.slice(initialSelection.start, initialSelection.end).slice(0, 1200) || undefined,
+          selectionAfter: selectionAfter || undefined,
+        },
         localVoiceInputHistory,
         readCurrentDraft: () => firstMessageRef.current,
-        onDraftChanged: setFirstMessageDraft,
+        onDraftChanged: (text, selection, replacement) => {
+          // Follow ASR until a native edit claims the caret; then preserve its
+          // position in the surrounding text as the voice range changes length.
+          let nextSelection = voiceSelectionUserOwnedRef.current ? undefined : selection;
+          if (voiceSelectionUserOwnedRef.current && replacement) {
+            const replacementEnd = replacement.start + replacement.text.length;
+            const rebaseOffset = (offset: number) => {
+              if (offset <= replacement.start) return offset;
+              if (offset >= replacement.end) return offset + replacementEnd - replacement.end;
+              return Math.min(offset, replacementEnd);
+            };
+            const current = firstMessageSelectionRef.current;
+            nextSelection = { start: rebaseOffset(current.start), end: rebaseOffset(current.end) };
+          }
+          if (nextSelection) {
+            const previous = firstMessageSelectionRef.current;
+            if (nextSelection.start !== previous.start || nextSelection.end !== previous.end) {
+              voicePendingSelectionEchoesRef.current.push(nextSelection);
+            }
+            firstMessageSelectionRef.current = nextSelection;
+            setFirstMessageSelection(nextSelection);
+          }
+          setFirstMessageDraft(text);
+        },
         onStateChanged: setVoiceState,
         onError: (message) => {
           setVoiceState('error');
@@ -3210,7 +3325,6 @@ export default function NewRemoteSessionScreen() {
           voiceControllerSessionRef.current = null;
           voiceRecordingActiveRef.current = false;
           voiceStopInFlightRef.current = false;
-          await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
         }
         await controller.cancel().catch(() => undefined);
         return;
@@ -3234,14 +3348,6 @@ export default function NewRemoteSessionScreen() {
           }
           await createdController.cancel().catch(() => undefined);
         }
-        if (
-          audioModeEnabled
-          && !voiceControllerSessionRef.current
-          && !voiceStartupInFlightRef.current
-          && !voiceRecordingActiveRef.current
-        ) {
-          await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
-        }
         return;
       }
       const controller = voiceControllerSessionRef.current;
@@ -3252,7 +3358,6 @@ export default function NewRemoteSessionScreen() {
       voiceRecordingActiveRef.current = false;
       setVoiceState('error');
       setVoiceError(formatRemoteError(err));
-      await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
     }
   }, [openLink, selectedDeviceId, setFirstMessageDraft, voiceIsProcessing, voiceState]);
 
@@ -3270,11 +3375,9 @@ export default function NewRemoteSessionScreen() {
     setVoiceError(null);
     try {
       const latestDraft = await controller.stop();
-      await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
       setVoiceState('done');
       requestAnimationFrame(() => {
-        const end = latestDraft.length;
-        firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
+        firstMessageInputRef.current?.setNativeProps({ selection: firstMessageSelectionRef.current });
       });
       return latestDraft;
     } catch (err) {
@@ -3282,7 +3385,6 @@ export default function NewRemoteSessionScreen() {
       voiceRecordingActiveRef.current = false;
       setVoiceState('error');
       setVoiceError(formatRemoteError(err));
-      await setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
       return null;
     } finally {
       voiceStopInFlightRef.current = false;
@@ -3350,19 +3452,17 @@ export default function NewRemoteSessionScreen() {
       voiceRecordingActiveRef.current = false;
       if (controller) void controller.cancel().catch(() => undefined);
       discardPendingPrewarm();
-      void setAudioModeAsync({ allowsRecording: false }).catch(() => undefined);
     };
   }, []);
 
   useEffect(() => {
     if (!voiceIsListening) return undefined;
     const frame = requestAnimationFrame(() => {
-      const end = firstMessageRef.current.length;
-      firstMessageInputRef.current?.setNativeProps({ selection: { start: end, end } });
-      voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
+      firstMessageInputRef.current?.setNativeProps({ selection: firstMessageSelectionRef.current });
+      voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
     });
     return () => cancelAnimationFrame(frame);
-  }, [composerInputContentHeight, draft.firstMessage, voiceIsListening]);
+  }, [composerInputContentHeight, draft.firstMessage, voiceDraftCaretFrame.top, voiceIsListening]);
 
   useEffect(() => {
     if (voiceIsListening && draft.firstMessage.length > 0) return;
@@ -3410,9 +3510,7 @@ export default function NewRemoteSessionScreen() {
     <Pressable
       accessibilityLabel={creating ? t('session.new.creatingSession') : t('session.new.createAndSend')}
       accessibilityHint={createValidation
-        ?? (worktreePreferenceSaving
-          ? t('session.new.worktreeSettingsSaving')
-          : worktreeBranchPreferenceSaving
+        ?? (worktreeBranchPreferenceSaving
             ? t('session.new.worktreeBranchSaving')
             : worktreeCreateBlocked && worktreeControlCaptionKey
               ? t(worktreeControlCaptionKey)
@@ -3421,7 +3519,6 @@ export default function NewRemoteSessionScreen() {
       accessibilityState={{
         busy: creating
           || voiceIsProcessing
-          || worktreePreferenceSaving
           || worktreeBranchPreferenceSaving
           || undefined,
         disabled: !canCreate || undefined,
@@ -3520,7 +3617,7 @@ export default function NewRemoteSessionScreen() {
       {composerShowCreateButton ? renderCreateButton() : null}
     </>
   );
-  const renderComposerInputOverlay = () => voiceIsListening ? (
+  const renderComposerInputOverlay = () => voiceIsListening && Platform.OS !== 'ios' ? (
     <ScrollView
       ref={voiceDraftScrollRef}
       contentContainerStyle={[
@@ -3529,12 +3626,12 @@ export default function NewRemoteSessionScreen() {
       ]}
       onContentSizeChange={() => {
         requestAnimationFrame(() => {
-          voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
+          voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
         });
       }}
       onLayout={() => {
         requestAnimationFrame(() => {
-          voiceDraftScrollRef.current?.scrollToEnd({ animated: false });
+          voiceDraftScrollRef.current?.scrollTo({ y: voiceDraftCaretFrame.top, animated: false });
         });
       }}
       pointerEvents="none"
@@ -3548,25 +3645,12 @@ export default function NewRemoteSessionScreen() {
           <Text style={styles.voiceDraftListeningText}>{composerListeningPlaceholder}</Text>
         </View>
       ) : (
-        <View style={styles.voiceDraftMeasuredBlock}>
-          <Text
-            onTextLayout={handleVoiceDraftTextLayout}
-            style={styles.voiceDraftText}
-          >
-            {draft.firstMessage}
+        <View ref={voiceDraftMeasuredBlockRef} collapsable={false} style={styles.voiceDraftMeasuredBlock}>
+          <Text onTextLayout={handleVoiceDraftTextLayout} style={styles.voiceDraftText}>
+            {draft.firstMessage.slice(0, firstMessageSelectionRef.current.end)}
+            <VoiceMicWaveCaret color={colors.textPrimary} testID="newSession.voiceMicCaret" viewRef={voiceDraftCaretRef} />
+            {draft.firstMessage.slice(firstMessageSelectionRef.current.end)}
           </Text>
-          <View
-            pointerEvents="none"
-            style={[
-              styles.voiceDraftCaretOverlay,
-              {
-                left: voiceDraftCaretFrame.left,
-                top: voiceDraftCaretFrame.top,
-              },
-            ]}
-          >
-            <VoiceMicWaveCaret color={colors.textPrimary} testID="newSession.voiceMicCaret" />
-          </View>
         </View>
       )}
     </ScrollView>
@@ -3697,7 +3781,12 @@ export default function NewRemoteSessionScreen() {
     if (initialWorkspaceKeyRef.current === key) return;
     initialWorkspaceKeyRef.current = key;
 
-    const initialWorkspace = pickInitialNewSessionWorkspace(draft.workingDir, recentWorkspaces);
+    // 先用该设备记住的上次显式选择(#4103),没有再取最近项目首项。
+    const initialWorkspace = pickInitialNewSessionWorkspace(
+      draft.workingDir,
+      recentWorkspaces,
+      newSessionPreferences?.workingDirByDevice?.[selectedDeviceId] ?? null,
+    );
     if (initialWorkspace) {
       selectWorkingDir(initialWorkspace);
       return;
@@ -3714,15 +3803,28 @@ export default function NewRemoteSessionScreen() {
     recentWorkspaces,
     selectWorkingDir,
     newSessionPreferencesLoaded,
+    newSessionPreferences?.workingDirByDevice,
     preferredDefaultDevice?.deviceId,
   ]);
 
   const selectSlashCommand = useCallback((command: MobileSlashCommand) => {
-    setFirstMessageDraft((current) => insertSlashCommand(current, detectComposerTrigger(current), command));
+    const current = firstMessageRef.current;
+    const next = insertSlashCommand(current, detectComposerTrigger(current), command);
+    if (next === current) return;
+    setFirstMessageDraft(next);
+    const selection = { start: next.length, end: next.length };
+    firstMessageSelectionRef.current = selection;
+    setFirstMessageSelection(selection);
   }, [setFirstMessageDraft]);
 
   const selectAtResource = useCallback((item: MobileAtResourceItem) => {
-    setFirstMessageDraft((current) => insertAtResource(current, detectComposerTrigger(current), item));
+    const current = firstMessageRef.current;
+    const next = insertAtResource(current, detectComposerTrigger(current), item);
+    if (next === current) return;
+    setFirstMessageDraft(next);
+    const selection = { start: next.length, end: next.length };
+    firstMessageSelectionRef.current = selection;
+    setFirstMessageSelection(selection);
   }, [setFirstMessageDraft]);
 
   const removeAttachment = useCallback((id: string) => {
@@ -3772,45 +3874,16 @@ export default function NewRemoteSessionScreen() {
     }
     return ids;
   }, [pendingUploads]);
-  // Context 面板媒体缩略图点选(Cursor 式两段提交):已附加 → 立即移除;
-  // 待选 → 取消待选;其余 → 加入待选,由底部「加入对话」按钮统一上传提交。
+  // 单张点按即同步入队，再关闭面板；不等待鉴权或上传才占用附件槽位。
   const toggleMediaAssetAttachment = useCallback((asset: ContextSheetMediaAsset) => {
-    const attachedId = mediaAssetAttachments[asset.id];
-    if (attachedId) {
-      // 复用统一移除路径:除清 attachments/previews/映射外,还会 best-effort 回收
-      // 已上传的 OSS 中转对象(codex review #504,缩略图取消与 X 按钮同语义)。
-      removeAttachment(attachedId);
-      setAttachmentError(null);
-      return;
-    }
-    if (pendingMediaAssets.some((item) => item.id === asset.id)) {
-      setPendingMediaAssets(pendingMediaAssets.filter((item) => item.id !== asset.id));
-      return;
-    }
-    // 上传中的资产不可再选(UI 已标 busy 禁点,这里是防御兜底),落定后转勾选态。
-    if (uploadingMediaAssetIds.has(asset.id)) return;
-    // 在途占坑读 getPendingUploadCount 同步真源(上传中 + 粘贴占位):粘贴占位
-    // 窗口(原生还在读剪贴板)任务未入队也未进 pendingUploads state,不计入的话
-    // 这里会放行超额选图,占位兑现时轮到粘贴图自己撞上限被丢(review P2)。
-    if (attachments.length + pendingMediaAssets.length + getPendingUploadCount() >= MOBILE_MAX_ATTACHMENTS) {
+    if (mediaTapAcceptedRef.current || mediaAssetAttachments[asset.id] || uploadingMediaAssetIds.has(asset.id)) return;
+    if (attachments.length + getPendingUploadCount() >= MOBILE_MAX_ATTACHMENTS) {
       setAttachmentError(t('session.common.maxAttachments', { max: MOBILE_MAX_ATTACHMENTS }));
       return;
     }
+    mediaTapAcceptedRef.current = true;
     setAttachmentError(null);
-    setPendingMediaAssets([...pendingMediaAssets, asset]);
-  }, [attachments.length, getPendingUploadCount, mediaAssetAttachments, pendingMediaAssets, removeAttachment, uploadingMediaAssetIds]);
-  // 底部「加入对话」:点击当帧把待选照片同步入队(缩略图立即进托盘)并关面板;token 传
-  // Promise 由任务自行等待(codex review R8:先 await token 再 enqueue 的等待窗里,面板可被
-  // 背板关掉、create() 的 waitForPendingUploads 看不到任务,首条消息会丢下刚选的图先发出去)。
-  // 全程同步也天然免疫双击重入与限额竞态:批次即时计入 pendingUploads,不再需要
-  // in-flight 门 / 限额预留 / enqueue 前复查那套等待窗补丁。解析(ph://→file://、HEIC
-  // 转码缩边)+ 降采样 + 上传全部在后台管线并发跑,单张失败经 onFailed 报错(含登录过期)。
-  const commitPendingMediaAssets = useCallback(() => {
-    const assets = pendingMediaAssets;
-    if (assets.length === 0) return;
-    setPendingMediaAssets([]);
-    setAttachmentError(null);
-    enqueueUploads(assets.map((asset, index) => ({
+    enqueueUploads([{
       kind: 'image' as const,
       uri: asset.uri,
       name: asset.filename,
@@ -3821,7 +3894,7 @@ export default function NewRemoteSessionScreen() {
         const candidate = buildMobileImageAttachmentCandidate({
           fileName: resolved.filename,
           uri: resolved.uri,
-        }, index);
+        }, 0);
         return {
           uri: candidate.uri,
           name: candidate.name,
@@ -3832,9 +3905,9 @@ export default function NewRemoteSessionScreen() {
           skipPreprocess: resolved.optimized === true,
         };
       },
-    })), { token: auth.getAccessToken() });
+    }], { token: auth.getAccessToken() });
     setContextSheetOpen(false);
-  }, [auth, enqueueUploads, pendingMediaAssets]);
+  }, [auth, enqueueUploads, attachments.length, getPendingUploadCount, mediaAssetAttachments, uploadingMediaAssetIds, t]);
   const selectedMediaAssetIds = useMemo(() => {
     const attachmentIds = new Set(attachments.map((item) => item.id));
     return new Set(
@@ -3843,11 +3916,6 @@ export default function NewRemoteSessionScreen() {
         .map(([assetId]) => assetId),
     );
   }, [attachments, mediaAssetAttachments]);
-  // 待选序号角标(从 1 起,按选中顺序)。
-  const pendingMediaOrder = useMemo(
-    () => new Map(pendingMediaAssets.map((item, index) => [item.id, index + 1])),
-    [pendingMediaAssets],
-  );
   // composer 托盘图片附件 → 全屏查看器图集(本地 file:// 直接可显示,不走远端取件)。
   // 标注附件点开显示**原图**(叠矢量笔迹可继续编辑/撤销)而非烧录预览图,同会话页。
   const composerGalleryImages = useMemo<MobileMessageGalleryImage[]>(() => {
@@ -3939,9 +4007,9 @@ export default function NewRemoteSessionScreen() {
       {renderComposerCollapsedAttachmentBadge()}
     </View>
   );
-  // 面板关闭即丢弃未提交的待选(不产生任何上传副作用)。
+  // 每次打开允许一次添加；同步门防止收起动画期间连续点按重复入队。
   useEffect(() => {
-    if (!contextSheetOpen) setPendingMediaAssets([]);
+    if (contextSheetOpen) mediaTapAcceptedRef.current = false;
   }, [contextSheetOpen]);
   // iOS 进页面就静默预取最近照片(仅已授权时),打开 + 面板即刻出图;Android 统一走系统选择器。
   useEffect(() => {
@@ -4000,40 +4068,9 @@ export default function NewRemoteSessionScreen() {
       setError(t('session.menu.aiRenameOffline'));
       return;
     }
-    if (
-      worktreeApplicable
-      && worktreeEligibility.status !== 'ineligible'
-      && (
-        worktreePreferenceWriteTargetRef.current === selectedDeviceId
-        || worktreePreferenceAuthorityUnknownByDeviceRef.current.has(selectedDeviceId)
-        || worktreePreferenceReadyKeyRef.current !== worktreePreferenceSyncKeyRef.current
-      )
-    ) {
-      setError(t(resolveWorktreePreferenceGateErrorKey()));
-      return;
-    }
-    if (
-      worktreeEnabled
-      && (
-        worktreeBranchPreferenceWriteTargetRef.current === worktreeBranchPreferenceKey
-        || (
-          worktreeEligibility.status === 'eligible'
-          && worktreeBranchPreferenceReadyKeyRef.current !== worktreeBranchPreferenceSyncKey
-        )
-      )
-    ) {
-      setError(t('session.new.worktreeBranchSaving'));
-      return;
-    }
-    if (worktreeCreateBlocked) {
-      setError(worktreeCaptionKey
-        ? t(worktreeCaptionKey)
-        : t(resolveWorktreePreferenceGateErrorKey()));
-      return;
-    }
     const worktreeIntent = captureWorktreeCreateIntent();
     if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-      setError(t(resolveWorktreePreferenceGateErrorKey()));
+      setError(t(resolveWorktreeCreateErrorKey()));
       return;
     }
     creatingRef.current = true;
@@ -4146,7 +4183,7 @@ export default function NewRemoteSessionScreen() {
           return;
         }
         if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-          setError(t(resolveWorktreePreferenceGateErrorKey()));
+          setError(t(resolveWorktreeCreateErrorKey()));
           return;
         }
       }
@@ -4213,7 +4250,7 @@ export default function NewRemoteSessionScreen() {
           if (!isCurrentOwner()) return;
           if (!ensureDeviceAlive()) return;
           if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-            setError(t(resolveWorktreePreferenceGateErrorKey()));
+            setError(t(resolveWorktreeCreateErrorKey()));
             return;
           }
           const recoveryKey = createNewSessionId();
@@ -4254,7 +4291,7 @@ export default function NewRemoteSessionScreen() {
               recoveryKey,
               createdAt,
             });
-            setError(t(resolveWorktreePreferenceGateErrorKey()));
+            setError(t(resolveWorktreeCreateErrorKey()));
             return;
           }
           const createRequest = buildWorktreeCreateRequest({
@@ -4542,7 +4579,7 @@ export default function NewRemoteSessionScreen() {
     worktreeEnabled,
     captureWorktreeCreateIntent,
     isWorktreeCreateIntentCurrent,
-    resolveWorktreePreferenceGateErrorKey,
+    resolveWorktreeCreateErrorKey,
   ]);
 
   // 目标模式建会话(对齐桌面 handleCreateGoal):createSession → goal.set(被控端落
@@ -4563,42 +4600,9 @@ export default function NewRemoteSessionScreen() {
       setGoalError(t('session.new.enterModel'));
       return;
     }
-    if (
-      worktreeApplicable
-      && worktreeEligibility.status !== 'ineligible'
-      && (
-        worktreePreferenceWriteTargetRef.current === selectedDeviceId
-        || worktreePreferenceAuthorityUnknownByDeviceRef.current.has(selectedDeviceId)
-        || worktreePreferenceReadyKeyRef.current !== worktreePreferenceSyncKeyRef.current
-      )
-    ) {
-      setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
-      return;
-    }
-    if (
-      worktreeEnabled
-      && (
-        worktreeBranchPreferenceWriteTargetRef.current === worktreeBranchPreferenceKey
-        || (
-          worktreeEligibility.status === 'eligible'
-          && worktreeBranchPreferenceReadyKeyRef.current !== worktreeBranchPreferenceSyncKey
-        )
-      )
-    ) {
-      setGoalError(t('session.new.worktreeBranchSaving'));
-      return;
-    }
-    // Goal 与普通创建共享同一 Worktree 门禁。分支偏好和 checkbox 仍是
-    // 独立轴：OFF 时直接走 base repo，ON 时必须等偏好/资格确认完成。
-    if (worktreeCreateBlocked) {
-      setGoalError(worktreeCaptionKey
-        ? t(worktreeCaptionKey)
-        : t(resolveWorktreePreferenceGateErrorKey()));
-      return;
-    }
     const worktreeIntent = captureWorktreeCreateIntent();
     if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-      setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
+      setGoalError(t(resolveWorktreeCreateErrorKey()));
       return;
     }
     // ㉙ 设备守卫入口(独立 review P1-1 + busy 泄漏):快照取自闭包 selectedDeviceId,
@@ -4732,7 +4736,7 @@ export default function NewRemoteSessionScreen() {
           return;
         }
         if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-          setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
+          setGoalError(t(resolveWorktreeCreateErrorKey()));
           return;
         }
       }
@@ -4757,7 +4761,7 @@ export default function NewRemoteSessionScreen() {
           if (!isCurrentOwner()) return;
           if (!ensureDeviceAlive()) return;
           if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-            setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
+            setGoalError(t(resolveWorktreeCreateErrorKey()));
             return;
           }
           const recoveryKey = createNewSessionId();
@@ -4793,7 +4797,7 @@ export default function NewRemoteSessionScreen() {
               recoveryKey,
               createdAt,
             });
-            setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
+            setGoalError(t(resolveWorktreeCreateErrorKey()));
             return;
           }
           const createRequest = buildWorktreeCreateRequest({
@@ -5316,11 +5320,19 @@ export default function NewRemoteSessionScreen() {
     worktreeEnabled,
     captureWorktreeCreateIntent,
     isWorktreeCreateIntentCurrent,
-    resolveWorktreePreferenceGateErrorKey,
+    resolveWorktreeCreateErrorKey,
   ]);
 
   return (
-    <SafeAreaView style={styles.safeArea} testID="newSession.screen">
+    <SafeAreaView edges={simpleScreenSafeAreaEdges()} style={styles.safeArea} testID="newSession.screen">
+      {Platform.OS === 'ios' ? (
+        <>
+          <Stack.Screen options={{ headerShown: true, headerBackVisible: false, headerShadowVisible: false, title: '', headerStyle: { backgroundColor: colors.surface }, headerTintColor: colors.textPrimary }} />
+          <Stack.Toolbar placement="left">
+            <Stack.Toolbar.Button icon="chevron.backward" accessibilityLabel={t('shared.back')} onPress={handleBack} />
+          </Stack.Toolbar>
+        </>
+      ) : null}
       <ComposerKeyboardAvoidingView
         keyboard={keyboardState}
         bottomInset={safeAreaInsets.bottom}
@@ -5330,20 +5342,21 @@ export default function NewRemoteSessionScreen() {
         style={styles.keyboard}
       >
         <View style={styles.screen}>
-          <View style={styles.topBar}>
-            <ScreenBackButton
+          {Platform.OS !== 'ios' || buildLabel || creating ? <View style={styles.topBar}>
+            {Platform.OS !== 'ios' ? <ScreenBackButton
               hitSlop={12}
               onPress={handleBack}
               style={styles.backButton}
               testID="newSession.backButton"
-            />
+            /> : null}
             {buildLabel ? (
               <Text numberOfLines={1} style={styles.buildLabel}>{buildLabel}</Text>
             ) : null}
             {creating ? <ActivityIndicator color={colors.textSecondary} /> : null}
-          </View>
+          </View> : null}
 
-          <View style={styles.bottomCluster}>
+          <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.bottomCluster}
+            keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <View style={styles.selectorStack}>
               <View style={styles.deviceSelectorWrap}>
               <Pressable
@@ -5369,7 +5382,7 @@ export default function NewRemoteSessionScreen() {
                   <ChevronsUpDown color={colors.borderStrong} size={iconSize.sm} strokeWidth={iconStroke.regular} />
                 ) : null}
               </Pressable>
-              {devicePickerOpen && deviceHasChoices ? (
+              {!nativeSelectionSheet && devicePickerOpen && deviceHasChoices ? (
                 <View style={styles.devicePickerPanel} testID="newSession.devicePickerPanel">
                   {deviceOptions.map((option) => {
                     const selected = option.deviceId === selectedDeviceId;
@@ -5399,6 +5412,7 @@ export default function NewRemoteSessionScreen() {
                 </View>
               ) : null}
               </View>
+              {deviceProviders.unsupported ? (
               <View style={styles.agentSelectorWrap}>
                 <Pressable
                   accessibilityLabel={t('session.new.selectAgent')}
@@ -5447,6 +5461,7 @@ export default function NewRemoteSessionScreen() {
                   </View>
                 ) : null}
               </View>
+              ) : null}
               <View style={styles.workspaceSelectorWrap}>
                 <Pressable
                   accessibilityLabel={t('session.new.selectWorkspace')}
@@ -5466,7 +5481,7 @@ export default function NewRemoteSessionScreen() {
                   <Text style={styles.selectorText} numberOfLines={1}>{workspaceLabel}</Text>
                   <ChevronsUpDown color={colors.borderStrong} size={iconSize.sm} strokeWidth={iconStroke.regular} />
                 </Pressable>
-                {workspacePickerOpen ? (
+                {!nativeSelectionSheet && workspacePickerOpen ? (
                   <View style={styles.workspacePickerPanel} testID="newSession.workspacePickerPanel">
                     <Pressable
                       accessibilityLabel={t('session.new.dialogueNoProject')}
@@ -5619,7 +5634,7 @@ export default function NewRemoteSessionScreen() {
               ) : null}
             </View>
 
-            {browseOpen ? (
+            {!nativeSelectionSheet && browseOpen ? (
               <View style={styles.browsePanel} testID="newSession.remoteBrowsePanel">
                 <View style={styles.browseHeader}>
                   <Text style={styles.browsePath} numberOfLines={1} testID="newSession.remoteBrowseCurrentPath">
@@ -5640,7 +5655,7 @@ export default function NewRemoteSessionScreen() {
                         accessibilityRole="button"
                         disabled={creating}
                         key={workspace.workingDir}
-                        onPress={() => selectWorkingDir(workspace.workingDir)}
+                        onPress={() => chooseWorkingDir(workspace.workingDir)}
                         style={({ pressed }) => [styles.workspaceQuickPick, pressed && styles.pressed]}
                         testID="newSession.workspaceQuickPick"
                       >
@@ -5668,7 +5683,7 @@ export default function NewRemoteSessionScreen() {
                     accessibilityLabel={t('session.new.useCurrentRemoteDir')}
                     accessibilityRole="button"
                     disabled={!browsePath || browseLoading}
-                    onPress={() => browsePath && selectWorkingDir(browsePath)}
+                    onPress={() => browsePath && chooseWorkingDir(browsePath)}
                     style={({ pressed }) => [
                       styles.browseActionButton,
                       (!browsePath || browseLoading) && styles.disabled,
@@ -5715,7 +5730,7 @@ export default function NewRemoteSessionScreen() {
                       disabled={creating || browseLoading}
                       entry={item}
                       onEnter={() => void loadBrowsePath(item.path)}
-                      onSelect={() => selectWorkingDir(item.path)}
+                      onSelect={() => chooseWorkingDir(item.path)}
                     />
                   )}
                   nestedScrollEnabled
@@ -5814,11 +5829,12 @@ export default function NewRemoteSessionScreen() {
                   inputRef={firstMessageInputRef}
                   leading={renderComposerCompactLeading()}
                   inputFrameAnimatedStyle={composerResize.frameStyle}
+                    collapseProgress={composerResize.collapseProgress}
                   // 听写期间把输入区撑到 44pt 触控目标:此时「点输入区停止听写」的命中层
                   // 是这层输入区自身(TextInput 的 onPressIn),单行时只有 28pt。
-                  inputFrameMinHeight={voiceIsListening ? MOBILE_COMPOSER_MIN_TOUCH_TARGET : undefined}
+                  inputFrameMinHeight={Platform.OS !== 'ios' && voiceIsListening ? MOBILE_COMPOSER_MIN_TOUCH_TARGET : undefined}
                   inputOverlay={renderComposerInputOverlay()}
-                  inputStyle={voiceIsListening ? styles.inputVoiceHidden : undefined}
+                  inputStyle={voiceIsListening && Platform.OS !== 'ios' ? styles.inputVoiceHidden : undefined}
                   inputTestID="newSession.firstMessageInput"
                   maxHeight={composerResize.inputMaxHeight}
                   multilineShape={!composerCardActive && composerInputIsMultiline}
@@ -5827,19 +5843,68 @@ export default function NewRemoteSessionScreen() {
                     // 失焦收起与「点别处收键盘」同语义:语音结束 hold 一并解除。
                     setComposerVoiceHoldArmed(false);
                   }}
-                  onChangeText={setFirstMessageDraft}
+                  onChangeText={(text) => {
+                    if (text !== firstMessageRef.current) {
+                      voicePendingSelectionEchoesRef.current = [];
+                      if (voiceStopInFlightRef.current) voiceSelectionUserOwnedRef.current = true;
+                    }
+                    setFirstMessageDraft(text);
+                  }}
+                  onKeyPress={() => { voicePendingSelectionEchoesRef.current = []; }}
+                  onSelectionChange={(event) => {
+                    const selection = event.nativeEvent.selection;
+                    if (!voiceRecordingActiveRef.current && voiceStopGestureSelectionGuardRef.current) {
+                      voiceStopGestureSelectionGuardRef.current = false;
+                      return;
+                    }
+                    // Native may echo an earlier ASR/refinement update after JS has
+                    // already published the next one, even after stop() resolves.
+                    const pending = voicePendingSelectionEchoesRef.current;
+                    const echoIndex = pending.findIndex((value) =>
+                      value.start === selection.start && value.end === selection.end);
+                    if (echoIndex >= 0) {
+                      // Selection events can coalesce: acknowledging a newer write
+                      // also retires older writes that never emitted an event.
+                      pending.splice(0, echoIndex + 1);
+                      return;
+                    }
+                    // finishVoiceRecording marks recording inactive before awaiting
+                    // ASR/refinement teardown, so native cursor edits remain user-owned.
+                    if (!voiceRecordingActiveRef.current) {
+                      voicePendingSelectionEchoesRef.current = [];
+                      const previous = firstMessageSelectionRef.current;
+                      // A matching native echo of a controlled selection is not a user move.
+                      if (voiceStopInFlightRef.current
+                        && (selection.start !== previous.start || selection.end !== previous.end)) {
+                        voiceSelectionUserOwnedRef.current = true;
+                      }
+                      firstMessageSelectionRef.current = selection;
+                      setFirstMessageSelection(selection);
+                    }
+                  }}
                   onContentSizeChange={handleFirstMessageInputContentSizeChange}
                   onFocus={() => setFirstMessageInputFocused(true)}
                   onPasteImages={(uris) => void addPastedImageAttachments(uris)}
                   onPasteImagesLoading={beginPastePlaceholders}
                   onPasteImagesLoadFailed={failPastePlaceholders}
                   onPressIn={() => {
-                    if (voiceIsListening) void finishVoiceRecording();
+                    if (voiceIsListening) {
+                      voiceStopGestureSelectionGuardRef.current = true;
+                      setTimeout(() => {
+                        voiceStopGestureSelectionGuardRef.current = false;
+                      }, 0);
+                      void finishVoiceRecording();
+                    } else {
+                      // A new editing gesture can intentionally return to any old
+                      // controlled value; it must not be mistaken for its echo.
+                      voicePendingSelectionEchoesRef.current = [];
+                    }
                   }}
                   placeholder={voiceIsListening ? '' : composerPlaceholder}
                   placeholderTextColor={colors.textTertiary}
                   resizeHandle={composerCardActive ? renderComposerResizeHandle() : null}
                   scrollEnabled={composerInputScrollEnabled}
+                  selection={firstMessageSelection}
                   selectionColor={colors.inputCaret}
                   testID="newSession.actions"
                   toolbar={renderComposerToolbar()}
@@ -5850,39 +5915,60 @@ export default function NewRemoteSessionScreen() {
                 />
               </View>
             </View>
-          </View>
+          </ScrollView>
         </View>
       </ComposerKeyboardAvoidingView>
       <ContextSheet
-        footer={contextSheetView !== 'goal' && pendingMediaAssets.length > 0 ? (
-          <ContextSheetFooterButton
-            disabled={creating}
-            label={t('session.common.joinConversation', { num: pendingMediaAssets.length })}
-            onPress={() => void commitPendingMediaAssets()}
-            testID="newSession.contextSheetCommitMedia"
-          />
-        ) : undefined}
+        media={contextSheetView === 'main' && contextSheetMediaLibraryEnabled ? (
+            <RecentPhotosStrip
+              busyAssetIds={uploadingMediaAssetIds}
+              disabled={creating}
+              enabled={contextSheetOpen}
+              onToggleAsset={toggleMediaAssetAttachment}
+
+              selectedAssetIds={selectedMediaAssetIds}
+              testID="newSession.contextSheetPhotos"
+            />
+          ) : null}
+        error={contextSheetView === 'main' ? attachmentError : null}
         keyboardAvoidingBehavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         onBack={contextSheetView !== 'main' ? () => setContextSheetView('main') : undefined}
         onClose={() => setContextSheetOpen(false)}
         testID="newSession.contextSheet"
-        title={contextSheetView === 'screenshots' ? t('session.common.screenshot') : contextSheetView === 'goal' ? t('session.common.goalMode') : t('session.common.context')}
+        title={contextSheetView === 'goal' ? t('session.common.goalMode') : t('session.common.context')}
         visible={contextSheetOpen}
       >
         {contextSheetView === 'main' ? (
           <>
-            {contextSheetMediaLibraryEnabled ? (
-              <RecentPhotosStrip
-                busyAssetIds={uploadingMediaAssetIds}
+
+
+            <ContextSheetGroup label={Platform.OS === 'ios' && contextSheetMediaLibraryEnabled ? '' : t('session.common.groupAdd')}>
+              <ContextSheetRow
                 disabled={creating}
-                enabled={contextSheetOpen}
-                onToggleAsset={toggleMediaAssetAttachment}
-                pendingOrder={pendingMediaOrder}
-                selectedAssetIds={selectedMediaAssetIds}
-                testID="newSession.contextSheetPhotos"
+                icon={<Image color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
+                label={t('session.common.photo')}
+                onPress={() => void addLocalImageAttachments('library')}
+                dismissBeforePress
+                  testID="newSession.contextSheetPhotoRow"
               />
-            ) : null}
-            <ContextSheetGroup label={t('session.common.groupMode')}>
+              <ContextSheetRow
+                disabled={creating}
+                icon={<Camera color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
+                label={t('session.common.takePhoto')}
+                onPress={() => void addLocalImageAttachments('camera')}
+                dismissBeforePress
+                  testID="newSession.contextSheetCameraRow"
+              />
+              <ContextSheetRow
+                disabled={creating}
+                icon={<Folder color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
+                label={t('session.common.file')}
+                onPress={() => void addLocalFileAttachment()}
+                dismissBeforePress
+                  testID="newSession.contextSheetFileRow"
+              />
+            </ContextSheetGroup>
+<ContextSheetGroup label={t('session.common.groupMode')}>
               {planModeSupported ? (
                 // 点击即切换计划模式并关面板(产品决策,不做开关);已开启时显示 ✓,再点退出。
                 <ContextSheetRow
@@ -5906,70 +5992,14 @@ export default function NewRemoteSessionScreen() {
                 trailing="chevron"
               />
             </ContextSheetGroup>
-            <ContextSheetGroup label={t('session.common.groupAdd')}>
-              <ContextSheetRow
-                disabled={creating}
-                icon={<Image color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                label={t('session.common.photo')}
-                onPress={() => void addLocalImageAttachments('library')}
-                testID="newSession.contextSheetPhotoRow"
-              />
-              {contextSheetMediaLibraryEnabled ? (
-                <ContextSheetRow
-                  disabled={creating}
-                  icon={<Scan color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                  label={t('session.common.screenshot')}
-                  onPress={() => setContextSheetView('screenshots')}
-                  testID="newSession.contextSheetScreenshotsRow"
-                  trailing="chevron"
-                />
-              ) : null}
-              <ContextSheetRow
-                disabled={creating}
-                icon={<Camera color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                label={t('session.common.takePhoto')}
-                onPress={() => void addLocalImageAttachments('camera')}
-                testID="newSession.contextSheetCameraRow"
-              />
-              <ContextSheetRow
-                disabled={creating}
-                icon={<Folder color={colors.textPrimary} size={iconSize.lg} strokeWidth={iconStroke.regular} />}
-                label={t('session.common.file')}
-                onPress={() => void addLocalFileAttachment()}
-                testID="newSession.contextSheetFileRow"
-              />
-            </ContextSheetGroup>
-            {attachmentError ? (
-              <Text style={{ color: colors.errorText, fontSize: typeScale.footnote, paddingTop: 12 }}>
-                {attachmentError}
-              </Text>
-            ) : null}
           </>
-        ) : contextSheetView === 'screenshots' && contextSheetMediaLibraryEnabled ? (
-          <ScreenshotsGrid
-            busyAssetIds={uploadingMediaAssetIds}
-            contentWidth={windowDimensions.width - 40}
-            disabled={creating}
-            enabled={contextSheetOpen && contextSheetView === 'screenshots'}
-            onToggleAsset={toggleMediaAssetAttachment}
-            pendingOrder={pendingMediaOrder}
-            selectedAssetIds={selectedMediaAssetIds}
-            testID="newSession.contextSheetScreenshotsGrid"
-          />
         ) : (
           <ContextSheetGoalCreateForm
             busy={goalBusy}
             disabled={worktreeCreateBlocked}
-            disabledHint={worktreePreferenceSaving
-              ? t('session.new.worktreeSettingsSaving')
-              : worktreeBranchPreferenceSaving
-                || (worktreeEnabled
-                  && worktreeEligibility.status === 'eligible'
-                  && !worktreeBranchPreferenceReady)
-                ? t('session.new.worktreeBranchSaving')
-                : worktreeControlCaptionKey
-                  ? t(worktreeControlCaptionKey)
-                  : undefined}
+            disabledHint={worktreeCreateBlocked && worktreeControlCaptionKey
+              ? t(worktreeControlCaptionKey)
+              : undefined}
             error={goalError}
             initial={draft.firstMessage.trim() ? { objective: draft.firstMessage.trim() } : undefined}
             onSetGoal={(input) => void createGoalSession(input)}
@@ -5977,6 +6007,30 @@ export default function NewRemoteSessionScreen() {
           />
         )}
       </ContextSheet>
+      {nativeSelectionSheet ? <NewTaskSelectionSheet
+        page={browseOpen ? 'directory' : devicePickerOpen ? 'device' : workspacePickerOpen ? 'workspace' : null}
+        busy={creating || voiceIsProcessing}
+        devices={deviceOptions}
+        selectedDeviceId={selectedDeviceId}
+        workspaces={recentWorkspaces}
+        workspaceKind={draft.workspaceKind}
+        workingDir={draft.workingDir}
+        path={browsePath}
+        parent={browseParent}
+        entries={visibleBrowseEntries}
+        loading={browseLoading}
+        error={browseError}
+        showHidden={showHiddenDirectories}
+        onClose={() => { setDevicePickerOpen(false); setWorkspacePickerOpen(false); setBrowseOpen(false); }}
+        onBack={() => { setBrowseOpen(false); setWorkspacePickerOpen(true); }}
+        onDevice={(id) => { const option = deviceOptions.find(device => device.deviceId === id); if (option && !deviceSelectorDisabled) selectDevice(option); }}
+        onDialogue={selectDialogueWorkspace}
+        onProject={selectRecentProject}
+        onBrowse={openProjectBrowse}
+        onEnter={(path) => void loadBrowsePath(path)}
+        onChoose={chooseWorkingDir}
+        onShowHidden={setShowHiddenDirectories}
+      /> : null}
       <SheetModal
         backdropTestID="newSession.worktreeBranchSheet.backdrop"
         onBackdropPress={() => setWorktreeBranchSheetOpen(false)}
@@ -6026,14 +6080,28 @@ export default function NewRemoteSessionScreen() {
         </SheetSurface>
       </SheetModal>
       <ModelPickerSheet
+        unified={{
+          scope: JSON.stringify([auth.user?.id, selectedDeviceId]),
+          agents: availableNewSessionAgentOptions(availableAgentKinds).map(option => option.kind),
+          loadCapabilities: async agent => {
+            const result = normalizeMobileAgentCapabilities(await maker.getCapabilities(agent));
+            if (!result) throw new Error('Capabilities unavailable');
+            return result;
+          },
+          onSelect: selectUnifiedModel,
+        }}
         activeModelId={draft.model}
         activePermissionMode={displayPermissionMode}
         agentKind={draft.agentKind}
         apiKeyStatus={deviceApiKeyStatus}
         capabilities={capabilities}
         disabled={creating}
-        emptyHint={selectedDeviceId ? t('session.new.noModelsAvailable') : t('session.new.selectDeviceFirst')}
+        emptyHint={deviceProviders.error && !deviceProviders.unsupported
+          ? humanizeRemoteError(deviceProviders.error)
+          : selectedDeviceId ? t('session.new.noModelsAvailable') : t('session.new.selectDeviceFirst')}
         flatOptions={runtimeOptions.modelOptions}
+        providersReady={deviceProviders.ready}
+        providersUnsupported={deviceProviders.unsupported}
         modelVisibilityOverrides={deviceProviders.modelVisibilityOverrides}
         keyboardAvoidingBehavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         loading={deviceProviders.loading || capabilitiesLoading}
@@ -6057,7 +6125,9 @@ export default function NewRemoteSessionScreen() {
       />
       {/* 权限模式独立浮窗:composer 权限药丸点开;列表复用 MobilePermissionPickerList,
           选择走 selectPermissionMode(含 Full access 确认弹层 + per-agent 记忆)后关浮窗。 */}
-      <SheetModal
+      {Platform.OS === 'ios' ? (<NativePermissionSheet visible={permissionSheetOpen} onClose={() => setPermissionSheetOpen(false)}
+ activeMode={displayPermissionMode} disabled={creating} onSelect={selectPermissionMode}
+ options={runtimeOptions.permissionOptions} testID="newSession.permissionSheet" />) : (<SheetModal
         backdropTestID="newSession.permissionSheet.backdrop"
         onBackdropPress={() => setPermissionSheetOpen(false)}
         onRequestClose={() => setPermissionSheetOpen(false)}
@@ -6083,7 +6153,7 @@ export default function NewRemoteSessionScreen() {
             testID="newSession.permissionSheet.option"
           />
         </SheetSurface>
-      </SheetModal>
+      </SheetModal>)}
       {composerPreviewUrl && composerGalleryImages.length > 0 ? (
         // composer 托盘图片的全屏查看(沿用聊天消息同款 ImageLightbox;本地图无需远端取件)。
         // annotation:托盘图可圈点标注 / 再编辑,保存后烧录替换附件重新上传。
@@ -6260,7 +6330,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     flexShrink: 0,
   },
   bottomCluster: {
-    flex: 1,
+    flexGrow: 1,
     gap: spacing.lg,
     justifyContent: 'flex-end',
     paddingBottom: spacing.md,
@@ -6759,9 +6829,6 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     minHeight: MOBILE_COMPOSER_INPUT_LINE_HEIGHT,
     position: 'relative',
   },
-  voiceDraftCaretOverlay: {
-    position: 'absolute',
-  },
   // 草稿层的文本档必须与真实 TextInput 完全一致,否则换行位置错开、超出的行被裁在
   // 框外(见 MOBILE_COMPOSER_DRAFT_TEXT_STYLE)。
   voiceDraftText: {
@@ -6809,6 +6876,9 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   },
   inputVoiceHidden: {
     color: 'transparent',
+    // Android Fabric can treat transparent text as an unset color and draw it black.
+    // Keep layout/presses; iOS needs nonzero view opacity for native hit testing.
+    ...(Platform.OS === 'android' ? { opacity: 0 } : {}),
   },
   sendButton: {
     alignItems: 'center',

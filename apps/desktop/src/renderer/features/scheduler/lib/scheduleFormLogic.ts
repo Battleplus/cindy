@@ -14,7 +14,7 @@
  *   - buildScheduleInput:表单 → CreateScheduleInput(原 toInput 迁入)
  */
 
-import type { CreateScheduleInput, ScheduleTemplate, ScheduleWorkspaceKind, ScriptCapability } from '@cindy/maker-scheduler';
+import type { Schedule, CreateScheduleInput, ScheduleTemplate, ScheduleWorkspaceKind, ScriptCapability } from '@cindy/maker-scheduler';
 import {
   effectiveSourceIdForModel,
   getModel,
@@ -120,6 +120,9 @@ export interface ScheduleFormState {
   /** 手动模式:true → 创建后永不自动 fire,只能 Run now。UI 上需要 recurring=false 才能勾。 */
   manual: boolean;
   agentKind: 'claude-code' | 'codex' | 'pi';
+  modelAgentKind?: 'claude-code' | 'codex' | 'pi';
+  /** The bound task's baseline, independent of the editable model choice. Form-only. */
+  boundAgent?: { sessionId: string; agentKind: ScheduleFormState['agentKind'] };
   model: string;
   /**
    * 显式选定的来源(供应商)id。'' = 跟随该 agent 原生默认来源（no-break，与未升级
@@ -164,8 +167,8 @@ export type RunMode = 'fresh' | 'persistent' | 'bound';
  * Agent-mode bound schedules may only be persisted after the selected session
  * has resolved as available and active. Archived sessions remain openable, so
  * their reference state is still `available`, but the runner cannot use them as
- * ordinary heartbeat targets. Script mode intentionally clears targetSessionId,
- * so a stale binding must not block that mode conversion.
+ * ordinary heartbeat targets. Script bindings are lifecycle owners: editing them remains allowed,
+ * and the runner pauses unavailable owners before executing hooks or scripts.
  */
 export function canSubmitSessionBinding(
   executionMode: ScheduleFormState['executionMode'],
@@ -275,6 +278,8 @@ export interface RememberedBinding {
   effort: EffortValue | '';
   fastMode: boolean;
   agentKind: ScheduleFormState['agentKind'];
+  modelAgentKind?: ScheduleFormState['modelAgentKind'];
+  boundAgent?: ScheduleFormState['boundAgent'];
 }
 
 /** 从 form 提取绑定快照;无真实绑定返回 null。 */
@@ -287,6 +292,8 @@ export function captureBinding(form: ScheduleFormState): RememberedBinding | nul
     effort: form.effort,
     fastMode: form.fastMode,
     agentKind: form.agentKind,
+    modelAgentKind: form.modelAgentKind,
+    boundAgent: form.boundAgent,
   };
 }
 
@@ -320,6 +327,8 @@ export function applyRunMode(
           effort: remembered.effort,
           fastMode: remembered.fastMode,
           agentKind: remembered.agentKind,
+          modelAgentKind: remembered.modelAgentKind,
+          boundAgent: remembered.boundAgent,
         }
       : f;
 
@@ -497,6 +506,13 @@ export function parseScriptTimeoutMs(sec: string): number | undefined {
   return Number.isFinite(n) && n > 0 ? Math.floor(n * 1000) : undefined;
 }
 
+/** Preserve a binding's baseline when saving; unbound tasks use the selected Harness. */
+export function scheduleAgentKindForForm(form: ScheduleFormState): ScheduleFormState['agentKind'] {
+  return form.executionMode !== 'script' && hasRealBinding(form) &&
+    form.boundAgent?.sessionId === form.targetSessionId.trim()
+    ? form.boundAgent.agentKind : form.agentKind;
+}
+
 export function buildScheduleInput(form: ScheduleFormState): CreateScheduleInput {
   const isHeartbeat = !!form.targetSessionId.trim();
   const isScript = (form.executionMode ?? 'agent') === 'script';
@@ -514,12 +530,13 @@ export function buildScheduleInput(form: ScheduleFormState): CreateScheduleInput
     // 恒带 key：编辑 Cron 任务时 undefined 会沿 storage patch 契约清空旧 intervalMs；
     // 相对间隔任务则原样保留权威值，不能从可能陈旧的 cronExpr 重新推导。
     intervalMs: form.intervalMs,
-    agentKind: form.agentKind,
+    agentKind: scheduleAgentKindForForm(form),
+    modelAgentKind: !isScript && form.model.trim() ? form.modelAgentKind : undefined,
     workspaceKind: form.workspaceKind,
     useWorktree: !isScript && form.workspaceKind === 'project' && form.useWorktree,
     persistentSession: !isScript && form.persistentSession,
     silentWhenIdle: !isScript && form.silentWhenIdle,
-    targetSessionId: !isScript ? (form.targetSessionId.trim() || undefined) : undefined,
+    targetSessionId: hasRealBinding(form) ? form.targetSessionId.trim() : undefined,
     preRunHook: buildPreRunHook(form),
     notify: {
       desktop: form.notifyDesktop,
@@ -532,14 +549,14 @@ export function buildScheduleInput(form: ScheduleFormState): CreateScheduleInput
     base.workspaceKind = 'project';
     base.workingDir = form.workingDir.trim();
     base.useWorktree = false;
-    // script 模式不叠前置检查(任务本体就是脚本,UI 也不展示该区块);保留 key,
-    // 编辑保存时按 hasKey + undefined = 写 NULL 契约把历史 hook 清列。
-    base.preRunHook = undefined;
+    // Preserve installed script gates when editing; hidden controls must not erase them.
     return base;
   }
 
   if (isHeartbeat) {
     base.useWorktree = false;
+    // Keep the key when following so an update clears a previously saved Fast override.
+    base.fastMode = form.modelAgentKind ? form.fastMode : undefined;
     base.model = form.model.trim() || undefined;
     base.providerId = form.providerId.trim() || undefined;
     base.effort = form.effort && isEffortValue(form.effort) ? form.effort : undefined;
@@ -557,4 +574,33 @@ export function buildScheduleInput(form: ScheduleFormState): CreateScheduleInput
   // capability × 模型 supportsFastMode 门控,Pi 只有真支持时才可能为 true。
   if (form.agentKind === 'codex' || form.agentKind === 'pi') base.fastMode = form.fastMode;
   return base;
+}
+
+/** Clone/demote drops the binding, so freeze the explicitly selected Harness for the new task. */
+export function scheduleToUserCreateInput(
+  schedule: Schedule,
+  overrides: Partial<CreateScheduleInput> = {},
+): CreateScheduleInput {
+  return {
+    name: schedule.name,
+    prompt: schedule.prompt,
+    kind: schedule.kind,
+    cronExpr: schedule.cronExpr,
+    timezone: schedule.timezone,
+    recurring: schedule.recurring,
+    manual: schedule.manual,
+    intervalMs: schedule.intervalMs,
+    agentKind: schedule.modelAgentKind ?? schedule.agentKind,
+    modelAgentKind: schedule.modelAgentKind,
+    model: schedule.model,
+    providerId: schedule.providerId,
+    fastMode: schedule.fastMode,
+    effort: schedule.effort,
+    workspaceKind: schedule.workspaceKind,
+    workingDir: schedule.workingDir,
+    useWorktree: schedule.useWorktree,
+    persistentSession: schedule.persistentSession,
+    notify: schedule.notify,
+    ...overrides,
+  };
 }

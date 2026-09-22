@@ -39,7 +39,13 @@
  *     attachment chip.
  */
 
-import { useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { Check, ChevronDown, ChevronRight, File as FileIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -51,6 +57,7 @@ import {
 } from '@cindy/maker-shared';
 
 import { cn, basename } from '@/lib/utils';
+import { getDataOwnerGeneration } from '@/contexts/dataOwnerGeneration';
 import { Spinner } from '@/components/ui/spinner';
 import type { ChatMessage } from '@/lib/makerChatStore';
 import {
@@ -58,7 +65,16 @@ import {
   verbLabelKeyForIntent,
   verbLabelKeyForRow,
 } from '@/lib/agent-actions/verbAggregator';
-import { statsForToolCall } from '@/lib/agent-actions/diffStats';
+import {
+  DIFF_MAIN_THREAD_MAX_CHARS,
+  DIFF_MAX_SEGMENTS,
+  diffSourcesForToolCall,
+  getDiffDetailsSync,
+  requestToolDiffDetails,
+  statsForToolCall,
+  type DiffDetails,
+  type ToolDiffDetails,
+} from '@/lib/agent-actions/diffStats';
 import { extractDisplayParam } from '@/lib/agent-actions/actionPresentation';
 import { SUPPORTED_IMAGE_EXTS, extractExt } from '@/lib/fileTypes';
 import { toLocalFileUrl, resolveToolFilePath } from '@/lib/localPathResolver';
@@ -281,16 +297,7 @@ function isToolAudioUrl(url: string): boolean {
  * renderer 据此从 ghostCardStore 取卡渲染;取不到令牌 = 走今日 generic 路径。
  */
 export function extractGhostCardId(toolResult: string): string | null {
-  if (!toolResult || typeof toolResult !== 'string') return null;
-  if (!toolResult.includes('xdt_card_id')) return null;
-  try {
-    const parsed = JSON.parse(toolResult) as { xdt_card_id?: unknown };
-    return typeof parsed.xdt_card_id === 'string' && parsed.xdt_card_id.length > 0
-      ? parsed.xdt_card_id
-      : null;
-  } catch {
-    return null;
-  }
+  return getToolResultMetadata(toolResult).cardId;
 }
 
 /**
@@ -301,19 +308,73 @@ export function extractGhostCardId(toolResult: string): string | null {
  * 采纳,锚不上回退本调用位置渲染(老意识/坏锚零影响)。
  */
 export function extractAnchorCardId(toolResult: string): string | null {
-  if (!toolResult || typeof toolResult !== 'string') return null;
-  if (!toolResult.includes('xdt_anchor_card_id')) return null;
-  try {
-    const parsed = JSON.parse(toolResult) as { xdt_anchor_card_id?: unknown };
-    return typeof parsed.xdt_anchor_card_id === 'string' && parsed.xdt_anchor_card_id.length > 0
-      ? parsed.xdt_anchor_card_id
-      : null;
-  } catch {
-    return null;
-  }
+  return getToolResultMetadata(toolResult).anchorId;
 }
 
 export function extractToolResultMedia(toolResult: string): ToolMediaItem[] {
+  // Callers may filter/append their own list; never lend out the cached array.
+  return getToolResultMetadata(toolResult).media.slice();
+}
+
+interface ToolResultMetadata {
+  cardId: string | null;
+  anchorId: string | null;
+  media: ToolMediaItem[];
+}
+
+const EMPTY_TOOL_METADATA: ToolResultMetadata = { cardId: null, anchorId: null, media: [] };
+// Bound both count and retained text. Large historical tool outputs must not turn
+// a small entry-count cache into unbounded retention. Parsed JSON is never kept.
+const TOOL_METADATA_MAX_ENTRIES = 512;
+const TOOL_METADATA_MAX_CHARACTERS = 32 * 1024 * 1024;
+const toolMetadataCache = new Map<string, ToolResultMetadata>();
+let toolMetadataCharacters = 0;
+let toolMetadataOwner = getDataOwnerGeneration();
+
+function getToolResultMetadata(toolResult: string): ToolResultMetadata {
+  const owner = getDataOwnerGeneration();
+  if (owner !== toolMetadataOwner) {
+    toolMetadataCache.clear();
+    toolMetadataCharacters = 0;
+    toolMetadataOwner = owner;
+  }
+  if (!toolResult || typeof toolResult !== 'string') return EMPTY_TOOL_METADATA;
+  const cached = toolMetadataCache.get(toolResult);
+  if (cached) {
+    toolMetadataCache.delete(toolResult);
+    toolMetadataCache.set(toolResult, cached);
+    return cached;
+  }
+  let metadata = EMPTY_TOOL_METADATA;
+  if (/xdt_(?:card_id|anchor_card_id|image_url|video_url|audio_url)/.test(toolResult)) {
+    try {
+      const parsed = JSON.parse(toolResult) as Record<string, unknown> | null;
+      if (parsed && typeof parsed === 'object') {
+        metadata = {
+          cardId: toolResult.includes('xdt_card_id') && typeof parsed.xdt_card_id === 'string' && parsed.xdt_card_id.length > 0
+            ? parsed.xdt_card_id : null,
+          anchorId: toolResult.includes('xdt_anchor_card_id') && typeof parsed.xdt_anchor_card_id === 'string' && parsed.xdt_anchor_card_id.length > 0
+            ? parsed.xdt_anchor_card_id : null,
+          media: extractParsedToolResultMedia(toolResult, parsed),
+        };
+      }
+    } catch {
+      // Malformed and ordinary text results have no media/card metadata.
+    }
+  }
+  if (toolResult.length <= TOOL_METADATA_MAX_CHARACTERS) {
+    toolMetadataCache.set(toolResult, metadata);
+    toolMetadataCharacters += toolResult.length;
+    while (toolMetadataCache.size > TOOL_METADATA_MAX_ENTRIES || toolMetadataCharacters > TOOL_METADATA_MAX_CHARACTERS) {
+      const oldest = toolMetadataCache.keys().next().value!;
+      toolMetadataCache.delete(oldest);
+      toolMetadataCharacters -= oldest.length;
+    }
+  }
+  return metadata;
+}
+
+function extractParsedToolResultMedia(toolResult: string, parsed: Record<string, unknown>): ToolMediaItem[] {
   if (!toolResult || typeof toolResult !== 'string') return [];
   // 快速否定:不含任何 xdt_*_url 字面量直接 short-circuit。
   if (
@@ -324,19 +385,6 @@ export function extractToolResultMedia(toolResult: string): ToolMediaItem[] {
     return [];
   }
   try {
-    const parsed = JSON.parse(toolResult) as {
-      xdt_image_url?: unknown;
-      xdt_image_urls?: unknown;
-      xdt_video_url?: unknown;
-      xdt_video_urls?: unknown;
-      xdt_audio_urls?: unknown;
-      xdt_audio_tracks?: unknown;
-      xdt_audio_in_card?: unknown;
-      xdt_images_in_card?: unknown;
-      _xdt_render_image?: unknown;
-      _xdt_model_files?: unknown;
-      _xdt_audio_tracks?: unknown;
-    };
     if (parsed._xdt_render_image === false) return [];
     const modelFiles = parseModelFiles(parsed._xdt_model_files);
     // Track which image index we're at across xdt_image_url + xdt_image_urls
@@ -556,7 +604,9 @@ type FileChangeDescriptor = Extract<ToolUseDescriptor, { kind: 'fileChange' }>;
 function buildDiffPayload(
   descriptor: ToolUseDescriptor,
   inp: Record<string, unknown> | null,
+  analysis?: ToolDiffDetails | null,
 ): ToolPayloadMode | null {
+  const detailByKey = new Map(analysis?.segments.map((segment) => [segment.key, segment.details]));
   if (descriptor.kind === 'fileChange') {
     return {
       kind: 'diff',
@@ -579,7 +629,9 @@ function buildDiffPayload(
         {
           key: filePath,
           filePath,
-          diffs: [{ key: 'edit:0', oldString: o, newString: n }],
+          diffs: [
+            { key: 'edit:0', oldString: o, newString: n, analysis: detailByKey.get('edit:0') },
+          ],
         },
       ],
     };
@@ -592,7 +644,9 @@ function buildDiffPayload(
         {
           key: filePath,
           filePath,
-          diffs: [{ key: 'write:0', oldString: '', newString: c }],
+          diffs: [
+            { key: 'write:0', oldString: '', newString: c, analysis: detailByKey.get('write:0') },
+          ],
         },
       ],
     };
@@ -600,23 +654,37 @@ function buildDiffPayload(
   // pi edit:声明 schema 的 edits[] 与 legacy 顶层 {oldText,newText} 两种形态,
   // 由共享的 piEditReplacements 归一化(只认一种会让另一种退化成空 diff)。
   if (toolName === 'edit') {
+    const allEdits = piEditReplacements(inp);
+    const visibleEdits = allEdits.slice(0, DIFF_MAX_SEGMENTS);
     return {
       kind: 'diff',
       files: [
         {
           key: filePath,
           filePath,
-          diffs: piEditReplacements(inp).map((edit, index) => ({
+          diffs: visibleEdits.map((edit, index) => ({
             key: `edit:${index}`,
             oldString: edit.oldText,
             newString: edit.newText,
+            analysis: detailByKey.get(`edit:${index}`),
           })),
+          ...(allEdits.length > visibleEdits.length
+            ? {
+                copyDiffs: allEdits.map((edit, index) => ({
+                  key: `edit:${index}`,
+                  oldString: edit.oldText,
+                  newString: edit.newText,
+                })),
+                omittedDiffCount: allEdits.length - visibleEdits.length,
+              }
+            : {}),
         },
       ],
     };
   }
   if (toolName === 'MultiEdit') {
-    const edits = Array.isArray(inp.edits) ? inp.edits : [];
+    const allEdits = Array.isArray(inp.edits) ? inp.edits : [];
+    const edits = allEdits.slice(0, DIFF_MAX_SEGMENTS);
     return {
       kind: 'diff',
       files: [
@@ -627,8 +695,24 @@ function buildDiffPayload(
             const er = e as Record<string, unknown> | null;
             const o = er && typeof er.old_string === 'string' ? er.old_string : '';
             const n = er && typeof er.new_string === 'string' ? er.new_string : '';
-            return { key: `edit:${index}`, oldString: String(o), newString: String(n) };
+            return {
+              key: `edit:${index}`,
+              oldString: String(o),
+              newString: String(n),
+              analysis: detailByKey.get(`edit:${index}`),
+            };
           }),
+          ...(allEdits.length > edits.length
+            ? {
+                copyDiffs: allEdits.map((e, index) => {
+                  const er = e as Record<string, unknown> | null;
+                  const o = er && typeof er.old_string === 'string' ? er.old_string : '';
+                  const n = er && typeof er.new_string === 'string' ? er.new_string : '';
+                  return { key: `edit:${index}`, oldString: String(o), newString: String(n) };
+                }),
+                omittedDiffCount: allEdits.length - edits.length,
+              }
+            : {}),
         },
       ],
     };
@@ -763,7 +847,59 @@ export function AgentActionRow({
   const userFacingToolResult = displayedToolResult
     ? (humanizeDocumentToolResult(toolName, displayedToolResult) ?? displayedToolResult)
     : null;
-  const stats = useMemo(() => statsForToolCall(toolName, inp), [toolName, inp]);
+  const diffSources = useMemo(() => diffSourcesForToolCall(toolName, inp), [toolName, inp]);
+  const syncDiff = useMemo<ToolDiffDetails | null>(() => {
+    if (!diffSources || diffSources.truncated) return null;
+    // Apply the budget to the complete tool call, not each segment. A
+    // MultiEdit with many individually-small replacements must still stay off
+    // the renderer thread.
+    const totalChars = diffSources.segments.reduce(
+      (total, segment) => total + segment.oldString.length + segment.newString.length,
+      0,
+    );
+    if (totalChars > DIFF_MAIN_THREAD_MAX_CHARS) return null;
+    const segments = diffSources.segments.map((segment) => ({
+      key: segment.key,
+      details: getDiffDetailsSync(segment.oldString, segment.newString),
+    }));
+    if (segments.some((segment) => !segment.details)) return null;
+    const resolvedSegments = segments as Array<{ key: string; details: DiffDetails }>;
+    return {
+      stats: segments.reduce(
+        (total, segment) => ({
+          add: total.add + (segment.details?.stats.add ?? 0),
+          del: total.del + (segment.details?.stats.del ?? 0),
+        }),
+        { add: 0, del: 0 },
+      ),
+      segments: resolvedSegments,
+      truncated: false,
+    };
+  }, [diffSources]);
+  const initialStats = useMemo(
+    () => syncDiff?.stats ?? statsForToolCall(toolName, inp),
+    [inp, syncDiff, toolName],
+  );
+  const [asyncDiff, setAsyncDiff] = useState<ToolDiffDetails | null>(null);
+
+  // Small edits stay synchronous for a stable first paint. Larger edits are
+  // analysed off-thread; the same result is passed to the lightbox on click.
+  useEffect(() => {
+    let active = true;
+    if (!diffSources || syncDiff || initialStats !== null) {
+      setAsyncDiff(null);
+      return () => {
+        active = false;
+      };
+    }
+    void requestToolDiffDetails(toolName, inp).then((result) => {
+      if (active) setAsyncDiff(result);
+    });
+    return () => {
+      active = false;
+    };
+  }, [diffSources, initialStats, inp, syncDiff, toolName]);
+  const stats = asyncDiff?.truncated ? null : (asyncDiff?.stats ?? initialStats);
   const isFilePathTool = FILE_PATH_TOOLS.has(toolName);
   const filePath = descriptor.kind === 'file' ? descriptor.filePath : '';
   const singleFileChange =
@@ -784,7 +920,7 @@ export function AgentActionRow({
    *   - Read → 文稿/图片 lightbox
    */
   const onActivate = async (anchor: HTMLElement) => {
-    const diffPayload = buildDiffPayload(descriptor, inp);
+    const diffPayload = buildDiffPayload(descriptor, inp, asyncDiff ?? syncDiff);
     if (diffPayload) {
       triggerRef.current = anchor;
       setLightbox({ kind: 'payload', payload: diffPayload });
@@ -932,13 +1068,13 @@ export function AgentActionRow({
               : rowVerbLabel
         }
         className={cn(
-          'group flex w-full items-center gap-[6px]',
+          'group flex w-full items-center gap-1.5',
           ACTIVITY_ROW_RADIUS_CLASS,
           'px-2 py-[3px]',
           ACTIVITY_ROW_HOVER_SURFACE_CLASS,
           ACTIVITY_ROW_COLOR_TRANSITION_CLASS,
           'cursor-pointer select-none outline-none',
-          'focus-visible:ring-2 focus-visible:ring-[var(--info-700)]/40',
+          'focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
           'text-left',
         )}
       >

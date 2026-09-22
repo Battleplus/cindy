@@ -1,5 +1,9 @@
+import type { ComponentProps, ReactNode } from "react";
 import { Stack } from "expo-router";
-import { ChevronDown, Ellipsis, Menu } from "lucide-react-native";
+import { HomeHeaderGlassButton } from "@/session/HomeHeaderGlassButton";
+import { BlurBackdrop } from "@/session/BlurBackdrop";
+import { QuietSyncIndicator } from '@/components/QuietSyncIndicator';
+import { ChevronDown, Menu } from "lucide-react-native";
 import { Pressable, StyleSheet, View } from "react-native";
 import { Text } from "@/components/AppText";
 import {
@@ -17,11 +21,11 @@ import {
   useThemedStyles,
   type ThemeColors,
 } from "@/theme";
-import { lineHeight, spacing } from "@/theme/tokens";
+import { lineHeight, radius, spacing } from "@/theme/tokens";
 
 /**
  * 首页 iOS 顶栏走系统 UINavigationBar。
- * 实底 surface,和列表同色;不要透明磨砂。Android 不渲染。
+ * 透明导航栏;设备标题使用与任务标题相同的轻磨砂胶囊。Android 不渲染。
  */
 export function HomeNativeStackHeader({
   displayA11y,
@@ -29,11 +33,14 @@ export function HomeNativeStackHeader({
   menuA11y,
   onDisplayAction,
   onOpenDeviceMenu,
-  onOpenDisplaySettings,
   onOpenMenu,
+  onOpenRemoteDesktop,
+  remoteDesktopA11y,
   onSelectScope,
   scopeActions,
   showRemoteGuide,
+  syncing = false,
+  keepMenuTopLeft = false,
   title,
   titleA11y,
 }: {
@@ -44,9 +51,13 @@ export function HomeNativeStackHeader({
   onOpenDeviceMenu(): void;
   onOpenDisplaySettings(): void;
   onOpenMenu(): void;
+  onOpenRemoteDesktop?: () => void;
+  remoteDesktopA11y: string;
   onSelectScope(id: string): void;
   scopeActions: readonly NativePullDownAction[];
   showRemoteGuide: boolean;
+  syncing?: boolean;
+  keepMenuTopLeft?: boolean;
   title: string;
   titleA11y: string;
 }) {
@@ -72,6 +83,7 @@ export function HomeNativeStackHeader({
         style={({ pressed }) => [styles.titleHit, pressed && styles.pressed]}
         testID="devices.title"
       >
+        <BlurBackdrop intensity={20} overlayColor={colors.surfaceTranslucent} />
         <View style={styles.titleCluster}>
           <Text numberOfLines={1} style={styles.title}>
             {title}
@@ -81,6 +93,7 @@ export function HomeNativeStackHeader({
             size={iconSize.xs}
             strokeWidth={iconStroke.medium}
           />
+          <QuietSyncIndicator active={syncing} />
         </View>
       </Pressable>
     </NativePullDownMenu>
@@ -93,75 +106,64 @@ export function HomeNativeStackHeader({
           headerBackVisible: false,
           headerShadowVisible: false,
           headerShown: true,
-          headerStyle: { backgroundColor: colors.surface },
+          headerStyle: { backgroundColor: "transparent" },
           headerTintColor: colors.textPrimary,
-          headerTransparent: false,
+          headerTransparent: true,
+          headerTitle: () => titleNode,
         }}
       />
       <Stack.Header
         style={{
-          backgroundColor: colors.surface,
+          backgroundColor: "transparent",
           color: colors.textPrimary,
           shadowColor: "transparent",
         }}
       />
-      <Stack.Title asChild>{titleNode}</Stack.Title>
       <Stack.Toolbar placement="left">
-        <Stack.Toolbar.View>
-          <Pressable
-            accessibilityLabel={menuA11y}
-            accessibilityRole="button"
-            onPress={onOpenMenu}
-            style={({ pressed }) => [styles.iconHit, pressed && styles.pressed]}
-            testID="home.chromeMenu"
-          >
-            <Menu
-              color={colors.textPrimary}
-              size={iconSize.xl}
-              strokeWidth={iconStroke.regular}
-            />
-          </Pressable>
-        </Stack.Toolbar.View>
+        {keepMenuTopLeft ? (
+          // This home-only custom item stays at the top left on Duo. Hosting it
+          // in the native bar keeps its hit target above the transparent header.
+          <Stack.Toolbar.View hidesSharedBackground>
+            <HomeHeaderGlassButton accessibilityLabel={menuA11y} onPress={onOpenMenu} testID="home.chromeMenu">
+              <Menu color={colors.textPrimary} size={iconSize.action} strokeWidth={iconStroke.regular} />
+            </HomeHeaderGlassButton>
+          </Stack.Toolbar.View>
+        ) : (
+          <Stack.Toolbar.Button icon="line.3.horizontal" accessibilityLabel={menuA11y} onPress={onOpenMenu} />
+        )}
       </Stack.Toolbar>
       {showRemoteGuide ? null : (
         <Stack.Toolbar placement="right">
-          <Stack.Toolbar.View>
-            <NativePullDownMenu
-              actions={displayActions}
-              onAction={onDisplayAction}
-            >
-              <Pressable
-                accessibilityLabel={displayA11y}
-                accessibilityRole="button"
-                onPress={nativeMenus ? () => undefined : onOpenDisplaySettings}
-                style={({ pressed }) => [
-                  styles.iconHit,
-                  pressed && styles.pressed,
-                ]}
-                testID="home.displaySettingsButton"
-              >
-                <Ellipsis
-                  color={colors.textPrimary}
-                  size={iconSize.xl}
-                  strokeWidth={iconStroke.regular}
-                />
-              </Pressable>
-            </NativePullDownMenu>
-          </Stack.Toolbar.View>
+          {onOpenRemoteDesktop ? <Stack.Toolbar.Button icon={require("../../../assets/navigation/monitor.png")} iconRenderingMode="template"
+            accessibilityLabel={remoteDesktopA11y} onPress={onOpenRemoteDesktop} /> : null}
+          <Stack.Toolbar.Menu icon="ellipsis" accessibilityLabel={displayA11y}>
+            {displayMenuItems(displayActions, onDisplayAction)}
+          </Stack.Toolbar.Menu>
         </Stack.Toolbar>
       )}
     </>
   );
 }
 
+
+function displayMenuItems(actions: readonly NativePullDownAction[], onAction: (id: string) => void): ReactNode {
+  return actions.map(action => action.subactions?.length ? (
+    <Stack.Toolbar.Menu key={action.id} title={action.title} inline={action.displayInline}
+      disabled={action.disabled} destructive={action.destructive}>
+      {displayMenuItems(action.subactions, onAction)}
+    </Stack.Toolbar.Menu>
+  ) : (
+    <Stack.Toolbar.MenuAction key={action.id} disabled={action.disabled}
+      destructive={action.destructive} isOn={action.state === 'on'} subtitle={action.subtitle}
+      icon={action.image as ComponentProps<typeof Stack.Toolbar.MenuAction>['icon']}
+      unstable_keepPresented={action.keepPresented} onPress={() => onAction(action.id)}>
+      {action.title}
+    </Stack.Toolbar.MenuAction>
+  ));
+}
+
 const makeStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    iconHit: {
-      alignItems: "center",
-      height: 44,
-      justifyContent: "center",
-      width: 44,
-    },
     pressed: { opacity: 0.72 },
     title: {
       color: colors.textPrimary,
@@ -179,6 +181,9 @@ const makeStyles = (colors: ThemeColors) =>
       minWidth: 0,
     },
     titleHit: {
+      borderRadius: radius.pill,
+      overflow: "hidden",
+      paddingHorizontal: spacing.md,
       alignItems: "center",
       justifyContent: "center",
       minHeight: 44,

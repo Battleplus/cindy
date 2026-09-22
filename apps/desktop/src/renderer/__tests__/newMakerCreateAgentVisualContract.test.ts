@@ -1,3 +1,5 @@
+import { colorRegistry } from '../themes/color-registry';
+import '../themes/colors';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -258,10 +260,9 @@ describe('NewMakerDraftRoute CREATE AGENT visual contract', () => {
     expect(sendButtonSource).toContain('function CreateAgentSendIcon');
     expect(sendButtonSource).toContain('fill="currentColor"');
 
-    // Claude|Codex 分段切换是新建对话框独有控件,不在统一范围,仍用 create-agent 分段 token
-    expect(vendorSwitcherSource).toContain('bg-[var(--create-agent-segment-track-bg)]');
-    expect(vendorSwitcherSource).toContain('text-[var(--create-agent-segment-inactive-text)]');
-    expect(vendorSwitcherSource).toContain('border-[var(--create-agent-control-border)]');
+    // Segmented v8 now owns both Agent selector densities; legacy tokens remain theme-compatible.
+    expect(vendorSwitcherSource).toContain('<SegmentedControl');
+    expect(vendorSwitcherSource).not.toContain('create-agent-segment-track-bg');
 
     // 引擎下拉:trigger 是描边控件(与协同按钮同族,区别于裸态的权限/模型 trigger),
     // 面板走 model dropdown 规格;定宽 h-30,引擎数量增加不改工具条布局。
@@ -289,29 +290,29 @@ describe('NewMakerDraftRoute CREATE AGENT visual contract', () => {
     expect(modelSelectorSource).not.toContain('max-w-[180px] truncate');
 
     expect(colorsSource).toContain("'create-agent-send-bg'");
-    expect(colorsSource).toContain("light: '#3C3F43'");
-    expect(colorsSource).toContain("dark: '#EEEEEE'");
+    expect(colorRegistry.resolveDefault('create-agent-send-bg', 'light')).toBe('#3C3F43');
+    expect(colorRegistry.resolveDefault('create-agent-send-bg', 'dark')).toBe('#EEEEEE');
     expect(colorsSource).toContain("'create-agent-send-icon'");
-    expect(colorsSource).toContain("light: '#FCFCFC'");
+    expect(colorRegistry.resolveDefault('create-agent-send-icon', 'light')).toBe('#FCFCFC');
     expect(colorsSource).not.toContain("'create-agent-send-border'");
     expect(colorsSource).toContain("'create-agent-send-bg-hover'");
-    expect(colorsSource).toContain("light: '#2E3237'");
-    expect(colorsSource).toContain("dark: '#E2E2E2'");
+    expect(colorRegistry.resolveDefault('create-agent-send-bg-hover', 'light')).toBe('#2E3237');
+    expect(colorRegistry.resolveDefault('create-agent-send-bg-hover', 'dark')).toBe('#E2E2E2');
     expect(colorsSource).toContain("'create-agent-send-bg-pressed'");
-    expect(colorsSource).toContain("light: '#25282C'");
-    expect(colorsSource).toContain("dark: '#D4D4D4'");
+    expect(colorRegistry.resolveDefault('create-agent-send-bg-pressed', 'light')).toBe('#25282C');
+    expect(colorRegistry.resolveDefault('create-agent-send-bg-pressed', 'dark')).toBe('#D4D4D4');
     expect(colorsSource).toContain("'create-agent-send-disabled-bg'");
-    expect(colorsSource).toContain("dark: '#444242'");
+    expect(colorRegistry.resolveDefault('create-agent-send-disabled-bg', 'dark')).toBe('#444242');
     expect(colorsSource).toContain("'create-agent-send-disabled-icon'");
-    expect(colorsSource).toContain("dark: '#585555'");
+    expect(colorRegistry.resolveDefault('create-agent-send-disabled-icon', 'dark')).toBe('#585555');
     expect(colorsSource).toContain("'create-agent-segment-inactive-text'");
-    expect(colorsSource).toContain("light: '#9A9DA3'");
-    expect(colorsSource).toContain("dark: '#6F6F6F'");
+    expect(colorRegistry.resolveDefault('create-agent-segment-inactive-text', 'light')).toBe('#9A9DA3');
+    expect(colorRegistry.resolveDefault('create-agent-segment-inactive-text', 'dark')).toBe('#6F6F6F');
     expect(colorsSource).toContain("'create-agent-control-border'");
-    expect(colorsSource).toContain("light: '#DCDFE3'");
-    expect(colorsSource).toContain("dark: '#434343'");
+    expect(colorRegistry.resolveDefault('create-agent-control-border', 'light')).toBe('#DCDFE3');
+    expect(colorRegistry.resolveDefault('create-agent-control-border', 'dark')).toBe('#434343');
     expect(colorsSource).toContain("'create-agent-control-icon'");
-    expect(colorsSource).toContain("light: '#3C3F43'");
+    expect(colorRegistry.resolveDefault('create-agent-control-icon', 'light')).toBe('#3C3F43');
 
     expect(chatInputSource).toContain(
       "'min-w-0 flex-nowrap justify-between gap-2 overflow-hidden'",
@@ -443,11 +444,11 @@ describe('NewMakerDraftRoute CREATE AGENT visual contract', () => {
     );
 
     expect(colorsSource).toContain("'send-btn-bg'");
-    expect(colorsSource).toContain("light: '#3C3F43'");
-    expect(colorsSource).toContain("dark: '#EEEEEE'");
+    expect(colorRegistry.resolveDefault('send-btn-bg', 'light')).toBe('var(--accent-cta-bg)');
+    expect(colorRegistry.resolveDefault('send-btn-bg', 'dark')).toBe('var(--accent-cta-bg)');
     expect(colorsSource).toContain("'send-btn-icon'");
-    expect(colorsSource).toContain("light: '#FCFCFC'");
-    expect(colorsSource).toContain("dark: '#252222'");
+    expect(colorRegistry.resolveDefault('send-btn-icon', 'light')).toBe('var(--surface-on-card)');
+    expect(colorRegistry.resolveDefault('send-btn-icon', 'dark')).toBe('var(--surface-on-card)');
     expect(colorsSource).not.toContain("'stop-btn-bg'");
     expect(colorsSource).not.toContain("'stop-btn-icon'");
   });

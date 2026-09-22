@@ -190,12 +190,15 @@ export class SkillhubMarketService {
     return { success: true as const, info };
   }
 
-  async getPublishedFiles({ name, version, catalogScope }: { name: string; version?: string; catalogScope?: SkillhubCatalogScope }) {
-    const qs = version ? `?version=${encodeURIComponent(version)}` : '';
+  async getPublishedFiles({ name, version, catalogScope, includeHashes }: { name: string; version?: string; catalogScope?: SkillhubCatalogScope; includeHashes?: boolean }) {
+    const search = new URLSearchParams();
+    if (version) search.set('version', version);
+    if (includeHashes) search.set('includeHashes', '1');
+    const qs = search.size ? `?${search}` : '';
     const result = await this.fetch<{
       slug: string;
       version: string;
-      files: Array<{ path: string; size: number; language: string; truncated: boolean }>;
+      files: Array<{ path: string; size: number; language: string; truncated: boolean; sha256?: string }>;
     }>(withSkillhubCatalogScope(`/api/skills-hub/skills/${encodeURIComponent(name)}/files${qs}`, catalogScope));
     return { success: true as const, ...result };
   }
@@ -296,7 +299,7 @@ export class SkillhubMarketService {
     };
   }
 
-  async listCategories(scope: SkillhubCatalogScope = 'market') {
+  async listCategories(scope: SkillhubCatalogScope = 'market', includeEmpty = true) {
     const items = await this.fetch<Array<{
       slug: string;
       name: string;
@@ -309,7 +312,9 @@ export class SkillhubMarketService {
         skillCount?: number;
         mySkillCount?: number;
       }>;
-    }>>(`/api/skills-hub/categories?scope=${scope}`);
+    }>>(`/api/skills-hub/categories?scope=${scope}${includeEmpty ? '' : '&includeEmpty=false'}`);
+    // Filtering belongs to the server: legacy counts may be absent, and older servers'
+    // team responses may contain public-market counts rather than team counts.
     const categories = flattenHubCategories(items ?? []);
     const totalCount = categories.reduce((s, c) => s + c.count, 0);
     const myTotalCount = categories.reduce((s, c) => s + c.myCount, 0);
@@ -332,7 +337,7 @@ export class SkillhubMarketService {
 
   async getScanStatus({ slug, version, catalogScope }: { slug: string; version?: string; catalogScope?: SkillhubCatalogScope }) {
     const path = `/api/skills-hub/skills/${encodeURIComponent(slug)}/scan${version ? `?version=${encodeURIComponent(version)}` : ''}`;
-    const result = await this.fetch<{ status: string; gates?: unknown[]; scorecard?: unknown }>(
+    const result = await this.fetch<{ status: string; rejectionReason?: string; gates?: unknown[]; scorecard?: unknown }>(
       withSkillhubCatalogScope(path, catalogScope),
       { cache: 'no-store', headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } },
     );

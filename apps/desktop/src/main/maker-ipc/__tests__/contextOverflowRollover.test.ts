@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CODEX_HISTORY_CONTINUE_MESSAGE,
   createContextOverflowRollover,
   effectiveContextWindow,
   effectivePiContextWindow,
@@ -284,10 +285,11 @@ describe('createContextOverflowRollover', () => {
       getSessionRow: vi.fn(
         async (): Promise<{
           status: string;
+          source?: string;
           agentKind: string;
           remoteHostId: string | null;
           clearedAt: number | null;
-          sdkSessionId: string;
+          sdkSessionId: string | null;
           contextTokens: number;
           contextWindow: number;
           model: string;
@@ -295,6 +297,7 @@ describe('createContextOverflowRollover', () => {
           workingDir?: string | null;
         }> => ({
           status: 'active',
+          source: 'desktop',
           agentKind: 'pi',
           remoteHostId: null,
           clearedAt: null,
@@ -332,6 +335,46 @@ describe('createContextOverflowRollover', () => {
       log: { info: vi.fn(), warn: vi.fn() },
     };
   }
+
+  it.each(['cc', 'codex', 'pi'] as const)('explicit Bot restart replaces a running %s context without replay', async (agentKind) => {
+    const deps = makeDeps([msg('user', 'keep my request', 'u1', 1)]);
+    deps.getSessionRow.mockResolvedValue({ ...await deps.getSessionRow(), source: 'bot', agentKind });
+    deps.getLiveSession.mockReturnValue({ isTurnRunning: () => true });
+    deps.closeSession.mockImplementation(async () => {
+      deps.listMessages.mockResolvedValue([
+        msg('user', 'keep my request', 'u1', 1),
+        msg('assistant', 'saved before close', 'a1', 2),
+      ]);
+    });
+    await createContextOverflowRollover(deps).prepareNativeSessionRecovery('s1', null, vi.fn());
+    expect(deps.closeSession).toHaveBeenCalledWith('s1');
+    expect(deps.commitRebuild).toHaveBeenCalledWith('s1', expect.stringContaining('saved before close'),
+      expect.objectContaining({ reason: 'native-session-recovery', sourceAgentKind: agentKind }));
+    expect(deps.commitRebuild).toHaveBeenCalledWith('s1', expect.any(String),
+      expect.not.objectContaining({ replacementRoute: expect.anything() }));
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('can restart a Bot before a native handle was ever created', async () => {
+    const deps = makeDeps([]);
+    deps.getSessionRow.mockResolvedValue({ ...await deps.getSessionRow(), source: 'bot', sdkSessionId: null, contextTokens: 0 });
+    await createContextOverflowRollover(deps).prepareNativeSessionRecovery('s1', null, vi.fn());
+    expect(deps.commitRebuild).toHaveBeenCalledOnce();
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not reset history bindings or publish success when the old Bot cannot close', async () => {
+    const deps = makeDeps([msg('user', 'keep', 'u1', 1)]);
+    deps.getSessionRow.mockResolvedValue({ ...await deps.getSessionRow(), source: 'bot' });
+    deps.getLiveSession.mockReturnValue({ isTurnRunning: () => true });
+    deps.closeSession.mockRejectedValueOnce(new Error('close failed'));
+    const recovery = createContextOverflowRollover(deps);
+    await expect(recovery.prepareNativeSessionRecovery('s1', null, vi.fn())).rejects.toThrow('close failed');
+    expect(deps.commitRebuild).not.toHaveBeenCalled();
+    expect(deps.setPendingHandoff).not.toHaveBeenCalled();
+    await recovery.prepareNativeSessionRecovery('s1', null, vi.fn());
+    expect(deps.commitRebuild).toHaveBeenCalledOnce();
+  });
 
   it.each(['cc', 'codex', 'pi'] as const)('native recovery carries %s history and the full target route without replay', async (agentKind) => {
     const deps = makeDeps([msg('user', 'KEEP_CONTEXT', 'u1', 1), msg('assistant', 'already finished', 'a1', 2)]);
@@ -811,7 +854,10 @@ describe('createContextOverflowRollover', () => {
     expect(remoteDeps.closeSession).not.toHaveBeenCalled();
   });
 
-  it('rebuilds Codex remote compact encrypted-content failures without a context-overflow reason key', async () => {
+  it.each([
+    'Error running remote compact task: { "type": "error", "error": { "code": "invalid_encrypted_content" } }',
+    'CINDY_ENCRYPTED_COMPACTION_INCOMPATIBLE',
+  ])('rebuilds proven Codex compaction failures without a context-overflow reason key: %s', async (message) => {
     const deps = makeDeps([
       msg('user', '先做 A', 'u1', 1),
       msg('assistant', '做完 A', 'a1', 2),
@@ -819,6 +865,7 @@ describe('createContextOverflowRollover', () => {
     ]);
     deps.getSessionRow.mockResolvedValue({
       status: 'active',
+      source: 'desktop',
       agentKind: 'codex',
       remoteHostId: null,
       clearedAt: null,
@@ -832,8 +879,7 @@ describe('createContextOverflowRollover', () => {
     rollover.claim('s1');
     await expect(
       rollover.tryRecover('s1', {
-        message:
-          'Error running remote compact task: { "type": "error", "error": { "code": "invalid_encrypted_content" } }',
+        message,
       }),
     ).resolves.toBe(true);
     expect(deps.commitRebuild).toHaveBeenCalledWith(
@@ -844,8 +890,9 @@ describe('createContextOverflowRollover', () => {
         sourceUserClientId: 'u2',
         sourceAgentKind: 'codex',
       }),
+      expect.any(AbortSignal),
     );
-    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', '再做 B');
+    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', '再做 B', undefined, { signal: expect.any(AbortSignal) });
   });
 
   it('rebuilds once, injects handoff, and wire-replays the same user content', async () => {
@@ -872,11 +919,12 @@ describe('createContextOverflowRollover', () => {
         sourceProviderId: 'xai',
         expectedClearedAt: null,
       }),
+      expect.any(AbortSignal),
     );
     expect(deps.setPendingHandoff).toHaveBeenCalledWith('s1', expect.any(String), 3);
     expect(deps.setPendingHandoff.mock.calls[0]?.[1]).toContain('先做 A');
     expect(deps.setPendingHandoff.mock.calls[0]?.[1]).not.toContain('再做 B');
-    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', '再做 B');
+    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', '再做 B', undefined, { signal: expect.any(AbortSignal) });
     expect(deps.onRebuilt).toHaveBeenCalledWith('s1');
     expect(deps.replayUserMessage.mock.invocationCallOrder[0]).toBeLessThan(
       deps.onRebuilt.mock.invocationCallOrder[0],
@@ -944,7 +992,7 @@ describe('createContextOverflowRollover', () => {
         agentMeta: { origin: { kind: 'orca', senderLabel: 'Lead', displayText: '派给 worker' } },
       },
     ]);
-    const rollover = createContextOverflowRollover(deps);
+    const rollover = createContextOverflowRollover({ ...deps, hasExternalRecoveryOwner: () => true });
     rollover.claim('s1');
     await expect(
       rollover.tryRecover('s1', { reason: 'context-overflow', message: 'prompt too long' }),
@@ -974,6 +1022,7 @@ describe('createContextOverflowRollover', () => {
     const deps = makeDeps([msg('user', '继续', 'u1'), msg('error', compactError, 'e1')]);
     deps.getSessionRow.mockResolvedValue({
       status: 'active',
+      source: 'desktop',
       agentKind: 'codex',
       remoteHostId: null,
       clearedAt: null,
@@ -1101,6 +1150,7 @@ describe('createContextOverflowRollover', () => {
     const deps = makeDeps([msg('user', '继续', 'u1'), msg('assistant', '好', 'a1')]);
     deps.getSessionRow.mockResolvedValue({
       status: 'active',
+      source: 'desktop',
       agentKind: 'codex',
       remoteHostId: null,
       clearedAt: null,
@@ -1301,6 +1351,7 @@ describe('createContextOverflowRollover', () => {
     const deps = makeDeps([msg('user', '继续', 'u1')]);
     deps.getSessionRow.mockResolvedValue({
       status: 'active',
+      source: 'desktop',
       agentKind: 'codex',
       remoteHostId: null,
       clearedAt: null,
@@ -1322,6 +1373,7 @@ describe('createContextOverflowRollover', () => {
     const deps = makeDeps([msg('user', '继续', 'u1')]);
     deps.getSessionRow.mockResolvedValue({
       status: 'active',
+      source: 'desktop',
       agentKind: 'codex',
       remoteHostId: 'remote-1',
       clearedAt: null,
@@ -1342,152 +1394,247 @@ describe('createContextOverflowRollover', () => {
     expect(deps.commitRebuild).not.toHaveBeenCalled();
   });
 
-  it('strips oversized Codex history in place instead of forking a Cindy session', async () => {
+  it('rebuilds oversized history after tool execution and continues without replaying the request', async () => {
     const deps = makeDeps([
-      msg('user', '继续', 'u1'),
-      msg('error', { reason: 'codex_history_oversized', message: 'oversized' }, 'e1'),
+      msg('user', 'Send the report once, then check delivery', 'u1'),
+      msg('tool_use', { toolUseId: 't1', toolName: 'send_report', input: { report: 'weekly' } }, 't1'),
+      { ...msg('tool_result', 'Report sent: delivery id 42', 'r1'), toolUseId: 't1' },
+      msg('assistant', 'Report sent; checking delivery', 'a1'),
     ]);
     deps.getSessionRow.mockResolvedValue({
-      status: 'active',
-      agentKind: 'codex',
-      remoteHostId: null,
-      clearedAt: null,
-      sdkSessionId: 'thread-fat',
-      contextTokens: 20_000,
-      contextWindow: 200_000,
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
+      ...(await deps.getSessionRow()), agentKind: 'codex', sdkSessionId: 'fat-thread',
     });
-    const tryStrip = vi.fn(async () => 'recovered' as const);
-    const rollover = createContextOverflowRollover({
-      ...deps,
-      tryStripOversizedCodexHistory: tryStrip,
-    });
+    const rollover = createContextOverflowRollover(deps);
     rollover.claim('s1');
-
-    await expect(
-      rollover.tryRecover('s1', { reason: 'codex_history_oversized', message: 'oversized' }),
-    ).resolves.toBe(true);
-    expect(tryStrip).toHaveBeenCalledWith({
-      sessionId: 's1',
-      threadId: 'thread-fat',
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
-    });
-    expect(deps.commitRebuild).not.toHaveBeenCalled();
-    expect(deps.onRebuilt).toHaveBeenCalledWith('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
+    expect(deps.commitRebuild).toHaveBeenCalledWith('s1', expect.stringContaining('Report sent: delivery id 42'),
+      expect.objectContaining({ sourceUserClientId: 'u1' }), expect.any(AbortSignal));
+    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', CODEX_HISTORY_CONTINUE_MESSAGE, undefined,
+      expect.objectContaining({ continueFromHistory: true, sourceUserClientId: 'u1' }));
   });
 
-  it('falls back to rollover when oversized strip fails', async () => {
-    const deps = makeDeps([msg('user', '继续', 'u1')]);
+  it('inherits input intent and allows only one continuation per user input', async () => {
+    const source = [
+      { ...msg('user', '继续', 'u1'), agentMeta: { agentFacingWireContent: {
+        type: 'user', content: [
+          { type: 'text', text: 'Use $image-plugin to finish this image' },
+          { type: 'image', path: '/retained/image.png' },
+        ],
+      } } },
+      msg('assistant', 'Already changed files; still checking the result', 'a1'),
+    ];
+    const deps = makeDeps(source);
     deps.getSessionRow.mockResolvedValue({
-      status: 'active',
-      agentKind: 'codex',
-      remoteHostId: null,
-      clearedAt: null,
-      sdkSessionId: 'thread-fat',
-      contextTokens: 20_000,
-      contextWindow: 200_000,
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
+      ...(await deps.getSessionRow()), agentKind: 'codex', sdkSessionId: 'fat-thread',
     });
-    const rollover = createContextOverflowRollover({
-      ...deps,
-      tryStripOversizedCodexHistory: vi.fn(async () => 'failed' as const),
-    });
+    const rollover = createContextOverflowRollover(deps);
     rollover.claim('s1');
-
-    await expect(
-      rollover.tryRecover('s1', { reason: 'codex_history_oversized', message: 'oversized' }),
-    ).resolves.toBe(true);
-    expect(deps.commitRebuild).toHaveBeenCalled();
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
+    expect(deps.replayUserMessage).toHaveBeenCalledWith(
+      's1', CODEX_HISTORY_CONTINUE_MESSAGE, undefined,
+      { signal: expect.any(AbortSignal), continueFromHistory: true, sourceUserContent: '继续', sourceUserClientId: 'u1',
+        sourceCapabilitySelectionText: 'Use $image-plugin to finish this image' },
+    );
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
+    expect(deps.commitRebuild).toHaveBeenCalledTimes(1);
+    expect(deps.replayUserMessage).toHaveBeenCalledTimes(1);
+    source.push(msg('user', 'Now check a different image', 'u2'));
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
+    expect(deps.replayUserMessage).toHaveBeenCalledTimes(2);
   });
 
-  it('does not rebuild when strip reports the turn is still running', async () => {
+  it('does not repeat a committed image recovery after a host restart', async () => {
+    const deps = makeDeps([msg('user', 'finish the task', 'u1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    const rollover = createContextOverflowRollover({
+      ...deps,
+      findLatestRebuildMeta: async () => ({ reason: 'context-overflow', sourceUserClientId: 'u1' }),
+    });
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
+    expect(deps.closeSession).not.toHaveBeenCalled();
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('recovers the input identity outside a tool-heavy history window', async () => {
     const deps = makeDeps([
-      msg('user', '继续', 'u1'),
-      msg('error', { reason: 'codex_history_oversized', message: 'oversized' }, 'e1'),
+      { ...msg('tool_result', 'Saved revision 42', 'r1'), toolUseId: 't1' },
     ]);
-    deps.getSessionRow.mockResolvedValue({
-      status: 'active',
-      agentKind: 'codex',
-      remoteHostId: null,
-      clearedAt: null,
-      sdkSessionId: 'thread-fat',
-      contextTokens: 20_000,
-      contextWindow: 200_000,
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
-    });
+    deps.findLatestUser.mockResolvedValue(msg('user', 'Save once then verify', 'u1'));
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    const rollover = createContextOverflowRollover(deps);
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
+    expect(deps.commitRebuild).toHaveBeenCalledWith('s1', expect.stringContaining('Save once then verify'),
+      expect.objectContaining({ sourceUserClientId: 'u1' }), expect.any(AbortSignal));
+    expect(deps.replayUserMessage).toHaveBeenCalledWith('s1', CODEX_HISTORY_CONTINUE_MESSAGE, undefined,
+      expect.objectContaining({ sourceUserClientId: 'u1' }));
+  });
+
+  it.each(['claimed', 'plan', 'close', 'commit', 'dispatch'] as const)(
+    'cancels image recovery during %s without advancing the old request', async (phase) => {
+      const deps = makeDeps([msg('user', 'old request', 'u1')]);
+      deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+      const cancelAt = (point: string) => {
+        if (phase === point) rollover.cancelRecovery('s1');
+      };
+      const rollover = createContextOverflowRollover({
+        ...deps,
+        findLatestRebuildMeta: async () => { cancelAt('plan'); return null; },
+        closeSession: async () => { await deps.closeSession(); cancelAt('close'); },
+        commitRebuild: async (...args) => {
+          expect(args[3]?.aborted).toBe(false);
+          await deps.commitRebuild();
+          cancelAt('commit');
+        },
+        replayUserMessage: async (...args) => {
+          await deps.replayUserMessage();
+          cancelAt('dispatch');
+          expect(args[3]?.signal?.aborted).toBe(true);
+          throw new Error('dispatch cancelled');
+        },
+      });
+      rollover.claim('s1');
+      cancelAt('claimed');
+      await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
+      expect(deps.closeSession).toHaveBeenCalledTimes(['claimed', 'plan'].includes(phase) ? 0 : 1);
+      expect(deps.commitRebuild).toHaveBeenCalledTimes(['commit', 'dispatch'].includes(phase) ? 1 : 0);
+      expect(deps.replayUserMessage).toHaveBeenCalledTimes(phase === 'dispatch' ? 1 : 0);
+      expect(deps.onRebuilt).not.toHaveBeenCalled();
+      expect(rollover.claim('s1')).toBe('claimed');
+    },
+  );
+
+  it('honors the coordinator cancellation signal while closing the old runtime', async () => {
+    const deps = makeDeps([msg('user', 'old request', 'u1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    const cancellation = new AbortController();
     const rollover = createContextOverflowRollover({
-      ...deps,
-      tryStripOversizedCodexHistory: vi.fn(async () => 'busy' as const),
+      ...deps, getRecoveryAbortSignal: () => cancellation.signal,
+      closeSession: async () => { cancellation.abort(); },
     });
     rollover.claim('s1');
-    await expect(
-      rollover.tryRecover('s1', { reason: 'codex_history_oversized', message: 'oversized' }),
-    ).resolves.toBe(false);
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(true);
     expect(deps.commitRebuild).not.toHaveBeenCalled();
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['slack-hook', 'telegram', undefined, 'bound', 'detached-active'])(
+    'leaves oversized recovery to its external owner: %s', async (origin) => {
+      const deps = makeDeps([msg('user', 'old desktop request', 'u1')]);
+      deps.getSessionRow.mockResolvedValue({
+        ...(await deps.getSessionRow()), agentKind: 'codex',
+        source: origin === 'bound' || origin === 'detached-active' ? 'desktop' : origin,
+      });
+      let externalTurnActive = origin === 'bound' || origin === 'detached-active';
+      const rollover = createContextOverflowRollover({
+        ...deps, hasExternalRecoveryOwner: () => externalTurnActive,
+      });
+      rollover.claim('s1');
+      const recovery = rollover.tryRecover('s1', { reason: 'codex_history_oversized' });
+      externalTurnActive = false;
+      await expect(recovery).resolves.toBe(false);
+      expect(deps.closeSession).not.toHaveBeenCalled();
+      expect(deps.replayUserMessage).not.toHaveBeenCalled();
+      expect(deps.commitRebuild).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ origin: { kind: 'scheduler' } }, { origin: { kind: 'orca' } }, { hookSource: 'im' }])(
+    'does not rebuild or continue an externally authored input: %j', async (agentMeta) => {
+      const deps = makeDeps([{ ...msg('user', 'external task', 'u1'), agentMeta }]);
+      deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+      const rollover = createContextOverflowRollover(deps);
+      rollover.claim('s1');
+      await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
+      expect(deps.closeSession).not.toHaveBeenCalled();
+      expect(deps.replayUserMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['plan', 'close', 'commit'] as const)('stops when an external owner takes over during %s', async (phase) => {
+    const deps = makeDeps([msg('user', 'finish editing', 'u1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    let external = false;
+    const rollover = createContextOverflowRollover({
+      ...deps,
+      hasExternalRecoveryOwner: () => external,
+      findLatestRebuildMeta: async () => { if (phase === 'plan') external = true; return null; },
+      closeSession: async () => { await deps.closeSession(); if (phase === 'close') external = true; },
+      commitRebuild: async () => { await deps.commitRebuild(); if (phase === 'commit') external = true; },
+    });
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
+    expect(deps.closeSession).toHaveBeenCalledTimes(phase === 'plan' ? 0 : 1);
+    expect(deps.commitRebuild).toHaveBeenCalledTimes(phase === 'commit' ? 1 : 0);
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['commit', 'dispatch'] as const)('surfaces a %s failure without retrying automatically', async (phase) => {
+    const deps = makeDeps([msg('user', 'finish editing', 'u1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    if (phase === 'commit') deps.commitRebuild.mockRejectedValue(new Error('owner changed before commit'));
+    else deps.replayUserMessage.mockResolvedValue({ accepted: false });
+    const rollover = createContextOverflowRollover(deps);
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
     expect(deps.onRebuilt).not.toHaveBeenCalled();
-  });
-
-  it('does not rebuild when oversized strip finds a stale owner', async () => {
-    const deps = makeDeps([
-      msg('user', '继续', 'u1'),
-      msg('error', { reason: 'codex_history_oversized', message: 'oversized' }, 'e1'),
-    ]);
-    deps.getSessionRow.mockResolvedValue({
-      status: 'active',
-      agentKind: 'codex',
-      remoteHostId: null,
-      clearedAt: null,
-      sdkSessionId: 'thread-fat',
-      contextTokens: 20_000,
-      contextWindow: 200_000,
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
-    });
-    const rollover = createContextOverflowRollover({
-      ...deps,
-      tryStripOversizedCodexHistory: vi.fn(async () => 'stale' as const),
-    });
     rollover.claim('s1');
-    await expect(
-      rollover.tryRecover('s1', { reason: 'codex_history_oversized', message: 'oversized' }),
-    ).resolves.toBe(false);
-    expect(deps.commitRebuild).not.toHaveBeenCalled();
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
+    expect(deps.commitRebuild).toHaveBeenCalledTimes(1);
+    expect(deps.replayUserMessage).toHaveBeenCalledTimes(phase === 'commit' ? 0 : 1);
   });
 
-  it('does not rollover before send when current Codex thread is already slim', async () => {
-    const deps = makeDeps([
-      msg('user', '继续', 'u1'),
-      msg('error', { reason: 'codex_history_oversized', message: 'oversized' }, 'e1'),
-    ]);
-    deps.getSessionRow.mockResolvedValue({
-      status: 'active',
-      agentKind: 'codex',
-      remoteHostId: null,
-      clearedAt: null,
-      sdkSessionId: 'thread-slim',
-      contextTokens: 20_000,
-      contextWindow: 200_000,
-      model: 'gpt-5.6',
-      providerId: 'openai',
-      workingDir: '/work',
-    });
-    const rollover = createContextOverflowRollover({
-      ...deps,
-      tryStripOversizedCodexHistory: vi.fn(async () => 'not-needed' as const),
-    });
-
-    await expect(rollover.prepareUnhealthySession('s1')).resolves.toBe(false);
+  it('does not rebuild a running turn', async () => {
+    const deps = makeDeps([msg('user', 'continue', 'u1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    deps.getLiveSession.mockReturnValue({ isTurnRunning: () => true });
+    const rollover = createContextOverflowRollover(deps);
+    rollover.claim('s1');
+    await expect(rollover.tryRecover('s1', { reason: 'codex_history_oversized' })).resolves.toBe(false);
     expect(deps.commitRebuild).not.toHaveBeenCalled();
     expect(deps.closeSession).not.toHaveBeenCalled();
+  });
+
+  it.each(['healthy', 'oversized', 'unknown'] as const)('rechecks a persisted image error against the current thread: %s', async (health) => {
+    const deps = makeDeps([
+      msg('user', 'old request', 'u1'),
+      msg('error', { reason: 'codex_history_oversized' }, 'e1'),
+    ]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex', sdkSessionId: 'current-thread' });
+    const classifyCodexHistory = vi.fn(async () => health);
+    const rollover = createContextOverflowRollover({ ...deps, classifyCodexHistory });
+    await expect(rollover.prepareUnhealthySession('s1')).resolves.toBe(health !== 'healthy');
+    expect(classifyCodexHistory).toHaveBeenCalledWith('current-thread');
+    expect(deps.commitRebuild).toHaveBeenCalledTimes(health === 'healthy' ? 0 : 1);
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not close or rebuild when the owner changes during history inspection', async () => {
+    const deps = makeDeps([msg('user', 'old request', 'u1'), msg('error', { reason: 'codex_history_oversized' }, 'e1')]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    const rollover = createContextOverflowRollover({
+      ...deps, classifyCodexHistory: async () => { throw new Error('owner changed'); },
+    });
+    await expect(rollover.prepareUnhealthySession('s1')).rejects.toThrow('owner changed');
+    expect(deps.closeSession).not.toHaveBeenCalled();
+    expect(deps.commitRebuild).not.toHaveBeenCalled();
+  });
+
+  it('rebuilds image history before an explicit send without sending an extra continuation', async () => {
+    const deps = makeDeps([
+      msg('user', 'Save then verify', 'u1'),
+      { ...msg('tool_result', 'Saved revision 42', 'r1'), toolUseId: 't1' },
+      msg('error', { reason: 'codex_history_oversized' }, 'e1'),
+    ]);
+    deps.getSessionRow.mockResolvedValue({ ...(await deps.getSessionRow()), agentKind: 'codex' });
+    const rollover = createContextOverflowRollover(deps);
+    await expect(rollover.prepareUnhealthySession('s1')).resolves.toBe(true);
+    expect(deps.commitRebuild).toHaveBeenCalledWith('s1', expect.stringContaining('Saved revision 42'),
+      expect.objectContaining({ sourceUserClientId: 'u1' }));
+    expect(deps.replayUserMessage).not.toHaveBeenCalled();
   });
 });
 

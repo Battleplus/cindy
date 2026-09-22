@@ -3,9 +3,11 @@ import { createLogger } from '../logger.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import { getSessionProvider } from '../maker-host/session-provider-store.js';
 import { verdictForModelRoute } from '../maker-host/model-route-guard-live.js';
+import { describeModelRouteRejection } from '../maker-host/model-route-guard.js';
 import { SilentStopTurnLeaseGate, SessionTurnLeaseTracker } from './sessionTurnLease.js';
 
 export interface InstallSessionTurnObserverDeps {
+  readonly beforeLocalProviderStart?: (session: Session) => Promise<void>;
   readonly silentStopTurnLeaseGate: Pick<
     SilentStopTurnLeaseGate,
     'supersede' | 'schedule' | 'supersedeOwnedBy'
@@ -22,6 +24,7 @@ export function installSessionTurnObserver(deps: InstallSessionTurnObserverDeps,
   session.setTurnLifecycleObserver({
     beforeProviderStart: async (turnGeneration) => {
       if (session.remoteHostId) return;
+      await deps.beforeLocalProviderStart?.(session);
       // 每条本地 Session.send 都经过这一个 Main-owned 边界，包括 renderer、IM、
       // Goal、Learn、Hook 与 Scheduler。付费权限不能只挂在普通 IPC 发送事务上。
       const model = session.model;
@@ -43,6 +46,9 @@ export function installSessionTurnObserver(deps: InstallSessionTurnObserverDeps,
         }
         if (verdict.kind === 'reject' && verdict.reason === 'payment-required') {
           throwIpcError('PERMISSION_DENIED', `model "${model}" requires paid access`);
+        }
+        if (verdict.kind === 'reject' && verdict.reason === 'explicit-source-unavailable') {
+          throwIpcError('INVALID_PARAMS', describeModelRouteRejection(verdict.reason, model, getSessionProvider(session.id)));
         }
       }
       deps.silentStopTurnLeaseGate.supersede(session.id);
@@ -71,6 +77,7 @@ export function installSessionTurnObserver(deps: InstallSessionTurnObserverDeps,
         // the bounded auto-resume decision runs. Its exact lease is either
         // replaced by the next provider generation or released by settle.
         const scheduled = deps.silentStopTurnLeaseGate.schedule(session.id, event, turnLeaseId);
+        if (scheduled) session.claimHostTurnContinuation(turnGeneration);
         if (!scheduled) {
           deps.log.debug('ignored duplicate silent-stop terminal for the current turn', {
             sessionId: session.id,

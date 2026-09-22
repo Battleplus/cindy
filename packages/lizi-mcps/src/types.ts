@@ -93,6 +93,8 @@ export interface FeishuBotSendMessageResult {
   ok: boolean;
   /** Feishu message id on success. */
   messageId?: string;
+  /** False means delivery succeeded but replies cannot resume the originating session. */
+  sessionLinked?: boolean;
   /** Short reason on failure (e.g. 'SEND_FAIL', 'EMPTY_TEXT'). */
   reason?: string;
 }
@@ -114,6 +116,8 @@ export interface FeishuBotMcpHostDeps {
   sendMessage(
     chatId: string,
     markdown: string,
+    /** Trusted calling session, only for notifications to the bot owner. */
+    notificationSessionId?: string,
   ): Promise<FeishuBotSendMessageResult>;
   /**
    * Return the bot's TOFU-recorded owner openId — i.e. the person who first
@@ -201,6 +205,16 @@ export interface SlackHookMcpDeps {
   /** 当前会话工作目录(out_file 泄洪根; 空 = 不落盘只截断)。 */
   workingDir?: string;
   logger?: LiziMcpLogger;
+}
+
+/** Native routine service; only caller-bound companion tools expose it to agents. */
+export interface RoutineToolService {
+  list(botId: string): Promise<import('@cindy/maker-scheduler').Routine[]>;
+  sources(): Promise<import('@cindy/maker-scheduler').RoutineSource[]>;
+  save(botId: string, input: import('@cindy/maker-scheduler').RoutineInput, id?: string): Promise<import('@cindy/maker-scheduler').Routine>;
+  history(botId: string, id: string): Promise<import('@cindy/maker-scheduler').RoutineRun[]>;
+  remove(botId: string, id: string): Promise<void>;
+  runNow(botId: string, id: string): Promise<void>;
 }
 
 /**
@@ -433,6 +447,17 @@ export interface SessionSearchOptions {
   role?: 'user' | 'assistant' | 'system';
   /** 默认 10 */
   limit?: number;
+  /**
+   * Host-owned caller identity used to enforce Bot history isolation. This is
+   * populated by the MCP adapter from the current runtime context and is never
+   * accepted from model tool arguments.
+   */
+  callerSessionId?: string;
+  /**
+   * Host-owned memory namespace. A `bot:` scope without a recoverable caller
+   * Session must fail closed instead of falling back to cross-session search.
+   */
+  callerMemoryScopeKey?: string;
 }
 
 export interface SessionSearchHit {
@@ -516,6 +541,8 @@ export type ControlWorkerAgent = 'claude-code' | 'codex' | 'pi';
 /** Browser automation MCP host deps. Core browser execution is injected by host. */
 export interface BrowserMcpDeps {
   getRuntime(): BrowserControlRuntime;
+  /** Switch the host-wide, persisted automation target; returns the actual mode. */
+  setBackend?(backend: 'external' | 'rsb-webview'): Promise<'external' | 'rsb-webview'>;
   /** Whether the active backend accepts managed resource downloads. */
   supportsResourceDownloads?(): boolean;
   /** Whether the active backend accepts semantic element queries. */
@@ -605,6 +632,8 @@ export interface ComputerDriverPermissionState {
 
 export interface ComputerMcpCallContext {
   sessionId?: string;
+  /** Host-only observation origin; automatic reads must not authorize resumed input. */
+  observationPurpose?: 'recovery';
   /** Request cancellation stays on the host side; never serialized to the driver. */
   signal?: AbortSignal;
   /** Identifies the agent runtime whose MCP server dispatched this call. */
@@ -874,6 +903,8 @@ export type LiziMcpCallerKind = 'root' | 'descendant' | 'unknown';
 export interface LiziMcpSessionContext {
   agentKind: string;
   workingDir: string;
+  /** Host-owned memory namespace override shared with the agent prompt path. */
+  memoryScopeKey?: string;
   /**
    * 当前 tool-call 的权威 session ctx accessor。
    *

@@ -17,6 +17,7 @@ import { serverApiFetch, ServerApiError } from '../serverApiClient';
 import { requireString, throwIpcError } from '../utils/ipcValidate';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer';
 import type { IpcErrorCode } from '../../shared/ipc-errors';
+import { decodeRemoteHistory } from '../../shared/remoteHistoryCache';
 import {
   DEVICE_LINK_INVOKE,
   DEVICE_LINK_PUSH,
@@ -205,6 +206,7 @@ const DEVICE_LINK_CODE_MAP: Record<string, IpcErrorCode> = {
   VERSION_MISMATCH: 'DEVICE_LINK_VERSION_MISMATCH',
   NOT_CONNECTED: 'DEVICE_LINK_NOT_CONNECTED',
   LINK_NOT_OPEN: 'DEVICE_LINK_NOT_CONNECTED',
+  PEER_RESET: 'DEVICE_LINK_NOT_CONNECTED',
   BACKPRESSURE: 'DEVICE_LINK_NOT_CONNECTED',
 };
 
@@ -954,6 +956,7 @@ export async function handleMirrorCacheGetMessages(
   sessionId: unknown,
 ): Promise<{
   messages: Record<string, unknown>[];
+  historyView?: string;
   invalidation?: number;
   ownerToken?: string;
   accountCounter?: number;
@@ -989,6 +992,7 @@ export async function handleMirrorCacheGetMessages(
   // 暴露给不可信 renderer(review: codex P2)。账号代际再区分同账号登出重登。
   return {
     messages,
+    ...(read.historyView !== undefined ? { historyView: read.historyView } : {}),
     invalidation: read.invalidation,
     ownerToken,
     accountCounter: read.accountCounter,
@@ -1009,10 +1013,12 @@ export async function handleMirrorCachePutMessages(
   expectedInvalidation?: unknown,
   expectedOwnerToken?: unknown,
   expectedAccountCounter?: unknown,
+  historyView?: unknown,
 ): Promise<{ ok: true; invalidation?: number }> {
   const device = requireCacheId(deviceId, 'deviceId');
   const session = requireCacheId(sessionId, 'sessionId');
   if (!Array.isArray(messages)) throwIpcError('INVALID_PARAMS', 'messages must be an array');
+  if (historyView !== undefined && !decodeRemoteHistory(historyView)) throwIpcError('INVALID_PARAMS', 'Invalid history view cache');
   const bounded = boundedItems(messages, MIRROR_CACHE_MAX_INBOUND_MESSAGES, 'messages');
   const expected =
     typeof expectedInvalidation === 'number'
@@ -1045,6 +1051,7 @@ export async function handleMirrorCachePutMessages(
       expected,
       expectedOwner,
       expectedAccount,
+      ...(historyView !== undefined ? [historyView as string] : []),
     );
     return { ok: true, invalidation: result.invalidation };
   } catch (err) {
@@ -1250,13 +1257,18 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
   // Keep the local keep-awake setting available without a Cindy account. The
   // setting is local-only and does not expose any remote-control capability.
   ipcMain.handle(DEVICE_LINK_INVOKE.GET_STATE, () => handleGetState(deps));
-  ipcMain.handle(DEVICE_LINK_INVOKE.SET_ENABLED, (_e, enabled: unknown) =>
-    gated(handleSetEnabled)(deps, enabled),
-  );
+  ipcMain.handle(DEVICE_LINK_INVOKE.SET_ENABLED, (e, enabled: unknown) => {
+    // Account capability does not identify the local page making a grant.
+    // This rejects foreign frames; it is not proof of a human click within
+    // a compromised app renderer.
+    assertTrustedAppRendererEvent(e);
+    return gated(handleSetEnabled)(deps, enabled);
+  });
   ipcMain.handle(DEVICE_LINK_INVOKE.SET_KEEP_AWAKE, (_e, enabled: unknown) =>
     handleSetKeepAwake(deps, enabled),
   );
-  ipcMain.handle(DEVICE_LINK_INVOKE.SET_DEVICE_CONTROL_ENABLED, (_e, payload: unknown) => {
+  ipcMain.handle(DEVICE_LINK_INVOKE.SET_DEVICE_CONTROL_ENABLED, (e, payload: unknown) => {
+    assertTrustedAppRendererEvent(e);
     requireDeviceLinkCapability();
     const p = (payload ?? {}) as { deviceId?: unknown; enabled?: unknown };
     return handleSetDeviceControlEnabled(deps, p.deviceId, p.enabled);
@@ -1319,17 +1331,20 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
     const p = (payload ?? {}) as { deviceId?: unknown; topics?: unknown };
     return handleUnsubscribe(deps, p.deviceId, p.topics, e.sender.id);
   });
-  ipcMain.handle(DEVICE_LINK_INVOKE.DISCONNECT_ALL, () => {
+  ipcMain.handle(DEVICE_LINK_INVOKE.DISCONNECT_ALL, (e) => {
+    assertTrustedAppRendererEvent(e);
     requireDeviceLinkCapability();
     resetSubscriptionRefcount(); // 整体断开 → 清空引用,后续重连各窗口重订阅
     return handleDisconnectAll(deps);
   });
-  ipcMain.handle(DEVICE_LINK_INVOKE.REVOKE, (_e, payload: unknown) => {
+  ipcMain.handle(DEVICE_LINK_INVOKE.REVOKE, (e, payload: unknown) => {
+    assertTrustedAppRendererEvent(e);
     requireDeviceLinkCapability();
     const p = (payload ?? {}) as { deviceId?: unknown };
     return handleRevoke(deps, p.deviceId);
   });
-  ipcMain.handle(DEVICE_LINK_INVOKE.RESTORE, (_e, payload: unknown) => {
+  ipcMain.handle(DEVICE_LINK_INVOKE.RESTORE, (e, payload: unknown) => {
+    assertTrustedAppRendererEvent(e);
     requireDeviceLinkCapability();
     const p = (payload ?? {}) as { deviceId?: unknown };
     return handleRestore(deps, p.deviceId);
@@ -1359,6 +1374,7 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
       expectedInvalidation?: unknown;
       expectedOwnerToken?: unknown;
       expectedAccountCounter?: unknown;
+      historyView?: unknown;
     };
     return handleMirrorCachePutMessages(
       getMirrorCache(),
@@ -1369,6 +1385,7 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
       p.expectedInvalidation,
       p.expectedOwnerToken,
       p.expectedAccountCounter,
+      p.historyView,
     );
   });
   ipcMain.handle(DEVICE_LINK_INVOKE.MIRROR_CACHE_GET_SESSION_LIST, (e) => {

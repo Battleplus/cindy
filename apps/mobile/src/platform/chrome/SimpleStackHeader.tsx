@@ -1,4 +1,7 @@
 import { Stack } from "expo-router";
+import { useTranslation } from 'react-i18next';
+import { QuietSyncIndicator } from '@/components/QuietSyncIndicator';
+import type { ReactNode } from "react";
 import { Platform, StyleSheet, View } from "react-native";
 import type { Edge } from "react-native-safe-area-context";
 import { Text } from "@/components/AppText";
@@ -33,39 +36,47 @@ export function simpleScreenSafeAreaEdges(): readonly Edge[] | undefined {
 
 export function SimpleStackHeader({
   action,
+  right,
   backTestID,
   eyebrow,
   onBack,
   subtitle,
   title,
   titleTestID,
+  syncing,
 }: {
   action?: MainWindowAction;
+  right?: ReactNode;
   backTestID?: string;
   eyebrow?: string;
   onBack?: () => void;
   subtitle?: string | null;
   title: string;
   titleTestID?: string;
+  syncing?: boolean;
 }) {
   const { colors } = useTheme();
+  const { t } = useTranslation();
   const styles = useThemedStyles(makeNativeTitleStyles);
 
   if (!usesNativeStackHeader()) {
     return (
       <ScreenHeader
         action={action}
+        right={right}
         backTestID={backTestID}
         eyebrow={eyebrow}
         onBack={onBack}
         subtitle={subtitle}
         title={title}
         titleTestID={titleTestID}
+        syncing={syncing}
       />
     );
   }
 
   return (
+    <>
     <Stack.Screen
       options={{
         headerShown: true,
@@ -78,32 +89,30 @@ export function SimpleStackHeader({
             <Text numberOfLines={1} style={styles.title}>
               {title}
             </Text>
+            {syncing !== undefined ? <QuietSyncIndicator active={syncing} /> : null}
           </View>
         ),
-        headerLeft: onBack
-          ? () => (
-              <ScreenBackButton
-                compact
-                onPress={onBack}
-                testID={backTestID ?? "screen.backButton"}
-              />
-            )
-          : undefined,
-        headerRight: action
+        headerRight: right ? () => right : action
           ? () => <MainWindowActionButton action={action} density="compact" />
           : undefined,
       }}
     />
+    {onBack ? <Stack.Toolbar placement="left">
+      <Stack.Toolbar.Button icon="chevron.backward" onPress={onBack} accessibilityLabel={t('shared.back')} />
+    </Stack.Toolbar> : null}
+    </>
   );
 }
 
 const makeNativeTitleStyles = (colors: ThemeColors) =>
   StyleSheet.create({
     wrap: {
+      flexDirection: 'row',
       alignItems: "center",
       maxWidth: 220,
     },
     title: {
+      flexShrink: 1,
       color: colors.textPrimary,
       fontSize: typeScale.body,
       fontWeight: fontWeight.medium,

@@ -98,6 +98,73 @@ describe('newMakerDraft store', () => {
     expect(reloaded.getDraft().defaultTupleCustomized).toBe(false);
   });
 
+  it.each([false, true])('Gateway 后到时仅更新未自定义草稿（手动选择=%s）', async (customized) => {
+    const { resolveNewMakerDefaultTuple } = await import('@/lib/newMakerDefaultTuple');
+    const { applySuggestedDefaultTuple, getDraft, markDefaultTupleCustomized } = await loadModule();
+    const sources: import('@cindy/model-providers').ProviderView[] = [
+      {
+        id: 'openai',
+        name: 'OpenAI',
+        source: 'builtin',
+        connected: true,
+        agents: ['codex'],
+        auth: { method: 'oauth' },
+        access: { kind: 'subscription', product: 'ChatGPT' },
+        routing: {},
+        models: {
+          codex: [
+            {
+              id: 'gpt-5.6-sol',
+              name: 'Sol',
+              contextWindow: 272000,
+              efforts: ['high'],
+              defaultEffort: 'high',
+            },
+          ],
+        },
+      },
+    ];
+    const resolve = () =>
+      resolveNewMakerDefaultTuple({
+        providers: sources,
+        providersLoading: false,
+        availableAgents: new Set(['cc', 'codex', 'pi']),
+        availableAgentsLoaded: true,
+      })!;
+    expect(applySuggestedDefaultTuple(resolve())).toBe(true);
+    expect(getDraft().vendor).toBe('codex');
+    if (customized) markDefaultTupleCustomized();
+    sources.push({
+      id: 'xd',
+      name: 'Cindy AI',
+      source: 'builtin',
+      connected: true,
+      agents: ['pi'],
+      auth: { method: 'managed' },
+      access: { kind: 'managed' },
+      routing: {},
+      models: {
+        pi: [
+          {
+            id: 'z-ai/glm-5.3-flash',
+            name: 'GLM',
+            contextWindow: 200000,
+            efforts: ['high'],
+            defaultEffort: 'high',
+            newSessionDefault: ['pi'],
+            modalities: { input: ['text', 'image'], output: ['text'] },
+          },
+        ],
+      },
+    });
+    expect(applySuggestedDefaultTuple(resolve())).toBe(!customized);
+    const draft = getDraft();
+    expect(draft.vendor).toBe(customized ? 'codex' : 'pi');
+    expect(draft.lastByVendor[draft.vendor].providerId).toBe(customized ? 'openai' : 'xd');
+    expect(draft.defaultTupleCustomized).toBe(customized);
+    expect(applySuggestedDefaultTuple(resolve())).toBe(false);
+  });
+
   it('用户明确改过组合后，登录态变化不再覆盖', async () => {
     const { applySuggestedDefaultTuple, getDraft, markDefaultTupleCustomized } = await loadModule();
     markDefaultTupleCustomized();
@@ -1741,5 +1808,50 @@ describe('newMakerDraft store', () => {
       patchDraft({ deviceLinkDeviceId: 'dev-a', deviceLinkDeviceName: 'Studio Mac', workingDir: '/host-a/other' });
       expect(getDraft().collab.workerConfig?.model).toBe('claude-opus-4-7');
     });
+  });
+});
+
+
+it('does not stamp a prior owner draft during the synchronous auth handoff', async () => {
+  const { setNewMakerDraftOwner, getDraftForOwnerPreferenceSync, patchCurrentVendorPrefs } = await loadModule();
+  setNewMakerDraftOwner('A');
+  patchCurrentVendorPrefs({ model: 'owner-a-model' });
+  expect(getDraftForOwnerPreferenceSync('B')).toBeNull();
+  setNewMakerDraftOwner('B');
+  expect(getDraftForOwnerPreferenceSync('B')?.lastByVendor.cc.model).not.toBe('owner-a-model');
+  expect(getDraftForOwnerPreferenceSync('A')).toBeNull();
+});
+
+describe('Bot default model write-through', () => {
+  async function setup() {
+    const store = await loadModule();
+    const owner = await import('@/contexts/dataOwnerGeneration');
+    owner.setDataOwnerGeneration('bot-owner', 8);
+    store.setNewMakerDraftOwner('bot-owner');
+    store.patchVendorPrefs('codex', { model: 'luna', providerId: 'openai', effort: 'medium' });
+    store.switchVendor('codex');
+    const route = { harness: 'codex' as const, providerId: 'openai', model: 'luna', effort: 'medium', fastMode: false };
+    return { store, selection: { requestId: "test-default-selection", route: { ...route, effort: 'low' }, expectedRoute: route,
+      ownerStamp: { dataOwnerId: 'bot-owner', ownerGeneration: 8 }, expiresAt: Date.now() + 5000 } };
+  }
+  it('persists the same default used by new tasks and survives reloading', async () => {
+    const { store, selection } = await setup();
+    expect(store.applyAppDefaultModelSelection(selection)).toBe(true);
+    vi.resetModules();
+    const reloaded = await loadModule();
+    reloaded.setNewMakerDraftOwner('bot-owner');
+    expect(reloaded.getDraft().lastByVendor.codex).toMatchObject({ model: 'luna', effort: 'low', providerId: 'openai' });
+    expect(reloaded.getDraft().vendor).toBe('codex');
+    expect(reloaded.getDraft().defaultTupleSelectionCustomized).toBe(true);
+  });
+  it.each(['owner', 'expiry', 'selection', 'disk'] as const)('refuses %s changes without reporting success', async reason => {
+    const { store, selection } = await setup();
+    if (reason === 'owner') selection.ownerStamp.ownerGeneration = 7;
+    if (reason === 'expiry') selection.expiresAt = Date.now() - 1;
+    if (reason === 'selection') store.patchVendorPrefs('codex', { model: 'a-new-user-choice' });
+    if (reason === 'disk') vi.spyOn(memStorage, 'setItem').mockImplementation(() => { throw new Error('full'); });
+    const before = store.getDraft();
+    expect(store.applyAppDefaultModelSelection(selection)).toBe(false);
+    expect(store.getDraft()).toEqual(before);
   });
 });

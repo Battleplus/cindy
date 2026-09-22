@@ -7,9 +7,9 @@
  *
  * 交互:
  *   - 左键 → 与正文文件链接同策(对齐 MarkdownRenderer activateResolvedLocalTarget):
- *     可识别文件直接在 Cindy 内打开——文本/代码 → TextLightbox,图片 → ImageLightbox,
- *     glb/gltf → ModelLightbox;其余(xlsx / pdf 等)交系统默认应用(远程会话取回
- *     缓存副本再打开)。
+ *     可识别文件直接在 Cindy 内打开——HTML → 安全网页预览,文本/代码 →
+ *     TextLightbox,图片 → ImageLightbox,glb/gltf → ModelLightbox;其余(xlsx /
+ *     pdf 等)交系统默认应用(远程会话取回缓存副本再打开)。
  *   - 右键 → 共享文件 chip 菜单(复制 / 路径 / 定位 / 打开方式…),与聊天里其它
  *     文件 chip 一致。
  *
@@ -27,10 +27,16 @@
  * 时间窗约束。远程会话无法读取创建时间,维持远端 stat 的存在性复核。
  */
 
+import { CHAT_FOCUS_CLASS, CHAT_COLOR_TRANSITION_CLASS } from './chatChrome';
 import { memo, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, FileText } from 'lucide-react';
+import { ChevronDown, ChevronUp, FileImage, FileText, Globe2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+import { useSidebarTargetSessionId } from '@/features/cc-agent/embeddedSessionNavigation';
+import {
+  generatedFileExtension,
+  partitionBotGeneratedFiles,
+} from '@/features/bots/botGeneratedArtifacts';
 import { cn } from '@/lib/utils';
 import type { DocumentArtifactMetadata, GeneratedFileRef } from '@/lib/generatedFiles';
 import { classifyMarkdownHref, toLocalFileUrl } from '@/lib/localPathResolver';
@@ -45,11 +51,13 @@ import {
 } from '@/lib/remoteFileOpen';
 import { shouldOpenTextLightboxForOrigin } from '@/lib/filePreview';
 import { rewriteToRemoteMediaOrigin } from '../../../shared/remoteMediaUrl';
+import { isBrowserOpenablePath } from '../../../shared/browserOpenableExts';
 import { useChatSessionFile } from './ChatSessionFileContext';
 import { useFileChipContextMenu } from './useFileChipContextMenu';
 import { ImageLightbox } from './ImageLightbox';
 import { TextLightbox } from './TextLightbox';
 import { ModelLightbox } from './ModelLightbox';
+import { isHtmlFilePath, openHtmlFileByPreference } from './useOpenWithMenu';
 
 function formatArtifactSummaryValue(summary: DocumentArtifactMetadata['summary']): number | string {
   if (!summary || summary.kind !== 'bytes') return summary?.value ?? '';
@@ -125,7 +133,7 @@ function DocumentCoverPreview({
             </span>
           )}
         </span>
-        <span className="mt-5 block h-1 w-9 rounded-[9999px] bg-[var(--doc-cover-accent)]" />
+        <span className="mt-5 block h-1 w-9 rounded-full bg-[var(--doc-cover-accent)]" />
         <span className="mt-3 line-clamp-2 text-15 font-semibold leading-5 text-[var(--doc-cover-ink)]">
           {title}
         </span>
@@ -152,7 +160,7 @@ function SlidePreview({ artifact, title }: { artifact: DocumentArtifactMetadata;
       data-document-theme={artifact.theme ?? 'light'}
     >
       <span className="min-w-0">
-        <span className="mx-auto mb-3 block h-1 w-9 rounded-[9999px] bg-[var(--doc-cover-accent)]" />
+        <span className="mx-auto mb-3 block h-1 w-9 rounded-full bg-[var(--doc-cover-accent)]" />
         <span className="block line-clamp-2 text-15 font-semibold leading-5 text-[var(--doc-cover-ink)]">
           {previewTitle}
         </span>
@@ -163,7 +171,7 @@ function SlidePreview({ artifact, title }: { artifact: DocumentArtifactMetadata;
         )}
       </span>
       {artifact.summary && (
-        <span className="absolute bottom-2 right-2 rounded-[9999px] border border-[var(--border-default)] px-2 py-0.5 text-11 text-[var(--doc-cover-muted)]">
+        <span className="absolute bottom-2 right-2 rounded-full border border-[var(--border-default)] px-2 py-0.5 text-11 text-[var(--doc-cover-muted)]">
           {t(`chat.generatedFiles.summary.${artifact.summary.kind}`, {
             count: formatArtifactSummaryValue(artifact.summary),
           })}
@@ -225,23 +233,40 @@ export function ArtifactPreview({
   return <DocumentCoverPreview artifact={artifact} title={title} />;
 }
 
-function GeneratedFileChip({ file }: { file: GeneratedFileRef }) {
+type GeneratedFilePresentation = 'default' | 'bot-primary' | 'bot-related';
+
+function GeneratedFileChip({
+  file,
+  presentation = 'default',
+}: {
+  file: GeneratedFileRef;
+  presentation?: GeneratedFilePresentation;
+}) {
   const { t } = useTranslation();
   const fileCtx = useChatSessionFile();
   const remoteOrigin = isRemoteFileOrigin(fileCtx.origin) ? fileCtx.origin : null;
-  const ctxMenu = useFileChipContextMenu({
-    getAbsPath: () => file.path,
-    // 生成物常是 .xlsx / .pdf / 图片等,"打开方式"对它们最有用;会话上下文
-    // (含侧边栏定位目标)由 useFileChipContextMenu 内部从 ChatSessionFileContext 取。
-    canOpenInBrowser: false,
-  });
-
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [textLightboxOpen, setTextLightboxOpen] = useState(false);
   const [modelLightboxPath, setModelLightboxPath] = useState<string | null>(null);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const htmlWithSession = isHtmlFilePath(file.path) ? fileCtx.sessionId : undefined;
+  const sidebarTargetSessionId = useSidebarTargetSessionId(htmlWithSession);
+  const ctxMenu = useFileChipContextMenu({
+    getAbsPath: () => file.path,
+    // HTML 左键看渲染结果；源码仍可从右键菜单进入。其它生成文件沿用原菜单。
+    canOpenInBrowser: isBrowserOpenablePath(file.path),
+    sidebarOpenSessionId: htmlWithSession,
+    onViewSource: htmlWithSession
+      ? async () => {
+          if (!(await shouldOpenTextLightboxForOrigin(fileCtx, file.path))) return;
+          setTextLightboxOpen(true);
+        }
+      : undefined,
+  });
 
-  // 左键与正文文件链接同策(见文件头注释)。非文本兜底交给
-  // shouldOpenTextLightboxForOrigin:本地 openPath、远程取回缓存副本,均含失败 toast。
+  // 左键与正文文件链接同策(见文件头注释)。HTML 按网页打开偏好渲染；其它
+  // 非文本兜底交给 shouldOpenTextLightboxForOrigin:本地 openPath、远程取回
+  // 缓存副本,均含失败 toast。
   const open = async (): Promise<void> => {
     const kind = classifyMarkdownHref(file.path);
     if (kind === 'image-local') {
@@ -277,6 +302,12 @@ function GeneratedFileChip({ file }: { file: GeneratedFileRef }) {
       setModelLightboxPath(file.path);
       return;
     }
+    if (htmlWithSession) {
+      if (sidebarTargetSessionId) {
+        await openHtmlFileByPreference(sidebarTargetSessionId, file.path, t, fileCtx);
+      }
+      return;
+    }
     if (!(await shouldOpenTextLightboxForOrigin(fileCtx, file.path))) return;
     setTextLightboxOpen(true);
   };
@@ -285,6 +316,22 @@ function GeneratedFileChip({ file }: { file: GeneratedFileRef }) {
   const format = artifact?.format;
   const formatLabel = format ? t(`chat.generatedFiles.formats.${format}`) : null;
   const artifactTitle = artifact?.title || file.name;
+  const fileExtension = generatedFileExtension(file).toUpperCase();
+  const localKind = classifyMarkdownHref(file.path);
+  const botImage = presentation === 'bot-primary' && localKind === 'image-local';
+  const botHtml = presentation === 'bot-primary' && isHtmlFilePath(file.path);
+  const botFile = presentation === 'bot-primary' && !artifact && !botImage && !botHtml;
+  const localBotThumbnail = botImage ? toLocalFileUrl(file.path) : null;
+  const rewrittenBotThumbnail = localBotThumbnail
+    ? rewriteToRemoteMediaOrigin(
+        localBotThumbnail,
+        toRemoteMediaOrigin(fileCtx.origin, fileCtx.workingDir),
+      )
+    : null;
+  // 远端 workdir 外的路径无法改写成远端媒体 URL。此时先退文件图标，避免
+  // xdt-file:// 误读本机同名路径；点击仍会走既有的下载缓存 + Lightbox 链路。
+  const botThumbnail =
+    remoteOrigin && rewrittenBotThumbnail === localBotThumbnail ? null : rewrittenBotThumbnail;
   const summaryLabel = artifact?.summary
     ? t(`chat.generatedFiles.summary.${artifact.summary.kind}`, {
         count: formatArtifactSummaryValue(artifact.summary),
@@ -299,9 +346,14 @@ function GeneratedFileChip({ file }: { file: GeneratedFileRef }) {
         onClick={() => void open()}
         onContextMenu={ctxMenu.onContextMenu}
         className={cn(
-          artifact
-            ? 'group block w-full max-w-[420px] cursor-pointer overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-left transition-colors hover:border-[var(--text-tertiary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]'
-            : 'inline-flex h-7 max-w-[280px] items-center gap-1.5 rounded-[9999px] bg-[var(--msg-md-inline-code-bg)] px-2.5 py-1.5 text-13 font-medium text-[var(--msg-assistant-text)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]',
+          CHAT_FOCUS_CLASS,
+          CHAT_COLOR_TRANSITION_CLASS,
+          artifact || presentation === 'bot-primary'
+            ? [
+                'group block cursor-pointer overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-left hover:border-[var(--text-tertiary)]',
+                artifact ? 'w-full max-w-[420px]' : 'min-w-0 flex-1 basis-[220px]',
+              ]
+            : 'inline-flex h-7 max-w-[280px] items-center gap-1.5 rounded-full bg-[var(--msg-md-inline-code-bg)] px-2.5 py-1.5 text-13 font-medium text-[var(--msg-assistant-text)] hover:bg-[var(--cmd-palette-item-hover)]',
         )}
       >
         {artifact ? (
@@ -329,6 +381,56 @@ function GeneratedFileChip({ file }: { file: GeneratedFileRef }) {
               </span>
             </span>
           </>
+        ) : botImage ? (
+          <>
+            {botThumbnail && !thumbnailFailed ? (
+              <img
+                src={botThumbnail}
+                alt={file.name}
+                onError={() => setThumbnailFailed(true)}
+                className="h-[148px] w-full border-b border-[var(--border-default)] bg-[var(--surface-hover)] object-contain"
+              />
+            ) : (
+              <span className="flex h-[104px] w-full items-center justify-center border-b border-[var(--border-default)] bg-[var(--surface-hover)] text-[var(--text-tertiary)]">
+                <FileImage size={24} aria-hidden="true" />
+              </span>
+            )}
+            <span className="flex min-w-0 items-center gap-2 px-3 py-2.5">
+              <span className="min-w-0 flex-1 truncate text-13 font-medium text-[var(--text-primary)]">
+                {file.name}
+              </span>
+              <span className="shrink-0 text-11 text-[var(--text-tertiary)]">{fileExtension}</span>
+            </span>
+          </>
+        ) : botHtml ? (
+          <>
+            <span className="flex h-[104px] w-full flex-col items-center justify-center gap-2 border-b border-[var(--border-default)] bg-[var(--surface-hover)] text-[var(--text-secondary)]">
+              <Globe2 size={24} aria-hidden="true" />
+              <span className="text-11">{t('chat.generatedFiles.openWebPreview')}</span>
+            </span>
+            <span className="flex min-w-0 items-center gap-2 px-3 py-2.5">
+              <span className="min-w-0 flex-1 truncate text-13 font-medium text-[var(--text-primary)]">
+                {file.name}
+              </span>
+              <span className="shrink-0 text-11 text-[var(--text-tertiary)]">HTML</span>
+            </span>
+          </>
+        ) : botFile ? (
+          <span className="flex min-h-[64px] min-w-0 items-center gap-3 px-3 py-2.5">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[var(--surface-hover)] text-[var(--text-secondary)]">
+              <FileText size={16} aria-hidden="true" />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-13 font-medium text-[var(--text-primary)]">
+                {file.name}
+              </span>
+              {fileExtension ? (
+                <span className="mt-0.5 block text-11 text-[var(--text-tertiary)]">
+                  {fileExtension}
+                </span>
+              ) : null}
+            </span>
+          </span>
         ) : (
           <>
             <FileText size={14} className="shrink-0 opacity-70" />
@@ -553,37 +655,55 @@ export function mergeGeneratedFileStatResults(input: {
 
 /** 折叠阈值:约两行 chip。超过则收起为「前 N 个 + 再显示 M 个文件」。 */
 const MAX_VISIBLE_FILES = 6;
+const MAX_VISIBLE_BOT_ARTIFACTS = 4;
 
 function generatedFilesCardPropsEqual(
   prev: {
+    renderItemKey?: string;
     files: readonly GeneratedFileRef[];
     turnStartMs: number | null;
     turnEndMs: number | null;
     turnSealed?: boolean;
+    botArtifacts?: boolean;
+    onVisibilityChange?: (checkKey: string, visible: boolean) => void;
   },
   next: {
+    renderItemKey?: string;
     files: readonly GeneratedFileRef[];
     turnStartMs: number | null;
     turnEndMs: number | null;
     turnSealed?: boolean;
+    botArtifacts?: boolean;
+    onVisibilityChange?: (checkKey: string, visible: boolean) => void;
   },
 ): boolean {
   return (
+    prev.renderItemKey === next.renderItemKey &&
+    prev.botArtifacts === next.botArtifacts &&
+    prev.onVisibilityChange === next.onVisibilityChange &&
     generatedFilesCheckKey(prev.files, prev.turnStartMs, prev.turnEndMs, prev.turnSealed) ===
-    generatedFilesCheckKey(next.files, next.turnStartMs, next.turnEndMs, next.turnSealed)
+      generatedFilesCheckKey(next.files, next.turnStartMs, next.turnEndMs, next.turnSealed)
   );
 }
 
 export const GeneratedFilesCard = memo(function GeneratedFilesCard({
+  renderItemKey,
   files,
   turnStartMs,
   turnEndMs,
   turnSealed = false,
+  botArtifacts = false,
+  onVisibilityChange,
 }: {
+  renderItemKey?: string;
   files: readonly GeneratedFileRef[];
   turnStartMs: number | null;
   turnEndMs: number | null;
   turnSealed?: boolean;
+  /** 伙伴会话专属：成果优先、辅助文件默认收起。 */
+  botArtifacts?: boolean;
+  /** Report the same checked visibility used by the card, never candidate paths. */
+  onVisibilityChange?: (checkKey: string, visible: boolean) => void;
 }) {
   const { t } = useTranslation();
   const fileCtx = useChatSessionFile();
@@ -592,6 +712,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
   // 已确认的路径不重复 IPC,工作目录 / 远端来源变了才整卡重来。
   const [existing, setExisting] = useState<GeneratedFileRef[] | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [relatedExpanded, setRelatedExpanded] = useState(false);
   const [remoteVerdictGen, setRemoteVerdictGen] = useState(0);
   const checkKey = generatedFilesCheckKey(files, turnStartMs, turnEndMs, turnSealed);
   const filesRef = useRef(files);
@@ -641,6 +762,9 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
       turnSealed,
     });
     visibleRef.current = plan.visible;
+    // A remounted viewport starts with unknown visibility. Keep the parent's
+    // last confirmation until this check settles instead of reviving prose.
+    if (plan.visible !== null) onVisibilityChange?.(checkKey, plan.visible.length > 0);
     if (plan.visible === null) {
       setExisting(null);
     } else {
@@ -696,6 +820,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
         turnWindowChanged,
       });
       visibleRef.current = merged;
+      onVisibilityChange?.(checkKey, merged.length > 0);
       setExisting((prev) => reuseGeneratedFilesIfUnchanged(prev, merged));
     })();
 
@@ -710,9 +835,77 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
     turnSealed,
     fileCtx.workingDir,
     remoteVerdictGen,
+    onVisibilityChange,
   ]);
 
   if (!existing || existing.length === 0) return null;
+
+  if (botArtifacts) {
+    const { primary, related } = partitionBotGeneratedFiles(existing, fileCtx.workingDir);
+    const visiblePrimary = expanded ? primary : primary.slice(0, MAX_VISIBLE_BOT_ARTIFACTS);
+    const hiddenPrimaryCount = primary.length - visiblePrimary.length;
+
+    return (
+      <div data-render-item-key={renderItemKey} className="my-1 flex max-w-[680px] flex-col gap-2" data-testid="bot-generated-artifacts">
+        {primary.length > 0 ? (
+          <>
+            <span className="text-12 font-medium text-[var(--text-secondary)]">
+              {t('chat.generatedFiles.botTitle')}
+            </span>
+            <div className="flex flex-wrap gap-2">
+              {visiblePrimary.map((file) => (
+                <GeneratedFileChip key={file.path} file={file} presentation="bot-primary" />
+              ))}
+            </div>
+            {hiddenPrimaryCount > 0 ? (
+              <button
+                type="button"
+                onClick={() => setExpanded(true)}
+                className="flex h-7 w-fit items-center gap-1 rounded-full px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
+              >
+                {t('chat.generatedFiles.showMore', { count: hiddenPrimaryCount })}
+                <ChevronDown size={14} className="shrink-0" />
+              </button>
+            ) : null}
+            {expanded && primary.length > MAX_VISIBLE_BOT_ARTIFACTS ? (
+              <button
+                type="button"
+                onClick={() => setExpanded(false)}
+                className="flex h-7 w-fit items-center gap-1 rounded-full px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
+              >
+                {t('chat.generatedFiles.showLess')}
+                <ChevronUp size={14} className="shrink-0" />
+              </button>
+            ) : null}
+          </>
+        ) : null}
+        {related.length > 0 ? (
+          <div className="flex flex-col items-start gap-2">
+            <button
+              type="button"
+              onClick={() => setRelatedExpanded((value) => !value)}
+              aria-expanded={relatedExpanded}
+              className="flex h-7 items-center gap-1 rounded-full px-2.5 py-1.5 text-12 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)] hover:text-[var(--text-secondary)]"
+            >
+              {t('chat.generatedFiles.relatedFiles', { count: related.length })}
+              {relatedExpanded ? (
+                <ChevronUp size={13} className="shrink-0" />
+              ) : (
+                <ChevronDown size={13} className="shrink-0" />
+              )}
+            </button>
+            {relatedExpanded ? (
+              <div className="flex flex-wrap gap-2">
+                {related.map((file) => (
+                  <GeneratedFileChip key={file.path} file={file} presentation="bot-related" />
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
 
   // 折叠(对标 Codex 的可展开产物列表):超过 MAX_VISIBLE_FILES 时只显示前
   // MAX_VISIBLE_FILES 个 + 「再显示 N 个文件」;展开后提供「收起」回折。
@@ -723,7 +916,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
   const hasOnlyArtifacts = existing.every((file) => file.artifact);
 
   return (
-    <div className="my-1 flex flex-col gap-2">
+    <div data-render-item-key={renderItemKey} className="my-1 flex flex-col gap-2">
       {!hasOnlyArtifacts && (
         <span className="text-12 font-medium text-[var(--text-secondary)]">
           {t('chat.generatedFiles.title')}
@@ -738,7 +931,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
             type="button"
             onClick={() => setExpanded(true)}
             className={cn(
-              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-[9999px]',
+              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-full',
               'text-13 text-[var(--text-secondary)]',
               'hover:bg-[var(--cmd-palette-item-hover)] transition-colors cursor-pointer',
             )}
@@ -752,7 +945,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
             type="button"
             onClick={() => setExpanded(false)}
             className={cn(
-              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-[9999px]',
+              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-full',
               'text-13 text-[var(--text-secondary)]',
               'hover:bg-[var(--cmd-palette-item-hover)] transition-colors cursor-pointer',
             )}

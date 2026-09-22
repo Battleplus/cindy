@@ -133,6 +133,22 @@ export {
   type SearchChatHistoryToolDeps,
 } from './search_chat_history.js';
 export {
+  registerBotSkillTools,
+  type BotSkillCallbacks,
+  type BotSkillSummaryWire,
+  type BotSkillToolDeps,
+} from './bot_skills.js';
+export {
+  registerCreateTeammateTool,
+  type CreateTeammateCallbacks,
+} from './create_teammate.js';
+export {
+  registerBotCapabilityTools,
+  buildFindBotCapabilitiesDescription,
+  withCindyGatedBotToolDescriptions,
+  type BotCapabilityCallbacks,
+} from './bot_capabilities.js';
+export {
   registerSubmitGithubIssueTool,
   type SubmitGithubIssueDeps,
   type SubmitGithubIssueHostResult,
@@ -140,6 +156,13 @@ export {
   type SubmitGithubIssueHostErr,
   type SubmitGithubIssueHostErrorCode,
 } from './submit_github_issue.js';
+export {
+  registerStartSkillLearningTool,
+  type AuthorizedSkillLearningContext,
+  type AuthorizeSkillLearningCallback,
+  type StartSkillLearningCallback,
+  type StartSkillLearningParams,
+} from './start_skill_learning.js';
 export type {
   XdtHelperHistoryDeps,
   HistoryAgentKind,

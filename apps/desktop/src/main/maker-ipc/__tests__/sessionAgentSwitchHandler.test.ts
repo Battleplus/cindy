@@ -76,6 +76,96 @@ const validParams = {
   providerId: null,
 };
 
+describe('same-engine selection at send', () => {
+  function selectionHarness() {
+    const pending = createPendingAgentSwitchRegistry();
+    let row = makeRow({ agentKind: 'codex', model: 'gpt-6-astra', providerId: 'openai' });
+    const apply = vi.fn(async (intent: PendingAgentSwitchIntent) => {
+      row = { ...row, model: intent.model, providerId: intent.providerId ?? null };
+    });
+    const { deps, calls } = makeDeps({
+      pendingSwitches: pending,
+      getSessionRow: async () => row,
+      selectSameAgentModel: async (id, intent, applyNow) => {
+        if (!applyNow) {
+          pending.set(id, intent);
+          return { deferred: true };
+        }
+        await apply(intent);
+        return { deferred: false };
+      },
+    });
+    return { deps, pending, apply, calls, row: () => row };
+  }
+
+  it('keeps the source thread untouched while selecting away and back, and applies only the final choice on send', async () => {
+    const h = selectionHarness();
+    for (const [model, providerId] of [['gpt-5.6-sol', 'xd'], ['gpt-6-astra', 'openai']]) {
+      expect(await performSessionAgentSwitch(h.deps, {
+        sessionId: 's1', targetAgentKind: 'codex', model, providerId, effort: 'high', fastMode: false,
+      })).toMatchObject({ deferred: true, switched: false });
+    }
+    expect(h.apply).not.toHaveBeenCalled();
+    expect(h.row()).toMatchObject({ model: 'gpt-6-astra', providerId: 'openai', sdkSessionId: 'sdk-old' });
+    expect(h.calls).toEqual([]);
+    await applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    await applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    expect(h.apply).toHaveBeenCalledTimes(1);
+    expect(h.apply).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6-astra', providerId: 'openai' }));
+    expect(h.pending.get('s1')).toBeUndefined();
+    expect(h.calls).toEqual([]);
+  });
+
+  it('keeps an internal cross-engine apply that already reached its target as a no-op', async () => {
+    const h = selectionHarness();
+    const select = vi.spyOn(h.deps, 'selectSameAgentModel');
+    const result = await performSessionAgentSwitch(h.deps, { ...validParams, applyNow: true });
+    expect(result).toMatchObject({ switched: false, engineReady: true });
+    expect(select).not.toHaveBeenCalled();
+    expect(h.apply).not.toHaveBeenCalled();
+    expect(h.row()).toMatchObject({ model: 'gpt-6-astra', providerId: 'openai' });
+  });
+
+  it('fails the send on preparation failure and retains the final selection for retry', async () => {
+    const h = selectionHarness();
+    await performSessionAgentSwitch(h.deps, { ...validParams, providerId: 'xd' });
+    h.apply.mockRejectedValueOnce(new Error('target is disconnected'));
+    await expect(applyPendingAgentSwitchIfIdle(h.deps, 's1')).rejects.toThrow('target is disconnected');
+    expect(h.pending.get('s1')?.providerId).toBe('xd');
+    expect(h.row().providerId).toBe('openai');
+    await applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    expect(h.row().providerId).toBe('xd');
+  });
+
+  it('does not apply before a running turn settles, or when send has been canceled', async () => {
+    const h = selectionHarness();
+    await performSessionAgentSwitch(h.deps, validParams);
+    h.deps.getLiveSession = () => ({ isTurnRunning: () => true });
+    await applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    expect(h.apply).not.toHaveBeenCalled();
+    h.deps.getLiveSession = () => ({ isTurnRunning: () => false });
+    const abort = new AbortController();
+    abort.abort();
+    await expect(applyPendingAgentSwitchIfIdle(h.deps, 's1', { signal: abort.signal })).rejects.toThrow('aborted');
+    expect(h.apply).not.toHaveBeenCalled();
+    expect(h.pending.get('s1')).toBeDefined();
+  });
+
+  it('coalesces concurrent sends and does not clear a newer pending selection', async () => {
+    const h = selectionHarness();
+    await performSessionAgentSwitch(h.deps, validParams);
+    let finish!: () => void;
+    h.apply.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const first = applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    const second = applyPendingAgentSwitchIfIdle(h.deps, 's1');
+    h.pending.set('s1', { targetAgentKind: 'codex', model: 'gpt-6-astra', providerId: 'openai', sameAgentSelection: true });
+    finish();
+    await Promise.all([first, second]);
+    expect(h.apply).toHaveBeenCalledTimes(1);
+    expect(h.pending.get('s1')?.model).toBe('gpt-6-astra');
+  });
+});
+
 describe('performSessionAgentSwitch', () => {
   it('cycles Claude → Codex → Pi → Claude → Codex and recovers a broken parked thread once', async () => {
     let row = makeRow();
@@ -748,6 +838,33 @@ describe('Phase 2:切回停泊引擎(resume + 增量交接)', () => {
       ...overrides,
     });
   }
+
+  it.each([false, true])('Agent recovery retains its source and blocks sending (missing boundary=%s)', async (missingBoundary) => {
+    const pending = createPendingAgentSwitchRegistry();
+    const { deps } = makeResumeDeps({
+      pendingSwitches: pending,
+      bootstrapSwitchedSession: vi.fn(async () => { throw new Error('resume unavailable'); }),
+      applyResumeFallbackAtomically: vi.fn(async () => { throw new Error('transaction unavailable'); }),
+      ...(missingBoundary ? { insertBoundaryMessage: vi.fn(async () => { throw new Error('boundary unavailable'); }) } : {}),
+    });
+    await performSessionAgentSwitch(deps, { ...validParams, runtimeSource: 'agent' });
+    await expect(applyPendingAgentSwitchIfIdle(deps, 's1')).rejects.toThrow('recovery is pending');
+    expect(pending.get('s1')).toMatchObject({ runtimeSource: 'agent', resumeFallbackRecovery: { boundaryClientId: missingBoundary ? null : 'boundary-client-1' } });
+    await expect(applyPendingAgentSwitchIfIdle(deps, 's1')).rejects.toThrow(missingBoundary ? 'boundary unavailable' : 'transaction unavailable');
+    expect(pending.get('s1')?.runtimeSource).toBe('agent');
+  });
+
+  it('consumes an Agent harness selection through the existing history handoff transaction', async () => {
+    const pending = createPendingAgentSwitchRegistry();
+    const { deps, calls } = makeResumeDeps({ pendingSwitches: pending });
+    await performSessionAgentSwitch(deps, { ...validParams, runtimeSource: 'agent' });
+    expect(calls).toEqual([]);
+    await applyPendingAgentSwitchIfIdle(deps, 's1');
+    expect(calls).toContain('db');
+    expect(calls).toContain('boundary');
+    expect(calls).toContain('bootstrap');
+    expect(pending.get('s1')).toBeUndefined();
+  });
 
   it('有停泊绑定:DB 落停泊 id、交接为增量模式、边界行标 resumed', async () => {
     const { deps } = makeResumeDeps();

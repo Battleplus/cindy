@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   setSessionProvider: vi.fn(),
   hydrateSessionProvider: vi.fn(),
   setSessionFastMode: vi.fn(),
+  setSessionEffort: vi.fn(),
   isSessionInTurn: vi.fn(),
 }));
 
@@ -46,6 +47,7 @@ vi.mock('../../maker-host/session-provider-store.js', () => ({
 
 vi.mock('../../maker-host/session-effort-store.js', () => ({
   setSessionFastMode: mocks.setSessionFastMode,
+  setSessionEffort: mocks.setSessionEffort,
 }));
 
 vi.mock('../../localDb/ipc/messages.js', () => ({
@@ -77,6 +79,9 @@ vi.mock('../runners/_shared', () => ({
 }));
 
 import { MakerScheduleRunner } from '../runner';
+import { applyScheduledModelSelection, resolveScheduledModelSelection } from '../../maker-ipc/scheduledModelSelection';
+import type { ProviderView } from '@cindy/model-providers';
+import type { Scheduler } from '@cindy/maker-scheduler';
 
 type SessionSendOptions = Parameters<Session['send']>[1];
 type SendImpl = (
@@ -221,11 +226,14 @@ function createRunnerHarness(
     model?: string;
     effort?: string;
     fastMode?: boolean;
+    agentKind?: Session['agentKind'];
     workDir?: string;
     sdkSessionId?: string;
   } | null = null,
   opts: {
     sessionAlive?: boolean;
+    acquirePendingAgentSwitch?: ConstructorParameters<typeof MakerScheduleRunner>[0]['acquirePendingAgentSwitch'];
+    resolveModelSelection?: ConstructorParameters<typeof MakerScheduleRunner>[0]['resolveModelSelection'];
     activeSessions?: Session[];
     availableModels?: Array<{
       id: string;
@@ -262,6 +270,8 @@ function createRunnerHarness(
     notifier,
     logger: createLogger(),
     checkModelRoute: opts.checkModelRoute,
+    acquirePendingAgentSwitch: opts.acquirePendingAgentSwitch,
+    resolveModelSelection: opts.resolveModelSelection,
     resolveRouteCopyCapabilities: opts.resolveRouteCopyCapabilities,
     resolveDefaultModelRoute: opts.resolveDefaultModelRoute,
   });
@@ -292,6 +302,106 @@ describe('MakerScheduleRunner model selection', () => {
     mocks.setSessionFastMode.mockReset();
     mocks.isSessionInTurn.mockReturnValue(false);
     mocks.getSessionRowSnapshot.mockResolvedValue({ status: 'active' });
+  });
+
+  describe('resolved automation selection survives the full fire', () => {
+    it.each(['active', 'archived', 'missing'] as const)('uses the explicit Pi route for a %s Codex target', async (status) => {
+      const h = createSessionHarness();
+      Object.assign(h.session, { agentKind: 'pi', model: 'shared-model' });
+      const release = vi.fn();
+      const providers = [{
+        id: 'selected', name: 'Selected', source: 'user', connected: true, agents: ['pi'],
+        auth: { method: 'none' }, routing: { pi: {} },
+        models: { pi: [{ id: 'shared-model', name: 'Shared', efforts: ['medium', 'high'], defaultEffort: 'high', supportsFastMode: false }] },
+      }] as unknown as ProviderView[];
+      mocks.getSessionRowSnapshot.mockResolvedValue(status === 'missing' ? null : { status });
+      const harness = createRunnerHarness(h, { agentKind: 'pi', model: 'shared-model', effort: 'high', fastMode: false, workDir: '/work' }, {
+        sessionAlive: status === 'active',
+        // The merged copy deliberately conflicts with the selected provider copy.
+        availableModels: [{ id: 'shared-model', efforts: ['low'], defaultEffort: 'low' }],
+        acquirePendingAgentSwitch: async (_id, _signal, selection) => ({
+          release,
+          selection: await applyScheduledModelSelection(selection!, {
+            getTarget: async () => status === 'missing' ? null : { agentKind: 'codex', status },
+            isBusy: () => false,
+            resolveSelection: async (choice) => resolveScheduledModelSelection(choice, providers),
+            switchHarness: async () => ({ engineReady: true }),
+            applyModel: async () => {},
+          }),
+        }),
+      });
+      const update = vi.fn(async () => undefined);
+      harness.runner.attachScheduler({ update, isRunSilenced: () => false } as unknown as Scheduler);
+      const schedule = baseSchedule({ agentKind: 'codex', modelAgentKind: 'pi', model: 'shared-model',
+        targetSessionId: h.session.id, persistentSession: true, effort: 'ultra', fastMode: true });
+      const saved = structuredClone(schedule);
+      const opts = await fireToCompletion(harness, h, schedule);
+      expect(opts).toMatchObject({ agentKind: 'pi', model: 'shared-model', providerId: 'selected', effort: 'high', fastMode: false });
+      expect(mocks.setSessionFastMode).toHaveBeenLastCalledWith(h.session.id, false);
+      expect(mocks.setSessionEffort).toHaveBeenLastCalledWith(h.session.id, 'high');
+      expect(mocks.backfillSessionMeta).toHaveBeenCalledWith(expect.anything(), h.session.id,
+        expect.objectContaining({ effort: 'high', fastMode: false, providerId: 'selected' }), expect.anything());
+      expect(h.setEffort.mock.calls.flat()).not.toContain('low');
+      expect(schedule).toEqual(saved);
+      expect(release).toHaveBeenCalledTimes(1);
+      if (status !== 'active') {
+        expect(update).toHaveBeenCalledWith(schedule.id, { targetSessionId: undefined });
+        expect(update).toHaveBeenCalledWith(schedule.id, { targetSessionId: h.session.id });
+        expect(harness.createSession.mock.calls[0][0].id).not.toBe(schedule.targetSessionId);
+      }
+    });
+
+    it.each([null, 'ultra', 'none'] as const)('resolves fresh explicit routes before creation, including %s effort', async (effort) => {
+      const h = createSessionHarness();
+      Object.assign(h.session, { agentKind: 'pi', model: 'shared-model' });
+      const selectedEfforts = effort === 'none' ? [] : ['medium', 'high'];
+      const providers = [{
+        id: 'selected', name: 'Selected', connected: true, agents: ['pi'],
+        models: { pi: [{ id: 'shared-model', name: 'Shared', efforts: selectedEfforts,
+          defaultEffort: effort === 'none' ? null : 'high', supportsFastMode: false }] },
+      }, {
+        id: 'other', name: 'Other', connected: true, agents: ['pi'],
+        models: { pi: [{ id: 'shared-model', name: 'Shared', efforts: ['ultra'], defaultEffort: 'ultra', supportsFastMode: true }] },
+      }] as unknown as ProviderView[];
+      const resolveModelSelection = vi.fn(async (choice) => resolveScheduledModelSelection(choice, providers));
+      const harness = createRunnerHarness(h, null, {
+        availableModels: [{ id: 'shared-model', efforts: ['ultra'], defaultEffort: 'ultra' }],
+        resolveModelSelection,
+      });
+      const schedule = baseSchedule({ agentKind: 'pi', modelAgentKind: 'pi', model: 'shared-model',
+        providerId: 'selected', effort: effort === null ? undefined : 'ultra', fastMode: true });
+      const saved = structuredClone(schedule);
+      const opts = await fireToCompletion(harness, h, schedule);
+      const expectedEffort = effort === 'none' ? undefined : 'high';
+      expect(opts).toMatchObject({ agentKind: 'pi', model: 'shared-model', providerId: 'selected',
+        effort: expectedEffort, fastMode: false });
+      expect(resolveModelSelection).toHaveBeenCalledTimes(1);
+      expect(resolveModelSelection.mock.invocationCallOrder[0]).toBeLessThan(harness.createSession.mock.invocationCallOrder[0]);
+      expect(mocks.setSessionFastMode).toHaveBeenLastCalledWith(h.session.id, false);
+      expect(mocks.setSessionEffort).toHaveBeenLastCalledWith(h.session.id, expectedEffort ?? null);
+      expect(mocks.backfillSessionMeta).toHaveBeenCalledWith(expect.anything(), h.session.id,
+        expect.objectContaining({ effort: expectedEffort, fastMode: false, providerId: 'selected' }), expect.anything());
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(schedule).toEqual(saved);
+    });
+
+    it('keeps resolved null effort instead of restoring saved or historical tiers', async () => {
+      const h = createSessionHarness();
+      Object.assign(h.session, { agentKind: 'pi', model: 'fixed-model' });
+      const harness = createRunnerHarness(h, { agentKind: 'pi', model: 'fixed-model', effort: 'ultra', workDir: '/work' }, {
+        sessionAlive: true,
+        availableModels: [{ id: 'fixed-model', efforts: ['low'], defaultEffort: 'low' }],
+        acquirePendingAgentSwitch: async () => ({ release: vi.fn(), selection: {
+          agentKind: 'pi', model: 'fixed-model', providerId: 'selected', effort: null, fastMode: false,
+        } }),
+      });
+      const opts = await fireToCompletion(harness, h, baseSchedule({ agentKind: 'pi', modelAgentKind: 'pi',
+        model: 'fixed-model', targetSessionId: h.session.id, effort: 'high', fastMode: true }));
+      expect(opts.effort).toBeUndefined();
+      expect(h.setEffort).not.toHaveBeenCalled();
+      expect(mocks.setSessionEffort).toHaveBeenLastCalledWith(h.session.id, null);
+      expect(mocks.backfillSessionMeta.mock.calls.at(-1)?.[2].effort).toBeUndefined();
+    });
   });
 
   describe('effort reconcile —— fire 时按所选模型能力 clamp(issue #456)', () => {
@@ -592,7 +702,7 @@ describe('MakerScheduleRunner model selection', () => {
       expect(requiresModelSwitchRebuild).toHaveBeenCalledWith('gpt-5.6-sol', {
         providerId: 'mygpt',
       });
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.closeSession.mock.invocationCallOrder[0]).toBeLessThan(
         harness.createSession.mock.invocationCallOrder[0],
       );
@@ -1258,7 +1368,7 @@ describe('MakerScheduleRunner model selection', () => {
         }),
       );
 
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.closeSession.mock.invocationCallOrder[0]).toBeLessThan(
         harness.createSession.mock.invocationCallOrder[0],
       );
@@ -1360,7 +1470,7 @@ describe('MakerScheduleRunner model selection', () => {
         }),
       );
 
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.closeSession.mock.invocationCallOrder[0]).toBeLessThan(
         harness.createSession.mock.invocationCallOrder[0],
       );
@@ -1451,7 +1561,7 @@ describe('MakerScheduleRunner model selection', () => {
       );
 
       expect(harness.closeSession).toHaveBeenCalledTimes(1);
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.createSession).toHaveBeenCalledWith(
         expect.objectContaining({ providerId: routeB!.providerId, model: 'shared-model' }),
       );
@@ -1489,7 +1599,7 @@ describe('MakerScheduleRunner model selection', () => {
         }),
       );
 
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.createSession).toHaveBeenCalledWith(
         expect.objectContaining({ providerId: routeA.providerId, model: 'chat-model' }),
       );
@@ -1536,7 +1646,7 @@ describe('MakerScheduleRunner model selection', () => {
       );
 
       expect(harness.closeSession).toHaveBeenCalledTimes(1);
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.closeSession).not.toHaveBeenCalledWith('unrelated-busy-codex');
       expect(harness.closeSession.mock.invocationCallOrder[0]).toBeLessThan(
         harness.createSession.mock.invocationCallOrder[0],
@@ -1608,7 +1718,7 @@ describe('MakerScheduleRunner model selection', () => {
         }),
       );
 
-      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session');
+      expect(harness.closeSession).toHaveBeenCalledWith('scheduler-session', 'runtime-refresh');
       expect(harness.closeSession.mock.invocationCallOrder[0]).toBeLessThan(
         harness.createSession.mock.invocationCallOrder[0],
       );

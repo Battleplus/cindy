@@ -201,7 +201,8 @@ export function useSessionRunningStatus(
         // 续跑),标记若被第一次中间 done 消费掉,最终那次真 done 就会当成普通完成
         // 把系统通知发出去。标记的清除只由 scheduler 事件驱动,见
         // silencedSessionDoneStore 的文件头注释。
-        const isSilencedDone = !hasError && isSessionDoneSilenced(sessionId);
+        const isSilencedDone = !hasError && (isSessionDoneSilenced(sessionId)
+          || makerChatStore.wasLastStopPrivateReply(sessionId));
         // Scheduler 已按 schedule.notify 接管这次终态的桌面 / 飞书通知。这里只
         // 抑制 callback。成功绿点改认 schedule 未读,不再从这条 running→done 点
         // `done` attention;失败红点仍立即挂。debounce 落地还会再读一次标记,
@@ -224,6 +225,10 @@ export function useSessionRunningStatus(
         // 不进 debounce 调度。中间 done 与最终 done 都会走到这里。
         if (isSilencedDone) continue;
 
+        // A recoverable interruption clears the terminal error while waiting to
+        // retry. That idle gap is not completion, even if it lasts beyond debounce.
+        if (makerChatStore.hasSessionRecoveryPending(sessionId)) continue;
+
         // 正常 done:走 debounce。QUEUE_DEBOUNCE_MS 内若同 session 又变 running
         // (main 自动衔接下一条队列),上面的 "--- 1. Detect new turn starts ---"
         // 分支会 clearTimeout 取消这次。窗口过完仍是 not-running,才认为队列真的
@@ -235,6 +240,8 @@ export function useSessionRunningStatus(
         const wasActiveAtCompletion = sessionId === activeSessionId;
         const timer = setTimeout(() => {
           pendingDoneTimersRef.current.delete(sessionId);
+          // Recovery may have been projected after this timer was scheduled.
+          if (makerChatStore.hasSessionRecoveryPending(sessionId)) return;
           // 落地前重查一次当前状态:若此刻会话正等待用户输入(ask-user / permission /
           // plan-review),不要用 done 橙角标覆盖 section 3 已亮的 awaiting 黄角标 ——
           // 否则「需要处理的交互」被降级成「已完成」,用户看不到。非 debounce 版本里
@@ -255,7 +262,8 @@ export function useSessionRunningStatus(
               cur.hasPendingPlanReview ||
               cur.hasPendingPluginSetup);
           // silenced 可能在 debounce 窗口内才到:转换当时没静默、进了 debounce,落地必须再读。
-          if (!hasTerminalError && isSessionDoneSilenced(sessionId)) return;
+          if (!hasTerminalError && (isSessionDoneSilenced(sessionId)
+            || makerChatStore.wasLastStopPrivateReply(sessionId))) return;
           const ownedNow = isSessionTerminalNotificationOwnedByScheduler(sessionId);
           if (
             !wasActiveAtCompletion &&
@@ -263,11 +271,12 @@ export function useSessionRunningStatus(
             !isRunning &&
             !hasTerminalError &&
             !stillPending &&
+            getSessionAttentionKind(sessionId) !== 'error' &&
             !ownedNow
           ) {
             addSessionAttention(sessionId, 'done');
           }
-          if (!ownedNow && !hasTerminalError) {
+          if (!ownedNow && !hasTerminalError && !isRunning) {
             onSessionDoneRef.current?.(sessionId);
           }
         }, QUEUE_DEBOUNCE_MS);

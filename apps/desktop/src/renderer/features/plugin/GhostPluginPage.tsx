@@ -3,7 +3,7 @@
  *
  * Inputs: installed Ghost snapshots and user actions. `embedded` mounts the same
  * catalog inside Settings; `onSelectCatalogTab` keeps Plugins / Skills in-panel.
- * Outputs: the Plugin list/detail UI, focus-stable installed queue, and Plugin action flows.
+ * Outputs: the Plugin list/detail UI, recommendation-aware return navigation, and Plugin action flows.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -65,6 +65,7 @@ import { resetDraftWorkspaceTargets } from '@/state/newMakerDraft';
 import { ghostInstallErrorKey } from '@/cindy-brain/installErrorKey';
 import { installGhostFromFile, pickAndUpdateGhost } from '@/cindy-brain/installFlow';
 import { Spinner } from '@/components/ui/spinner';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { cn } from '@/lib/utils';
 import { AttentionDot } from '@/components/sidebar/AttentionDot';
 import {
@@ -117,6 +118,7 @@ import {
   PluginManagementLayout,
   PluginManagementPage,
 } from './PluginManagementLayout';
+import { usePluginListScrollRestoration } from './lib/usePluginListScrollRestoration';
 import { GhostPagePanelHost } from './GhostPagePanelHost';
 import { GhostPluginDetailView } from './GhostPluginDetailView';
 import {
@@ -489,6 +491,15 @@ export function GhostPluginPage({
   }, [ignoredRoundKey]);
   const [originFilter, setOriginFilter] = useState<PluginPresentationFilter>('all');
   const [marketDetail, setMarketDetail] = useState<PluginMarketDetail | null>(null);
+  // 列表与详情是互斥分支;列表节点会卸载,返回时需显式恢复进入前的滚动位置。
+  const pluginCatalogVisible = marketDetail === null && selectedId === null;
+  const {
+    listRef: pluginCatalogListRef,
+    onListScroll: onPluginCatalogScroll,
+    capture: capturePluginCatalogScroll,
+    requestRestore: requestPluginCatalogScrollRestore,
+    clearPendingRestore: clearPluginCatalogScrollRestore,
+  } = usePluginListScrollRestoration(pluginCatalogVisible);
   const [marketBusyId, setMarketBusyId] = useState<string | null>(null);
   // 市场操作的同步互斥锁。React state 在提交前有窗口期,快速连点会让多个回调
   // 都读到 null;ref 先到先得,state 只驱动按钮禁用等 UI 展示。每次占锁都返回
@@ -550,13 +561,14 @@ export function GhostPluginPage({
     }
   }, []);
   useEffect(() => {
+    clearPluginCatalogScrollRestore();
     setMarketSnapshot(null);
     setMarketDetail(null);
     marketBusyLockRef.current = null;
     setMarketBusyId(null);
     marketDetailRequestRef.current += 1;
     void refreshMarket();
-  }, [refreshMarket, mode, dataOwnerId]);
+  }, [clearPluginCatalogScrollRestore, refreshMarket, mode, dataOwnerId]);
   const refreshMarketOnForeground = useCallback(() => refreshMarket(true), [refreshMarket]);
   usePluginMarketForegroundRefresh(refreshMarketOnForeground, lastMarketRefreshAtRef);
   useEffect(() => {
@@ -1303,6 +1315,7 @@ export function GhostPluginPage({
       // 与 handleMarketUpdate 共用同一互斥锁:更新进行中不叠加其它市场操作。
       const marketBusyLease = acquireMarketBusy(pluginId);
       if (!marketBusyLease) return;
+      capturePluginCatalogScroll();
       const requestId = ++marketDetailRequestRef.current;
       try {
         const detail = await window.electronAPI.pluginMarket.detail(pluginId);
@@ -1323,8 +1336,14 @@ export function GhostPluginPage({
         releaseMarketBusy(marketBusyLease);
       }
     },
-    [acquireMarketBusy, isMarketBusyLeaseActive, releaseMarketBusy, t],
+    [acquireMarketBusy, capturePluginCatalogScroll, isMarketBusyLeaseActive, releaseMarketBusy, t],
   );
+  const handleMarketBack = useCallback(() => {
+    cancelPendingPluginSuggestion(recommendationNonce ?? undefined);
+    requestPluginCatalogScrollRestore();
+    marketDetailRequestRef.current += 1;
+    setMarketDetail(null);
+  }, [recommendationNonce, requestPluginCatalogScrollRestore]);
 
   const refreshVisibleMarketDetail = useCallback(async (pluginId: string) => {
     // A background icon renewal may observe navigation, but must never invalidate a
@@ -1510,11 +1529,7 @@ export function GhostPluginPage({
             <MarketPluginDetailView
               detail={marketDetail}
               busy={marketBusyId === marketDetail.pluginId}
-              onBack={() => {
-                cancelPendingPluginSuggestion(recommendationNonce ?? undefined);
-                marketDetailRequestRef.current += 1;
-                setMarketDetail(null);
-              }}
+              onBack={handleMarketBack}
               onInstall={
                 canOfferMarketInstall(mode, marketDetail.ghostId)
                   ? () => void handleInstallFromMarket()
@@ -1596,10 +1611,12 @@ export function GhostPluginPage({
     >
       <div className="flex min-h-0 flex-1">
         <main
+          ref={pluginCatalogListRef}
           className={cn(
             'min-h-0 w-full min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]',
             embedded ? 'bg-transparent' : 'bg-[var(--surface)]',
           )}
+          onScroll={onPluginCatalogScroll}
         >
           <PluginManagementPage>
             {recommendationNotice}
@@ -1799,42 +1816,36 @@ export function GhostPluginPage({
                   <h2 className="shrink-0 whitespace-nowrap text-20 font-medium text-[var(--text-primary)]">
                     {t('settings.ghosts.page.recommendedSection')}
                   </h2>
-                  <div
-                    className="plugin-catalog-filters flex min-w-0 max-w-full items-center gap-1"
-                    role="group"
+                  <SegmentedControl
+                    className="plugin-catalog-filters"
+                    role="radiogroup"
                     aria-label={t('settings.ghosts.page.filtersAria')}
                     style={WINDOW_NO_DRAG_STYLE}
-                  >
-                    {recommendedFilters.map((filter) => {
-                      const selected = effectiveOriginFilter === filter;
+                    height={32}
+                    optionHeight={28}
+                    optionClassName="px-3.5 text-12"
+                    value={effectiveOriginFilter}
+                    onValueChange={setOriginFilter}
+                    options={recommendedFilters.map((filter) => {
                       const count =
                         filter === 'all'
                           ? searchedAvailableMarketItems.length
                           : recommendedCounts[filter];
-                      return (
-                        <button
-                          key={filter}
-                          type="button"
-                          aria-pressed={selected}
-                          onClick={() => setOriginFilter(filter)}
-                          className={cn(
-                            'shrink-0 select-none rounded-full border border-transparent px-3.5 py-2 text-12 transition-colors duration-150',
-                            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
-                            selected
-                              ? 'plugin-motion-selected text-[var(--text-primary)]'
-                              : 'text-[var(--text-secondary)] hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)]',
-                          )}
-                        >
-                          {filter === 'all'
-                            ? t('settings.ghosts.page.filterAll')
-                            : t(`settings.ghosts.page.origin.${filter}`)}
-                          <span className="ml-1.5 tabular-nums text-[var(--text-tertiary)]">
-                            {count}
-                          </span>
-                        </button>
-                      );
+                      return {
+                        value: filter,
+                        label: (
+                          <>
+                            {filter === 'all'
+                              ? t('settings.ghosts.page.filterAll')
+                              : t(`settings.ghosts.page.origin.${filter}`)}
+                            <span className="ml-1.5 tabular-nums text-[var(--text-tertiary)]">
+                              {count}
+                            </span>
+                          </>
+                        ),
+                      };
                     })}
-                  </div>
+                  />
                 </div>
 
                 {marketSnapshot?.unavailableReason ? (

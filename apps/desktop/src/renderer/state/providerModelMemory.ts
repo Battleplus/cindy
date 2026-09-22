@@ -61,7 +61,7 @@ function storageKey(): string {
 /**
  * 单个来源槽:真实来源槽记「上次选中的模型」+ 兼容副本;`*` 槽记权威模型级 effort / fast。
  * lastModel 可为空(只记过 effort/fast 没法确定 lastModel 的脏数据);
- * effortByModel / fastByModel 至少一边非空才保留。
+ * lastModel 或任一模型预设非空就保留。
  */
 interface ProviderMemory {
   lastModel: string;
@@ -86,7 +86,7 @@ function presetKeyOf(agent: AgentKind): string {
 
 /**
  * 严格校验 v2:每个槽收敛成 { lastModel, effortByModel },其中 effortByModel 只保留
- * model / effort 都是非空 string 的条目;effortByModel 为空的槽整条丢弃(无可恢复信息)。
+ * model / effort 都是非空 string 的条目;lastModel 和预设都为空才丢弃。
  * 老版本 / 手改 localStorage 损坏时静默回退空表(不抛)。
  */
 function sanitize(raw: unknown): Record<string, ProviderMemory> {
@@ -127,6 +127,7 @@ function sanitize(raw: unknown): Record<string, ProviderMemory> {
       }
     }
     if (
+      !(typeof rec.lastModel === 'string' && rec.lastModel.length > 0) &&
       Object.keys(effortByModel).length === 0 &&
       Object.keys(fastByModel).length === 0 &&
       Object.keys(thinkingByModel).length === 0
@@ -556,6 +557,11 @@ export function hasAnyProviderModelOverride(): boolean {
   );
 }
 
+/** Saved selections identify an existing profile without creating a settings override. */
+export function hasProviderModelHistory(): boolean {
+  return Object.values(load()).some((slot) => slot.lastModel.length > 0);
+}
+
 function persist(
   map: Record<string, ProviderMemory>,
   ops: ProviderMemoryOp[],
@@ -755,22 +761,12 @@ export function clearProviderModelFast(agent: AgentKind, providerId: string, mod
  * 用于 renderer → main 缓存和 device-link 控制端镜像被控设备的全局模型预设。
  * 深拷贝,调用方拿到的快照不随后续本地改动变化。
  */
-export function snapshotForSeed(): Record<
-  string,
-  {
-    effortByModel: Record<string, Effort>;
-    fastByModel: Record<string, boolean>;
-    thinkingByModel: Record<string, boolean>;
-  }
-> {
-  const out: Record<
-    string,
-    {
-      effortByModel: Record<string, Effort>;
-      fastByModel: Record<string, boolean>;
-      thinkingByModel: Record<string, boolean>;
-    }
-  > = {};
+type ModelMemorySeed = Record<string, Pick<ProviderMemory, 'effortByModel' | 'fastByModel' | 'thinkingByModel'>>;
+export function snapshotForSeed(): ModelMemorySeed;
+export function snapshotForSeed(expectedOwner: string | null): ModelMemorySeed | null;
+export function snapshotForSeed(expectedOwner?: string | null): ModelMemorySeed | null {
+  if (expectedOwner !== undefined && activeDataOwnerId !== expectedOwner) return null;
+  const out: ModelMemorySeed = {};
   for (const [k, slot] of Object.entries(load())) {
     out[k] = {
       effortByModel: { ...slot.effortByModel },

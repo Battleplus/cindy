@@ -42,6 +42,10 @@ type FullMaker = typeof window.electronAPI.maker;
  * REMOTE_INVOKE_ALLOWLIST 白名单内(被控端执行前还会再校验一层)。
  */
 export interface RoutableMaker {
+  predictNextPrompt: FullMaker['predictNextPrompt'];
+  listBotDelegations: FullMaker['listBotDelegations'];
+  cancelBotDelegation: FullMaker['cancelBotDelegation'];
+  getBotDirectMessageThread: FullMaker['getBotDirectMessageThread'];
   send: FullMaker['send'];
   setModel: FullMaker['setModel'];
   // session-agent-switch:跨引擎切换是**会话级**操作,数据真相(pending 意图注册表 +
@@ -141,6 +145,10 @@ function remoteMakerApi(deviceId: string): RoutableMaker {
     (...args: unknown[]): Promise<unknown> =>
       invokeRemote(deviceId, channel, args);
   return {
+    predictNextPrompt: t('maker:predict-prompt') as FullMaker['predictNextPrompt'],
+    listBotDelegations: t('maker:bot-delegations:list') as FullMaker['listBotDelegations'],
+    cancelBotDelegation: t('maker:bot-delegation:cancel') as FullMaker['cancelBotDelegation'],
+    getBotDirectMessageThread: t('maker:bot-direct-message-thread:get') as FullMaker['getBotDirectMessageThread'],
     send: t('maker:send') as FullMaker['send'],
     setModel: (async (...args: SetModelArgs) =>
       invokeRemote(

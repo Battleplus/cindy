@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   DeviceLinkClient,
   DeviceLinkError,
+  DEVICE_LINK_CAPABILITY_HISTORY_VIEW_V1,
   DL_SUBSCRIBE_CHANNEL,
   INVOKE_TIMEOUT_OVERRIDES_MS,
   PROTOCOL_VERSION,
@@ -35,6 +36,13 @@ const deviceLinkSettings = vi.hoisted(() => ({
     revokedControllers: [] as string[],
   },
 }));
+const diagnosticLog = vi.hoisted(() => ({
+  debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), trace: vi.fn(), fatal: vi.fn(),
+}));
+vi.mock('../../logger', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../logger')>(),
+  createLogger: () => diagnosticLog,
+}));
 
 vi.mock('../settings-store', () => ({
   readDeviceLinkSettings: () => deviceLinkSettings.value,
@@ -51,6 +59,7 @@ import {
   wireInboundDispatch,
 } from '../dispatch';
 import * as subscriptions from '../subscriptions';
+import { remoteDesktop } from '../../remote-desktop';
 
 function mkClient(
   over: Partial<{
@@ -214,6 +223,7 @@ function makeDispatchTestClient(relay: DispatchTestRelay, deviceId: string): Dev
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.clearAllMocks();
   deviceLinkSettings.value = {
     remoteControlEnabled: true,
     revokedControllers: [],
@@ -223,9 +233,19 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('[1] link-accept 发送失败的有限重试', () => {
+  it('declares history projection support in the host accept, including for legacy controllers', () => {
+    const client = mkClient();
+    __testing.setActiveClient(client as never);
+    __testing.handleLinkOpen(client as never, 'ctrl-a', 'open-1', undefined);
+    expect(client.sendLinkAccept).toHaveBeenCalledWith('ctrl-a', 'open-1', expect.objectContaining({
+      capabilities: expect.arrayContaining([DEVICE_LINK_CAPABILITY_HISTORY_VIEW_V1]),
+    }));
+  });
+
   it('背压首发失败 → 不提交订阅;500ms 重试成功后才提交', () => {
     const sendLinkAccept = vi.fn().mockImplementationOnce(() => {
       throw backpressure();
@@ -374,7 +394,7 @@ describe('[2] outbox 离线不自旋,上线事件驱动投递', () => {
         client as never,
         'ctrl-a',
         'req-1',
-        { ok: true, result: 1 },
+        { ok: true, result: 'PRIVATE_RESPONSE_BODY' },
         'local-db:sessions:list',
       ),
     ).toBe(true);
@@ -391,6 +411,10 @@ describe('[2] outbox 离线不自旋,上线事件驱动投递', () => {
     flushRemoteInvokeResultOutboxOnReconnect();
     expect(sendInvokeResult).toHaveBeenCalledTimes(2);
     expect(__testing.remoteInvokeResultOutboxSize()).toBe(0);
+    expect(diagnosticLog.warn).toHaveBeenCalledWith(expect.stringContaining('request=req-1 queueMessages=1'));
+    expect(diagnosticLog.info).toHaveBeenCalledWith(expect.stringContaining('request=req-1 queuedMs=20000'));
+    expect(JSON.stringify(diagnosticLog.warn.mock.calls)).not.toContain('PRIVATE_RESPONSE_BODY');
+    expect(JSON.stringify(diagnosticLog.info.mock.calls)).not.toContain('PRIVATE_RESPONSE_BODY');
   });
 });
 
@@ -627,6 +651,8 @@ describe('[5] orphan 截止时间按 channel 收窄', () => {
 
 describe('[6] active controller 生命周期与故障半径', () => {
   it('真实双 peer 链路中 A 的 DEVICE_OFFLINE 不清 B，B 的在途请求仍能完成', async () => {
+    const lost = vi.spyOn(remoteDesktop, 'signalingLost');
+    const stop = vi.spyOn(remoteDesktop, 'stop');
     vi.useRealTimers();
     const relay = new DispatchTestRelay();
     const target = makeDispatchTestClient(relay, 'target');
@@ -675,9 +701,14 @@ describe('[6] active controller 生命周期与故障半径', () => {
     // 模拟 relay 对 target→A 的真实路由错误:DeviceLinkClient 先发 typed offline,
     // 再由 host 接入唯一的 deactivateController 状态转换。
     relay.offline.add('ctrl-a');
+    lost.mockClear();
+    stop.mockClear();
     target.sendInvokeResult('ctrl-a', 'offline-probe', { ok: true, result: null });
 
     expect(routeChanges).toContain('ctrl-a:offline');
+    expect(lost).toHaveBeenCalledWith('ctrl-a');
+    expect(lost).not.toHaveBeenCalledWith('ctrl-b');
+    expect(stop).not.toHaveBeenCalledWith('ctrl-b');
     expect(__testing.getActiveControllers().map((controller) => controller.deviceId).sort()).toEqual([
       'ctrl-b',
     ]);

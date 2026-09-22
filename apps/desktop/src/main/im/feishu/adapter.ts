@@ -1,3 +1,4 @@
+import { captureImContext } from '../../../shared/imMessageSource';
 /**
  * main/im/feishu/adapter.ts
  * ---------------------------------------------------------------------------
@@ -21,6 +22,7 @@
  *     (飞书有拉历史 API, 不需要 telegram 那样的本地群消息池)。
  */
 
+import { resolveFeishuNotificationReply } from './notificationOrigin';
 import path from 'node:path';
 import fs from 'node:fs';
 import { app } from 'electron';
@@ -241,6 +243,12 @@ export function buildFeishuAdapter(
         : '[飞书·群] ';
   return {
     channel: 'feishu',
+    messageSourceIm: () => feishuIm.getService(),
+    resolveNotificationReply: (event) => resolveFeishuNotificationReply(feishuIm, event),
+    notificationReplyText: {
+      unavailable: '暂时无法继续这条通知对应的任务，请在 Cindy 中确认任务仍可用后重试。',
+      commands: '本话题用于继续通知对应的任务。停止请用 !stop；其他命令请在主聊天中操作。',
+    },
     im: feishuIm,
     output: { kind: 'rich-card', im: feishuIm },
     config,
@@ -336,7 +344,7 @@ export function buildFeishuAdapter(
     // 注入可借 owner 轮次的宽松档执行危险操作; 确认卡经 deliverToOwnerDm
     // 改投 owner 私聊, 点击也只认 owner。DM 不挂, owner 私聊保持全速。
     turnPermissionPolicyFor: (event) =>
-      event.speaker ? createFeishuGroupTurnPermissionPolicy(event.messageId) : undefined,
+      event.speaker ? createFeishuGroupTurnPermissionPolicy(event.messageId, event.speaker.isOwner) : undefined,
     // 群护栏取缔: 用户在渠道设置里显式允许群会话用「完全访问」→ 该档位
     // 不再挂强确认策略(maker 不再拒绝, 按用户选择直接执行)。群上下文的
     // 防注入过滤/包裹在 prepareAgentTurnText 里独立生效, 不随权限档关闭;
@@ -361,8 +369,10 @@ export function buildFeishuAdapter(
               ...(event.replyContext.isBot ? { isBot: true } : {}),
             }
           : event.replyContext;
+        const replyPrefix = buildFeishuReplyContextBlock(safeReply);
         return {
-          agentText: `${buildFeishuReplyContextBlock(safeReply)}${event.text}`,
+          agentText: `${replyPrefix}${event.text}`,
+          contextSnapshot: captureImContext({ replyPrefix, replyMessageCount: 1 }),
         };
       }
       // 群主流 @ 开新话题: 上下文取数 lane 与路由 lane 分离(见
@@ -393,6 +403,10 @@ export function buildFeishuAdapter(
       if (!built) return null;
       return {
         agentText: `${built.prefix}${event.text}`,
+        contextSnapshot: captureImContext({
+          groupPrefix: built.prefix,
+          groupMessageCount: built.messageCount,
+        }),
         ...(built.contextAttachments.length > 0
           ? { contextAttachments: built.contextAttachments }
           : {}),

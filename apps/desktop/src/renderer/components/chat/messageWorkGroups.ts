@@ -92,6 +92,7 @@ interface WorkGroupRenderItem {
   type: 'work_group';
   key: string;
   children: WorkGroupChildItem[];
+  deferred?: import('@cindy/maker-shared/message-window').DeferredHistoryWork;
   durationMs?: number;
   /** 当前是否是仍在执行的尾部动作段。完成态时间线始终 false。 */
   isStreaming: boolean;
@@ -327,7 +328,7 @@ export function renderItemStartMs(item: RenderItem): number | null {
  * 段里只有一个 tool_use,它的 createdAt 是"开始执行"的时刻,拿它当段末会把结束
  * 时间低估整个执行时长,紧随其后的最终答复照样被误判成空洞。
  */
-function renderItemEndMs(item: RenderItem): number | null {
+export function renderItemEndMs(item: RenderItem): number | null {
   if (item.type === 'tool_segment') {
     let latest = Number.NEGATIVE_INFINITY;
     for (const call of item.toolCalls) {

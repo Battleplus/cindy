@@ -4,6 +4,11 @@ import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
 import JSZip from 'jszip';
+import {
+  PLUGIN_MEMBER_UPLOAD_MAX_ARCHIVE_BYTES,
+  PLUGIN_MEMBER_UPLOAD_MAX_UNCOMPRESSED_BYTES,
+  PLUGIN_MEMBER_UPLOAD_MAX_ZIP_ENTRIES,
+} from '@cindy/plugin-protocol';
 
 import {
   GHOST_MANIFEST_FILE,
@@ -60,7 +65,7 @@ import { installedFileModeFromZip, isZipSymbolicLinkMode } from './ghostZipPermi
 
 /** 普通沙箱插件维持小包上限；随包 Node/CLI 允许更大的预打包产物。 */
 export const MAX_BASIC_CINDY_FILE_BYTES = 8 * 1024 * 1024;
-export const MAX_NODE_CINDY_FILE_BYTES = 128 * 1024 * 1024;
+export const MAX_NODE_CINDY_FILE_BYTES = PLUGIN_MEMBER_UPLOAD_MAX_ARCHIVE_BYTES;
 /** 身份卡本身只应是小 JSON；先限流读取，避免在识别包类型前被单文件撑爆内存。 */
 const MAX_GHOST_MANIFEST_BYTES = GHOST_MANIFEST_MAX_BYTES;
 
@@ -104,9 +109,9 @@ async function readRegularFileStableWithLimit(
 }
 /** 解压后总大小/条目数上限；Node 包允许携带已打包 CLI，但仍有硬闸。 */
 export const MAX_BASIC_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
-export const MAX_NODE_UNCOMPRESSED_BYTES = 256 * 1024 * 1024;
+export const MAX_NODE_UNCOMPRESSED_BYTES = PLUGIN_MEMBER_UPLOAD_MAX_UNCOMPRESSED_BYTES;
 export const MAX_BASIC_ZIP_ENTRIES = 256;
-export const MAX_NODE_ZIP_ENTRIES = 2_048;
+export const MAX_NODE_ZIP_ENTRIES = PLUGIN_MEMBER_UPLOAD_MAX_ZIP_ENTRIES;
 /** 停用标记文件名(安装目录内;存在即停用)。 */
 const DISABLED_MARKER_FILE = '.disabled';
 /** 安装时由主机写入的信任快照与权限 receipt；作者包不能提供。 */
@@ -2593,6 +2598,8 @@ export class GhostManager {
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
       installOrigin?: 'agent-forge';
+      /** Synchronous live-authority check immediately before publishing the staged package. */
+      beforePackagePlacement?: () => void;
     },
   ) {
     return this.runExclusiveMutation(() => this.installUnlocked(lizFilePath, opts));
@@ -2605,6 +2612,7 @@ export class GhostManager {
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
       installOrigin?: 'agent-forge';
+      beforePackagePlacement?: () => void;
     },
   ): Promise<{ ghost: InstalledGhost } | { rejection: InstallRejection }> {
     // 装入初始启用态由调用方决定；缺省 true 保持既有调用方语义不变。
@@ -2694,6 +2702,15 @@ export class GhostManager {
         ...(clearBuiltinTombstoneOnCommit ? { clearBuiltinTombstone: true } : {}),
       });
       this.untrustedApprovals.add(this.isolationKey(manifest.id));
+      try {
+        opts?.beforePackagePlacement?.();
+      } catch (error) {
+        // No package bytes were published. Clear the prepared journal so a
+        // cancelled request cannot leave an installation waiting for recovery.
+        await this.receiptStore.clearPendingMutation(manifest.id);
+        this.untrustedApprovals.delete(this.isolationKey(manifest.id));
+        throw error;
+      }
       await fs.promises.rename(stagingDir, finalDir);
       try {
         receipt = createGhostInstallReceipt({

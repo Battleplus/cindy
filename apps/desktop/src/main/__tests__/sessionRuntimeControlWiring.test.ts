@@ -11,10 +11,14 @@ const registerSource = readFileSync(resolve(mainRoot, 'maker-ipc/register.ts'), 
   /\r\n?/g,
   '\n',
 );
-const deviceLinkHostSource = readFileSync(resolve(mainRoot, 'device-link/index.ts'), 'utf8').replace(
-  /\r\n?/g,
-  '\n',
-);
+const runtimeControlSource = readFileSync(
+  resolve(mainRoot, 'maker-ipc/sessionRuntimeControl.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
+const deviceLinkHostSource = readFileSync(
+  resolve(mainRoot, 'device-link/index.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n');
 const makerSendSource = readFileSync(
   resolve(mainRoot, 'maker-ipc/makerSendTransaction.ts'),
   'utf8',
@@ -29,6 +33,21 @@ function handlerBody(source: string, channel: string, nextChannel: string): stri
 }
 
 describe('session runtime control wiring', () => {
+  it('replays Windows attention after the main window is shown independently of inventory loading', () => {
+    const body = handlerBody(
+      bootstrapSource,
+      "mainWindow.once('ready-to-show'",
+      'void runComputerUseSmokeIfRequested();',
+    );
+    const shown = body.indexOf('showMainWindowAndRestoreFullscreen(');
+    const badge = body.indexOf('refreshWindowsAppBadge();');
+    expect(shown).toBeGreaterThan(-1);
+    expect(badge).toBeGreaterThan(shown);
+    expect(body.indexOf('markDesktopDevWindowReady(')).toBeGreaterThan(badge);
+    expect(body).toMatch(
+      /if \(!app.isPackaged \|\| isCindyVersionLaunchPending\(\)\)\s+markDesktopDevWindowReady\(mainWindow.webContents.getOSProcessId\(\)\);/,
+    );
+  });
   it('advertises host-side model-window protection to remote controllers', () => {
     const capabilities = handlerBody(
       registerSource,
@@ -70,9 +89,7 @@ describe('session runtime control wiring', () => {
       expect(body).toContain('stampTrustedDesktopQueuedOrigin(');
     }
     expect(makerSendSource).toContain('clientId: explicitUserItem.clientId');
-    expect(makerSendSource).toContain(
-      'persistedContent: explicitUserItem.persistedContent',
-    );
+    expect(makerSendSource).toContain('persistedContent: explicitUserItem.persistedContent');
     expect(makerSendSource).toContain(
       'if (deviceLinkInvoke || !canTrustDesktopPiCommand(item)) return explicitUserItem',
     );
@@ -119,7 +136,10 @@ describe('session runtime control wiring', () => {
       ['MAKER_IPC_INVOKE.PI_COMPACTION_GET_PCT', 'MAKER_IPC_INVOKE.PI_COMPACTION_GET_STATE'],
       ['MAKER_IPC_INVOKE.PI_COMPACTION_GET_STATE', 'MAKER_IPC_INVOKE.PI_COMPACTION_RESET_PCT'],
       ['MAKER_IPC_INVOKE.PI_COMPACTION_RESET_PCT', 'MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT'],
-      ['MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT', 'WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL'],
+      [
+        'MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT',
+        'WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL',
+      ],
     ] as const) {
       const body = handlerBody(bootstrapSource, channel, nextChannel);
       const guard = body.indexOf('assertTrustedAppRendererEvent(event);');
@@ -150,13 +170,21 @@ describe('session runtime control wiring', () => {
       ['MAKER_IPC_INVOKE.COMPACTION_RESET_PCT', 'MAKER_IPC_INVOKE.COMPACTION_SET_PCT'],
       ['MAKER_IPC_INVOKE.COMPACTION_SET_PCT', 'MAKER_IPC_INVOKE.PI_COMPACTION_GET_PCT'],
       ['MAKER_IPC_INVOKE.PI_COMPACTION_RESET_PCT', 'MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT'],
-      ['MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT', 'WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL'],
+      [
+        'MAKER_IPC_INVOKE.PI_COMPACTION_SET_PCT',
+        'WINDOW_BEHAVIOR_SET_SWALLOW_ACTIVATION_CLICK_CHANNEL',
+      ],
     ] as const) {
       const body = handlerBody(bootstrapSource, channel, nextChannel);
       const stamp = body.indexOf('assertCompactionMutationOwner(owner);');
       expect(stamp).toBeGreaterThan(-1);
       const write = Math.min(
-        ...['writeCompactionPct(', 'resetCompactionPct()', 'writePiCompactionPct(', 'resetPiCompactionPct()']
+        ...[
+          'writeCompactionPct(',
+          'resetCompactionPct()',
+          'writePiCompactionPct(',
+          'resetPiCompactionPct()',
+        ]
           .map((needle) => body.indexOf(needle))
           .filter((index) => index >= 0),
       );
@@ -171,6 +199,10 @@ describe('session runtime control wiring', () => {
       '// ── Custom protocol registration',
     );
     expect(body).toContain('ghostPanelWindowsController.closeForOwnerChange();');
+    expect(body.indexOf('clearAllSessionAttention();')).toBeGreaterThan(-1);
+    expect(body.indexOf('clearAllSessionAttention();')).toBeLessThan(
+      body.indexOf('authManager.setStableOwnerPostCommitTask('),
+    );
     expect(body).toContain('clearAllSessionProviders();');
     expect(body).toContain('clearAllSessionRuntimeAxes();');
     expect(body.indexOf('clearAllSessionProviders();')).toBeLessThan(
@@ -205,9 +237,7 @@ describe('session runtime control wiring', () => {
       [fast, 'return await applyFastMode();'],
     ] as const) {
       expect(body).toContain('withSendToSessionLock(sessionId');
-      expect(body.indexOf('withSendToSessionLock(sessionId')).toBeLessThan(
-        body.indexOf(applyCall),
-      );
+      expect(body.indexOf('withSendToSessionLock(sessionId')).toBeLessThan(body.indexOf(applyCall));
       expect(body).toContain('await resolvePendingRuntimeAxisPatch(sessionId, livePatch)');
       expect(body).toContain(
         'recordUserSessionRuntimeAxisMutation(sessionId, livePatch, pendingPatch)',
@@ -246,7 +276,7 @@ describe('session runtime control wiring', () => {
     expect(registerSource).toContain('const persistOnly = !sess');
     expect(registerSource).toContain('await applyLibraryReadonlyExtraDir(sessionId, nextRoot)');
     expect(registerSource).toContain(
-      'const extraDirs = extraDirsForRuntime(await readSessionExtraDirsFromDb(target.sessionId))',
+      'const storedExtraDirs = await readSessionExtraDirsFromDb(target.sessionId)',
     );
     const applyLibrary = handlerBody(
       registerSource,
@@ -266,15 +296,21 @@ describe('session runtime control wiring', () => {
       'async function syncLibraryReadonlyExtraDir(',
       'let agentInputCoordinatorHolder',
     );
-    expect(syncLibrary).toContain('listVisibleActiveSessionIds()');
-    expect(syncLibrary).toContain('targets.add(focused)');
+    expect(syncLibrary).toContain('listVisibleActiveSessionDirectoryGrants()');
+    expect(syncLibrary).toContain('libraryExtraDirSyncTargets(');
+    expect(syncLibrary).toContain('listActiveSessions()');
     expect(syncLibrary).toContain('sessionIsRemote(sessionId)');
-    expect(syncLibrary).toContain('!remote && grantRoot && sessionId === focused ? grantRoot : null');
+    expect(syncLibrary).toContain(
+      '!remote && grantRoot && sessionId === focused ? grantRoot : null',
+    );
     expect(syncLibrary).toContain("return 'superseded'");
     expect(syncLibrary).not.toContain("throw new Error('library extraDirs sync superseded')");
-    expect(syncLibrary).toContain("throw new Error('library extraDirs not granted to focused session')");
+    expect(syncLibrary).toContain(
+      "throw new Error('library extraDirs not granted to focused session')",
+    );
     expect(syncLibrary).toContain('if (!remote && nextRoot && sessionId === focused) throw error');
     expect(syncLibrary).toContain('libraryExtraDirSyncChain.then(run, run)');
+    expect(syncLibrary).toContain('applied?.some(isLibraryExtraDirSlot)');
     expect(syncLibrary).toMatch(
       /await applyLibraryReadonlyExtraDir\(sessionId, nextRoot\);[\s\S]*if \(generation !== libraryExtraDirSyncGeneration\) return 'superseded'/,
     );
@@ -289,20 +325,17 @@ describe('session runtime control wiring', () => {
       'const handleSetModel = async (',
       'const recoverRemoteRuntimeAxisPersistence',
     );
-    const guard = setModel.indexOf(
-      "if (internalOptions.source === 'user' && !isDeviceLinkInvoke()) {",
+    const ingress = setModel.indexOf('registerSessionSetModelHandler(makerSessionRegistry, {');
+    expect(ingress).toBeGreaterThan(-1);
+    expect(setModel.slice(0, ingress)).not.toContain('assertTrustedAppRendererEvent(');
+    expect(setModel.slice(ingress)).toContain(
+      'assertTrustedSender: (event) => assertTrustedAppRendererEvent(',
     );
-    expect(guard).toBeGreaterThan(-1);
-    expect(setModel.indexOf('assertTrustedAppRendererEvent(')).toBeGreaterThan(
-      guard,
-    );
-    expect(setModel.indexOf('assertTrustedAppRendererEvent(')).toBeLessThan(
-      setModel.indexOf("typeof sessionId !== 'string'"),
-    );
+    expect(setModel.slice(ingress)).toContain('isDeviceLinkInvoke,');
     expect(setModel).toContain('!isSupportedRuntimeEffort(selectionEffort)');
     expect(setModel).toContain("internalOptions.source !== 'user'");
     expect(registerSource).toMatch(
-      /handleSetModel\(\s*undefined,\s*sessionId,\s*model,\s*providerId,\s*undefined,\s*selection,\s*options,?\s*\)/,
+      /handleSetModel\(\s*sessionId,\s*model,\s*providerId,\s*undefined,\s*selection,\s*options,?\s*\)/,
     );
     expect(setModel).toMatch(/\{\s*source:\s*'user',?\s*\}/);
     expect(setModel).not.toContain('ipcMain.handle(MAKER_INVOKE.SET_MODEL, handleSetModel)');
@@ -348,18 +381,14 @@ describe('session runtime control wiring', () => {
     );
     const axisValidation = setModel.indexOf('if (atomicSelection) {');
     expect(axisValidation).toBeGreaterThan(-1);
-    expect(setModel).not.toContain(
-      "if (internalOptions.source !== 'user' && atomicSelection)",
-    );
+    expect(setModel).not.toContain("if (internalOptions.source !== 'user' && atomicSelection)");
     expect(setModel).toContain(
       "internalOptions.source === 'user' || internalOptions.effortExplicit === true",
     );
     expect(setModel).toContain(
       "internalOptions.source === 'user' || internalOptions.fastExplicit === true",
     );
-    expect(setModel).toContain(
-      "allowFixedEffortPlaceholder: internalOptions.source === 'user'",
-    );
+    expect(setModel).toContain("allowFixedEffortPlaceholder: internalOptions.source === 'user'");
     expect(axisValidation).toBeLessThan(setModel.indexOf('applyRuntimeSetModelChange({'));
     expect(axisValidation).toBeLessThan(setModel.indexOf('persistSessionFields(sessionId'));
   });
@@ -376,14 +405,15 @@ describe('session runtime control wiring', () => {
       resolveAxes,
     );
     const commitEffort = persistRoute.indexOf('setSessionEffort(sessionId, finalEffort);', persist);
-    const commitFast = persistRoute.indexOf('setSessionFastMode(sessionId, finalFastMode);', persist);
+    const commitFast = persistRoute.indexOf(
+      'setSessionFastMode(sessionId, finalFastMode);',
+      persist,
+    );
     const broadcast = persistRoute.indexOf('broadcastSessionPatched(sessionId, patch);', persist);
 
     expect(persistRoute).toContain('const [desiredRow] = await getDbClient()');
     expect(persistRoute).toContain('const restoringPreviousRoute =');
-    expect(persistRoute).toContain(
-      'let finalEffort = restoringPreviousRoute && route.effort',
-    );
+    expect(persistRoute).toContain('let finalEffort = restoringPreviousRoute && route.effort');
     expect(persistRoute).toContain(
       'let finalFastMode = restoringPreviousRoute && route.fastMode !== undefined',
     );
@@ -421,9 +451,7 @@ describe('session runtime control wiring', () => {
 
     expect(setModel).toContain('atomicSelection.effort === null');
     expect(setModel).toContain('isDeviceLinkInvoke() ||');
-    expect(setModel).toContain(
-      "(atomicSelection?.effort === null && runtimeAgentKind !== 'pi')",
-    );
+    expect(setModel).toContain("(atomicSelection?.effort === null && runtimeAgentKind !== 'pi')");
     expect(setModel).toContain('!rebuildLiveOrcaWorker && !atomicSelection');
     expect(setModel).toContain('{ wake: false }');
     expect(setModel).toContain("runtimeAgentKind !== 'pi' &&");
@@ -466,9 +494,7 @@ describe('session runtime control wiring', () => {
     expect(registerSource).toContain(
       'function localModelWindowSwitchErrorCode(code: IpcErrorCode): IpcErrorCode',
     );
-    expect(registerSource).toContain(
-      "return isDeviceLinkInvoke() ? 'PRECONDITION_FAILED' : code;",
-    );
+    expect(registerSource).toContain("return isDeviceLinkInvoke() ? 'PRECONDITION_FAILED' : code;");
     expect(setModel).toContain('await maker.getSessionMeta(sessionId)');
     expect(setModel).toContain(
       'liveSessionBeforeRouteChange?.model ?? persistedSessionMeta?.model',
@@ -493,28 +519,69 @@ describe('session runtime control wiring', () => {
     expect(setModel).toContain('return deferLockedSelection()');
     expect(setModel).toContain("preparation === 'remote-unsupported'");
     expect(setModel).toContain('beforeClose: () => {');
-    expect(setModel).toContain('clearPendingCredentialSwitchForSession(sessionId, { wake: false })');
+    expect(setModel).toContain(
+      'clearPendingCredentialSwitchForSession(sessionId, { wake: false })',
+    );
     expect(setModel).toContain('sessionRuntimeControlOwnerEpochMatches(runtimeOwnerEpoch)');
     expect(setModel).toContain('modelWindowRebuilt ||');
     expect(setModel).toContain('patch.contextWindow = targetContextWindow;');
-    expect(setModel).toContain(
-      '(rebuildLiveOrcaWorker || modelWindowRebuilt || atomicSelection)',
-    );
+    expect(setModel).toContain('(rebuildLiveOrcaWorker || modelWindowRebuilt || atomicSelection)');
     expect(setModel).toContain('wakeSessionInputAfterCredentialSwitch(sessionId);');
+  });
+
+  it('restores the cold-session source provider before window evaluation even when the switch names a target provider (#3996)', () => {
+    const setModel = handlerBody(
+      registerSource,
+      'const handleSetModel = async (',
+      'const recoverRemoteRuntimeAxisPersistence',
+    );
+    // 目标 provider(用户要切去的来源)与源会话 provider(窗口评估所需身份)是两个
+    // 独立事实。冷会话内存未 hydrate 时,即使请求显式携带目标 provider,也必须先从
+    // DB 恢复源 provider,否则 currentProviderId 为 null,源模型窗口按全局 modelId
+    // 反查,同名模型跨 provider 时不确定 → fail-closed 误报
+    // MODEL_WINDOW_CURRENT_CONTEXT_UNKNOWN(#3996)。
+    expect(setModel).not.toContain(
+      'if (requestedProviderId === undefined && !hasSessionProvider(sessionId)) {',
+    );
+    const requested = setModel.indexOf('const requestedProviderId = normalizeSessionProviderId(');
+    const restore = setModel.indexOf('if (!hasSessionProvider(sessionId)) {');
+    const hydrate = setModel.indexOf('hydrateSessionProvider(sessionId, persistedProviderId);');
+    const current = setModel.indexOf('const currentProviderId = resolveCurrentSetModelProviderId(');
+    const catalogCurrent = setModel.indexOf('const catalogCurrentWindow =');
+    expect(requested).toBeGreaterThan(-1);
+    expect(restore).toBeGreaterThan(requested);
+    expect(hydrate).toBeGreaterThan(restore);
+    expect(current).toBeGreaterThan(hydrate);
+    // 恢复出的源 provider 必须先于源窗口解析被消费;目标窗口仍由目标 provider 解析。
+    expect(catalogCurrent).toBeGreaterThan(current);
+    expect(setModel).toContain(
+      'lookupVerifiedContextWindow(\n          resolveRouteWindow,\n          model,\n          targetRouteProviderId,',
+    );
+    expect(setModel).toContain('const targetProviderId =');
+    // 停用轴准入只依赖目标路由,源 provider 的 DB 查询失败不能跳过准入
+    // (只能放弃独占 pin 重裁决,#3996 review)。
+    expect(setModel).not.toContain('? await assertModelRouteUsable(');
+    const admission = setModel.indexOf('await assertModelRouteUsable(');
+    const rerouteApply = setModel.indexOf('resolveExclusiveSetModelReroute(');
+    expect(admission).toBeGreaterThan(-1);
+    expect(rerouteApply).toBeGreaterThan(admission);
   });
 
   it('projects rebuilt zero usage and the verified window after the runtime is closed', () => {
     const commitRebuild = handlerBody(
       registerSource,
-      'commitRebuild: async (sessionId, handoff, meta) => {',
+      'commitRebuild: async (sessionId, handoff, meta, signal) => {',
       'setPendingHandoff: (sessionId, handoff, expectedGeneration)',
     );
     const query = commitRebuild.indexOf('contextWindow: sessions.contextWindow,');
     const commit = commitRebuild.indexOf('commitContextRebuild(sessionId, handoff, meta)');
+    const cancellation = commitRebuild.indexOf('signal?.throwIfAborted();');
     const broadcast = commitRebuild.indexOf('broadcastSessionPatched(\n        sessionId,');
 
     expect(query).toBeGreaterThan(-1);
     expect(commit).toBeGreaterThan(query);
+    expect(cancellation).toBeGreaterThan(query);
+    expect(commit).toBeGreaterThan(cancellation);
     expect(broadcast).toBeGreaterThan(commit);
     expect(commitRebuild).toContain('contextTokens: 0,');
     expect(commitRebuild).toContain('{ contextWindow: projectionContextWindow }');
@@ -554,7 +621,10 @@ describe('session runtime control wiring', () => {
     // sessions.effort 列是 NOT NULL——把 null 写进 DB patch 会让整个模型切换被
     // NOT NULL 约束炸掉(issue #3691)。持久化 patch 必须省略该字段,内存 store
     // 照常清 null,重启后按目标模型能力重新归一化。
-    const atomicPatch = setModel.indexOf('if (atomicSelection) {', setModel.indexOf('const patch: Record<string, unknown>'));
+    const atomicPatch = setModel.indexOf(
+      'if (atomicSelection) {',
+      setModel.indexOf('const patch: Record<string, unknown>'),
+    );
     expect(atomicPatch).toBeGreaterThan(-1);
     const persistCall = setModel.indexOf('persistSessionFields(sessionId', atomicPatch);
     expect(persistCall).toBeGreaterThan(atomicPatch);
@@ -661,128 +731,49 @@ describe('session runtime control wiring', () => {
     expect(terminalGuard).toBeGreaterThan(setModel.indexOf('const applyLocked = async () => {'));
     expect(terminalGuard).toBeLessThan(setModel.indexOf('acceptSessionRuntimeMutation({'));
     expect(terminalGuard).toBeLessThan(setModel.indexOf('applyRuntimeSetModelChange({'));
-    expect(setModel).toContain('return withSendToSessionLock(sessionId, applyLocked);');
+    expect(setModel).toContain(
+      'internalOptions.sessionLockHeld ? applyLocked() : withSendToSessionLock(sessionId, applyLocked)',
+    );
   });
 
-  it('maps every Codex relink failure to the structured IPC error protocol', () => {
-    const setModel = handlerBody(
+  it('stages user routes before every runtime mutation and prevents remote persistence of the source route', () => {
+    const body = handlerBody(
       registerSource,
       'const handleSetModel = async (',
       'const recoverRemoteRuntimeAxisPersistence',
     );
-    const relinkBoundary = setModel.slice(
-      setModel.indexOf('const relinkCodexThread ='),
-      setModel.indexOf('const rebuildLiveOrcaWorker'),
+    const stage = body.indexOf('agentSwitchPending.set(sessionId, intent)');
+    expect(stage).toBeGreaterThan(body.indexOf('assertModelRouteUsable('));
+    expect(stage).toBeGreaterThan(body.indexOf('resolveSessionRuntimeAxes('));
+    expect(stage).toBeLessThan(body.indexOf('prepareModelWindowSwitch('));
+    expect(stage).toBeLessThan(body.indexOf('applyRuntimeSetModelChange({'));
+    const early = body.slice(body.indexOf('// A picker click'), body.indexOf('const axisPatch:'));
+    expect(early).toContain('!internalOptions.applyingUserSelectionOnSend');
+    expect(early).toContain('pendingUntilSend: true');
+    expect(early).toContain('markRemoteSettingPersistedInsideHandler(response)');
+    expect(early).not.toContain('persistSessionFields(');
+    expect(early).not.toContain('closeSession(');
+    expect(body).toContain(
+      "internalOptions.source === 'user' && agentSwitchPending.get(sessionId)?.sameAgentSelection",
     );
-    expect(relinkBoundary).toContain(
-      "throwIpcError(\n                'PRECONDITION_FAILED'",
-    );
-    expect(relinkBoundary).toContain('.catch(async (error) => {');
-    expect(relinkBoundary).toContain('isCodexHistoryRecoveryRequired(error)');
-    expect(relinkBoundary).toContain('prepareNativeSessionRecovery(');
-    const applicability = setModel.slice(setModel.indexOf('const hasPersistedLocalCodexThread'), setModel.indexOf('const relinkDecision'));
-    expect(applicability).not.toContain('isDeviceLinkInvoke');
-    expect(applicability).not.toContain("internalOptions.source === 'user'");
-    expect(applicability).toContain('routeExplicit');
-    expect(setModel).toContain('if (requiresCodexThreadRelink && isSessionInTurn(sessionId))');
-    const busyCatch = setModel.slice(setModel.indexOf('if (err instanceof CredentialModeSwitchBusyError)'));
-    expect(busyCatch.indexOf('return deferLockedSelection();')).toBeGreaterThan(0);
-    expect(busyCatch.indexOf('return deferLockedSelection();')).toBeLessThan(busyCatch.indexOf("throwIpcError('CREDENTIAL_SWITCH_BUSY'"));
-    expect(relinkBoundary).toContain('reserveCodexForkCleanup(');
-    expect(relinkBoundary).toContain('...(cleanup ? { cleanup } : {})');
-    expect(relinkBoundary).toContain('if (isIpcError(error)) throw error;');
-    expect(relinkBoundary).toContain(
-      "throwIpcError('INTERNAL', 'Failed to rebuild Codex provider thread')",
-    );
-    expect(relinkBoundary).not.toContain('throw new Error');
   });
 
-  it('relinks legacy provider selections with the persisted effort and Fast axes', () => {
-    const setModel = handlerBody(
+  it('resumes native Codex history across credentials and reserves window rebuilding for send', () => {
+    const body = handlerBody(
       registerSource,
       'const handleSetModel = async (',
       'const recoverRemoteRuntimeAxisPersistence',
     );
-    const targetRoute = setModel.slice(
-      setModel.indexOf('const targetCodexRoute:'),
-      setModel.indexOf('const relinkCodexThread ='),
+    expect(body).not.toContain('forkSdkSession(');
+    expect(body).not.toContain('relinkCodexProviderThread(');
+    expect(body).not.toContain('prepareNativeSessionRecovery(');
+    expect(body).toContain('codexAuthInjection: getCodexProxyAuthInjectionState()');
+    expect(body).toContain('confirmedTargetPressure:');
+    expect(body).toContain('internalOptions.applyingUserSelectionOnSend === true');
+    expect(body).toContain('if (atomicSelection.effort !== null)');
+    expect(registerSource).toContain(
+      'sessionLockHeld: true, applyingUserSelectionOnSend: applyNow',
     );
-    expect(targetRoute).toContain('requiresCodexThreadRelink');
-    expect(targetRoute).toContain('? {');
-    expect(targetRoute).toContain(
-      'effort: atomicSelection ? atomicSelection.effort : runtimeStatus.effort',
-    );
-    expect(targetRoute).toContain(
-      'fastMode: atomicSelection ? atomicSelection.fastMode : runtimeStatus.fastMode',
-    );
-    expect(targetRoute).not.toContain('requiresCodexThreadRelink && atomicSelection');
-  });
-
-  it('skips stale Codex thread relink after rebuild and still commits the target route', () => {
-    const setModel = handlerBody(
-      registerSource,
-      'const handleSetModel = async (',
-      'const recoverRemoteRuntimeAxisPersistence',
-    );
-    const rebuilt = setModel.indexOf("modelWindowRebuilt = preparation === 'rebuilt'");
-    const relinkGate = setModel.indexOf(
-      'const shouldRelinkCodexThread = requiresCodexThreadRelink && !modelWindowRebuilt;',
-    );
-    const apply = setModel.indexOf('await applyRuntimeSetModelChange({');
-    const persist = setModel.indexOf('await persistSessionFields(sessionId, patch);');
-
-    expect(rebuilt).toBeGreaterThan(-1);
-    expect(relinkGate).toBeGreaterThan(rebuilt);
-    expect(relinkGate).toBeLessThan(apply);
-    expect(setModel.slice(apply, persist)).toContain(
-      'requiresCodexThreadRelink: shouldRelinkCodexThread',
-    );
-    expect(setModel.slice(apply, persist)).toContain(
-      'shouldRelinkCodexThread && relinkCodexThread',
-    );
-    expect(setModel.slice(apply, persist)).toContain(
-      'result.persistedRoute !== true &&\n          (modelWindowRebuilt ||',
-    );
-    expect(persist).toBeGreaterThan(apply);
-  });
-
-  it('omits null runtime effort from the Codex relink SQLite commit', () => {
-    const setModel = handlerBody(
-      registerSource,
-      'const handleSetModel = async (',
-      'const recoverRemoteRuntimeAxisPersistence',
-    );
-    const relinkCommit = setModel.slice(
-      setModel.indexOf('commit: async ({ sessionId: targetSessionId, source, newSdkSessionId, target })'),
-      setModel.indexOf('if (write.changes === 0) return false;'),
-    );
-    expect(relinkCommit).toContain('persistableSessionEffort(target.effort)');
-    expect(relinkCommit).toContain(
-      '...(persistableEffort !== undefined ? { effort: persistableEffort } : {})',
-    );
-    expect(relinkCommit).not.toContain(
-      'effort: target.effort as (typeof sessions.$inferInsert)[\'effort\']',
-    );
-  });
-
-  it('derives the Codex relink boundary from effective credential identities', () => {
-    const setModel = handlerBody(
-      registerSource,
-      'const handleSetModel = async (',
-      'const recoverRemoteRuntimeAxisPersistence',
-    );
-    const relinkGate = setModel.slice(
-      setModel.indexOf('const hasPersistedLocalCodexThread ='),
-      setModel.indexOf('const targetCodexRoute:'),
-    );
-    expect(relinkGate).toContain('decideCodexProviderThreadRelink(');
-    expect(relinkGate).toContain(
-      '{ model: runtimeStatus.model, providerId: runtimeStatus.providerId }',
-    );
-    expect(relinkGate).toContain('{ model, providerId: targetProviderId }');
-    expect(relinkGate).toContain("relinkDecision === 'unresolved'");
-    expect(relinkGate).toContain("relinkDecision === 'relink'");
-    expect(relinkGate).toContain("throwIpcError(\n          'PRECONDITION_FAILED'");
   });
 
   it('rejects terminal tasks before effort or Fast mutations recreate runtime state', () => {
@@ -937,7 +928,7 @@ describe('session runtime control wiring', () => {
       /effectiveProviderId === null\s*\? null\s*: \(normalizeSessionProviderId\(effectiveProviderId\) \?\? currentProviderId\)/,
     );
     expect(registerSource).toContain('effort: pending.profile.effort,');
-    expect(registerSource).toContain('effort: candidate.effort, fastMode: candidate.fastMode');
+    expect(registerSource).toContain('effort: selected.effort, fastMode: selected.fastMode');
     expect(registerSource).toContain('effort: next.effort, fastMode: next.fastMode');
   });
 
@@ -945,12 +936,12 @@ describe('session runtime control wiring', () => {
     expect(registerSource).toContain('setSessionRuntimeProjector((session) =>');
     expect(registerSource).toContain('setSessionRuntimeCleanup((sessionId) =>');
     expect(registerSource).toContain('broadcastSessionRuntimeProjection(sessionId');
-    expect(registerSource).toContain('runtimeEffective: effective');
-    expect(registerSource).toContain('runtimePending: control.pending');
-    expect(registerSource).toContain("effort: effective.effort ?? '',");
+    expect(registerSource).toContain('projectSessionRuntimeControl(session.id');
+    expect(runtimeControlSource).toContain('runtimeEffective: effective');
+    expect(runtimeControlSource).toContain('runtimePending: control.pending');
+    expect(runtimeControlSource).toContain("effort: effective.effort ?? '',");
   });
   // persists Pi runtime-verified windows without catalog replacement: covered by the executable sessionEventPipeline tests.
-
 
   it('counts fallback eligibility across the whole interrupted-turn episode', () => {
     expect(registerSource).toContain(
@@ -1008,6 +999,50 @@ describe('session runtime control wiring', () => {
     expect(setModel).toContain('Pi current runtime could not be verified');
   });
 
+  it('skips the cold Pi window rehydration when the live usage leaves the target headroom', () => {
+    const setModel = handlerBody(
+      registerSource,
+      'const handleSetModel = async (',
+      'const recoverRemoteRuntimeAxisPersistence',
+    );
+    // 冷启动核实(2~3s)必须经预检：目标窗口对**已知占用**有余量时不再拉起运行时，
+    // 路由照常落定、下一次发送按目标窗口懒重建；danger/overflow 仍走原核实路径。
+    const pressurePreflight = setModel.indexOf('shouldSkipColdPiWindowRehydration({');
+    const rehydrate = setModel.indexOf(
+      'await rehydrateColdPiRuntimeForWindowVerification(sessionId)',
+    );
+    expect(pressurePreflight).toBeGreaterThan(-1);
+    expect(pressurePreflight).toBeLessThan(rehydrate);
+    // 占用只能取 runtime 关闭时固化的 live 读数：sessions.context_tokens 可能因
+    // 中断 / 崩溃低报，拿它判「有余量」会绕过缩窗交接（Greptile P1）。
+    const liveUsageRead = setModel.indexOf('getSessionLastLiveUsage(sessionId)');
+    expect(liveUsageRead).toBeGreaterThan(-1);
+    expect(liveUsageRead).toBeLessThan(pressurePreflight);
+    expect(setModel).toContain('set-model: skipped cold Pi window verification');
+    expect(setModel).toContain('coldPiRouteWithoutLiveWindowCheck = true;');
+    // 终态活进程核验必须同步跳过，否则只是换成 'Pi target runtime could not be verified'。
+    const finalBlockStart = setModel.indexOf('const piSessionAfterRouteChange =');
+    const finalVerification = setModel.indexOf(
+      'Pi target runtime could not be verified',
+      finalBlockStart,
+    );
+    expect(finalBlockStart).toBeGreaterThan(-1);
+    expect(finalVerification).toBeGreaterThan(finalBlockStart);
+    expect(setModel.slice(finalBlockStart, finalVerification)).toContain(
+      '!coldPiRouteWithoutLiveWindowCheck',
+    );
+    // 固化点：每个会话关闭时先记 live 用量，再走关闭清理。
+    const closeCaptureLine = 'rememberSessionLastLiveUsage(session.id, session.getUsageSnapshot?.());';
+    const closeCapture = registerSource.indexOf(closeCaptureLine);
+    const closeHook = registerSource.indexOf(
+      'finalizeClosedSession: (session: WiredSession, context) => {',
+    );
+    expect(closeCapture).toBeGreaterThan(-1);
+    expect(closeHook).toBeGreaterThan(-1);
+    expect(closeCapture).toBeGreaterThan(closeHook);
+    expect(closeCapture - closeHook).toBeLessThan(600);
+  });
+
   it('closes a cold Pi runtime when route persistence fails after rehydrate', () => {
     const setModel = handlerBody(
       registerSource,
@@ -1050,7 +1085,9 @@ describe('session runtime control wiring', () => {
       'setSessionProvider(sessionId, previousRuntime.providerId);',
     );
     expect(restoreControlStores).toContain('setSessionEffort(sessionId, previousRuntime.effort);');
-    expect(restoreControlStores).toContain('setSessionFastMode(sessionId, previousRuntime.fastMode);');
+    expect(restoreControlStores).toContain(
+      'setSessionFastMode(sessionId, previousRuntime.fastMode);',
+    );
     expect(rollback).not.toContain('.send(');
     expect(rollback).toContain('throw persistenceError;');
   });
@@ -1074,7 +1111,9 @@ describe('session runtime control wiring', () => {
     const apply = setModel.indexOf('await applyRuntimeSetModelChange({');
     expect(gate).toBeGreaterThan(-1);
     expect(setModel).toContain("modelSwitchPlan.outcome === 'reject'");
-    expect(setModel).toContain('isRemote: !!runtimeStatus.remoteHostId || isDeviceLinkInvoke()');
+    expect(setModel.replace(/\s+/g, ' ')).toContain(
+      'isRemote: !!runtimeStatus.remoteHostId || (!internalOptions.applyingUserSelectionOnSend && isDeviceLinkInvoke())',
+    );
     expect(remotePressureRejection).toBeGreaterThan(gate);
     expect(remotePressureRejection).toBeLessThan(apply);
     expect(setModel).toContain(
@@ -1096,9 +1135,9 @@ describe('session runtime control wiring', () => {
     const apply = setModel.indexOf('await applyRuntimeSetModelChange({');
 
     expect(setModel.indexOf('return deferLockedSelection()')).toBeLessThan(apply);
-    expect(
-      setModel.indexOf('cold remote Pi runtime cannot verify the target window'),
-    ).toBeLessThan(apply);
+    expect(setModel.indexOf('cold remote Pi runtime cannot verify the target window')).toBeLessThan(
+      apply,
+    );
     expect(setModel).toContain("runtimeAgentKind === 'pi' && runtimeRouteChanged");
     expect(setModel).not.toContain('busy Pi task cannot change runtime selection');
     expect(setModel).toContain('finalPiWindow < verifiedCurrentWindow!');
@@ -1161,7 +1200,9 @@ describe('session runtime control wiring', () => {
       finalWindow,
     );
     expect(finalRemotePressureRejection).toBeGreaterThan(finalWindow);
-    expect(setModel).toContain('targetContextWindow = confirmedContextWindow ?? targetContextWindow');
+    expect(setModel).toContain(
+      'targetContextWindow = confirmedContextWindow ?? targetContextWindow',
+    );
     expect(setModel).toContain('confirmedContextWindow === targetContextWindow');
     expect(setModel).toContain('confirmedContextWindow === finalPiWindow');
     expect(finalPreparation).toBeGreaterThan(smallerFinalWindow);
@@ -1180,13 +1221,13 @@ describe('session runtime control wiring', () => {
       'const recoverRemoteRuntimeAxisPersistence',
     );
     const refreshStart = setModel.indexOf(
-      "if (!response.deferred) {\n          try {\n            const currentAgentKind =",
+      'if (!response.deferred) {\n          try {\n            const currentAgentKind =',
     );
     const refreshEnd = setModel.indexOf('const projectionMeta =', refreshStart);
     const refresh = setModel.slice(refreshStart, refreshEnd);
 
     expect(setModel).toContain(
-      "effectiveProviderId === undefined\n          ? (previousRuntime.pendingCredentialSwitch?.providerId ?? currentProviderId)",
+      'effectiveProviderId === undefined\n          ? (previousRuntime.pendingCredentialSwitch?.providerId ?? currentProviderId)',
     );
     expect(refresh).toContain('model,\n              targetRouteProviderId,');
     expect(refresh).not.toContain(
@@ -1205,9 +1246,9 @@ describe('session runtime control wiring', () => {
     const contextSnapshot = setModel.indexOf('await recordSessionContextSnapshot(');
     expect(runtimeCommit).toBeGreaterThan(-1);
     expect(contextSnapshot).toBeGreaterThan(runtimeCommit);
-    expect(setModel.indexOf('recordUserSessionRuntimeMutation(sessionId)', runtimeCommit)).toBeLessThan(
-      contextSnapshot,
-    );
+    expect(
+      setModel.indexOf('recordUserSessionRuntimeMutation(sessionId)', runtimeCommit),
+    ).toBeLessThan(contextSnapshot);
     expect(setModel.indexOf('settlePendingSessionRuntimeMutation(', runtimeCommit)).toBeLessThan(
       contextSnapshot,
     );
@@ -1262,7 +1303,9 @@ describe('session runtime control wiring', () => {
     expect(setModel).toContain('acceptSessionRuntimeAxisMutation({');
     expect(setModel).toContain("runtimeAgentKind !== 'pi' &&");
     expect(setModel).toContain('(routeExplicit || internalOptions.effortExplicit === true)');
-    expect(setModel).toContain('applyFastMode: routeExplicit || internalOptions.fastExplicit === true');
+    expect(setModel).toContain(
+      'applyFastMode: routeExplicit || internalOptions.fastExplicit === true',
+    );
   });
 
   it('defers in-turn selections with the clicked effort/Fast snapshot', () => {

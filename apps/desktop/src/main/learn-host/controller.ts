@@ -34,6 +34,7 @@ import {
 } from '../../shared/learnTypes';
 import type { FileChange } from '../skillhub/snapshot';
 import { getSkillInstallLockOwner, tryAcquireSkillInstallLock } from '../skillhub/installLock';
+import { acquireSharedSkillMutationLease, type SkillMutationRelease } from '../skillhub/sharedMutationLease';
 import { prependHandoffToUserMessage } from '../maker-ipc/agentHandoff';
 import type { EvidenceSearchFn } from './evidence';
 import { collectEvidence } from './evidence';
@@ -328,11 +329,21 @@ export class LearnController {
     if (req.sourceKind === 'session' && !req.originSessionId) {
       throw new LearnError('INVALID_PARAMS', 'session source requires the origin session');
     }
+    if (
+      req.sourceKind === 'session'
+      && req.originSessionId
+      && !(await this.deps.getConversationBlock(req.originSessionId))
+    ) {
+      throw new LearnError(
+        'INVALID_PARAMS',
+        'the origin conversation has no distillable content',
+      );
+    }
     if (req.sourceKind === 'hub' && !req.hubSlug) {
       throw new LearnError('INVALID_PARAMS', 'hubSlug is required for hub source');
     }
     // hubSlug 会作为路径段进入 resolveInstalledSkillDir / writeReferenceFiles:
-    // builtins 的 /learn hub: 正则已限,但 IPC learn:start 可直调 —— 边界处再校
+    // 内置 Skill 与 IPC learn:start 都可能传入 hubSlug —— 在状态机边界再校
     // 一次,拒绝分隔符 / '..' 等任意串(自查;与市场 slug 规则一致)。
     if (req.sourceKind === 'hub' && req.hubSlug && !/^[a-z0-9][a-z0-9-]*$/.test(req.hubSlug)) {
       throw new LearnError('INVALID_PARAMS', `invalid hubSlug: ${req.hubSlug}`);
@@ -896,6 +907,7 @@ export class LearnController {
     const pausedWatcher = await this.pauseRevisionWatcherForApply(runId);
     let frozenDir: string | null = null;
     let releaseSkillLock: (() => void) | null = null;
+    let releaseShared: SkillMutationRelease | null = null;
     let applied = false;
     try {
       this.assertNotDisposedForReview(runId);
@@ -942,6 +954,8 @@ export class LearnController {
         run = await this.update(run, { skillName: verdict.skillName });
       }
       releaseSkillLock = this.acquireSkillApplyLock(verdict.skillName);
+      releaseShared = await acquireSharedSkillMutationLease([verdict.skillName]);
+      if (!releaseShared) throw new LearnError('LEARN_BUSY', 'another client is changing this skill');
       // 必须先经 getProposalDiff 审查(reviewed 指纹已登记)且与当前提案一致。
       // 只查"已定义且不等"会留一个窗:重扫刚把 reviewed 清空、面板还没刷新完,
       // 这时点 apply 装的是没人看过的新内容(收严 Codex 的初版)。
@@ -971,19 +985,21 @@ export class LearnController {
         runId: run.runId,
       };
       this.assertNotDisposedForReview(runId);
-      const result = await this.deps.applyProposal({
-        proposalDir: frozenDir,
+      const proposalDir = frozenDir;
+      const result = await releaseShared.run(() => this.deps.applyProposal({
+        proposalDir,
         // 用重校验后的 verdict 名(string 且为冻结副本的真实值;run.skillName 经
         // update 重赋值后类型收窄丢失,语义上两者已一致)
         skillName: verdict.skillName,
         provenance,
-      });
+      }));
       applied = true;
       this.detachWatcher(runId);
       await this.deps.staging.cleanup(runId);
       await this.update(run, { status: 'applied' });
       return result;
     } finally {
+      await releaseShared?.();
       releaseSkillLock?.();
       // 失败路径(校验拒绝 / applyProposal 抛错回滚到冻结位)把提案放回 staging。
       if (!applied) {

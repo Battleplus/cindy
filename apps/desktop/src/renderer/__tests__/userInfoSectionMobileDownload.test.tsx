@@ -1,22 +1,33 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { authState, betaChannelState, listAccounts, navigate, syncAccounts, switchAccount } =
-  vi.hoisted(() => ({
-    authState: {
-      user: { name: 'Cindy user', avatar: null } as { name: string; avatar: string | null } | null,
-      mode: 'cloud' as 'cloud' | 'local',
-      dataOwnerId: 'owner-a' as string | null,
-      isCanary: false,
-    },
-    betaChannelState: { enableBeta: false, isCustomized: false, loading: false },
-    listAccounts: vi.fn(),
-    navigate: vi.fn(),
-    syncAccounts: vi.fn(),
-    switchAccount: vi.fn(),
-  }));
+const {
+  authState,
+  betaChannelState,
+  confirm,
+  runningSnapshot,
+  listAccounts,
+  navigate,
+  syncAccounts,
+  switchAccount,
+} = vi.hoisted(() => ({
+  authState: {
+    user: { name: 'Cindy user', avatar: null } as { name: string; avatar: string | null } | null,
+    mode: 'cloud' as 'cloud' | 'local',
+    dataOwnerId: 'owner-a' as string | null,
+    isCanary: false,
+  },
+  betaChannelState: { enableBeta: false, isCustomized: false, loading: false },
+  confirm: vi.fn(),
+  runningSnapshot: new Map<string, { isRunning: boolean }>(),
+  listAccounts: vi.fn(),
+  navigate: vi.fn(),
+  syncAccounts: vi.fn(),
+  switchAccount: vi.fn(),
+}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -39,11 +50,11 @@ vi.mock('@/contexts/AuthContext', () => ({
 }));
 
 vi.mock('@/components/ui/confirm-dialog-provider', () => ({
-  useOptionalConfirmDialog: () => ({ confirm: vi.fn().mockResolvedValue(true) }),
+  useOptionalConfirmDialog: () => ({ confirm }),
 }));
 
 vi.mock('@/lib/makerChatStore', () => ({
-  makerChatStore: { getRunningSnapshot: () => new Map() },
+  makerChatStore: { getRunningSnapshot: () => runningSnapshot },
 }));
 
 vi.mock('@/hooks/useUpdateStatus', () => ({
@@ -88,9 +99,19 @@ vi.mock('@/components/sidebar/MobileDownloadDialog', () => ({
 }));
 
 import { UserInfoSection } from '@/components/sidebar/UserInfoSection';
+import { toast } from '@/lib/toast';
+
+vi.mock('@/lib/toast', () => ({
+  toast: { loading: vi.fn(() => 'progress-toast'), dismiss: vi.fn(), error: vi.fn() },
+}));
 
 beforeEach(() => {
-  navigate.mockClear();
+  vi.mocked(toast.loading).mockClear();
+  vi.mocked(toast.dismiss).mockClear();
+  vi.mocked(toast.error).mockClear();
+  confirm.mockReset().mockResolvedValue(true);
+  runningSnapshot.clear();
+  navigate.mockReset();
   authState.user = { name: 'Cindy user', avatar: null };
   authState.mode = 'cloud';
   authState.dataOwnerId = 'owner-a';
@@ -210,13 +231,170 @@ describe('UserInfoSection mobile download entry', () => {
     });
 
     expect(await screen.findByRole('menuitem', { name: /Other user/ })).toBeTruthy();
+    expect(screen.getByText('sidebar.accountSwitcher.current')).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: /Cindy user/ }).getAttribute('aria-disabled')).toBe(
       'true',
     );
 
-    fireEvent.click(screen.getByRole('menuitem', { name: /Other user/ }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /Other user/ }));
     await waitFor(() => expect(switchAccount).toHaveBeenCalledWith('other'));
   });
+
+  it('explains a loaded shared-data restriction without mislabeling the loading state', async () => {
+    const saved = await listAccounts();
+    let resolveList!: (value: typeof saved) => void;
+    listAccounts.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveList = resolve;
+      }),
+    );
+    syncAccounts.mockResolvedValue({ ...saved, mutationAllowed: false });
+    render(<UserInfoSection isCollapsed={false} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      key: 'Enter',
+    });
+    expect(screen.queryByText('sidebar.accountSwitcher.sharedDataRestriction')).toBeNull();
+
+    await act(async () => resolveList({ ...saved, mutationAllowed: false }));
+    expect(await screen.findByText('sidebar.accountSwitcher.sharedDataRestriction')).toBeTruthy();
+    const other = screen.getByRole('menuitem', { name: /Other user/ });
+    expect(other.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(other);
+    expect(switchAccount).not.toHaveBeenCalled();
+    expect(toast.loading).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'keeps progress visible after menu dismissal and clears it on completion (failure=%s)',
+    async (failure) => {
+      let resolveSwitch!: () => void;
+      let rejectSwitch!: (reason: Error) => void;
+      switchAccount.mockReturnValueOnce(
+        new Promise<void>((resolve, reject) => {
+          resolveSwitch = resolve;
+          rejectSwitch = reject;
+        }),
+      );
+      render(<UserInfoSection isCollapsed={false} />);
+      fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+        key: 'Enter',
+      });
+      await userEvent.click(await screen.findByRole('menuitem', { name: /Other user/ }));
+      await waitFor(() =>
+        expect(toast.loading).toHaveBeenCalledWith('sidebar.accountSwitcher.switching'),
+      );
+      expect(screen.queryByRole('menu')).toBeNull();
+      expect(toast.dismiss).not.toHaveBeenCalled();
+
+      await act(async () => {
+        if (failure) rejectSwitch(new Error('switch failed'));
+        else resolveSwitch();
+      });
+      expect(toast.dismiss).toHaveBeenCalledWith('progress-toast');
+      if (failure) expect(toast.error).toHaveBeenCalledWith('sidebar.accountSwitcher.switchFailed');
+      else expect(toast.error).not.toHaveBeenCalled();
+      fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+        key: 'Enter',
+      });
+      expect(
+        (await screen.findByRole('menuitem', { name: /Other user/ })).getAttribute('aria-disabled'),
+      ).not.toBe('true');
+    },
+  );
+
+  it('does not report switching while confirmation is pending or cancelled', async () => {
+    runningSnapshot.set('running-session', { isRunning: true });
+    let resolveConfirm!: (confirmed: boolean) => void;
+    confirm.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveConfirm = resolve;
+      }),
+    );
+    render(<UserInfoSection isCollapsed={false} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      key: 'Enter',
+    });
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Other user/ }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(toast.loading).not.toHaveBeenCalled();
+    await act(async () => resolveConfirm(false));
+    expect(toast.loading).not.toHaveBeenCalled();
+    expect(switchAccount).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'does not switch on a release over an asynchronously loaded account (collapsed=%s)',
+    async (isCollapsed) => {
+      render(<UserInfoSection isCollapsed={isCollapsed} />);
+
+      // The opening press starts on the trigger. Account rows arrive before
+      // release; Radix must not turn that release into an account selection.
+      fireEvent.pointerDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      const account = await screen.findByRole('menuitem', { name: /Other user/ });
+      await act(async () => {
+        fireEvent.pointerUp(account, { button: 0 });
+        // Flush the asynchronous running-task check used by switchSavedAccount.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(switchAccount).not.toHaveBeenCalled();
+      expect(screen.getByRole('menu')).toBeTruthy();
+    },
+  );
+
+  it.each(['Enter', ' '])('still switches with keyboard selection (%s)', async (key) => {
+    render(<UserInfoSection isCollapsed={false} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      key: 'Enter',
+    });
+    const account = await screen.findByRole('menuitem', { name: /Other user/ });
+    act(() => account.focus());
+    fireEvent.keyDown(account, { key });
+    await waitFor(() => expect(switchAccount).toHaveBeenCalledWith('other'));
+  });
+
+  it.each([false, true])('keeps running-task confirmation (confirmed=%s)', async (confirmed) => {
+    runningSnapshot.set('running-session', { isRunning: true });
+    confirm.mockResolvedValue(confirmed);
+    render(<UserInfoSection isCollapsed={false} />);
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Other user/ }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    if (confirmed) {
+      await waitFor(() => expect(switchAccount).toHaveBeenCalledWith('other'));
+    } else {
+      expect(switchAccount).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([false, true])(
+    'does not switch during repeated open/dismiss (collapsed=%s)',
+    async (isCollapsed) => {
+      render(<UserInfoSection isCollapsed={isCollapsed} />);
+      const trigger = screen.getByRole('button', { name: 'sidebar.user.moreLabel' });
+      for (const closeWith of ['trigger', 'outside', 'escape', 'trigger', 'outside']) {
+        fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+        await screen.findByRole('menuitem', { name: /Other user/ });
+        if (closeWith === 'escape') {
+          fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
+        } else {
+          fireEvent.pointerDown(closeWith === 'trigger' ? trigger : document.body, {
+            button: 0,
+            ctrlKey: false,
+            pointerType: 'mouse',
+          });
+        }
+        await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+      }
+      expect(switchAccount).not.toHaveBeenCalled();
+      expect(confirm).not.toHaveBeenCalled();
+    },
+  );
 
   it('drops the previous account menu snapshot as soon as the owner changes', async () => {
     const view = render(<UserInfoSection isCollapsed={false} />);
@@ -298,5 +476,27 @@ describe('UserInfoSection mobile download entry', () => {
     await waitFor(() =>
       expect(navigate).toHaveBeenCalledWith('/add-account', { state: { returnTo: '/' } }),
     );
+    expect(toast.loading).not.toHaveBeenCalled();
+  });
+
+  it('reports navigation failure and re-enables the sign-in entry', async () => {
+    authState.user = null;
+    authState.mode = 'local';
+    navigate.mockRejectedValueOnce(new Error('navigation failed'));
+    render(<UserInfoSection isCollapsed={false} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      key: 'Enter',
+    });
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'login.signIn' }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('sidebar.accountSwitcher.startFailed'),
+    );
+    expect(toast.loading).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByRole('button', { name: 'sidebar.user.moreLabel' }), {
+      key: 'Enter',
+    });
+    expect(
+      (await screen.findByRole('menuitem', { name: 'login.signIn' })).getAttribute('aria-disabled'),
+    ).not.toBe('true');
   });
 });

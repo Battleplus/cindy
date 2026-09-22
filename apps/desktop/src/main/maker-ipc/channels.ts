@@ -25,6 +25,8 @@ export const MAKER_INVOKE = {
    */
   SESSION_ENABLE_ORCA: 'maker:session:enable-orca',
   SESSION_DISABLE_ORCA: 'maker:session:disable-orca',
+  /** renderer 回填「该会话是否真的在 turn 中」的权威运行态(#4513 中断横幅假阳性)。 */
+  SESSION_TURN_ACTIVE: 'maker:session:turn-active',
   CLOSE_SESSION: 'maker:close-session',
   /**
    * 单条 user / assistant 消息本地内容删除。保留后续可见消息，但清当前原生
@@ -248,11 +250,22 @@ export const MAKER_INVOKE = {
    * Settings mutation: local trusted renderer only; deliberately excluded from the
    * device-link allowlist.
    */
+  PROVIDER_CUSTOM_DISCONNECT: 'maker:provider:custom:disconnect',
+  PROVIDER_PRESENTATION_SET: 'maker:provider:presentation:set',
   PROVIDER_ORDER_SET: 'maker:provider:order:set',
   /** Visual Settings UI only: read/write/reset a per-provider × runtime × model price estimate. */
   MODEL_PRICE_OVERRIDE_GET: 'maker:model-price-override:get',
   MODEL_PRICE_OVERRIDE_SET: 'maker:model-price-override:set',
   MODEL_PRICE_OVERRIDE_RESET: 'maker:model-price-override:reset',
+  /**
+   * 单模型上下文上限 override(设置 → 模型 → 高级设置)。窗口是自动压缩比例的分母,
+   * 调小它让压缩按用户设的长度提前触发。与价格 override 同一个 (providerId, agent,
+   * modelId) 目标形状。设置类写操作:仅本机主页面可调,**不进 device-link allowlist**
+   * (远程改被控端全局设置越权)。
+   */
+  MODEL_CONTEXT_LIMIT_GET: 'maker:model-context-limit:get',
+  MODEL_CONTEXT_LIMIT_SET: 'maker:model-context-limit:set',
+  MODEL_CONTEXT_LIMIT_RESET: 'maker:model-context-limit:reset',
   // 附加只读引用目录 — 走 closure 推送; DB 持久化由 renderer 同步调
   // local-db:sessions:update (跟 SET_MODEL / sessionService.update 双 IPC 协调先例一致)
   SET_EXTRA_DIRS: 'maker:set-extra-dirs',
@@ -269,6 +282,7 @@ export const MAKER_INVOKE = {
   REGENERATE_TITLE: 'maker:regenerate-title',
   /** 输入框推荐提示词:turn 结束后预测用户下一步输入(走 titleModel 轻量 one-shot)。 */
   PREDICT_PROMPT: 'maker:predict-prompt',
+  WORKING_STATUS: 'maker:working-status',
   HELP_ASK: 'maker:help:ask',
   /**
    * Help-assistant 反馈草稿 (Phase 1):用户对某条回答不满时,点 👎 → 弹小表单 →
@@ -405,8 +419,9 @@ export const MAKER_INVOKE = {
   CHAT_EMBEDDING_SET: 'maker:chat-embedding:set',
   CHAT_EMBEDDING_RESET: 'maker:chat-embedding:reset',
   /**
-   * Git safety workflow: automatic XDT snapshot commits and the dependent
-   * Codex file rewind entry. Default false; SET writes a user override.
+   * Git safety workflow: three-state automatic XDT savepoint policy. File
+   * rewind remains available as conversation-only rewind when no savepoint
+   * exists; SET writes a user override.
    */
   GIT_SAFETY_GET: 'maker:git-safety:get',
   GIT_SAFETY_SET: 'maker:git-safety:set',
@@ -482,7 +497,7 @@ export const MAKER_INVOKE = {
    * 实时连接状态（XD=gateway key / Anthropic=Claude.ai OAuth / OpenAI=Codex OAuth）。
    * 供应商的「连接 / 断开」复用各 agent 已有的鉴权通道（CLAUDE_OAUTH_* / AUTH_* / 登录托管），
    * 不另立重复通道。
-  */
+   */
   PROVIDER_LIST: 'maker:provider:list',
   /**
    * 内置四家模型清单手动刷新。入参仅允许 xd / anthropic / openai / xai；
@@ -516,6 +531,9 @@ export const MAKER_INVOKE = {
   /** 在 Cindy 数据目录安装官方 Ollama 运行时。renderer 只传 consent=true，不传 URL。 */
   LOCAL_MODEL_INSTALL: 'maker:local-model:install',
   LOCAL_MODEL_INSTALL_ABORT: 'maker:local-model:install-abort',
+  PROVIDER_IMPORT_PREVIEW: 'maker:provider:import:preview',
+  PROVIDER_IMPORT_CONFIRM: 'maker:provider:import:confirm',
+  PROVIDER_IMPORT_CANCEL: 'maker:provider:import:cancel',
   /**
    * 自定义 MCP 服务器 CRUD（配置入 localDb，可选 bearer token 另走通用 safe-storage IPC）。
    * list 无入参；create/update 入参 = CustomMcpConfig；delete 入参 = mcpId。
@@ -656,6 +674,9 @@ export const MAKER_INVOKE = {
   ANDROID_SET_DEFAULT_DEVICE: 'maker:android:set-default-device',
   ANDROID_SET_ADB_PATH: 'maker:android:set-adb-path',
   ANDROID_PREPARE_ADB: 'maker:android:prepare-adb',
+  // iOS Simulator presentation preference. Owner-scoped and independent from task grants.
+  IOS_SIMULATOR_GET_PREFERENCES: 'maker:ios-simulator:get-preferences',
+  IOS_SIMULATOR_SET_AUTO_OPEN_EMBEDDED_PANEL: 'maker:ios-simulator:set-auto-open-embedded-panel',
   // iOS Simulator pane and Agent discovery. Session id is required and checked in main.
   IOS_SIMULATOR_REQUEST_ACCESS: 'maker:ios-simulator:request-access',
   IOS_SIMULATOR_STATUS: 'maker:ios-simulator:status',
@@ -744,6 +765,13 @@ export const MAKER_INVOKE = {
   GOAL_PAUSE: 'maker:goal:pause',
   GOAL_RESUME: 'maker:goal:resume',
   GOAL_UPDATE: 'maker:goal:update',
+  /** Cindy Bot 父任务列出自己发起的 Bot 间委派。 */
+  BOT_DELEGATIONS_LIST: 'maker:bot-delegations:list',
+  /** Cindy Bot 父任务取消仍在运行或等待中的委派。 */
+  BOT_DELEGATION_CANCEL: 'maker:bot-delegation:cancel',
+  /** Read one hidden Bot-to-Bot conversation after a timeline trace is opened. */
+  BOT_DIRECT_MESSAGE_THREAD_GET: 'maker:bot-direct-message-thread:get',
+  BOT_LIFECYCLE_ACTION: 'maker:bot-lifecycle:action',
 } as const;
 
 /**
@@ -885,8 +913,17 @@ export const MAKER_PUSH = {
    * 分支处理; payload 还带 ctx (sessionId / workingDir / args) 让 renderer 知道在哪触发的。
    */
   DESKTOP_COMMAND_TRIGGERED: 'maker:desktop-command-triggered',
+  /** Main-owned Cindy Make operation snapshots, broadcast to every trusted renderer. */
+  CINDY_MAKE_STATE_CHANGED: 'maker:cindy-make:state-changed',
   /** multi-worker: worker 增删改 / focus 切换时 broadcast, renderer useWorkers hook 订阅刷新。 */
   ORCA_WORKER_CHANGED: 'maker:orca:worker-changed',
+  /** Bot 间委派状态改变；payload 带父/子任务 id，广播自动附 owner generation。 */
+  BOT_DELEGATION_CHANGED: 'maker:bot-delegation:changed',
+  /** Hidden Bot pair conversation accepted another message or reached its limit. */
+  BOT_DIRECT_MESSAGE_CHANGED: 'maker:bot-direct-message:changed',
+  /** Bot 档案经主进程创建或更新后变化；renderer 收到后重拉伙伴列表。 */
+  BOT_PROFILE_CHANGED: 'maker:bot-profile:changed',
+  BOT_LIFECYCLE_CHANGED: 'maker:bot-lifecycle:changed',
   /**
    * 被控端「当前 New Maker 草稿」全量变更广播。SYNC_NEW_MAKER_DRAFT 落 main 缓存后随即发,
    * 经 device-link tap 转发给控制端(account 级 → sessions topic),控制端刷新远程草稿显示镜像。

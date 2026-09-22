@@ -18,6 +18,8 @@ import path from 'node:path';
 
 import { app, BrowserWindow } from 'electron';
 
+import { acquireIOSSimulatorProjectUse, resolveIOSSimulatorProjectDir } from './ios-simulator-project-source';
+
 import {
   createIOSSimulatorRuntime,
   createIOSSimulatorSimctlLifecycle,
@@ -113,6 +115,7 @@ import {
 import { resolveIOSSimulatorDesktopAdmissionPolicy } from './ios-simulator-admission.js';
 import { registerIOSSimulatorExitAbortHandler } from './ios-simulator-exit.js';
 import { compareIOSSimulatorPngBuffers, IOSSimulatorMediaCapture } from './ios-simulator-media.js';
+import { readIOSSimulatorPreferences } from './ios-simulator-preferences.js';
 import {
   clearIOSSimulatorRendererAccess,
   configureIOSSimulatorRendererAccessRevocationObserver,
@@ -555,6 +558,8 @@ export interface IOSSimulatorHostOptions {
   withSessionLock?: <T>(sessionId: string, task: () => Promise<T>) => Promise<T>;
   resolveWorktreeRoot?: (workDir: string) => Promise<string>;
   requestViewerFocus?: (sessionId: string, instanceId: string) => void;
+  /** Owner preference gate for automatic presentation only; explicit focus bypasses it. */
+  shouldAutoOpenViewer?: () => boolean;
   /** Main → renderer route diagnostics seam; injected in tests, broadcast by default. */
   pushRouteStatus?: (status: IOSSimulatorPublicRouteStatus) => void;
   /** Main → exact owning viewer frame seam; injected in tests, fail-closed by default. */
@@ -2285,6 +2290,11 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
         });
       }
     });
+  const shouldAutoOpenViewer = options.shouldAutoOpenViewer ?? (() => true);
+  const requestAutomaticViewerFocus = (sessionId: string, instanceId: string): void => {
+    if (!shouldAutoOpenViewer()) return;
+    requestViewerFocus(sessionId, instanceId);
+  };
 
   async function resolveSession(
     sessionId: string,
@@ -5213,7 +5223,7 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
           viewerSessions.delete(instance.instanceId);
           viewerVisibilityIntents.delete(instance.instanceId);
           clearViewportState(instance.instanceId);
-          requestViewerFocus(sessionId, instance.instanceId);
+          requestAutomaticViewerFocus(sessionId, instance.instanceId);
           publishRouteStatusForInstance(instance, getDriverManager().get(instance.instanceId));
           return {
             ok: true,
@@ -6225,7 +6235,9 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
           // Validate before beginBuild: a rejected argument must not leave a
           // build registered that never reaches the cleanup finally below.
           const containerPath = readOptionalString(args, 'containerPath', 4_096);
+          const projectDir = readOptionalString(args, 'projectDir', 4_096);
           const activeBuild = beginBuild(instance, buildAdmissionEpoch);
+          let releaseProjectUse: (() => Promise<void>) | null = null;
           let buildLeaseHeartbeatError: unknown = null;
           let stopBuildLeaseHeartbeat: (() => void) | null = null;
           const expectedArch = process.arch === 'x64' ? 'x86_64' : 'arm64';
@@ -6251,8 +6263,15 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
             // (`Demo.xcodeproj`, `./Demo.xcodeproj`, absolute paths, or the
             // implicit single-container selection) must share one identity,
             // while an invalid container must not create empty cache trees.
+            const projectRoot = await resolveIOSSimulatorProjectDir(instance.worktreeRoot, projectDir);
+            releaseProjectUse = await acquireIOSSimulatorProjectUse(
+              instance.sessionId, projectRoot, activeBuild.controller,
+            );
+            if (activeBuild.controller.signal.aborted) {
+              throw new IOSSimulatorInstanceError('MUTATION_CANCELLED', 'The app build was cancelled before project inspection.', true);
+            }
             const inspectedProject = projectBuilder.inspect
-              ? await projectBuilder.inspect(instance.worktreeRoot, containerPath)
+              ? await projectBuilder.inspect(projectRoot, containerPath)
               : null;
             if (disposePromise) throw new IOSSimulatorHostDisposedError();
             if (buildLeaseHeartbeatError) throw buildLeaseHeartbeatError;
@@ -6264,7 +6283,7 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
               );
             }
             actor.assertRoute(route);
-            const canonicalWorktreeRoot = inspectedProject?.worktreeRoot ?? instance.worktreeRoot;
+            const canonicalWorktreeRoot = inspectedProject?.worktreeRoot ?? projectRoot;
             const canonicalContainerPath = inspectedProject
               ? (inspectedProject.containerPath ?? undefined)
               : containerPath;
@@ -6415,7 +6434,7 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
               try {
                 await assertIOSSimulatorArtifactSymlinksContained(immutableAppPath);
                 artifact = await appLifecycle.inspectArtifact(
-                  instance.worktreeRoot,
+                  canonicalWorktreeRoot,
                   immutableAppPath,
                   derivedDataPath,
                   activeBuild.controller.signal,
@@ -6467,6 +6486,15 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
                     projectKind: built.kind,
                     scheme: built.scheme,
                     createdAt: artifact.createdAt,
+                    project: {
+                      name: path.basename(canonicalWorktreeRoot),
+                      sourceFingerprint: sourceFingerprint(canonicalWorktreeRoot),
+                      containerPath: canonicalContainerPath
+                        ? (path.isAbsolute(canonicalContainerPath)
+                            ? path.relative(canonicalWorktreeRoot, canonicalContainerPath)
+                            : canonicalContainerPath)
+                        : undefined,
+                    },
                   },
                   diagnostics,
                 },
@@ -6492,6 +6520,7 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
               // live skip callback still protects builds admitted mid-sweep.
               scheduleBuildCachePrune();
             }
+            await releaseProjectUse?.();
             finishBuild(instance.instanceId, activeBuild);
           }
         }
@@ -6630,11 +6659,26 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
               requireControlGrant(instance, context);
               const stored = appArtifacts.get(artifactId);
               if (stored?.projectKind === 'cindy-mobile' && projectBuilder.validateLaunch) {
-                await projectBuilder.validateLaunch(
-                  stored.artifact.worktreeRoot,
-                  instance.simulatorUdid,
-                  signal,
+                const sourceController = new AbortController();
+                const sourceSignal = AbortSignal.any([signal, sourceController.signal]);
+                const releaseProjectUse = await acquireIOSSimulatorProjectUse(
+                  instance.sessionId, stored.artifact.worktreeRoot, sourceController, sourceSignal,
                 );
+                try {
+                  if (sourceSignal.aborted) {
+                    throw new IOSSimulatorInstanceError('MUTATION_CANCELLED', 'The app launch was cancelled before project validation.', true);
+                  }
+                  await projectBuilder.validateLaunch(
+                    stored.artifact.worktreeRoot,
+                    instance.simulatorUdid,
+                    sourceSignal,
+                  );
+                  if (sourceSignal.aborted) {
+                    throw new IOSSimulatorInstanceError('MUTATION_CANCELLED', 'The app launch was cancelled during project validation.', true);
+                  }
+                } finally {
+                  await releaseProjectUse?.();
+                }
               }
               await appLifecycle.launchExact(
                 instance.simulatorUdid,
@@ -6647,7 +6691,7 @@ export function createIOSSimulatorHost(options: IOSSimulatorHostOptions = {}): I
           } finally {
             unpinArtifact(artifactId);
           }
-          requestViewerFocus(sessionId, route.instanceId);
+          requestAutomaticViewerFocus(sessionId, route.instanceId);
           return { ok: true, data: { artifactId, launched: true } };
         }
         if (name === 'terminate_app') {
@@ -7395,6 +7439,7 @@ function installDefaultIOSSimulatorHost(
       ...(pendingCreateEvidence ? { pendingCreateEvidence } : {}),
       ...(seams.getSession ? { getSession: seams.getSession } : {}),
       driverManager: createDefaultDriverManager(),
+      shouldAutoOpenViewer: () => readIOSSimulatorPreferences().autoOpenEmbeddedPanel,
     });
     configureIOSSimulatorRendererAccessRevocationObserver((grants) => {
       for (const grant of grants) {

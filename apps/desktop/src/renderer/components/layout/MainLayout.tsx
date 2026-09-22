@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useRememberMainEntry } from './MainEntryRedirect';
 import { useTranslation } from 'react-i18next';
 
 import { BrowserWebviewPool } from '@/components/layout/BrowserWebviewPool';
@@ -32,6 +33,8 @@ import { CredentialStoreBanner } from '@/components/layout/CredentialStoreBanner
 import { useDeviceLinkRemoteProjects } from '@/features/device-link/useDeviceLinkRemoteProjects';
 import { pluginScheduleNavigationState } from '@/features/scheduler/lib/pluginScheduleCreateIntent';
 import { ScheduleSessionIndexOwner } from '@/features/scheduler/components/ScheduleSessionIndexOwner';
+import { AppBadgeAttentionSync } from '@/components/layout/AppBadgeAttentionSync';
+import { usePendingAlertAttention } from '@/hooks/usePendingAlertAttention';
 import { FeatureSidebarSlotProvider } from '@/features/feature-context';
 import { useAppShortcut } from '@/hooks/useAppShortcut';
 import { isAppInteractionLocked } from '@/lib/appInteractionLock';
@@ -95,11 +98,16 @@ import {
 } from '@/features/right-sidebar/lib/sidebarCommands';
 import { requestSessionSwitch } from '@/features/cc-agent/lib/sessionSwitchCommands';
 import { makeFolderPickerNewMakerRouteState } from '@/features/cc-agent/lib/newMakerRouteState';
+import { makeGenericNewMakerRouteState } from '@/features/cc-agent/lib/genericNewMakerRouteState';
 import { resolveSessionRoute } from '@/lib/orcaSessionIdentity';
+import { getBotProfiles } from '@/features/bots/botStore';
+import { botRouteForOwnedSession } from '@/features/bots/botSessionOwners';
 import { remoteProjectsStore } from '@/features/device-link/remoteProjectsStore';
 import {
   isAgentIslandVisibleSessionOwnedByWorkdirBrowseRoute,
+  isAgentIslandVisibleSessionOwnedByBotRoute,
   resolveAgentIslandVisibleSessionFromRouteTarget,
+  resolveAgentIslandVisibleSessionsFromPath,
   resolveAgentIslandVisibleSessionIdFromPath,
 } from '@/lib/agentIslandVisibleSessionRoute';
 
@@ -137,8 +145,6 @@ interface RightSidebarSessionDeclarationOptions {
 
 const applicationMenuLog = createLogger('ApplicationMenu');
 const log = createLogger('MainLayout');
-// Keep in sync with single-segment static routes under /cc-agent in router.tsx.
-const CC_AGENT_STATIC_SEGMENTS = ['boot', 'files', 'new', 'new-dialogue', 'orca', 'scheduled'];
 
 function getInitialCollapsed(): boolean {
   // 「在新窗口打开」的副窗口默认折叠侧栏 —— 多开盯多个会话时,每个窗口都铺一条
@@ -187,13 +193,6 @@ function isZoomShortcutBlockedTarget(target: EventTarget | null): boolean {
   );
 }
 
-function hasInlineControlledBannerPath(pathname: string): boolean {
-  const parts = pathname.split('/').filter(Boolean);
-  if (parts[0] !== 'cc-agent') return false;
-  if (parts.length === 2) return !CC_AGENT_STATIC_SEGMENTS.includes(parts[1]);
-  return parts.length === 3 && parts[1] === 'orca' && parts[2] !== 'new';
-}
-
 /**
  * SidebarPinSpacer —— peek 抽屉固定展开(pinning)期的流内占位。
  * 抽屉在 pinning 期保持 fixed 冻结不动,本组件在流内跑 0→width 的宽度动画
@@ -223,6 +222,9 @@ function SidebarPinSpacer({ width }: { width: number }) {
 }
 
 export function MainLayout() {
+  useRememberMainEntry();
+  // 未处理报错的恢复与已处置收敛不依赖当前路由或侧栏是否挂载。
+  usePendingAlertAttention();
   const splitGroup = useSplitGroup();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(getInitialCollapsed);
   const [shareImportRequest, setShareImportRequest] = useState<{
@@ -394,7 +396,6 @@ export function MainLayout() {
   }, []);
 
   const isSettingsRoute = location.pathname === '/settings';
-  const hasInlineControlledBanner = hasInlineControlledBannerPath(location.pathname);
 
   // 完全隐藏态 hover 临时浮出(peek)状态机 —— hover 折叠按钮抽屉滑出预览,
   // 点击/⌘B 固定展开(pin)。rail 态(isCollapsed=false)不触发。见 useSidebarPeek。
@@ -420,22 +421,23 @@ export function MainLayout() {
     }
   }, [sidebarPeek.peekState, isRailMode, handleRailModeChange]);
 
-  const routeSessionId = resolveAgentIslandVisibleSessionIdFromPath(location.pathname);
-  const splitVisibleSessionIds = useMemo(() => {
-    const splitSessionIds = getSplitSessionIds(splitGroup.root);
-    return routeSessionId && splitSessionIds.length >= 2
-      ? [...new Set([routeSessionId, ...splitSessionIds])]
-      : [];
-  }, [routeSessionId, splitGroup.root]);
+  const visibleSessions = useMemo(
+    () => resolveAgentIslandVisibleSessionsFromPath(
+      location.pathname,
+      getSplitSessionIds(splitGroup.root),
+    ),
+    [location.pathname, splitGroup.root],
+  );
 
   const syncAgentIslandVisibleSession = useCallback(() => {
     if (!isAgentIslandSupported()) return;
     if (!document.hasFocus()) return;
     if (isAgentIslandVisibleSessionOwnedByWorkdirBrowseRoute(location.pathname)) return;
+    if (isAgentIslandVisibleSessionOwnedByBotRoute(location.pathname)) return;
     void window.electronAPI.agentIsland?.setVisibleSession?.(
-      splitVisibleSessionIds.length >= 2 ? splitVisibleSessionIds : routeSessionId,
+      visibleSessions,
     );
-  }, [location.pathname, routeSessionId, splitVisibleSessionIds]);
+  }, [location.pathname, visibleSessions]);
 
   useEffect(() => {
     syncAgentIslandVisibleSession();
@@ -491,6 +493,12 @@ export function MainLayout() {
   currentPathRef.current = `${location.pathname}${location.search}`;
   const navigateToSession = useCallback(
     (sessionId: string, messageClientId?: string) => {
+      const botRoute = botRouteForOwnedSession(getBotProfiles(), sessionId);
+      if (botRoute) {
+        const target = botRoute;
+        if (currentPathRef.current !== target) navigate(target);
+        return;
+      }
       // device-link 远程会话本地无 row:resolveSessionRoute 内部的 sessionService.get
       // 会 miss → 远程 Orca lead/worker 被当普通会话路由,CCAgentSessionView 再
       // redirect 到 orca 路由时会丢 searchJump 锚点。传入远程镜像的 session 对象,
@@ -608,6 +616,7 @@ export function MainLayout() {
         | { type: 'project'; workingDir: string }
         | { type: 'new-session'; workingDir: string }
         | { type: 'share-import'; filePath: string }
+        | { type: 'provider-import'; importId: string }
         | { type: 'settings'; tab: 'voice-input' | 'providers'; connect?: string },
     ) => {
       if (payload.type === 'session') {
@@ -632,6 +641,10 @@ export function MainLayout() {
         openShareImport(payload.filePath);
         return;
       }
+      if (payload.type === 'provider-import') {
+        navigate(`/settings?tab=providers&import=${encodeURIComponent(payload.importId)}`);
+        return;
+      }
       if (payload.type === 'settings') {
         // connect 透传给 ProvidersSection 已有的 ?connect=<providerId> 消费逻辑
         // (可指向内置 provider 或 preset;providers 就绪后一次性消费、消费即从
@@ -646,13 +659,23 @@ export function MainLayout() {
     [navigate, navigateToSession, openShareImport],
   );
   useEffect(() => {
-    const unsubscribe = window.electronAPI.onDeepLinkNavigate(handleDeepLinkPayload);
+    const unsubscribe = window.electronAPI.onDeepLinkNavigate((payload) => {
+      if (payload.type !== 'provider-import') {
+        handleDeepLinkPayload(payload);
+        return;
+      }
+      // Main retains imports through login. Both this wake-up and the mount pull
+      // use the same atomic take, so either ordering navigates only once.
+      void window.electronAPI.takePendingDeepLink().then((pending) => {
+        if (pending) handleDeepLinkPayload(pending);
+      });
+    });
     return unsubscribe;
   }, [handleDeepLinkPayload]);
 
   // pull-on-mount:冷启动期间 (mainWindow 未 ready / renderer 未挂 listener)
   // 缓存在 main 端的 deep link / --open-folder payload, MainLayout 第一次 mount
-  // 时拉一次消费。已运行场景始终返回 null,no-op。
+  // 时拉一次消费。导入唤醒事件也会 take，两者只有先到者拿到 payload。
   //
   // 关键场景:未登录用户右键 "通过 Cindy 打开" → 冷启动 → LoginPage 接管 →
   // 用户走完 Feishu OAuth → MainLayout (在 ProtectedRoute 之内) 第一次 mount →
@@ -1015,7 +1038,9 @@ export function MainLayout() {
           return;
         }
         applicationMenuLog.info('new-maker shortcut invoked, navigating to /cc-agent/new');
-        navigate('/cc-agent/new');
+        navigate('/cc-agent/new', {
+          state: makeGenericNewMakerRouteState(currentPathRef.current.split('?')[0]),
+        });
       })
       .catch((err: unknown) => {
         applicationMenuLog.warn('new-maker shortcut routing failed', err);
@@ -1056,11 +1081,11 @@ export function MainLayout() {
           navigate('/issues');
           break;
         case 'new-maker':
-          // 等价于 CCAgentSidebarUpper.handleNewCCS (sidebar 顶部 "+ New Maker" 按钮):
-          // 单步 navigate 到 /cc-agent/new, draft 状态由 NewMakerDraftRoute 自己读取。
-          // 不重置 workingDir —— sidebar 按钮也不重置, 保留用户上次的目录上下文。
+          // 与侧栏同口径：继承当前任务电脑，同机保留草稿项目。
           applicationMenuLog.info('new-maker invoked, navigating to /cc-agent/new');
-          navigate('/cc-agent/new');
+          navigate('/cc-agent/new', {
+            state: makeGenericNewMakerRouteState(currentPathRef.current.split('?')[0]),
+          });
           break;
         case 'new-maker-shortcut':
           handleNewMakerShortcut();
@@ -1167,7 +1192,9 @@ export function MainLayout() {
       if (action.type !== 'command') return false;
       switch (action.commandId) {
         case 'newTask':
-          navigate('/cc-agent/new');
+          navigate('/cc-agent/new', {
+            state: makeGenericNewMakerRouteState(currentPathRef.current.split('?')[0]),
+          });
           return true;
         case 'settings':
           navigate('/settings?tab=shortcuts');
@@ -1354,6 +1381,7 @@ export function MainLayout() {
       isCollapsed={sidebarPeek.isPeekVisible ? false : isSidebarCollapsed || isRailMode}
     >
       <ScheduleSessionIndexOwner />
+      {!isSecondaryWindow() && <AppBadgeAttentionSync />}
       <div
         ref={rowRef}
         className={cn(
@@ -1382,6 +1410,7 @@ export function MainLayout() {
               onResetWidth={resetWidth}
               onOpenUpdateNotice={openNotice}
               onOpenVersionNotice={openVersionNotice}
+              onOpenStorage={() => navigate('/settings?tab=storage')}
               peekState={sidebarPeek.isPeekVisible ? sidebarPeek.peekState : null}
               peekDrawerProps={sidebarPeek.drawerProps}
             />
@@ -1625,8 +1654,8 @@ export function MainLayout() {
           单例 + vanilla DOM,这里只挂一个空 React 节点,Phase 6 maximize 时
           会在这里加 layout 控制。 */}
       <BrowserWebviewPool />
-      {/* 被控端可见性:主聊天页在输入区内联渲染;其它页面保留全局兜底。 */}
-      {!hasInlineControlledBanner && <ControlledBanner />}
+      {/* 实际存在内联提示（含伙伴 / 折叠态）时组件自行退让，其余页面保留兜底。 */}
+      <ControlledBanner />
     </FeatureSidebarSlotProvider>
   );
 }

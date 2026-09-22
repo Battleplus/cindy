@@ -1,3 +1,4 @@
+import { useRetainedHomeState, type HomeViewSession } from './homeViewSession';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDeviceLink } from '@/device-link/DeviceLinkContext';
@@ -18,6 +19,7 @@ import {
   type ConversationSearchProjectSelection,
 } from '@/session/conversationSearch';
 import { remoteSessionStore } from '@/session/remoteSessionStore';
+import { useStableValue } from '@/utils/useStableValue';
 import type {
   ConversationSearchAgentFilter,
   ConversationSearchLastActivityFilter,
@@ -32,11 +34,13 @@ export type ConversationSearchStatus = 'idle' | 'searching' | 'ready';
 export function useConversationSearch({
   origins,
   enabled,
+  retainedState,
   lockedWorkingDirs,
   projects,
 }: {
   origins: readonly ConversationSearchDeviceOrigin[];
   enabled: boolean;
+  retainedState?: HomeViewSession;
   lockedWorkingDirs?: string[] | null;
   projects?: readonly ConversationSearchProjectOption[];
 }): {
@@ -60,15 +64,15 @@ export function useConversationSearch({
 } {
   const { invoke } = useDeviceLink();
   const { t } = useTranslation();
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useRetainedHomeState(retainedState, 'search.query', '');
   const [status, setStatus] = useState<ConversationSearchStatus>('idle');
   const [results, setResults] = useState<ConversationSearchListItem[]>([]);
-  const [sortBy, setSortBy] = useState<ConversationSearchSortBy>('relevance');
-  const [statusFilter, setStatusFilter] = useState<ConversationSearchStatusFilter>('all');
-  const [agentFilter, setAgentFilter] = useState<ConversationSearchAgentFilter>('all');
+  const [sortBy, setSortBy] = useRetainedHomeState<ConversationSearchSortBy>(retainedState, 'search.sortBy', 'relevance');
+  const [statusFilter, setStatusFilter] = useRetainedHomeState<ConversationSearchStatusFilter>(retainedState, 'search.statusFilter', 'all');
+  const [agentFilter, setAgentFilter] = useRetainedHomeState<ConversationSearchAgentFilter>(retainedState, 'search.agentFilter', 'all');
   const [lastActivityFilter, setLastActivityFilter] =
-    useState<ConversationSearchLastActivityFilter>('all');
-  const [projectSelection, setProjectSelection] = useState<ConversationSearchProjectSelection>('all');
+    useRetainedHomeState<ConversationSearchLastActivityFilter>(retainedState, 'search.lastActivityFilter', 'all');
+  const [projectSelection, setProjectSelection] = useRetainedHomeState<ConversationSearchProjectSelection>(retainedState, 'search.projectSelection', 'all');
   const requestSeq = useRef(0);
   const unnamedLabel = t('session.menu.unnamedTitle');
   const visibleProjectKeys = useMemo(
@@ -80,15 +84,21 @@ export function useConversationSearch({
     () => (lockedWorkingDirs?.length ? [...lockedWorkingDirs] : null),
     [lockedWorkingDirs?.join('|') ?? ''],
   );
-  const scopedOrigins = useMemo(
-    () => (lockedDirs ? [...origins] : scopedConversationSearchOrigins(origins, projectSelection, projects ?? [])),
-    [lockedDirs, origins, projectSelection, projects],
-  );
-  const originKey = useMemo(
-    () => scopedOrigins.map((origin) => (
-      `${origin.deviceId}:${origin.reachable ? '1' : '0'}:${(origin.workingDirs ?? []).join(',')}`
-    )).join('|'),
-    [scopedOrigins],
+  const scopedOrigins = useStableValue(
+    useMemo(
+      () =>
+        (lockedDirs
+          ? [...origins]
+          : scopedConversationSearchOrigins(origins, projectSelection, projects ?? [])
+        )
+          .map((origin) => ({
+            ...origin,
+            workingDirs: origin.workingDirs ? [...origin.workingDirs].sort() : null,
+          }))
+          .sort((a, b) => a.deviceId.localeCompare(b.deviceId)),
+      [lockedDirs, origins, projectSelection, projects],
+    ),
+    (a, b) => JSON.stringify(a) === JSON.stringify(b),
   );
 
   useEffect(() => {
@@ -167,6 +177,7 @@ export function useConversationSearch({
     }, CONVERSATION_SEARCH_DEBOUNCE_MS);
 
     return () => {
+      requestSeq.current += 1;
       clearTimeout(timer);
     };
   }, [
@@ -174,7 +185,6 @@ export function useConversationSearch({
     enabled,
     invoke,
     lastActivityFilter,
-    originKey,
     scopedOrigins,
     query,
     sortBy,

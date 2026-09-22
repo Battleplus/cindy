@@ -18,19 +18,47 @@ describe('background push recovery', () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100_000); });
   afterEach(() => vi.useRealTimers());
 
-  function fixture() {
+  function fixture(pendingTransitions?: () => Promise<void>[]) {
     let background = true;
     const release = deferred<void>();
     const stop = vi.fn();
     const connect = vi.fn();
+    const report = vi.fn();
     const releaseTopics = vi.fn(() => [release.promise]);
     const lifecycle = createBackgroundConnection({
       isBackground: () => background,
-      releaseTopics, stop, connect,
+      releaseTopics, stop, connect, report,
+      pendingTransitions,
       graceMs: 2500, releaseWaitMs: 1000, suspendMs: 10_000,
     });
-    return { lifecycle, release, stop, connect, releaseTopics, active: () => { background = false; lifecycle.active(); } };
+    return { lifecycle, release, stop, connect, releaseTopics, report, active: () => { background = false; lifecycle.active(); } };
   }
+
+  it('keeps stopping and reconnecting when a diagnostic sink throws', async () => {
+    const f = fixture();
+    f.report.mockImplementation(() => { throw new Error('diagnostic unavailable'); });
+    f.lifecycle.background();
+    await vi.advanceTimersByTimeAsync(3500);
+    expect(f.stop).toHaveBeenCalledTimes(1);
+    f.active();
+    expect(f.connect).toHaveBeenCalledTimes(1);
+    f.release.resolve();
+    f.lifecycle.dispose();
+  });
+
+  it('records grace execution and ignores release completion from an old background', async () => {
+    const f = fixture();
+    f.lifecycle.background();
+    expect(f.report).toHaveBeenLastCalledWith({ phase: 'background', generation: 1, elapsedMs: 0, releases: 1 });
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(f.report).toHaveBeenLastCalledWith({ phase: 'grace-fired', generation: 1, elapsedMs: 2500, transitions: 0 });
+    f.active();
+    const count = f.report.mock.calls.length;
+    f.release.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.report).toHaveBeenCalledTimes(count);
+    expect(f.stop).not.toHaveBeenCalled();
+  });
 
   it('replaces a half-open socket immediately when JS was suspended during the final unsubscribe', async () => {
     const f = fixture();
@@ -41,6 +69,8 @@ describe('background push recovery', () => {
     // Wall time passes without running timers: iOS suspended the JS runtime.
     vi.setSystemTime(Date.now() + 60_000);
     f.active();
+    expect(f.report).toHaveBeenCalledWith({ phase: 'active', generation: 1, elapsedMs: 62500 });
+    expect(f.report).toHaveBeenLastCalledWith({ phase: 'stop', generation: 1, elapsedMs: 62500, reason: 'suspended' });
     expect(f.stop).toHaveBeenCalledTimes(1);
     expect(f.connect).toHaveBeenCalledTimes(1);
     expect(f.stop.mock.invocationCallOrder[0]).toBeLessThan(f.connect.mock.invocationCallOrder[0]);
@@ -62,6 +92,33 @@ describe('background push recovery', () => {
     expect(f.connect).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['authorize', 'reject', 'timeout', 'foreground', 'dispose'])(
+    'keeps signaling through a slow media handoff without retaining heavy topics: %s', async (outcome) => {
+      const handoff = deferred<void>();
+      const f = fixture(() => [handoff.promise]);
+      f.lifecycle.background();
+      expect(f.releaseTopics).toHaveBeenCalledTimes(1);
+      f.release.resolve();
+      await vi.advanceTimersByTimeAsync(3200);
+      expect(f.stop).not.toHaveBeenCalled();
+      if (outcome === 'foreground') f.active();
+      if (outcome === 'dispose') f.lifecycle.dispose();
+      if (outcome === 'reject') handoff.reject(new Error('denied'));
+      else if (outcome !== 'timeout') handoff.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      if (outcome === 'timeout') {
+        await vi.advanceTimersByTimeAsync(799);
+        expect(f.stop).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(f.stop).toHaveBeenCalledTimes(['foreground', 'dispose'].includes(outcome) ? 0 : 1);
+      handoff.resolve();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(f.stop).toHaveBeenCalledTimes(['foreground', 'dispose'].includes(outcome) ? 0 : 1);
+      f.lifecycle.dispose();
+    },
+  );
+
   it('bounds final unsubscribe and prevents an old tail from stopping a later background generation', async () => {
     const f = fixture();
     f.lifecycle.background();
@@ -78,6 +135,7 @@ describe('background push recovery', () => {
     g.lifecycle.background();
     await vi.advanceTimersByTimeAsync(3500);
     expect(g.stop).toHaveBeenCalledTimes(1);
+    expect(g.report).toHaveBeenLastCalledWith({ phase: 'stop', generation: 1, elapsedMs: 3500, reason: 'grace', releaseOutcome: 'timed-out' });
     g.lifecycle.dispose();
   });
 });

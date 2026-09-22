@@ -1,3 +1,5 @@
+import { localizedModelDescription } from '@/lib/modelDescriptions';
+import { localizedModelName, matchesModelName } from '@/lib/modelDisplayNames';
 import {
   useCallback,
   useState,
@@ -76,14 +78,11 @@ import {
   prefetchDeviceProviders,
   useDeviceProviders,
 } from '@/hooks/useDeviceProviders';
-import {
-  modelPriceDiscountLabelValues,
-  modelPriceDetailRows,
-  modelPricePresentation,
-} from '@/lib/modelPriceFormat';
+import { modelPriceDiscountLabelValues, modelPriceDetailRows } from '@/lib/modelPriceFormat';
+import { resolveModelPricePresentation } from '@/lib/modelPricePresentation';
 import {
   filterChatBridgedCodexProviders,
-  isChatBridgedCodexProvider,
+  isLocalOnlyProviderForAgent,
   isDeviceModelVisible,
   providerMonogram,
   resolveVisibleModelAgentKind,
@@ -105,6 +104,8 @@ import {
   chatEligibleSourcesForModel,
   actualSourceIdForModel,
   effectiveSourceIdForModel,
+  findCatalogModel,
+  nativeDefaultSourceId,
   getModel,
   modelSupportsFastMode,
   providerOffersModel,
@@ -117,7 +118,6 @@ import {
 } from '@cindy/model-providers';
 import { isProviderLogoKind } from '@cindy/model-providers/branding';
 import { compactEnglishEffortLabel } from '@cindy/maker-shared/agent-capabilities';
-import { getModelPriceQuote } from '../../../shared/modelPriceQuote';
 import type { ModelAccessAccountTier } from '../../../shared/modelAccess';
 import { applyProviderOrder } from '../../../shared/providerOrder';
 import type { ModelPricingCatalog } from '../../../shared/regionalMoney';
@@ -129,15 +129,25 @@ import { buildProviderSections } from './sourceSwitch';
 const MODEL_DISCOVERY_INDICATOR_DELAY_MS = 300;
 
 /**
+ * 工具栏紧凑统一面板宽度。规格 `docs/product-rules/model-selector-unified.md` §1.2：
+ * max-content，下限 300px，上限 min(460px, 100vw-48px)。完整 class 字面量必须留在
+ * 源码里给 Tailwind 扫描；改数字时同步规格。
+ */
+export const UNIFIED_COMPACT_PANEL_MAX_WIDTH_PX = 460;
+export const UNIFIED_COMPACT_PANEL_WIDTH_CLASS =
+  'w-max min-w-[300px] max-w-[min(460px,calc(100vw-48px))]';
+
+/**
  * 标签降级按选择器 pane 宽度生效。这里的 width 是整个 pane 宽度，不是模型名
  * 实际可用宽度；行还要扣掉左右 padding、来源图标、effort 和选中勾选。因此不能把
  * 300px 当成“能放下全部标签”的阈值，否则英文 Subscription 会先把模型名压成省略号。
  * 模型名优先：促销标签先收起，订阅标签随后收起，只保留「已隐藏」和选中勾选。
+ * full 只在宽过紧凑面板上限时启用，避免 460px 触顶时促销标签把刚留给长模型名的空间吃回去。
  */
 export type ModelTagDensity = 'full' | 'subscription' | 'hidden';
 
 export function modelTagDensityForWidth(width: number | null): ModelTagDensity {
-  if (width === null || width >= 450) return 'full';
+  if (width === null || width > UNIFIED_COMPACT_PANEL_MAX_WIDTH_PX) return 'full';
   if (width >= 370) return 'subscription';
   return 'hidden';
 }
@@ -266,7 +276,7 @@ function ModelOptionsFloatingPanel({
     <div
       ref={refs.setFloating}
       data-radix-popper-content-wrapper=""
-      className="z-50 w-[248px]"
+      className={cn('z-50 w-[248px]', className)}
       style={{
         ...floatingStyles,
         visibility: isPositioned ? undefined : 'hidden',
@@ -318,6 +328,23 @@ function ModelOptionsFloatingPanel({
 
 function providerDisplayName(p: ProviderView, t: (key: string) => string): string {
   return sharedProviderDisplayName(p, t);
+}
+
+/** Display-only alias lookup; implicit choices retain the default-source eligibility/order. */
+function modelDisplayProvider(
+  providers: ProviderView[], providerId: string | null | undefined,
+  modelId: string, agent: AgentKind, actualRoute: boolean,
+): ProviderView | undefined {
+  if (providerId) return providers.find((provider) => provider.id === providerId);
+  const resolveSource = actualRoute ? actualSourceIdForModel : effectiveSourceIdForModel;
+  const eligible = providers.filter((provider) => {
+    // Source eligibility must preserve distinct products such as [1m]. Metadata
+    // may fall back to the base model only after the source has been selected.
+    const model = findCatalogModel(provider, modelId, agent, { exact: true });
+    return model && resolveSource([provider], provider.id, model.id, agent) === provider.id;
+  });
+  const defaultId = nativeDefaultSourceId(eligible, agent);
+  return eligible.find((provider) => provider.id === defaultId);
 }
 
 // 来源供应商 → 单色官方 mark(fill=currentColor)。trigger 默认右间距 + trigger 文字色;
@@ -446,6 +473,7 @@ interface RowModel {
   description?: string;
   contextWindow: number;
   efforts: readonly Effort[];
+  displayEfforts?: readonly Effort[];
   defaultEffort: Effort | null;
   effortDisplayNames?: Partial<Record<string, string>>;
   supportsFastMode?: boolean;
@@ -688,12 +716,16 @@ interface ModelSelectorProps {
   maxVisibleModelRows?: number;
   /** 关闭模型的 effort / Fast 编辑入口与行内状态摘要；只选择模型 id 的设置项使用。 */
   configurationEnabled?: boolean;
+  /** Restrict Fast to the Harnesses this entry can persist and dispatch; false disables it. */
+  fastModeConfigurable?: boolean | readonly AgentKind[];
   /** 语义同 ModelSelectorContentProps.unifiedPanel（统一模型选择器面板，默认开启）。 */
   unifiedPanel?: boolean;
   /** 语义同 ModelSelectorContentProps.sessionEngineFilter（统一面板的会话内形态）。 */
   sessionEngineFilter?: UnifiedModelPanelProps['sessionEngineFilter'];
   /** 语义同 ModelSelectorContentProps.unifiedAgents（参与联合列表的引擎集合）。 */
   unifiedAgents?: readonly AgentKind[];
+  /** 统一面板是否只采用目录官方推荐配置，不读取个人引擎偏好与收藏配置。 */
+  unifiedSelectionPolicy?: UnifiedModelPanelProps['selectionPolicy'];
   /**
    * composer pill 尾部的**引擎小标**(model-selector-unified §1.1)。
    *
@@ -727,7 +759,7 @@ interface ModelSelectorProps {
   /** 点击当前已选模型行时打开该行的配置浮层，而不是直接收起选择器。 */
   selectedRowClickOpensConfiguration?: boolean;
   /**
-   * modelId 非空但不在可见清单时的 trigger 文案（默认落「选择模型」占位符）。
+   * modelId 非空但不在可见清单时的诊断文案（默认提示模型信息暂不可用）。
    * 供展示已持久化偏好的调用方给出诊断性文案，避免把「存过但当前不可用」显示成「没选过」。
    */
   unknownModelLabel?: (modelId: string) => string;
@@ -822,14 +854,15 @@ interface ModelSelectorContentProps {
   followSession?: { active: boolean; label: string; onFollow: () => void | boolean | Promise<void | boolean> };
   /** 是否显示模型的 effort / Fast 编辑入口。 */
   configurationEnabled?: boolean;
+  /** Restrict Fast to the Harnesses this entry can persist and dispatch; false disables it. */
+  fastModeConfigurable?: boolean | readonly AgentKind[];
   /** A is the default for every entry. False is reserved for capabilities-only remote compatibility. */
   unifiedPanel?: boolean;
   /**
    * 统一面板的**会话内形态**(model-selector-unified §1.6,M6 面板侧)。仅在
    * `unifiedPanel` 为 true 时生效;新会话 / 草稿不传。
    *
-   * 传入后:rail 顶部出现「同引擎」过滤(默认选中)、该视图内的行默认落在当前引擎上、
-   * 离开该视图时列表顶部出现有损警示、选中跨引擎行时走 `onCrossEngineSelect`
+   * 传入后默认展示全部，保留有损切换警示；选中跨引擎行时走 `onCrossEngineSelect`
    * (调用方在那里执行既有的 performAgentSwitch 事务)。
    *
    * 与 `agentSwitch` 的关系:两者**不要同时用**。旧的两步分段(先选引擎 tab、再选模型)
@@ -851,6 +884,7 @@ interface ModelSelectorContentProps {
    * 不隐藏任何引擎);当前引擎必须始终在列。
    */
   unifiedAgents?: readonly AgentKind[];
+  unifiedSelectionPolicy?: UnifiedModelPanelProps['selectionPolicy'];
   /**
    * 统一面板里被选中的**收藏锚点** uid(规格 §1.5:选中的是那一条收藏副本,不是模型本体)。
    * 由调用方持有(草稿层),因为它与 (来源, 模型) 一样属于「当前选了什么」这份状态。
@@ -1036,9 +1070,11 @@ function ModelSelectorContentView({
   onNavigateToProviders,
   followSession,
   configurationEnabled = true,
+  fastModeConfigurable = true,
   unifiedPanel: useUnifiedPanel = true,
   sessionEngineFilter,
   unifiedAgents: requestedUnifiedAgents,
+  unifiedSelectionPolicy = 'personalized',
   selectedFavoriteUid = null,
   onSessionFavoriteAnchorChange,
   onUnifiedSelect,
@@ -1290,7 +1326,7 @@ function ModelSelectorContentView({
     () =>
       excludeChatBridgedCodex
         ? (provider: ProviderView, agent: AgentKind): boolean =>
-            agent === 'codex' && isChatBridgedCodexProvider(provider)
+            isLocalOnlyProviderForAgent(provider, agent)
         : undefined,
     [excludeChatBridgedCodex],
   );
@@ -1310,7 +1346,7 @@ function ModelSelectorContentView({
   // seedDefaultFavorite 内部保证,这里重复跑只是 no-op。device-link 远程视图不投:
   // 标记来自被控端目录,控制端的本机收藏不该被它污染。
   useEffect(() => {
-    if (!unifiedPanel || deviceId || providersOverride) return;
+    if (!unifiedPanel || deviceId || providersOverride || unifiedSelectionPolicy === 'official') return;
     const entries = unifiedModelEntries({
       providers,
       ...(unifiedAgents ? { agents: unifiedAgents } : {}),
@@ -1353,6 +1389,7 @@ function ModelSelectorContentView({
     unifiedExcludeModel,
     unifiedScope,
     unifiedAgentsKey,
+    unifiedSelectionPolicy,
   ]);
 
   // 模型清单来源:本机会话从 live providers 派生(builtin + 自定义合集);device-link 远程会话
@@ -1493,8 +1530,9 @@ function ModelSelectorContentView({
   };
 
   // ── 模型单价 ─────────────────────────────────────────────────────────────
-  // XD 实际报价与非 XD Catalog 参考价是两份独立快照。这里只按行来源选择快照，
-  // 相同 modelId 不跨 Provider 复用或兜底。
+  // 快照选择与折扣叠加的规则在 `lib/modelPricePresentation.ts`,与设置页 → 模型列表共用
+  // 同一份实现(那三条判断复制一份就会漂,见该文件头注)。这里只做选择器特有的两件事:
+  // 远程会话不展示价格,以及「行来源未知时回溯解析」。
   // agentOverride:统一面板的行各自有自己的生效引擎(不共用面板级 currentAgentKind),
   // 报价必须按**该行的引擎**查(同一 id 跨引擎可以是两条不同的路由 / 两份不同的价)。
   const pricePresentationOf = (
@@ -1511,20 +1549,14 @@ function ModelSelectorContentView({
       (priceAgentKind
         ? resolveCurrentSourceId(providers, currentProviderId, id, priceAgentKind)
         : null);
-    const pricing = effectiveProviderId === 'xd' ? gatewayPricing : referencePricing;
-    const quote = getModelPriceQuote(pricing, effectiveProviderId, id, priceAgentKind ?? undefined);
-    if (effectiveProviderId === 'xd' && (!quote || quote.source === 'gateway')) {
-      if (!quote && gatewayPricing == null) return null;
-      const effectiveProvider = providers.find((provider) => provider.id === effectiveProviderId);
-      const effectiveCost =
-        effectiveProvider && priceAgentKind
-          ? getModel(effectiveProvider, id, priceAgentKind)?.cost
-          : undefined;
-      return modelPricePresentation(quote ?? null, effectiveCost);
-    }
-    if (!quote) return null;
-    const displayQuote = quote.approximate ? { ...quote, approximate: false } : quote;
-    return modelPricePresentation(displayQuote, undefined);
+    return resolveModelPricePresentation({
+      providerId: effectiveProviderId,
+      modelId: id,
+      agent: priceAgentKind,
+      providers,
+      gatewayPricing,
+      referencePricing,
+    });
   };
   // SSH 远程会话里订阅直连模型(chatgpt/ / xai/)不可路由:远端 cc 不经本地
   // compat-proxy 的 responses-bridge,选了必失败。保留在列表但置灰 + 原因提示,
@@ -1537,7 +1569,7 @@ function ModelSelectorContentView({
         ? t('newChat.modelSelector.subscriptionDirectDisabled.xai')
         : t('newChat.modelSelector.subscriptionDirectDisabled.generic');
   };
-  const modelDisabledOf = (provider: ProviderView | null, id: string): boolean => {
+  const modelDisabledOf = (provider: ProviderView | null, id: string, rowAgent?: AgentKind): boolean => {
     if (!deviceId) {
       if (subscriptionDirectDisabledReason(id)) return true;
       // codex/ 的本机 key gate 只属于 XD 网关折扣路由。自定义(user)供应商目录里的
@@ -1549,7 +1581,7 @@ function ModelSelectorContentView({
     }
     if (remoteModelListStatus !== 'ready') return true;
     if (remoteProviders.error) return remoteProviders.unsupported ? false : true;
-    const rowAgentKind = resolveVisibleModelAgentKind({
+    const rowAgentKind = rowAgent ?? resolveVisibleModelAgentKind({
       modelId: id,
       agentKind,
       ccModels: cc.capabilities?.availableModels ?? [],
@@ -1563,11 +1595,13 @@ function ModelSelectorContentView({
     // 该拷贝不算可路由 —— 只数「来源连接且启用 + 模型条目未停用」的拷贝,否则远程
     // flat picker(如 CreateWorkerPopover)选中后到 Main 准入才失败
     // (PR #744 review 第二十二轮)。
-    return !providers.some(
+    const candidates = provider ? [provider] : providers;
+    return !candidates.some(
       (provider) =>
         provider.connected &&
         !provider.suspended &&
         provider.agents.includes(rowAgentKind) &&
+        provider.routing?.[rowAgentKind]?.disabled !== true &&
         providerOffersModel(provider, id, rowAgentKind) &&
         getModel(provider, id, rowAgentKind)?.disabled !== true,
     );
@@ -1636,9 +1670,11 @@ function ModelSelectorContentView({
               defaultEnabled: cat?.defaultEnabled,
             });
           },
-      query,
       includePaymentRequired: true,
-    });
+    }).map((section) => ({
+      ...section,
+      models: section.models.filter((model) => matchesModelName(model, query, t)),
+    })).filter((section) => section.models.length > 0);
     // visibilityVersion 仅作刷新触发器(设置页改显示开关后强制重算);deviceId 切换需重算分段。
   }, [
     sourcesEnabled,
@@ -1648,6 +1684,7 @@ function ModelSelectorContentView({
     currentAgentKind,
     modelId,
     activeSourceId,
+    t,
     query,
     visibilityVersion,
     deviceId,
@@ -1699,11 +1736,12 @@ function ModelSelectorContentView({
       : base;
     if (!q) return selectable;
     return selectable.filter(
-      (m) => m.displayName.toLowerCase().includes(q) || m.id.toLowerCase().includes(q),
+      (m) => matchesModelName(m, q, t),
     );
   }, [
     sections,
     visibleModels,
+    t,
     query,
     browsing,
     agentKind,
@@ -2040,7 +2078,7 @@ function ModelSelectorContentView({
   const editThinkingToggle =
     canConfigure && currentAgentKind === 'pi' && editingModel?.thinkingToggle === true;
   const editHasEfforts =
-    canConfigure && (editingModel?.efforts.length ?? 0) > 0 && !editThinkingToggle;
+    canConfigure && ((editingModel?.displayEfforts ?? editingModel?.efforts)?.length ?? 0) > 0 && !editThinkingToggle;
 
   // 配置列当前 effort 值(选中 → live;否则记忆/默认)。
   const editEffortValue: Effort | null = editingModel
@@ -2122,20 +2160,21 @@ function ModelSelectorContentView({
 
   // 每个模型行的信息 / 配置内容由一个独立的 portaled Popover 承载,而不是拼进主菜单宽度。
   // 这样浮层会像 Hermes 的 Radix submenu 一样贴着当前行移动,切行不触发主菜单重排。
+  const editingDescription = editingModel ? localizedModelDescription(editingModel, t) : undefined;
   const configPanel = editingModel ? (
     <div
       role="group"
-      aria-label={`${editingModel.displayName} ${t('newChat.modelSelector.options')}`}
+      aria-label={`${localizedModelName(editingModel.displayName, t)} ${t('newChat.modelSelector.options')}`}
       className="flex flex-col gap-0.5"
     >
       {/* 名字 / 简介先帮助确认模型；面板整体居中后，操作区仍贴近当前 hover 行。 */}
       <div className="flex flex-col gap-1 px-2 py-1.5">
         <span className="min-w-0 text-14 font-medium text-[var(--model-item-text)]">
-          {editingModel.displayName}
+          {localizedModelName(editingModel.displayName, t)}
         </span>
-        {editingModel.description && (
+        {editingDescription && (
           <span className="line-clamp-2 text-12 font-normal leading-[1.4] text-[var(--text-secondary)]">
-            {editingModel.description}
+            {editingDescription}
           </span>
         )}
       </div>
@@ -2209,20 +2248,22 @@ function ModelSelectorContentView({
               {t('newChat.modelSelector.effortLabel')}
             </span>
           </div>
-          {editingModel.efforts.map((e) => {
+          {(editingModel.displayEfforts ?? editingModel.efforts).map((e) => {
+            const available = editingModel.efforts.includes(e);
             const selected = editEffortValue === e;
             return (
               <button
                 type="button"
                 key={e}
-                onClick={() => handleEditEffort(e)}
+                disabled={!available}
+                onClick={() => available && handleEditEffort(e)}
                 role="option"
                 aria-selected={selected}
                 className={cn(
                   // 行内边距/圆角/hover 与选中底统一到 --model-item-hover(见 §Select 菜单行规约),
                   // 与一级模型行、权限、+ 菜单一致;px-3 对齐其它菜单行的横向内边距。
                   'flex w-full items-center justify-between rounded-[8px] px-3 py-2 text-left transition-colors duration-100',
-                  'hover:bg-[var(--model-item-hover)]',
+                  available ? 'hover:bg-[var(--model-item-hover)]' : 'cursor-not-allowed opacity-45',
                   selected && 'bg-[var(--model-item-hover)]',
                 )}
               >
@@ -2453,7 +2494,7 @@ function ModelSelectorContentView({
             aria-disabled={disabled ? true : undefined}
             aria-label={
               paymentRequired
-                ? `${model.displayName} · ${t('newChat.modelSelector.paymentRequired.unlock')}`
+                ? `${localizedModelName(model.displayName, t)} · ${t('newChat.modelSelector.paymentRequired.unlock')}`
                 : undefined
             }
             title={disabledReason ?? undefined}
@@ -2523,7 +2564,7 @@ function ModelSelectorContentView({
               <span className="flex min-w-0 flex-1 items-center gap-1.5">
                 <span className="flex min-w-0 flex-1 items-center gap-1.5">
                   <span className="truncate text-14 font-medium leading-5 text-[var(--model-item-text)]">
-                    {model.displayName}
+                    {localizedModelName(model.displayName, t)}
                   </span>
                   {rowEffort && (
                     <span
@@ -2695,12 +2736,12 @@ function ModelSelectorContentView({
   );
   const unifiedAgentFastCapable = useCallback(
     (agent: AgentKind): boolean =>
-      !!(onFastModeChange || onUnifiedSelect) && (agent === 'claude-code'
+      (typeof fastModeConfigurable === 'boolean' ? fastModeConfigurable : fastModeConfigurable.includes(agent)) && !!(onFastModeChange || onUnifiedSelect) && (agent === 'claude-code'
         ? !!cc.capabilities?.hasFastMode
         : agent === 'codex'
           ? !!codex.capabilities?.hasFastMode
           : !!pi.capabilities?.hasFastMode),
-    [cc.capabilities, codex.capabilities, pi.capabilities, onFastModeChange, onUnifiedSelect],
+    [cc.capabilities, codex.capabilities, pi.capabilities, onFastModeChange, onUnifiedSelect, fastModeConfigurable],
   );
 
   if (emptyState) return emptyState;
@@ -2782,12 +2823,8 @@ function ModelSelectorContentView({
             // popover 裁掉超出部分,用户就翻不到最后几行(2026-08-13 实测)。列表侧配
             // min-h-0 + flex-1 收缩并内部滚动,搜索框与底部 footer 始终露着。
             'max-h-[min(560px,calc(100vh-120px))]',
-            // 宽度自适应(规格 §1.2):长模型名先把面板撑宽,到上限才截断,不硬砍名字。
-            // 最小宽只兜「搜索行 + 空态不局促」的底(Chris 2026-08-13:min 460 让短名列表
-            // 中间留一条空隙 —— 面板应该贴着最长行收窄,理论最小值可以很小)。
-            fluidWidth
-              ? 'w-full min-w-0'
-              : 'w-max min-w-[300px] max-w-[min(600px,calc(100vw-48px))]',
+            // 紧凑宽度契约见 UNIFIED_COMPACT_PANEL_WIDTH_CLASS；field 入口仍绑 trigger。
+            fluidWidth ? 'w-full min-w-0' : UNIFIED_COMPACT_PANEL_WIDTH_CLASS,
           )}
         >
           {/* 设计稿 .search-wrap:无框平铺行 + 底部 hairline(不是独立的胶囊输入框)。 */}
@@ -2816,6 +2853,8 @@ function ModelSelectorContentView({
             />
           </div>
           <UnifiedModelPanel
+            deviceId={deviceId}
+            localProviderUsage={!deviceId && !providersOverride}
             providers={providers}
             providerOrder={deviceId ? undefined : localProviders.providerOrder}
             {...(unifiedAgents ? { agents: unifiedAgents } : {})}
@@ -2835,9 +2874,9 @@ function ModelSelectorContentView({
             panelWidthFluid={fluidWidth}
             selected={{ providerId: activeSourceId, modelId }}
             selectedFavoriteUid={selectedFavoriteUid}
-            liveAgentKind={currentAgentKind}
-            fastMode={fastMode}
-            selectedEffort={effort}
+            liveAgentKind={unifiedSelectionPolicy === 'official' ? null : currentAgentKind}
+            fastMode={unifiedSelectionPolicy === 'official' ? false : fastMode}
+            selectedEffort={unifiedSelectionPolicy === 'official' ? undefined : effort}
             {...(modelMemory ? { modelMemory } : {})}
             agentFastModeCapable={unifiedAgentFastCapable}
             priceOf={(providerId, id, agent) => pricePresentationOf(providerId, id, agent)}
@@ -2852,7 +2891,8 @@ function ModelSelectorContentView({
             paymentRequiredUnlockLabel={t('newChat.modelSelector.paymentRequired.unlock')}
             onPaymentRequired={showPaymentRequired}
             configurationEnabled={configurationEnabled}
-            isRouteDisabled={(providerId, id) => providersOverride ? false : modelDisabledOf(providers.find((provider) => provider.id === providerId) ?? null, id)}
+            selectionPolicy={unifiedSelectionPolicy}
+            isRouteDisabled={(providerId, id, rowAgent) => providersOverride ? false : modelDisabledOf(providers.find((provider) => provider.id === providerId) ?? null, id, rowAgent)}
             {...(sessionEngineFilter ? { sessionEngineFilter } : {})}
             {...(followSession ? { followSession: {
               ...followSession,
@@ -2991,9 +3031,6 @@ function ModelSelectorContentView({
             dense
             width={304}
             className="mx-auto"
-            // 浮层内选中段用黑白反转强对比(default 的暗色 Card 凸起在浮层
-            // 表面上分不清"当前选的是哪家",2026-07-20 产品实测反馈)。
-            visualVariant="dropdown"
           />
           {browsing && (
             <div className="px-2 pb-0.5 text-12 text-[var(--text-tertiary)]">
@@ -3187,9 +3224,11 @@ export function ModelSelector({
   popoverSide = 'top',
   maxVisibleModelRows,
   configurationEnabled = true,
+  fastModeConfigurable = true,
   unifiedPanel: useUnifiedPanel = true,
   sessionEngineFilter,
   unifiedAgents,
+  unifiedSelectionPolicy = 'personalized',
   engineMarkVendor = null,
   selectedFavoriteUid = null,
   onSessionFavoriteAnchorChange,
@@ -3354,6 +3393,10 @@ export function ModelSelector({
   });
   const remoteModelLoading = !!deviceId && remoteModelListStatus === 'loading';
   const remoteModelLoadFailed = !!deviceId && remoteModelListStatus === 'error';
+  const localModelLoading = !deviceId && !(!providersOverride && localProviders.loadFailed) && (
+    (!providersOverride && localProviders.loading) ||
+    (agentKind === 'codex' ? codex.loading : agentKind === 'pi' ? pi.loading : cc.loading)
+  );
   const visibleModels = useMemo(
     () =>
       selectVisibleModels({
@@ -3383,18 +3426,38 @@ export function ModelSelector({
   const currentModel = routeModel
     ? { ...routeModel, displayName: routeModel.name, id: modelId }
     : visibleModels.find((m) => m.id === modelId);
-  // 已保存模型即使隐藏、断开或下架，实际任务仍保留模型 ID；偏好字段可通过
-  // unknownModelLabel 提供诊断文案。没有保存选择的入口才显示选择模型占位符。
+  // Wire IDs can differ from catalog IDs during a switch. Resolve display metadata
+  // through the existing alias lookup without changing routing/capability decisions.
+  const displayProvider = agentKind
+    ? modelDisplayProvider(providers, currentProviderId, modelId, agentKind, actualRoute)
+    : undefined;
+  const resolvedModelName = (agentKind ? findCatalogModel(displayProvider, modelId, agentKind)?.name : undefined)
+    ?? currentModel?.displayName;
+  const labelKey = JSON.stringify([deviceId ?? null, currentProviderId ?? null, agentKind, modelId]);
+  const lastModelName = useRef<{ key: string; name: string | undefined } | null>(null);
+  const modelName = resolvedModelName
+    ?? (lastModelName.current?.key === labelKey ? lastModelName.current.name : undefined);
+  useEffect(() => {
+    // Retain only this selection's label through catalog refresh/failure. Never
+    // borrow the previous model, source, engine or device's name for a new choice.
+    lastModelName.current = { key: labelKey, name: modelName };
+  }, [labelKey, modelName]);
+  const localizedName = modelName ? localizedModelName(modelName, t) : undefined;
+  // Explicit diagnostic fields can supply unknownModelLabel; ordinary triggers
+  // must not expose internal wire IDs when no display metadata is available.
   // unknown label 空串/全空白按缺省处理(否则 ?? 不回落,trigger 渲染成空白)。
   const unknownLabel = modelId && unknownModelLabel ? unknownModelLabel(modelId).trim() : '';
   const displayLabel = fallbackOption?.active
     ? fallbackOption.label
-    : (currentModel?.displayName ??
+    : (localizedName ??
       (remoteModelLoading ? t('newChat.modelSelector.remoteLoading') : null) ??
       (remoteModelLoadFailed ? t('newChat.modelSelector.remoteLoadFailedShort') : null) ??
       (unknownLabel !== '' ? unknownLabel : null) ??
-      (actualRoute && modelId ? modelId : null) ??
-      t('newChat.modelSelector.trigger.placeholder'));
+      (modelId
+        ? t(localModelLoading
+            ? 'newChat.modelSelector.trigger.loading'
+            : 'newChat.modelSelector.trigger.unresolved')
+        : t('newChat.modelSelector.trigger.placeholder')));
   const agentName =
     agentIdentity && !fallbackOption?.active
       ? agentIdentity.vendorKey === 'cc'
@@ -3556,11 +3619,12 @@ export function ModelSelector({
   // compact 会隐藏断连状态文字；原生 title 仍需保留同一状态，避免鼠标用户悬停
   // 错误图标时只看到模型名、无法判断发送为何被阻断。
   const describeSelection = (selection: SessionRuntimeProfileProjection): string => {
-    const pid = actualSourceIdForModel(providers, selection.providerId, selection.model, selection.agentKind);
-    const provider = providers.find((p) => p.id === (selection.providerId ?? pid));
-    const model = provider ? getModel(provider, selection.model, selection.agentKind) : undefined;
+    const provider = modelDisplayProvider(providers, selection.providerId, selection.model, selection.agentKind, true);
+    const model = findCatalogModel(provider, selection.model, selection.agentKind);
+    const selectionKey = JSON.stringify([deviceId ?? null, selection.providerId, selection.agentKind, selection.model]);
+    const name = selectionKey === labelKey ? localizedName : model?.name ? localizedModelName(model.name, t) : undefined;
     const vendor = selection.agentKind === 'claude-code' ? 'Claude Code' : selection.agentKind === 'pi' ? 'Pi' : 'Codex';
-    return [vendor, model?.name ?? selection.model, provider ? providerDisplayName(provider, t) : selection.providerId,
+    return [vendor, name ?? t('newChat.modelSelector.trigger.placeholder'), provider ? providerDisplayName(provider, t) : selection.providerId,
       selection.effort ? modelEffortLabel(t, model, selection.effort) : null,
       selection.fastMode ? t('newChat.modelSelector.meta.fastBadge') : null].filter(Boolean).join(' · ');
   };
@@ -3675,7 +3739,7 @@ export function ModelSelector({
                 ? 'w-[64px] min-w-[64px]'
                 : isCompactToolbar
                   ? 'w-[148px] min-w-[72px]'
-                  : 'min-w-[72px]',
+                  : 'min-w-[72px] max-w-[min(320px,100%)]',
               'border border-transparent bg-transparent',
               'hover:border-[var(--border-default)] hover:bg-[var(--composer-pill-bg,#FCFCFC)] dark:hover:bg-[var(--composer-pill-bg,#393838)]',
             ),
@@ -3746,9 +3810,7 @@ export function ModelSelector({
               isCreateAgentVariant ? 'text-12' : dense ? 'text-12' : 'text-13',
             )}
           >
-            {/* 断开来源可能是该模型的唯一提供方 → visibleModels 查不到,回落显示原始 id,
-                    比 "Select model" 占位更能说明「哪个模型的来源断了」。 */}
-            {currentModel?.displayName ?? modelId}
+            {displayLabel}
           </span>
           {/* 来源断开是**来源**的事,引擎身份位照常保留(规格 §1.2:引擎可见性靠一致的
               结构位,不靠出错才显示)。 */}
@@ -3938,10 +4000,12 @@ export function ModelSelector({
       onProviderChange={onProviderChange}
       onNavigateToProviders={onNavigateToProviders}
       configurationEnabled={configurationEnabled}
+      fastModeConfigurable={fastModeConfigurable}
       providersOverride={providersOverride}
       unifiedPanel={unifiedPanel}
       sessionEngineFilter={contentSessionEngineFilter}
       unifiedAgents={unifiedAgents}
+      unifiedSelectionPolicy={unifiedSelectionPolicy}
       selectedFavoriteUid={selectedFavoriteUid}
       onSessionFavoriteAnchorChange={onSessionFavoriteAnchorChange}
       onUnifiedSelect={onUnifiedSelect}
@@ -3984,7 +4048,7 @@ export function ModelSelector({
         wrapperClassName="min-w-0 max-w-full shrink"
         panelClassName="flex min-h-0 flex-col p-0"
         // 宽度只进不退(2026-08-14 实测反馈):rail 筛选把内容变窄时面板宽度回缩,
-        // rail 图标在指针底下移位。高度照常双向跟随(底边锚定向上收)。
+        // rail 图标在指针底下移位。统一面板主体使用固定高度，仅随窗口可用空间收缩。
         stickyWidth
         panelAriaLabel={ariaLabel}
         {...(restoreFocusTarget ? { restoreFocusTarget } : {})}
@@ -4008,7 +4072,7 @@ export function ModelSelector({
           // 与隔壁权限字段同规则),且压掉共享 PopoverContent 的 shadow-md(§4 面板无
           // 阴影);toolbar 等非 field 的 Radix 分支维持既有视觉不动。
           isFieldTrigger ? 'w-[var(--radix-popover-trigger-width)] shadow-none' : 'w-auto',
-          'overflow-hidden rounded-[12px] p-0',
+          'flex min-h-0 max-h-[var(--radix-popover-content-available-height)] flex-col overflow-hidden rounded-[12px] p-0',
           'bg-[var(--model-dropdown-bg)]',
           'border border-[var(--model-dropdown-border)]',
         )}

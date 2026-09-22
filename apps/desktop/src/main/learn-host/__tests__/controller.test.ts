@@ -13,6 +13,11 @@ import {
 import type { ScanStagingResult } from '../staging';
 import { computeProposalFingerprint } from '../stagingValidation.pure';
 import { tryAcquireSkillInstallLock } from '../../skillhub/installLock';
+vi.mock('../../skillhub/sharedMutationLease', () => ({
+  acquireSharedSkillMutationLease: vi.fn(async () => Object.assign(async () => {}, {
+    run: <T>(operation: () => Promise<T>) => operation(),
+  })),
+}));
 
 vi.mock('../../logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
@@ -1111,6 +1116,12 @@ describe('LearnController 状态机', () => {
       releaseMarket();
     }
 
+    const { acquireSharedSkillMutationLease } = await import('../../skillhub/sharedMutationLease');
+    vi.mocked(acquireSharedSkillMutationLease).mockResolvedValueOnce(null);
+    await expect(h.controller.apply('r1')).rejects.toMatchObject({ code: 'LEARN_BUSY' });
+    expect(h.applyCalls).toHaveLength(0);
+    expect(h.store.get('r1')!.status).toBe('awaiting-review');
+
     // 不同名的市场安装不阻塞;同名锁释放后重试成功
     const releaseUnrelated = tryAcquireSkillInstallLock('unrelated-skill', 'market-install')!;
     try {
@@ -1498,6 +1509,20 @@ describe('LearnController 状态机', () => {
     await expect(h.controller.startLearn({ input: '', sourceKind: 'session' })).rejects.toMatchObject({
       code: 'INVALID_PARAMS',
     });
+  });
+
+  it('session 源在创建 run 前拒绝没有可蒸馏消息的空任务', async () => {
+    const h = makeHarness({ getConversationBlock: async () => '' });
+
+    await expect(h.controller.startLearn({
+      input: '',
+      sourceKind: 'session',
+      originSessionId: 'empty-origin',
+    })).rejects.toMatchObject({
+      code: 'INVALID_PARAMS',
+      message: 'the origin conversation has no distillable content',
+    });
+    expect(h.store.list()).toEqual([]);
   });
 
   it('证据检索抛错 → 无证据继续(不整轮失败)', async () => {

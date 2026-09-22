@@ -1,3 +1,4 @@
+import type { ImMessageSource } from '../../shared/imMessageSource';
 import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 import type { SessionSource } from '../../shared/sessionSource';
 import type { TurnUsageDetails } from '../../shared/turnUsageDetails';
@@ -87,6 +88,10 @@ export interface CcMeta {
    * user bubble was sent as a normal next-turn message or as same-turn 插话.
    */
   delivery?: 'turn' | 'steer';
+  /** Host-owned authorization evidence; IPC callers cannot mint or replace it. */
+  autoReviewUserText?: string
+    | { text: string; acceptedAt: number }
+    | { kind: 'scheduled-continuation' };
 
   /**
    * Host-side origin marker（与 delivery 同类，非 SDK 字段）。
@@ -125,7 +130,9 @@ export interface CcMeta {
    * hook session-runner 注入; renderer 据此渲染 Cindy 署名任务卡片
    * (userText 为卡片正文, 与发给 agent 的完整 prompt 分离)。
    */
-  hookSource?: { im: string; channelName?: string | null; userText?: string; threadContext?: Array<{ author: string; text: string; isBot?: boolean }> };
+  hookSource?: ImMessageSource;
+  /** Local IM metadata stays separate so older clients retain ordinary user actions. */
+  imSource?: ImMessageSource;
 
   /** 历史 per-turn USD；新数据以 turnCost 为区域金额事实。 */
   turnCostUsd?: number;
@@ -180,8 +187,44 @@ export interface CcMeta {
    */
   goalNotice?: 'usage-resumed' | 'capacity-resumed';
 
+  /**
+   * Host-side marker:个人版制作任务里 Agent 调用 cindy_make.report_complete 后落的
+   * 完成记录(role:'assistant' + 空 content)。renderer 渲成完成卡片,不进 prompt。
+   */
+  cindyMakeCompletion?: import('../../shared/cindyMakeSession').CindyMakeCompletionMeta;
+
   /** /review 创建的独立只读审查任务及其来源卡状态。 */
   reviewRun?: ReviewRunMeta;
+
+  /**
+   * Host-side marker: 后台 Session 任务的持久卡片锚点或后续消息留痕。
+   * renderer 只用它呈现和打开对应任务，不进 prompt。历史角色仍由
+   * shared/botCollaboration.ts 严格解析，但新数据不再创建伙伴客座镜像。
+   */
+  botCollaboration?: import('../../shared/botCollaboration').BotCollaborationMeta;
+
+  /**
+   * Host-side marker for the read-only entrance to a hidden Bot pair conversation.
+   * The actual messages live in the dedicated Bot DM tables and never enter the
+   * normal task transcript through this metadata field.
+   */
+  /** Automatic reply to a private Bot message; retained without unread attention. */
+  botPrivateReply?: boolean;
+  botAuthorization?: import('../../shared/botAuthorization').BotAuthorizationCard;
+  botDirectMessage?: import('../../shared/botDirectMessage').BotDirectMessageMeta;
+
+  /**
+   * Host-side marker for a Hermes-style Bot group room message. The text still
+   * lives in Cindy's normal messages table; this metadata only identifies who
+   * spoke so the room renderer can label it without parsing display text.
+   */
+  botGroup?: {
+    roomId: string;
+    threadId: string;
+    senderKind: 'user' | 'bot';
+    botId?: string;
+    name: string;
+  };
 
   /**
    * Host-side marker:这条 user 消息是一个 /goal 目标的设定 / 更新(goal-host 在新建或
@@ -210,6 +253,7 @@ export interface CcMeta {
 export type AgentMeta = CcMeta;
 
 export interface Session {
+  tags?: import('@cindy/maker-shared').TaskTag[];
   id: string;
   userId: string;
   title: string;
@@ -270,6 +314,8 @@ export interface Session {
    * 消费方按 null 兜底(不提示)。
    */
   activeTurnStartedAt?: number | null;
+  /** Host-confirmed pre-boot interruption generation; absent on older hosts. */
+  interruptedTurnStartedAt?: number | null;
   lastTurnEndedAt?: number | null;
   /**
    * worktree-parallel-sessions: 本 session 绑定的 git worktree 绝对路径（null = 无 worktree）。
@@ -363,7 +409,8 @@ export interface SessionRuntimePendingProjection {
 // 内存(coordinator projection + store.error),事后点进会话毫无痕迹,红点无从追溯。
 // 'agent_switch':session 内 agent 引擎切换边界行(session-agent-switch,main 落库)。
 // content 为 AgentSwitchContent;渲染成分隔条(可展开查看交接摘要),不是对话正文。
-export type MessageRole = 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'ask_user' | 'plan_review' | 'thinking' | 'error' | 'agent_switch';
+export type MessageRole =
+  | 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'ask_user' | 'plan_review' | 'thinking' | 'error' | 'agent_switch';
 
 /**
  * role='agent_switch' 行的 content 结构(JSON 存于 messages.content)。

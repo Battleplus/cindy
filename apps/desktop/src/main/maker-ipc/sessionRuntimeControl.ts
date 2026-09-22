@@ -1,4 +1,5 @@
 import type { AgentKind, Effort } from '@cindy/maker-core';
+import type { Session as RendererSession } from '../../renderer/lib/ccAgent.types';
 import {
   connectedProvidersForAgent,
   isModelSelectableForNewRoute,
@@ -28,6 +29,26 @@ export interface SessionRuntimeControlSnapshot {
   pending: PendingSessionRuntimeMutation | null;
   fallbackHop: number;
   visitedRoutes: string[];
+}
+
+/** Shared by full session reads and route-change pushes; all axes come from one profile. */
+export function projectSessionRuntimeControl(
+  sessionId: string,
+  baseline: SessionRuntimeProfile,
+): Partial<RendererSession> {
+  const control = getSessionRuntimeControlSnapshot(sessionId);
+  const effective = control.effectiveOverride ?? baseline;
+  return {
+    model: effective.model,
+    providerId: effective.providerId,
+    // The legacy wire axis is string-compatible; the profile preserves null.
+    effort: effective.effort ?? '',
+    fastMode: effective.fastMode,
+    runtimeGeneration: control.generation,
+    runtimeBaseline: baseline,
+    runtimeEffective: effective,
+    runtimePending: control.pending,
+  };
 }
 
 export type SessionRuntimeProfilePatch = Partial<
@@ -64,8 +85,10 @@ interface SessionRuntimeControlState {
 const states = new Map<string, SessionRuntimeControlState>();
 let ownerEpoch = 0;
 
-function routeKey(profile: Pick<SessionRuntimeProfile, 'providerId' | 'model'>): string {
-  return `${profile.providerId ?? ''}\u0000${profile.model}`;
+function routeKey(
+  profile: Pick<SessionRuntimeProfile, 'agentKind' | 'providerId' | 'model'>,
+): string {
+  return `${profile.agentKind}\u0000${profile.providerId ?? ''}\u0000${profile.model}`;
 }
 
 function stateFor(sessionId: string): SessionRuntimeControlState {
@@ -465,7 +488,11 @@ export function pickSessionRuntimeFallback(params: {
   }
 
   for (const candidate of candidates) {
-    const key = routeKey({ providerId: candidate.providerId, model: candidate.model.id });
+    const key = routeKey({
+      agentKind: params.current.agentKind,
+      providerId: candidate.providerId,
+      model: candidate.model.id,
+    });
     if (visited.has(key)) continue;
     const axes = resolveSessionRuntimeAxes({
       model: candidate.model,

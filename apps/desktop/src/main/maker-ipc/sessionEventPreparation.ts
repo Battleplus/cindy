@@ -1,3 +1,5 @@
+import { captureTurnUsageContext, type TurnUsageContext } from './turnUsageContext.js';
+import type { BotCompactRuntimeRefreshCoordinator } from './botCompactRuntimeRefresh.js';
 import type {
   AgentEvent,
   InteractionDecision,
@@ -14,12 +16,14 @@ import { noteSubagentObservationTurnStarted } from '../subagentObservationRewind
 import { persistSessionFields } from '../localDb/ipc/sessions.js';
 
 import { createLogger } from '../logger.js';
+import { t } from '../i18n.js';
 import type { GitSnapshotCoordinator } from '../git-snapshot/gitSnapshotCoordinator.js';
 import { markSessionTurnStarted } from '../localDb/sessionActiveTurn.js';
 import {
   backgroundTurnPredatesSessionClear,
   noteAgentMeta,
   noteTurnStarted,
+  onStandaloneTextEvent,
 } from '../messagePersistBroadcaster.js';
 import { isCcMgrUpgradeInFlight } from '../remote-ssh/index.js';
 import { AgentInputCoordinator } from './agent-input-coordinator.js';
@@ -27,7 +31,6 @@ import { clearPromptPredictionSessionStopped } from './promptPredictionStopLedge
 import { MAKER_PUSH } from './channels.js';
 import { finalizeTurnChangeSet } from '../turn-change-set/store.js';
 import { type OrcaTeamService } from './orcaTeamService.js';
-import { getSessionFastMode } from '../maker-host/session-effort-store.js';
 import { noteClaudeSessionTurnState } from '../maker-host/claude-session-background-activity.js';
 import { consumeClaudeOpusPlanMismatch } from '../maker-host/claude-gateway-error-observer.js';
 import {
@@ -52,6 +55,7 @@ interface DismissedInteraction {
 }
 
 export interface PrepareSessionEventDeps {
+  readonly botCompactRuntimeRefreshCoordinator: Pick<BotCompactRuntimeRefreshCoordinator, 'noteBoundary'>;
   readonly isFencedStaleSessionTerminal: (sessionId: string, event: AgentEvent) => boolean;
   readonly log: Pick<ReturnType<typeof createLogger>, 'debug' | 'warn'>;
   readonly interruptedTurnAutoResumeGuard: Pick<
@@ -98,11 +102,11 @@ export interface PrepareSessionEventDeps {
   readonly orcaTeamServiceForEvents: Pick<OrcaTeamService, 'handleWorkerTurnStarted'> | null;
   readonly turnModelPromiseBySession: Map<string, Promise<string>>;
   readonly readSessionModelForUsage: (sessionId: string) => Promise<string>;
-  readonly turnPiFastModeBySession: Map<string, boolean>;
+  readonly turnUsageContextBySession: Map<string, TurnUsageContext>;
   readonly silentStopTurnLeaseGate: Pick<SilentStopTurnLeaseGate, 'turnLeaseIdForEvent'>;
   readonly agentInputCoordinatorHolder: Pick<
     AgentInputCoordinator,
-    'onTurnEvent' | 'noteSuppressedTerminalError'
+    'onTurnEvent' | 'noteSuppressedTerminalError' | 'getActiveInputClientId'
   > | null;
   readonly handleSilentStopTurnEnd: (
     session: Session,
@@ -126,6 +130,7 @@ export function prepareSessionEvent(
   // on-demand detail IPC; forwarding the raw diff through maker:event would duplicate a
   // potentially multi-megabyte payload to every renderer and device-link controller.
   if (event.type === 'turn_diff') return;
+  if (event.type === 'compact_boundary') deps.botCompactRuntimeRefreshCoordinator.noteBoundary(session);
   if (
     event.turnScope === 'background' &&
     Object.prototype.hasOwnProperty.call(event, 'backgroundTurnStartedAt') &&
@@ -142,13 +147,46 @@ export function prepareSessionEvent(
     });
     return;
   }
+  // Post-terminal Host recovery bypasses the model. Localize before both
+  // persistence and renderer delivery, without mutating the internal receipt.
+  if (event.runtimeRecovery && event.source === 'pi' && event.type === 'text') {
+    event = {
+      ...event,
+      data: {
+        ...(event.data as Record<string, unknown>),
+        text: t('settings.piPackages.failure.runtimeRetirementFailed'),
+      },
+    };
+  }
+  if (event.type === 'text' && event.standaloneText === true) {
+    // Deliver through the existing persisted-row channel only. Sending a text
+    // event as well would let older renderers adopt the notice as their active
+    // assistant stream and overwrite/misdate the next model reply.
+    const redacted = deps.redactEventForRenderer(event);
+    const text = (redacted.data as { text?: unknown } | null)?.text;
+    const inputId = deps.agentInputCoordinatorHolder?.getActiveInputClientId(session.id, event.sessionTurnGeneration);
+    // Private-message visibility is still owned by the accepted input, even
+    // though the notice is independent of the model's reply/usage state.
+    const privateReply = inputId ? inputId.startsWith('bot-dm:') : event.agentMeta?.botPrivateReply;
+    if (typeof text === 'string') {
+      onStandaloneTextEvent(session.id, text,
+        typeof privateReply === 'boolean' ? { botPrivateReply: privateReply } : null);
+    }
+    return;
+  }
   // 自动续跑的 pending 不能只靠 status(isRunning=true) 清理：Pi/Claude 的
   // terminal-only 路径可能首个事件就是 error。Session 已把 host-owned token
   // 盖到事件上，首个匹配 token 的事件即视为 provider accepted。
   if (typeof event.turnAttemptToken === 'number') {
     deps.interruptedTurnAutoResumeGuard.noteAttemptEvent(session.id, event.turnAttemptToken);
   }
-  let attributedEvent = event;
+  const activeInputId = event.turnScope === 'background' ? null
+    : deps.agentInputCoordinatorHolder?.getActiveInputClientId(session.id, event.sessionTurnGeneration);
+  // The host's accepted input owns provenance across all three SDKs. Explicit
+  // false restores normal replies when the user steers a private message turn.
+  let attributedEvent = activeInputId
+    ? { ...event, agentMeta: { ...event.agentMeta, botPrivateReply: activeInputId.startsWith('bot-dm:') } }
+    : event;
   if (event.type === 'error' && isTerminalTurnErrorEvent(event)) {
     const reason =
       !session.remoteHostId && session.agentKind === 'claude-code'
@@ -159,7 +197,7 @@ export function prepareSessionEvent(
         event.data && typeof event.data === 'object' && !Array.isArray(event.data)
           ? (event.data as Record<string, unknown>)
           : {};
-      attributedEvent = { ...event, data: { ...eventData, reason } };
+      attributedEvent = { ...attributedEvent, data: { ...eventData, reason } };
       deps.log.warn('Claude Opus plan error normalized for renderer', {
         sessionId: session.id,
         model: session.model,
@@ -296,8 +334,9 @@ export function prepareSessionEvent(
       ) {
         deps.turnModelPromiseBySession.set(session.id, deps.readSessionModelForUsage(session.id));
       }
-      if (event.source === 'pi' && !deps.turnPiFastModeBySession.has(session.id)) {
-        deps.turnPiFastModeBySession.set(session.id, getSessionFastMode(session.id));
+      if ((event.source === 'pi' || event.source === 'codex' || event.source === 'claude-code')
+        && (!wasInTurn || !deps.turnUsageContextBySession.has(session.id))) {
+        deps.turnUsageContextBySession.set(session.id, captureTurnUsageContext(session.id));
       }
     } else if (
       data.isRunning === false &&
@@ -411,7 +450,8 @@ export function prepareSessionEvent(
     shouldMarkTurnTerminalIdleAfterBroadcast = true;
     if (event.source === 'claude-code' || event.source === 'codex' || event.source === 'pi') {
       deps.turnModelPromiseBySession.delete(session.id);
-      if (event.source === 'pi') deps.turnPiFastModeBySession.delete(session.id);
+      // A paired done may still carry usage after this error. Retain its billing
+      // identity until done; a new product turn overwrites it using wasInTurn.
     }
     const errData =
       attributedEvent.type === 'error'
@@ -478,7 +518,7 @@ export function prepareSessionEvent(
   // 把 persistId 盖进广播 payload 让 renderer 在途气泡用同一 id;真正落库走模块内
   // 异步队列、不在此同步执行(规则19 热路径)。终止型 error 同样在广播前预留 persistId
   // (O(1) createId,不 flush、不写库),让 live 横幅与事后 error 行绑定同一 id。
-  const eventAgentMeta = (event as { agentMeta?: AgentMeta | null }).agentMeta ?? null;
+  const eventAgentMeta = (attributedEvent as { agentMeta?: AgentMeta | null }).agentMeta ?? null;
   // 跟踪会话最近一次非空 agentMeta(镜像 renderer state.lastAgentMeta),给 interaction
   // 边界 flush 当兜底锚点,保 agent_meta 不丢(rewind/fork)。
   if (eventAgentMeta && event.turnScope !== 'background') noteAgentMeta(session.id, eventAgentMeta);

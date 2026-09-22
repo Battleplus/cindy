@@ -1,3 +1,4 @@
+import { resetTaskTagCatalogCache } from '@/features/task-tags/taskTagEvents';
 import {
   createContext,
   useCallback,
@@ -39,6 +40,7 @@ import {
   setChatEmbeddingSettingsOwner,
 } from '@/lib/chatEmbeddingStore';
 import { sessionsStore } from '@/lib/sessionsStore';
+import { recentWorkdirsStore } from '@/lib/recentWorkdirsStore';
 import { isSidebarWindow } from '@/lib/sidebarWindow';
 import { isGhostPanelWindow } from '@/lib/ghostPanelWindow';
 import { setModelEnginePrefsOwner } from '@/state/modelEnginePrefs';
@@ -48,6 +50,7 @@ import { setFavoriteAnchorMemoryOwner } from '@/state/favoriteAnchorMemory';
 import { setNewMakerDraftOwner } from '@/state/newMakerDraft';
 import { setModelVisibilityOwner } from '@/state/modelVisibilityPrefs';
 import { setComposerDraftOwner } from '@/lib/composerDraftStore';
+import { setBotReadStateOwner } from '@/features/bots/botReadState';
 import { setPendingHandoffOwner } from '@/state/pendingFirstMessage';
 import { rememberSsoOrgIdentifier } from '@/state/ssoOrgHistory';
 import { setDeferredUiAssignmentOwner } from '@/features/cc-agent/deferredUiAssignment';
@@ -70,6 +73,13 @@ export interface AuthContextValue {
   dataOwnerId: string | null;
   /** Failed auth boundaries remount owner-scoped routes so stale generations can rehydrate. */
   dataOwnerRecoveryEpoch: number;
+  /**
+   * Main-owned owner generation as last pushed. It advances on every owner commit,
+   * including same-owner repairs that keep `dataOwnerId` and never touch
+   * `dataOwnerRecoveryEpoch`; owner-stamped mirrors in main are fenced on it, so a
+   * consumer that pushes such a mirror must re-push when this changes (#4469).
+   */
+  dataOwnerGeneration: number;
   canEnterApp: boolean;
   isAuthenticated: boolean;
   /** 当前账号是否加入 Canary 发布通道。 */
@@ -114,9 +124,11 @@ const log = createLogger('AuthContext');
 function publishDataOwnerGeneration(dataOwnerId: string | null, ownerGeneration?: number): void {
   const previousOwnerId = getDataOwnerGeneration().dataOwnerId;
   if (previousOwnerId !== dataOwnerId) {
+    resetTaskTagCatalogCache();
     cancelRemoteOptimisticSendsForDataOwnerBoundary();
   }
   setDataOwnerGeneration(dataOwnerId, ownerGeneration);
+  recentWorkdirsStore.setDataOwner(getDataOwnerGeneration());
   setSelectedMachineOwner(dataOwnerId);
   if (previousOwnerId !== dataOwnerId) invalidateProvidersSnapshot();
 }
@@ -133,6 +145,7 @@ export function AuthProvider({
   const [mode, setMode] = useState<'signed-out' | 'local' | 'cloud'>('signed-out');
   const [dataOwnerId, setDataOwnerId] = useState<string | null>(null);
   const [dataOwnerRecoveryEpoch, setDataOwnerRecoveryEpoch] = useState(0);
+  const [dataOwnerGeneration, setDataOwnerGenerationState] = useState(0);
   const [canEnterApp, setCanEnterApp] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isCanary, setIsCanary] = useState(false);
@@ -170,6 +183,7 @@ export function AuthProvider({
         activeDataOwnerIdRef.current,
         activeDataOwnerGenerationRef.current,
       );
+      setDataOwnerGenerationState(activeDataOwnerGenerationRef.current);
       setDataOwnerRecoveryEpoch((epoch) => epoch + 1);
       void preloadLocalCatalogSnapshot();
       throw error;
@@ -198,6 +212,7 @@ export function AuthProvider({
       }
       activeDataOwnerIdRef.current = state.dataOwnerId;
       activeDataOwnerGenerationRef.current = state.ownerGeneration;
+      setDataOwnerGenerationState(state.ownerGeneration);
       setNewMakerDraftOwner(state.dataOwnerId);
       setProviderModelMemoryOwner(state.dataOwnerId);
       // 模型选择器的持久记忆与 newMakerDraft 同待遇:同一处、同一个 dataOwnerId、
@@ -208,10 +223,11 @@ export function AuthProvider({
       // 收藏**锚点**记忆(面板上哪一行打勾)与收藏本体同分区:漏接同样是多账号串号。
       setFavoriteAnchorMemoryOwner(state.dataOwnerId);
       setComposerDraftOwner(state.dataOwnerId);
+      setBotReadStateOwner(state.dataOwnerId);
       setPendingHandoffOwner(state.dataOwnerId);
       setDeferredUiAssignmentOwner(state.dataOwnerId);
       setUserPromptOwner(state.dataOwnerId);
-      setModelVisibilityOwner(state.dataOwnerId, state.ownerGeneration, state.mode);
+      void setModelVisibilityOwner(state.dataOwnerId, state.ownerGeneration, state.mode);
       const chatEmbeddingOwnerChanged = setChatEmbeddingSettingsOwner(
         state.dataOwnerId,
         state.ownerGeneration,
@@ -501,6 +517,7 @@ export function AuthProvider({
       mode,
       dataOwnerId,
       dataOwnerRecoveryEpoch,
+      dataOwnerGeneration,
       canEnterApp,
       isAuthenticated,
       isCanary,
@@ -532,6 +549,7 @@ export function AuthProvider({
       mode,
       dataOwnerId,
       dataOwnerRecoveryEpoch,
+      dataOwnerGeneration,
       canEnterApp,
       isAuthenticated,
       isCanary,
