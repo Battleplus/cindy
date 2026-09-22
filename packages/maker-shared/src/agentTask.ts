@@ -245,6 +245,18 @@ export function isAgentTaskToolName(toolName: string): boolean {
   return isSubagentSpawnToolName(toolName) || toolName.startsWith('collab:');
 }
 
+/**
+ * Claude 子任务工具名（`Agent` / `Task`）。
+ *
+ * `isSubagentResultError` 识别的 `<tool_use_error>` 是 Claude SDK 协议级标记，只对这两个
+ * 工具的结果有意义。后台 Bash、PI subagent 与 Codex `collab:*` 的成功产物可能合法地以该
+ * 前缀开头（例如把该标记当成搜索命中打印出来），无条件按它收口会把成功任务误标成
+ * `failed`。调用方必须先确认工具名属于 Claude 子任务，再把结果交给 `isSubagentResultError`。
+ */
+export function isClaudeSubagentToolName(toolName: string | undefined): boolean {
+  return toolName === 'Agent' || toolName === 'Task';
+}
+
 /** PI 子代理工具名 —— maker-core 的 pi 扩展注册端与本文件的卡片判据共用,不各写字面量。 */
 export const PI_SUBAGENT_TOOL_NAME = 'subagent';
 

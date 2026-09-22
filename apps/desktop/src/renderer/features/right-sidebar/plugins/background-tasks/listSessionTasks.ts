@@ -19,6 +19,7 @@
 import {
   deriveAgentTaskStatus,
   isAgentTaskToolName,
+  isClaudeSubagentToolName,
   isSubagentResultError,
   subagentSpawnReceiptName,
   subagentSpawnResultIndicatesRunning,
@@ -338,7 +339,10 @@ export function listSessionTasks(input: {
     // 重载后与聊天卡(AgentTaskCard)共用 deriveAgentTaskStatus:持久化终态
     // (agentMeta.agentTaskStatus)必须传入,否则列表与卡片会对同一任务给出不同终态。
     const persistedStatus = msg.agentMeta?.agentTaskStatus;
-    const resultIsError = isSubagentResultError(resultText);
+    // `<tool_use_error>` 是 Claude SDK 协议级标记,只对 Claude 子任务(Agent/Task)的结果
+    // 有意义。后台 Bash、PI subagent 与 Codex `collab:*` 的成功产物可能合法地以该前缀
+    // 开头,无条件判定会把成功任务误标成 failed(与 AgentTaskCard 同口径)。
+    const resultIsError = isClaudeSubagentToolName(toolName) && isSubagentResultError(resultText);
     const status: AgentTaskStatus = isWorkflowTool
       ? update?.status ?? (settled ? 'completed' : isSessionStreaming ? 'running' : 'stopped')
       : update

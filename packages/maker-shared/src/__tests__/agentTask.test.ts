@@ -5,6 +5,7 @@ import {
   deriveAgentTaskStatus,
   findAgentTaskUpdate,
   isAgentTaskToolName,
+  isClaudeSubagentToolName,
   isSubagentResultError,
   isSubagentSpawnToolName,
   mergeAgentTaskUpdate,
@@ -620,5 +621,23 @@ describe('isSubagentResultError', () => {
     expect(isSubagentResultError('failed to launch')).toBe(false);
     expect(isSubagentResultError('unable to start the service')).toBe(false);
     expect(isSubagentResultError('Error: something happened')).toBe(false);
+  });
+});
+
+describe('isClaudeSubagentToolName', () => {
+  it('accepts only Claude subagent tools', () => {
+    expect(isClaudeSubagentToolName('Agent')).toBe(true);
+    expect(isClaudeSubagentToolName('Task')).toBe(true);
+  });
+
+  it('rejects tools whose successful output may legitimately start with <tool_use_error>', () => {
+    // 后台 Bash 把该标记当搜索命中打印、PI subagent / Codex collab 透传工作产物时,
+    // 按 Claude 协议收口会把成功任务误标成 failed。
+    expect(isClaudeSubagentToolName('Bash')).toBe(false);
+    expect(isClaudeSubagentToolName(PI_SUBAGENT_TOOL_NAME)).toBe(false);
+    expect(isClaudeSubagentToolName('collab:spawn')).toBe(false);
+    expect(isClaudeSubagentToolName('collab:spawnAgent')).toBe(false);
+    expect(isClaudeSubagentToolName('Workflow')).toBe(false);
+    expect(isClaudeSubagentToolName(undefined)).toBe(false);
   });
 });
