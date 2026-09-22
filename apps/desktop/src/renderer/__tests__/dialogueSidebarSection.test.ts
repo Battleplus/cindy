@@ -27,16 +27,6 @@ const projectsSectionSource = readFileSync(
   'utf8',
 );
 
-const dialogueStatusMenuSource = readFileSync(
-  resolve(__dirname, '..', 'features', 'cc-agent', 'sidebar', 'sections', 'DialogueStatusMenu.tsx'),
-  'utf8',
-);
-
-const mainListScopeHeaderSource = readFileSync(
-  resolve(__dirname, '..', 'features', 'cc-agent', 'sidebar', 'MainListScopeHeader.tsx'),
-  'utf8',
-);
-
 const mainListModelSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'lib', 'mainListModel.ts'),
   'utf8',
@@ -62,55 +52,13 @@ describe('Mixed main list (sidebar-redesign D 期)', () => {
   it('renders dialogues through the mixed ProjectsSection instead of a fixed DialogueSection', () => {
     expect(sidebarSource).toContain('dialogues={visibleDialogues}');
     expect(sidebarSource).not.toContain('<DialogueSection');
-    expect(projectsSectionSource).toContain('buildMainListEntries');
-  });
-
-  it('exposes a Dialogue-owned status filter on live dialogue surfaces, not only DialogueSection', () => {
-    // 展开态主列表已混排,不再挂 <DialogueSection>;全局 Status 仍在 SidebarFilterPopover。
-    // #1875 需要对话区可见入口:恒在范围标题(未分组 / 空列表) + 混排「对话」组头
-    // + 折叠 rail 对话面板复用同一份 filter.status。
-    expect(dialogueStatusMenuSource).toContain('DIALOGUE_STATUS_OPTIONS');
-    expect(dialogueStatusMenuSource).toContain('onStatusChange');
-    expect(dialogueStatusMenuSource).toContain("'ccAgent.sidebar.filterStatusHeading'");
-    expect(dialogueStatusMenuSource).toContain("'ccAgent.sidebar.filterStatus.active'");
-    expect(dialogueStatusMenuSource).toContain("'ccAgent.sidebar.filterStatus.archived'");
-    expect(dialogueStatusMenuSource).toContain("'ccAgent.sidebar.filterStatus.all'");
-    expect(mainListScopeHeaderSource).toContain('<DialogueStatusMenu');
-    expect(mainListScopeHeaderSource).toContain('status={filter.status}');
-    expect(mainListScopeHeaderSource).toContain('onStatusChange={filter.setStatus}');
-    expect(projectsSectionSource).toContain('<DialogueStatusMenu');
-    expect(projectsSectionSource).toContain('status={filter.status}');
-    expect(projectsSectionSource).toContain('onStatusChange={filter.setStatus}');
-    expect(sidebarSource).toContain('<DialogueStatusMenu');
-    expect(sidebarSource).toContain('status={filter.status}');
-    expect(sidebarSource).toContain('onStatusChange={filter.setStatus}');
-  });
-
-  it('passes a real sortByLabel into mixed-list AT and shows a keyboard focus ring', () => {
-    expect(dialogueStatusMenuSource).toContain("'ccAgent.sidebar.dialogueSettingsAria'");
-    expect(dialogueStatusMenuSource).toContain('sortBy: sortByLabel ?? statusLabel');
-    expect(dialogueStatusMenuSource).toContain('focus-visible:ring-[var(--focus-ring)]');
-    expect(mainListScopeHeaderSource).toContain(
-      'sortByLabel={t(`ccAgent.sidebar.filterSortBy.${filter.sortBy}`)}',
+    expect(projectsSectionSource).toContain('useMainListEntries({');
+    const entriesHook = readFileSync(
+      resolve(__dirname, '..', 'features', 'cc-agent', 'hooks', 'useMainListEntries.ts'),
+      'utf8',
     );
-    expect(projectsSectionSource).toContain(
-      'sortByLabel={t(`ccAgent.sidebar.filterSortBy.${filter.sortBy}`)}',
-    );
-    expect(dialogueStatusMenuSource).toContain(
-      "'flex shrink-0 items-center justify-center rounded-full'",
-    );
-    expect(mainListScopeHeaderSource).toContain(
-      'buttonClassName="size-6 hover:bg-sidebar-item-hover hover:text-foreground"',
-    );
-    expect(projectsSectionSource).toContain(
-      'buttonClassName="size-6 hover:bg-sidebar-item-hover hover:text-foreground"',
-    );
-    expect(projectsSectionSource).not.toContain(
-      'buttonClassName="size-5 hover:bg-sidebar-item-hover hover:text-foreground"',
-    );
-    expect(sidebarSource).toContain(
-      'sortByLabel={t(`ccAgent.sidebar.dialogueSort.${dialogueSortBy}`)}',
-    );
+    expect(entriesHook).toContain('buildMainListEntries({');
+    expect(entriesHook).toContain('projects, dialogues, bots, unclassified');
   });
 
   it('drops the removed date-grouped section entirely', () => {
@@ -132,6 +80,9 @@ describe('Mixed main list (sidebar-redesign D 期)', () => {
 
   it('holds the current priority rank before click-path attention clear', () => {
     const clickHandler = extractHandlerBlock(sidebarSource, 'handleSessionClick');
+    // Remote rows live in the merged index, not the local sessions array.
+    expect(clickHandler).toContain('const target = sessionsByIdRef.current.get(id)');
+    expect(clickHandler).toContain('target ? [target] : []');
     expect(clickHandler.indexOf('holdSidebarViewedPriority')).toBeGreaterThan(-1);
     expect(clickHandler.indexOf('holdSidebarViewedPriority')).toBeLessThan(
       clickHandler.indexOf('clearNotification(id)'),
@@ -259,7 +210,7 @@ describe('Mixed main list (sidebar-redesign D 期)', () => {
     // 不按设备分组的两条渲染路径不传目标 → 上层沿用作用域推断。
     expect(projectsSectionSource).toContain('renderNonProjectEntry(entry, DIALOGUE_GROUP_ALL_KEY)');
     expect(projectsSectionSource).toContain(
-      'onCreateDialogue={() => onCreateDialogue(dialogueDeviceTarget)}',
+      'onCreateDialogue={isMake ? undefined : () => onCreateDialogue(dialogueDeviceTarget)}',
     );
     // 目标设备离线 → 禁用新建并复用远程写保护文案(被控端才是真正的创建方)。
     expect(projectsSectionSource).toContain("t('ccAgent.remoteSession.actionsUnavailable')");

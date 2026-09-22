@@ -1,3 +1,4 @@
+import { registerTaskTagsIpc } from './taskTags';
 import { registerRoutineRemoteResources } from '../../routines/remote.js';
 import { registerRoutinesIpc } from '../../routines/service.js';
 /**
@@ -32,7 +33,8 @@ import { enqueueDurableWrite } from '../../messagePersistBroadcaster';
 import { registerDevSqliteVecIpc } from './dev/sqliteVec';
 import { registerSearchIpc } from './search';
 import { registerRemoteHistoryIpc } from './history';
-import { recoverActiveBotTemplateSkills, registerBotIpc } from './bots';
+import { recoverActiveTeammateInvitations, registerBotIpc } from './bots';
+import { botRemoteManagement } from './botRemoteManagement';
 import { registerBotRemoteResourceProvider } from './botRemoteResourceProvider';
 
 import { createLogger } from '../../logger';
@@ -140,9 +142,8 @@ export function registerLocalDbIpc(opts: RegisterLocalDbIpcOpts = {}): void {
         tryGetDbClient() === client &&
         getCurrentDbClientUserId() === userId &&
         (opts.isOwnerCurrent?.(userId) ?? true);
-      // 数据库与账号边界都已就绪后再补装旧版内置伙伴能力；不依赖用户先打开
-      // 伙伴页面。列表/get 仍保留幂等恢复，覆盖同进程账号切换后的读取路径。
-      await recoverActiveBotTemplateSkills();
+      // Resume saved invitations after the database and account boundary are ready.
+      await recoverActiveTeammateInvitations();
       if (!isReadyOwnerCurrent()) return;
       startMediaRefCompensationReconcile(userId, client, isReadyOwnerCurrent);
 
@@ -260,13 +261,14 @@ export function registerLocalDbIpc(opts: RegisterLocalDbIpcOpts = {}): void {
   registerRemoteHistoryIpc();
   registerBotIpc();
   registerRoutinesIpc();
-  registerRoutineRemoteResources();
-  registerBotRemoteResourceProvider();
+  registerRoutineRemoteResources(botRemoteManagement);
+  registerBotRemoteResourceProvider(botRemoteManagement);
   registerSessionImportIpc();
   registerSessionShareIpc();
   registerOrcaWorkflowIpc();
   registerRecentWorkdirsIpc();
   registerProjectAliasesIpc();
+  registerTaskTagsIpc();
   registerRightSidebarTabsIpc();
   // Durable Subagent projection writes share the agent event path's FIFO, so a
   // reconciliation and an agent_task_update cannot both insert the first

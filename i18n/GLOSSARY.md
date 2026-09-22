@@ -175,6 +175,10 @@ Anthropic Messages API / wire protocol 的用户可见名称。四语统一保�
 
 企业认证与业务服务所在区域的用户可见名称，用于组织登录检测到中国大陆服务区域时的确认文案；它描述连接的服务区域，不代表当前安装的是中国大陆版。先按现有四语文案登记为 proposed，避免后续出现“中国区／国内区／China region”等多套说法。
 
+### Automatically unlock computer
+
+远程桌面操作菜单的安全设置；仅用于可选的本机保存密码自动解锁。
+
 ### reply (the bot's public post on X)
 
 Cindy 在 X 上发出的那条公开回复。zh-CN 取「回帖」以强调它是**一条公开帖子**而不是私聊消息——这正是 X 与 Slack / Telegram 的性质差异, 也是风险告知的核心。与「消息」区分开: 后者按 task-and-conversation-naming 只用于任务内的单条往来。proposed 同上。
@@ -182,6 +186,10 @@ Cindy 在 X 上发出的那条公开回复。zh-CN 取「回帖」以强调它�
 ### Security check
 
 登录邮箱发码前的 CAPTCHA(Cloudflare Turnstile)挑战。中文用「安全验证」(腾讯/阿里系产品的通行叫法,2026-08-19 用户反馈弃用「人机验证」;与「验证码」= verification code 消歧——后者已被 login.codePlaceholder 占用指 6 位数字码);en 用 Security check 而非品牌词 Turnstile 或缩写 CAPTCHA。消费处:login.captcha.* 与 login.errors.CAPTCHA_*(desktop 五语 + mobile 影子 catalog)。
+
+### Chat workspace
+
+用户于 2026-09-18 明确指定的存储设置名称，表示未绑定项目的新任务工作目录的分配位置。单个任务的 working directory 仍称工作目录，不改其术语。
 
 ### China
 
@@ -197,7 +205,31 @@ Cindy AI 个人账号的免费会员身份标签。只在服务端明确下发 a
 
 ### Cindy Make
 
-用户通过内置 /cindy-make 显式开启的 Cindy 个人版制作流程，先复用 /cindy-make-doctor 检查本机环境，再按平台补齐缺少的便携工具，并在消息流卡片中保留修改需求；Doctor 自身只检查，上游查询与构建分阶段接入。命令名已由用户指定，卡片保留同一专名。
+用户通过 /cindy-make 显式开启的本机定制流程。输入区承接准备与每轮完成选择；修改时使用普通输入框。完成后可继续修改、启动隔离测试或生成个人版，版本切换由原生客户端处理。Doctor 自身只检查。
+
+### Make history
+
+Cindy Make 设置中保留全部制作、修改轮次与合入记录的列表；结束制作及清理工作目录后仍可回看。
+
+### Reapply integration
+
+重新应用之前明确撤销的制作改动，区别于把尚未合入的新修改首次加入个人源码。
+
+### Undo integration
+
+撤销单次制作已合入个人源码的全部改动，保留其他制作与已有应用成品；通过新的反向提交实现。
+
+### Version Control
+
+Cindy Make 设置中用户指定的页签名称，汇总我的版本与制作历史，并提供本地合入、撤销和生成入口。
+
+### Original Version
+
+Cindy Make 中与个人版对应的来源应用。用户明确要求 Dev 和正式安装版属于同一个类型；Dev 只影响底层启动方式，不作为第三类版本。
+
+### Personal Version
+
+Cindy Make 生成的本机定制应用成品。可与原版切换并沿用同一份日常数据，与使用独立数据的隔离测试版区分。
 
 ### Content Update
 
@@ -247,9 +279,13 @@ OAuth 2.0 Device Authorization Grant 中由用户在另一设备验证页输入�
 
 伙伴设置里「跑在哪个 Agent 上」那个选择(Claude / Codex / Pi)。代码里叫 harness,但那是实现名词,普通用户看不懂;2026-08-21 实机截图里中文界面直接显示英文 Harness。这里先提「引擎」待裁决 —— 它不精确(Pi 严格说是多协议接入层),但对用户能表达「换一个跑法」。定不下来的话另一个候选是直接列三个名字不给类目名。
 
+### Face ID verification
+
+远程桌面操作菜单的安全设置；仅用于可选的本机保存密码自动解锁。
+
 ### Harness
 
-用户确认并公开提交 Issue 时显示承载当前 Agent 的运行框架。五语暂统一保留英文 Harness；具体值固定使用 Claude Code、Codex、Pi 的公开全名，不使用 cc/cx/pi 等内部缩写。
+用于任务筛选、搜索筛选，以及用户确认并公开提交 Issue 时显示承载当前 Agent 的运行框架。五语暂统一保留英文 Harness；具体值固定使用 Claude Code、Codex、Pi 的公开全名，不使用 cc/cx/pi 等内部缩写。
 
 ### Hunyuan
 
@@ -270,6 +306,14 @@ Orca 协同角色名，与 Worker 成对。五语统一保留英文 Lead，不�
 ### Local model
 
 用户机器上运行的开源权重模型（经 Ollama / LM Studio 等本机 runtime）。刻意不用「本地模型」——「本地模式」已废弃，指未登录 Cindy 账号；「本机」强调权重和推理都在用户这台电脑上。设置页本机模型分组、Ollama 详情副标题使用。proposed：等本机模型入口上线后再固化。
+
+### Local
+
+用于 Desktop 本机范围标签。translations 中带任务／セッション／세션 的译法仅用于侧栏任务范围标题 ccAgent.sidebar.scopeLocalSessions；设备菜单、新建任务按钮和设备分组标题使用 alsoAllowed 中不带任务的设备标签译法，不可互换。英文统一使用 Local，表示当前电脑或其上的任务；其他语言保留各位置现有表达。不表示本地模型、离线模式或未登录状态，也不约束其他语境中的 local。
+
+### Mac Login Password
+
+远程桌面原生密码表单中的 macOS 系统账户密码，区别于 Cindy 账号密码；密码不经过 JavaScript。
 
 ### Black Cat
 
@@ -371,9 +415,25 @@ dev 版登录页区域徽标上的标签值（DESIGN.md §16.3），四语同值
 
 已确定禁用：`开发版（仅当英文含 Dev）`（zh-CN）、`開発版（仅当英文含 Dev）`（ja）、`개발판（仅当英文含 Dev）`（ko）
 
+### Remote computer
+
+用户可见文案用具体对象说明连接与操作，避免被控端、被控电脑等实现术语；指当前电脑时用这台电脑，指保存密码的位置时用此设备。
+
 ### Remote desktop
 
 同账号手机查看和操作电脑真实桌面，独立于 Cindy 内部设备控制授权。
+
+### Run in background
+
+远程桌面的持续开关，用户已确认中文名。离开页面或切到后台时以小窗继续显示，回到全屏后仍保持开启；不是任意后台任务或强制退出后继续运行的承诺。其他语言译名登记为 proposed。
+
+### Direct to computer
+
+远程桌面传输状态，桌面端沿用手机端现有用语。表示画面不经过中转服务器；直连也可能穿过公网 NAT，不能据此标成内网直连。
+
+### Display & Sound
+
+Remote desktop panel containing picture and audio settings; icon-only toolbar trigger.
 
 ### Lock screen control
 
@@ -391,9 +451,21 @@ Remote desktop display controls; resolution changes the host display, small wind
 
 Remote desktop display controls; resolution changes the host display, small window uses system picture in picture.
 
+### Server screenshot relay
+
+远程桌面退回通过现有设备连接逐张传送截图的方式，桌面端沿用手机端现有用语，避免仅写兼容模式而隐藏实际传输方式。
+
 ### Take over connection
 
 Explicit user action that replaces the current remote desktop viewer; never used for automatic recovery.
+
+### Server video relay
+
+远程桌面使用服务器中转实时视频，桌面与手机沿用同一用语；区别于逐张截图传输。
+
+### Remote device
+
+远程连接、任务与设备列表中的另一台设备；明确是电脑时优先说远程电脑。不要把本地浏览器内部控制器称为远程设备。
 
 ### Activity Monitor
 
@@ -428,6 +500,10 @@ macOS TCC 的 kTCCServiceListenEvent(系统设置里叫「输入监控」)在 Ci
 ### Smart routing
 
 Codex Subagent 的可选扩展调配开关。默认关闭以保留 Codex 原生 Sol/Terra 调配；开启后允许 Codex 从 Cindy 已连接的更多模型中按任务选择。
+
+### Tag
+
+任务列表的 Finder 式颜色标签；仅标识任务，不改变运行状态。用户已确认显示为重叠色球，整合现有任务菜单，当前不增加筛选入口。
 
 ### Teammate
 

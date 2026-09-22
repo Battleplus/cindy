@@ -27,6 +27,7 @@ import { LanguageSection } from './LanguageSection';
 import { LogoutSection } from './LogoutSection';
 import { ImBotSection, isImBotSettingsGroup, type ImBotSettingsGroup } from './ImBotSection';
 import { AboutSection } from './AboutSection';
+import { WorktreeRecycleCard } from './WorktreeRecycleCard';
 import { StorageManagementCard } from './StorageManagementCard';
 import { UserPromptSection } from './UserPromptSection';
 import { MemorySection } from './MemorySection';
@@ -54,6 +55,8 @@ import { BillingSettingsSection } from '@/features/billing/BillingPage';
 import { BotsGlobalSettingsSection } from '@/features/bots/BotsGlobalSettingsSection';
 import { canAccessBillingSettings } from './billingVisibility';
 import { canAccessUsageSettings } from './usageVisibility';
+import { canAccessCindyMakeSettings } from './cindyMakeVisibility';
+import { useCindyVersions } from '@/lib/useCindyVersions';
 import { UsageHistorySection } from './usage/UsageHistorySection';
 
 const DEFAULT_SETTINGS_MENU_WIDTH = 260;
@@ -85,6 +88,8 @@ export function SettingsView() {
   // 用量历史对所有**已登录**身份开放 (local / cloud personal / cloud org),
   // 与 billing 的 canAccessBillingSettings 无关 —— #2785 维护者裁决。
   const canAccessUsage = canAccessUsageSettings({ mode });
+  const versions = useCindyVersions(!import.meta.env.DEV);
+  const canAccessCindyMake = canAccessCindyMakeSettings(import.meta.env.DEV, versions.state);
 
   const activeTab = useMemo<SettingsTab>(() => {
     const raw = rawTab;
@@ -96,9 +101,10 @@ export function SettingsView() {
     if (raw === 'tina') return 'im-bot';
     if (raw === 'billing' && !canAccessBilling) return 'general';
     if (raw === 'usage' && !canAccessUsage) return 'general';
+    if (raw === 'cindy-make' && !canAccessCindyMake) return 'general';
     if (raw === 'agent-island' && !isMac) return 'general';
     return isSettingsTab(raw) ? raw : 'general';
-  }, [canAccessBilling, canAccessUsage, isMac, rawTab]);
+  }, [canAccessBilling, canAccessCindyMake, canAccessUsage, isMac, rawTab]);
   const piExtensionsPanelOpen =
     activeTab === 'general' &&
     (rawTab === 'pi-extensions' || searchParams.get('openPanel') === 'pi-extensions');
@@ -186,9 +192,10 @@ export function SettingsView() {
         (tabId) =>
           (isMac || tabId !== 'agent-island') &&
           (canAccessBilling || tabId !== 'billing') &&
-          (canAccessUsage || tabId !== 'usage'),
+          (canAccessUsage || tabId !== 'usage') &&
+          (canAccessCindyMake || tabId !== 'cindy-make'),
       ),
-    [canAccessBilling, canAccessUsage, isMac],
+    [canAccessBilling, canAccessCindyMake, canAccessUsage, isMac],
   );
 
   // deep-link: ?section=... → scroll to a section inside the active tab.
@@ -359,7 +366,6 @@ export function SettingsView() {
                     >
                       <BotsGlobalSettingsSection />
                     </section>
-
 
                     {/* Section — App Behavior(「应用行为」)
                         「保持电脑唤醒」跨平台生效,故 section 常驻;其中
@@ -623,7 +629,7 @@ export function SettingsView() {
               </div>
             )}
 
-            {activeTab === 'cindy-make' && (
+            {canAccessCindyMake && activeTab === 'cindy-make' && (
               <div
                 role="tabpanel"
                 id="settings-panel-cindy-make"
@@ -657,6 +663,7 @@ export function SettingsView() {
               >
                 <section aria-label={t('settings.about.storage.title')}>
                   <StorageManagementCard />
+                  <WorktreeRecycleCard />
                 </section>
               </div>
             )}

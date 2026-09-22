@@ -1,5 +1,3 @@
-import { Tip } from '@/components/ui/tooltip';
-import { openRoutinesTab } from '../right-sidebar/lib/openRoutinesTab';
 /**
  * The ContentHeader lockup for a teammate's canonical chat.
  *
@@ -11,16 +9,19 @@ import { openRoutinesTab } from '../right-sidebar/lib/openRoutinesTab';
  * "the gear is on the right" is the learned one.
  */
 import { useMemo } from 'react';
-import { CalendarClock, Settings2 } from 'lucide-react';
+import { Settings2 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 
 import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
 import { useRegisterContentHeader } from '../feature-context';
 import { BotAvatar } from './BotAvatar';
+import { isCindyDeviceBot } from './cindyDeviceRoster';
+import { CindyHeaderDevicePicker } from './CindyDevicePicker';
 
 export interface BotChatIdentity {
   id: string;
+  templateId?: string;
   deviceId?: string;
   deviceName?: string;
   name: string;
@@ -28,17 +29,11 @@ export interface BotChatIdentity {
   avatarColor?: string | null;
 }
 
-export function BotSessionContentHeader({
-  bot,
-  sessionId,
-}: {
-  bot: BotChatIdentity;
-  /** 没有会话 id 就打不开那一个会话的仓库 —— 此时整枚入口不渲染,不给死按钮。 */
-  sessionId?: string | null;
-}) {
+export function BotSessionContentHeader({ bot }: { bot: BotChatIdentity }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  const isCindy = isCindyDeviceBot(bot);
   const openSettings = () => {
     const search = new URLSearchParams(location.search);
     search.set('settings', '1');
@@ -61,20 +56,8 @@ export function BotSessionContentHeader({
         <BotAvatar bot={bot} size="xs" />
         <span className="min-w-0 truncate">{bot.name}</span>
       </button>
-      <div className="ml-auto flex shrink-0 items-center gap-1">
-        {!bot.deviceId && sessionId ? (
-          <Tip text={t('routines.title')} side="bottom">
-            <button
-              type="button"
-              aria-label={t('routines.title')}
-              style={WINDOW_NO_DRAG_STYLE}
-              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--text-tertiary)] hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]"
-              onClick={() => void openRoutinesTab(sessionId, bot.id)}
-            >
-              <CalendarClock size={17} />
-            </button>
-          </Tip>
-        ) : null}
+      {isCindy ? <CindyHeaderDevicePicker bot={bot} /> : null}
+      {!bot.deviceId || !isCindy ? <div className="ml-auto flex shrink-0 items-center gap-1">
         {!bot.deviceId ? <button
           type="button"
           onClick={openSettings}
@@ -84,7 +67,7 @@ export function BotSessionContentHeader({
         >
           <Settings2 size={15} />
         </button> : <span className="truncate text-12 text-[var(--text-tertiary)]">{bot.deviceName}</span>}
-      </div>
+      </div> : null}
     </div>
   );
 }
@@ -96,13 +79,11 @@ export function BotSessionContentHeader({
  */
 export function BotSessionContentHeaderRegistration({
   bot,
-  sessionId,
 }: {
   bot: BotChatIdentity;
-  sessionId?: string | null;
 }) {
   useRegisterContentHeader(
-    useMemo(() => <BotSessionContentHeader bot={bot} sessionId={sessionId} />, [bot, sessionId]),
+    useMemo(() => <BotSessionContentHeader bot={bot} />, [bot]),
   );
   return null;
 }

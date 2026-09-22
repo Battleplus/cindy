@@ -1,3 +1,4 @@
+import { normalizeTaskTags, reconcileTaskTags } from '@cindy/maker-shared';
 import {
   createContext,
   createElement,
@@ -26,6 +27,7 @@ import { isRemoteTextDelta, readRemoteTextSnapshot, reconcileRemoteText, consume
 import { applyCodexPlanSnapshotOnDone, markCodexPlanTurnFailed } from '@cindy/maker-shared/message-render';
 import {
   buildSessionMessagePreviewIndex,
+  sessionRowMessagePreview,
   type RemoteSessionLiveActivity,
 } from '@cindy/maker-shared/session-list';
 import { buildDeviceIdentity, resolveCanonicalDeviceId } from '@cindy/maker-shared/mobile-home';
@@ -114,6 +116,8 @@ export const sessionMetaWriteQueue = createSessionWriteQueue();
 
 export interface RemoteSessionRunStatus {
   isRunning: boolean;
+  /** Terminal failure remains sticky until the next run, even after read acknowledgement. */
+  hasTerminalError?: boolean;
   reconnectAttempt: RemoteSessionReconnectAttempt | null;
   sideTaskRunning: boolean;
   startedAt: number | null;
@@ -141,6 +145,7 @@ export interface RemoteSessionReconnectAttempt {
 interface SessionMessageSyncMarker {
   messageCount: number | null;
   updatedAt: string;
+  preview?: string | null;
 }
 
 export interface SetLatestMessageWindowOptions {
@@ -692,7 +697,7 @@ const messageIdentityIndexes = new WeakMap<
 >();
 const messagePreviewCache = new WeakMap<
   readonly RemoteMessage[],
-  { preview: string | undefined }
+  { preview: string | undefined; liveSession?: RemoteSession }
 >();
 const EMPTY_MESSAGE_STRUCTURE_TOKEN = Object.freeze({ kind: 'empty-message-structure' });
 const emptySessionMessageStructureTokens = new Map<string, object>();
@@ -1484,6 +1489,7 @@ function recomputeSessions(): void {
   for (const { session, physicalDeviceId } of byId.values()) {
     const prev = prevById.get(session.id);
     const projected = applyPendingTitlePreview(session);
+    if (!prev || !remoteSessionEqual(prev, projected)) pendingMessagePreviewSessionIds.add(session.id);
     next.push(prev && remoteSessionEqual(prev, projected) ? prev : projected);
     sessionDeviceIndex.set(session.id, physicalDeviceId);
   }
@@ -2169,12 +2175,10 @@ function reanchorPendingLiveAssistantRows(
       messageIdentityMatches(message, row.message)
     )));
     if (groupedRows.length === 0) continue;
-    const withoutPending = next.filter((message) => !group.pendingRows.some((row) => (
-      messageIdentityMatches(message, row.message)
-    )));
-    const anchorIndex = withoutPending.findIndex((message) => (
-      messageIdentityMatches(message, group.afterMessage)
+    const withoutPending = next.filter((message) => !group.pendingRows.some((row) => messageIdentityMatches(message, row.message)
     ));
+    const anchorIndex = withoutPending.findIndex((message) =>
+      messageIdentityMatches(message, group.afterMessage));
     if (anchorIndex < 0) continue;
     next = [
       ...withoutPending.slice(0, anchorIndex + 1),
@@ -2440,6 +2444,26 @@ function findMessageIndexByIdentity(
 }
 
 function applyRemoteTextEvent(
+  sessionId: string,
+  event: Record<string, unknown>,
+  persistId?: string,
+  deviceId?: string,
+): boolean {
+  const previous = messages.get(sessionId);
+  const changed = mergeRemoteTextEvent(sessionId, event, persistId, deviceId);
+  const list = messages.get(sessionId);
+  if (list && list !== previous) {
+    // Cache provenance with the extracted text, not with a lingering streaming
+    // pointer. Any later session metadata makes this live preview yield to Host.
+    messagePreviewCache.set(list, {
+      preview: buildSessionMessagePreviewIndex([sessionId], () => list).get(sessionId),
+      liveSession: sessionById(sessionId),
+    });
+  }
+  return changed;
+}
+
+function mergeRemoteTextEvent(
   sessionId: string,
   event: Record<string, unknown>,
   persistId?: string,
@@ -2838,6 +2862,8 @@ function finalizeRemoteStreamingMessageByClientId(
     return { ...message, agentMeta: clearStreamingMeta(message.agentMeta) };
   });
   if (!changed) return false;
+  const preview = messagePreviewCache.get(existing);
+  if (preview) messagePreviewCache.set(next, preview);
   messages.set(sessionId, next);
   bumpMessageVersion(sessionId);
   return true;
@@ -2863,6 +2889,8 @@ function finalizeRemoteStreamingMessages(
     return { ...message, agentMeta: clearStreamingMeta(mergedMeta) };
   });
   if (!changed) return false;
+  const preview = messagePreviewCache.get(existing);
+  if (preview) messagePreviewCache.set(next, preview);
   messages.set(sessionId, next);
   bumpMessageVersion(sessionId);
   return true;
@@ -2924,6 +2952,64 @@ function recallParkedTaskUpdates(
   }
   if (parkedMap.size === 0) sessionParkedTaskUpdates.delete(sessionId);
   return recalled ?? prevMap;
+}
+
+/**
+ * `markDeviceOffline` / `markDevicesOffline` 共用的清扫主体:逐台执行离线清理,
+ * 返回是否有任何投影变化。调用方负责决定 emit 一次(批量)还是逐台 emit。
+ */
+function sweepDevicesOffline(deviceIds: readonly string[]): boolean {
+  let changed = false;
+  const idSet = new Set(deviceIds);
+  if (idSet.size === 0) return false;
+  // A first text delta can still be waiting in the 32ms batch before any session
+  // metadata/index exists. Flush batches from this transport first so they create a
+  // device-owned host anchor, then freeze that identity before reconnect metadata can
+  // bind it to a newer send round.
+  for (const [sessionId, batch] of [...pendingTextDeltaBatches]) {
+    if (batch.deviceId === undefined || !idSet.has(batch.deviceId)) continue;
+    changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
+    changed = clearStreamingAssistantPointer(sessionId) || changed;
+    changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, batch.deviceId) || changed;
+  }
+  for (const [sessionId, indexedDeviceId] of sessionDeviceIndex) {
+    if (!idSet.has(indexedDeviceId)) continue;
+    if (sessionMessageSyncMarkers.delete(sessionId)) {
+      bumpMessageVersion(sessionId);
+      changed = true;
+    }
+    changed = livePlanSnapshots.delete(sessionId) || changed;
+    changed = pendingRefreshSessions.delete(sessionId) || changed;
+    changed = deletePendingInteractionState(sessionId) || changed;
+    // 投影没了,这份(空)列表就不再权威:重连拿到全量快照前不许据此做清理。
+    changed = pendingInteractionsAuthoritative.delete(sessionId) || changed;
+    changed = invalidateInputProjectionForOffline(sessionId) || changed;
+    bumpInputProjectionAuthorityEpoch(sessionId);
+    changed = deleteSessionLiveActivity(sessionId) || changed;
+    changed = sessionGoalStatus.delete(sessionId) || changed;
+    changed = sessionTaskUpdates.delete(sessionId) || changed;
+    changed = sessionParkedTaskUpdates.delete(sessionId) || changed;
+    changed = sessionMakerActivityEpochs.delete(sessionId) || changed;
+    changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
+    changed = clearStreamingAssistantPointer(sessionId) || changed;
+    // The message window survives a soft offline transition, so both pending
+    // identities must survive too: one protects the live row during latest-window
+    // reconciliation, and the other lets a reconnecting authoritative user row
+    // restore question → reply order. Persisted reconciliation, explicit window
+    // invalidation, or actual device removal will retire them.
+    changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, indexedDeviceId) || changed;
+    changed = writeMakerTurnRunning(sessionId, false) || changed;
+    changed = writeSessionRunStatus(sessionId, EMPTY_SESSION_RUN_STATUS) || changed;
+  }
+  for (const [sessionId, pendingAnchors] of pendingHostAnchorLiveAssistantClientIds) {
+    for (const identity of pendingAnchors.values()) {
+      for (const deviceId of identity.deviceIds) {
+        if (!idSet.has(deviceId)) continue;
+        changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, deviceId) || changed;
+      }
+    }
+  }
+  return changed;
 }
 
 export const remoteSessionStore = {
@@ -3525,9 +3611,13 @@ export const remoteSessionStore = {
     return true;
   },
 
-  markSessionMessagesSynced(sessionId: string, session: Pick<RemoteSession, '_count' | 'updatedAt'>): void {
+  markSessionMessagesSynced(sessionId: string, session: Pick<RemoteSession, '_count' | 'updatedAt' | 'preview'>): void {
     if (!sessionId) return;
+    if (this.isSessionMessageWindowSynced(sessionId, session)
+      && sessionMessageSyncMarkers.get(sessionId)?.preview === session.preview) return;
     sessionMessageSyncMarkers.set(sessionId, buildSessionMessageSyncMarker(session));
+    bumpMessageVersion(sessionId);
+    emit();
   },
 
   isSessionMessageWindowSynced(sessionId: string, session: Pick<RemoteSession, '_count' | 'updatedAt'>): boolean {
@@ -3547,7 +3637,10 @@ export const remoteSessionStore = {
     pendingRefreshSessions.delete(sessionId);
     // A history read already in flight when the dirty push arrived may have
     // reinstalled its older marker. The queued repair must still read history.
-    sessionMessageSyncMarkers.delete(sessionId);
+    if (sessionMessageSyncMarkers.delete(sessionId)) {
+      bumpMessageVersion(sessionId);
+      emit();
+    }
     return true;
   },
 
@@ -3710,7 +3803,7 @@ export const remoteSessionStore = {
     const next = existing.filter((message) => (
       !deletedClientIds.has(message.clientId) && !deletedClientIds.has(message.id)
     ));
-    sessionMessageSyncMarkers.delete(sessionId);
+    const syncMarkerChanged = sessionMessageSyncMarkers.delete(sessionId);
     // 连续性结论随窗口一起失效:rewind 可能删掉中间的行,清空/回收更是整窗重来。
     // 重置为未知,下一次最新窗口同步会重建(见 sessionWindowCoverage)。
     forgetWindowCoverage(sessionId);
@@ -3762,7 +3855,7 @@ export const remoteSessionStore = {
       applyMessageWriteRetention(sessionId);
     }
     resetRemoteHistoryViews(deviceId, sessionId);
-    if (!messagesChanged && !tasksChanged && !projectionSettled) return;
+    if (!messagesChanged && !tasksChanged && !projectionSettled && !syncMarkerChanged) return;
     bumpMessageVersion(sessionId);
     emit();
   },
@@ -4161,6 +4254,18 @@ export const remoteSessionStore = {
       applySessionModelPrefPush(payload);
       return;
     }
+    if (channel === 'local-db:task-tags:changed' && isRecord(payload)) {
+      bumpDeviceSessionListMutationEpoch(deviceId);
+      const shard = shards.get(deviceId);
+      if (!shard) return;
+      const catalog = normalizeTaskTags(payload.tags, 256);
+      shard.sessions = shard.sessions.map((session) => ({
+        ...session,
+        tags: reconcileTaskTags(session.tags, catalog),
+      }));
+      recomputeSessions();
+      return;
+    }
     if (channel === 'local-db:sessions:patched' && isRecord(payload)) {
       const sessionId = readString(payload, 'sessionId');
       const patch = isRecord(payload.patch) ? payload.patch : null;
@@ -4446,6 +4551,7 @@ export const remoteSessionStore = {
       changed = writeSessionRunStatus(sessionId, {
         ...current,
         isRunning: false,
+        ...(phase === 'error' ? { hasTerminalError: true } : {}),
         reconnectAttempt: null,
         sideTaskRunning: false,
         startedAt: null,
@@ -4548,6 +4654,11 @@ export const remoteSessionStore = {
           }
         }
       }
+      const terminalErrorChanged = isTerminalMakerErrorEvent(event)
+        && writeSessionRunStatus(sessionId, {
+          ...readSessionRunStatus(sessionId),
+          hasTerminalError: true,
+        });
       this.setSessionRunning(
         sessionId,
         false,
@@ -4555,8 +4666,8 @@ export const remoteSessionStore = {
       );
       if (terminalPlanChanged) {
         bumpMessageVersion(sessionId);
-        emit();
       }
+      if (terminalPlanChanged || terminalErrorChanged) emit();
       return;
     }
 
@@ -4744,6 +4855,7 @@ export const remoteSessionStore = {
       }
       const next: RemoteSessionRunStatus = {
         isRunning,
+        ...(current.hasTerminalError !== undefined ? { hasTerminalError: current.hasTerminalError } : {}),
         reconnectAttempt: null,
         sideTaskRunning: isRunning ? data?.skipTurnReset === true : false,
         startedAt: isRunning ? (current.startedAt ?? Date.now()) : null,
@@ -4773,48 +4885,18 @@ export const remoteSessionStore = {
    * 最新消息窗口,不会把断线前缓存误判为 fresh。
    */
   markDeviceOffline(deviceId: string): void {
-    let changed = false;
-    // A first text delta can still be waiting in the 32ms batch before any session
-    // metadata/index exists. Flush batches from this transport first so they create a
-    // device-owned host anchor, then freeze that identity before reconnect metadata can
-    // bind it to a newer send round.
-    for (const [sessionId, batch] of [...pendingTextDeltaBatches]) {
-      if (batch.deviceId !== deviceId) continue;
-      changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
-      changed = clearStreamingAssistantPointer(sessionId) || changed;
-      changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, deviceId) || changed;
-    }
-    for (const [sessionId, indexedDeviceId] of sessionDeviceIndex) {
-      if (indexedDeviceId !== deviceId) continue;
-      changed = sessionMessageSyncMarkers.delete(sessionId) || changed;
-      changed = livePlanSnapshots.delete(sessionId) || changed;
-      changed = pendingRefreshSessions.delete(sessionId) || changed;
-      changed = deletePendingInteractionState(sessionId) || changed;
-      // 投影没了,这份(空)列表就不再权威:重连拿到全量快照前不许据此做清理。
-      changed = pendingInteractionsAuthoritative.delete(sessionId) || changed;
-      changed = invalidateInputProjectionForOffline(sessionId) || changed;
-      bumpInputProjectionAuthorityEpoch(sessionId);
-      changed = deleteSessionLiveActivity(sessionId) || changed;
-      changed = sessionGoalStatus.delete(sessionId) || changed;
-      changed = sessionTaskUpdates.delete(sessionId) || changed;
-      changed = sessionParkedTaskUpdates.delete(sessionId) || changed;
-      changed = sessionMakerActivityEpochs.delete(sessionId) || changed;
-      changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
-      changed = clearStreamingAssistantPointer(sessionId) || changed;
-      // The message window survives a soft offline transition, so both pending
-      // identities must survive too: one protects the live row during latest-window
-      // reconciliation, and the other lets a reconnecting authoritative user row
-      // restore question → reply order. Persisted reconciliation, explicit window
-      // invalidation, or actual device removal will retire them.
-      changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, deviceId) || changed;
-      changed = writeMakerTurnRunning(sessionId, false) || changed;
-      changed = writeSessionRunStatus(sessionId, EMPTY_SESSION_RUN_STATUS) || changed;
-    }
-    for (const [sessionId, pendingAnchors] of pendingHostAnchorLiveAssistantClientIds) {
-      if (![...pendingAnchors.values()].some((identity) => identity.deviceIds.has(deviceId))) continue;
-      changed = freezeUnboundPendingHostAnchorsForOffline(sessionId, deviceId) || changed;
-    }
-    if (changed) emit();
+    if (!sweepDevicesOffline([deviceId])) return;
+    emit();
+  },
+
+  /**
+   * 批量离线:同一波(如 presence 整批离线)只 emit 一次。逐台 markDeviceOffline
+   * 时每台各 notify 一轮,叠加 schedule store 的逐台失效,设备数超过 React 嵌套
+   * 更新上限即致命退出(2026-09-10 Android 冷启动,40/80 台隔离复现)。
+   */
+  markDevicesOffline(deviceIds: readonly string[]): void {
+    if (!sweepDevicesOffline(deviceIds)) return;
+    emit();
   },
 
   removeDevice(deviceId: string): void {
@@ -5019,6 +5101,27 @@ export const remoteSessionStore = {
     const preview = buildSessionMessagePreviewIndex([sessionId], () => list).get(sessionId);
     messagePreviewCache.set(list, { preview });
     return preview;
+  },
+
+  /** Lists must not let an old message mirror hide fresh history-view metadata. */
+  getSessionListMessagePreview(sessionId: string, session = sessionById(sessionId)): string | undefined {
+    const loaded = this.getSessionMessagePreview(sessionId);
+    if (!session || (this.isSessionMessageWindowSynced(sessionId, session)
+      && sessionMessageSyncMarkers.get(sessionId)?.preview === session.preview)) return loaded;
+    // Only text received against the current metadata may outrun its preview.
+    // A missed done event must not let an old stream win after foreground refresh.
+    const cached = messagePreviewCache.get(messages.get(sessionId) ?? emptyMessages);
+    if (cached?.liveSession === session) return loaded;
+    return sessionRowMessagePreview(session) ?? (typeof session.preview === 'string' ? '' : loaded);
+  },
+
+  getSessionListMessagePreviewIndex(sessions: readonly RemoteSession[]): Map<string, string> {
+    const index = new Map<string, string>();
+    for (const session of sessions) {
+      const preview = this.getSessionListMessagePreview(session.id, session);
+      if (preview) index.set(session.id, preview);
+    }
+    return index;
   },
 
   getMessageVersion(): number {
@@ -5350,6 +5453,9 @@ function writeMakerTurnRunning(sessionId: string, running: boolean): boolean {
 
 function writeSessionRunStatus(sessionId: string, next: RemoteSessionRunStatus): boolean {
   const current = readSessionRunStatus(sessionId);
+  if (next.isRunning && !current.isRunning && current.hasTerminalError) {
+    next = { ...next, hasTerminalError: false };
+  }
   if (shallowRecordEqual(current as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>)) {
     return false;
   }
@@ -5364,10 +5470,11 @@ function writeSessionRunStatus(sessionId: string, next: RemoteSessionRunStatus):
   return true;
 }
 
-function buildSessionMessageSyncMarker(session: Pick<RemoteSession, '_count' | 'updatedAt'>): SessionMessageSyncMarker {
+function buildSessionMessageSyncMarker(session: Pick<RemoteSession, '_count' | 'updatedAt' | 'preview'>): SessionMessageSyncMarker {
   const count = session._count?.messages;
   return {
     updatedAt: session.updatedAt,
+    preview: session.preview,
     messageCount: typeof count === 'number' && Number.isFinite(count) ? count : null,
   };
 }
@@ -5598,7 +5705,7 @@ export function useRemoteSessionMessagePreview(sessionId: string): string | unde
   );
   return usePausableRemoteSessionStoreSnapshot(
     `message-preview:${sessionId}`,
-    useCallback(() => remoteSessionStore.getSessionMessagePreview(sessionId), [sessionId]),
+    useCallback(() => remoteSessionStore.getSessionListMessagePreview(sessionId), [sessionId]),
     subscribe,
   );
 }

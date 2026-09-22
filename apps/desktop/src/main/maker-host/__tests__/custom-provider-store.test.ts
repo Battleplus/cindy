@@ -7,6 +7,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { DbClient } from '../../localDb/client/DbClient.js';
+import { createDbClient } from '../../localDb/client/DbClient.js';
 import { clearCurrentDbClient, setCurrentDbClient } from '../../localDb/client/current.js';
 import * as schema from '../../localDb/schema.js';
 import {
@@ -74,7 +75,39 @@ afterEach(() => {
   raw = null;
 });
 
+describe('custom provider updates through the runtime database proxy', () => {
+  it('reports an applied model update and rejects a stale snapshot', async () => {
+    const worker = await createDbClient({ useInlineWorker: true });
+    try {
+      for (const sql of CREATE_SQL.split(';').map((part) => part.trim()).filter(Boolean)) {
+        await worker.exec(sql);
+      }
+      setCurrentDbClient(worker, 'test-user');
+      await createCustomProvider(valid);
+      const before = (await getCustomProvider(valid.id))!;
+      const next = { ...before, runtimes: { codex: { ...before.runtimes.codex!, models: [
+        ...before.runtimes.codex!.models, { id: 'new-model', name: 'New model' },
+      ] } } };
+      const applied = await updateCustomProviderIfUnchanged(valid.id, before, next);
+      expect((await getCustomProvider(valid.id))?.runtimes.codex?.models).toHaveLength(2);
+      expect(applied).toBe(true);
+      expect(await updateCustomProviderIfUnchanged(valid.id, before, before)).toBe(false);
+      expect((await getCustomProvider(valid.id))?.runtimes.codex?.models).toHaveLength(2);
+    } finally {
+      clearCurrentDbClient(worker);
+      await worker.dispose();
+    }
+  });
+});
+
 describe('validateCustomProviderConfig (per-runtime)', () => {
+  it('accepts only the native Codex route for account credentials', () => {
+    const account: CustomProviderConfig = { id: 'openai-work', name: 'Work', auth: { method: 'oauth', native: 'codex' },
+      runtimes: { codex: { baseUrl: 'https://chatgpt.com/backend-api/codex', wireProtocol: 'openai-responses', models: [] } } };
+    expect(validateCustomProviderConfig(account).ok).toBe(true);
+    expect(validateCustomProviderConfig({ ...account, runtimes: { codex: { ...account.runtimes.codex, baseUrl: 'https://other.invalid' } } }).ok).toBe(false);
+    expect(validateCustomProviderConfig({ ...account, runtimes: { codex: { ...account.runtimes.codex, headers: { Authorization: 'secret' } } } }).ok).toBe(false);
+  });
   it.each(['codex', 'claude-code', 'pi'] as const)(
     'round-trips opaque preset references for %s',
     async (agent) => {
@@ -669,6 +702,7 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
             { id: 'a', name: 'A', contextWindow: 1_000_000 },
             { id: 'a', name: 'A dup' },
             { id: 'hidden', name: 'Hidden', defaultEnabled: false },
+            { id: 'checked', name: 'Checked', defaultEnabled: true },
           ],
           headers: { 'X-Org': 'acme' },
         },
@@ -678,6 +712,7 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     expect(got?.runtimes.codex?.models).toEqual([
       { id: 'a', name: 'A', contextWindow: 1_000_000 },
       { id: 'hidden', name: 'Hidden', defaultEnabled: false },
+      { id: 'checked', name: 'Checked', defaultEnabled: true },
     ]);
     expect(got?.runtimes.codex?.headers).toBeUndefined();
   });
@@ -1297,19 +1332,19 @@ describe('custom-provider-store CRUD (per-runtime)', () => {
     ).toBe(false);
   });
 
-  it('rejects unsupported protocol/runtime combinations', () => {
+  it.each(['openai-chat', 'openai-responses', 'anthropic-messages'] as const)('accepts Claude portable protocol %s through its native or bridge path', wireProtocol => {
     expect(
       validateCustomProviderConfig({
         ...valid,
         runtimes: {
           'claude-code': {
             baseUrl: 'https://v.ai/chat',
-            wireProtocol: 'openai-chat',
+            wireProtocol,
             models: [{ id: 'm', name: 'M' }],
           },
         },
       }).ok,
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it('update returns null when row absent', async () => {
@@ -1552,6 +1587,7 @@ describe('supplier metadata persistence', () => {
               contextWindow: 2000,
               supportsImageInput: false,
               discoveredMetadata: metadata,
+              discoveredCost: { input: 0.7, output: 1.4, cacheRead: 0 },
             },
           ],
         },
@@ -1565,6 +1601,7 @@ describe('supplier metadata persistence', () => {
       contextWindow: 2000,
       supportsImageInput: false,
       discoveredMetadata: metadata,
+              discoveredCost: { input: 0.7, output: 1.4, cacheRead: 0 },
     });
     const next = {
       ...saved!,
@@ -1587,5 +1624,25 @@ describe('supplier metadata persistence', () => {
       supportsImageInput: false,
       discoveredMetadata: { contextWindow: 3000 },
     });
+    await updateCustomProvider(valid.id, {
+      ...next, runtimes: { codex: { ...next.runtimes.codex, baseUrl: 'https://different.example/v1' } },
+    });
+    const moved = (await getCustomProvider(valid.id))?.runtimes.codex?.models[0];
+    expect(moved?.discoveredCost).toBeUndefined();
+    expect(moved?.contextWindow).toBe(2000);
+
   });
+});
+
+
+it('persists and reloads Google runtime/model routes without converting them to Chat', async () => {
+  mountDb();
+  const config: CustomProviderConfig = { id: 'google-roundtrip', name: 'Google', runtimes: {
+    pi: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta', wireProtocol: 'google-generative-ai', models: [{
+      id: 'new-gemini', name: 'Gemini', api: 'google-generative-ai',
+      route: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta', wireProtocol: 'google-generative-ai' },
+    }] },
+  } };
+  await createCustomProvider(config);
+  expect((await getCustomProvider(config.id))?.runtimes).toEqual(config.runtimes);
 });

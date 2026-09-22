@@ -1,7 +1,7 @@
 /**
  * McpServerDialog —— 自定义 MCP 服务器「新建 / 编辑」表单弹窗。
  *
- * 结构参照 CustomProviderDialog:显示名称 + transport(http/sse)分段 + 端点 URL +
+ * 结构参照 ProviderConnectionDialog:显示名称 + transport(http/sse)分段 + 端点 URL +
  * 可选 bearer token + 可选请求头(增删行)。
  *
  * 「MCP id」内部句柄由显示名 slug 派生 + 去重,对用户隐藏(= agent 侧 mcpServers[name],
@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button';
 import { FormField } from '@/components/ui/form-field';
 import { Tip } from '@/components/ui/tooltip';
 import { SettingsTextInput } from './SettingsTextInput';
-import { SettingsSegmentedControl } from './SettingsSegmentedControl';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 
 import { cn } from '@/lib/utils';
 import { toast } from '@/lib/toast';
@@ -264,7 +264,7 @@ export function McpServerDialog({ initial, existingIds, onSaved, onClose }: McpS
                   segmented controls):单一 Tab 停靠点、方向键 / Home / End 与 RTL
                   键盘行为由控件自带,不再用独立 Button 自造第二套选中态(review P2)。
                 */}
-                <SettingsSegmentedControl
+                <SegmentedControl
                   aria-label={t('settings.mcp.fields.transport')}
                   value={transport}
                   onValueChange={setTransport}

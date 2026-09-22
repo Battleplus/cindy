@@ -1,4 +1,10 @@
+import { emitTaskTagCatalog } from '@/features/task-tags/taskTagEvents';
+import { normalizeTaskTags } from '@cindy/maker-shared';
+import type { ImMessageSource } from '../../shared/imMessageSource';
 import { readBotAuthorizationCard } from '../../shared/botAuthorization';
+import { applyCindyMakeCardAttention } from './cindyMakeAttention';
+import { confirmRemoteUsers, reserveRemoteUser } from './remoteUserHandoff';
+import { readRemoteHistoryCache, remoteHistoryCacheWriter } from './remoteHistoryCache';
 /**
  * makerChatStore — Module-level store for Maker chat (Claude / Codex), sharded by sessionId.
  * ---------------------------------------------------------------------------
@@ -140,6 +146,7 @@ import { clearSessionStarting, markSessionStarting } from '@/lib/sessionStarting
 import { createLogger } from '@/lib/logger';
 import {
   markSessionAutomaticHistoryLoadCompleted,
+  readSessionScroll,
   resetSessionAutomaticHistoryLoadCompletion,
 } from '@/lib/sessionScrollStore';
 import {
@@ -445,6 +452,8 @@ export interface ChatMessage {
    * UI 可以据此显示 spinner / 灰色态（本轮不做，留给后续）。
    */
   isPendingPersist?: boolean;
+  /** Renderer-only position; DB acknowledgement does not yet transfer ownership to history. */
+  localSendPrecedingClientIds?: readonly string[];
   /**
    * 意识拦截(订阅槽①):本条用户消息被某意识钩子拦下(未入库、未起 turn)。
    * 气泡照常显示(未发出),其下渲一条 error 红条,内容 = 意识返回的文本
@@ -467,12 +476,7 @@ export interface ChatMessage {
   /** user 消息投递方式:普通新 turn 或运行中 steer。 */
   delivery?: 'turn' | 'steer';
   /** Hook 来源元数据(IM 平台 + 用户干净原文 + thread 上下文),UserMessage 据此渲染 Cindy 任务卡片。 */
-  hookSource?: {
-    im: string;
-    channelName?: string | null;
-    userText?: string;
-    threadContext?: Array<{ author: string; text: string; isBot?: boolean }>;
-  };
+  hookSource?: ImMessageSource;
   /** /goal 目标设定/更新标记:该 user 消息是目标文案,renderer 在气泡上方渲「目标 / 目标已更新」徽标。 */
   goalBadge?: { updated: boolean };
   /** F7.2: ask_user message fields */
@@ -503,6 +507,8 @@ export interface ChatMessage {
     | 'cmd'
     | 'goal-complete'
     | 'goal-resumed'
+    /** 个人版制作任务的完成记录,由持久化的 agentMeta.cindyMakeCompletion 派生,重开仍在。 */
+    | 'cindy-make-complete'
     | 'learn'
     | 'review'
     | 'auto-resume'
@@ -675,6 +681,8 @@ export interface AgentStatus {
   contextTokens: number;
   /** Context window size from SDK modelUsage (0 = not yet known). */
   contextWindow: number;
+  /** Model-picker metadata is replaceable until a runtime snapshot arrives. */
+  contextWindowFromRuntime?: boolean;
   isRunning: boolean;
   startedAt: number | null;
   /** Turn-cumulative output tokens for live TPS. */
@@ -850,9 +858,14 @@ export interface PendingGhostGrantConfirm {
    * 往目录里存文件;reveal_path = 允许当前 Agent 获得单个媒体仓本机路径;
    * fs_write = 意识申请写工作目录文件(会话 permission 为
    * 逐条确认档时逐次弹,同目录本会话批一次);workspace = 意识申请以该目录
-   * 为工作区在侧边栏创建/复用会话入口(不过户字节)。
+   * 为工作区在侧边栏创建/复用会话入口(不过户字节);
+   * forge_source = Forge 打包/骨架/安装的源码目录在工作目录外;
+   * outside_workdir = 文档/电脑等内置工具读写工作目录外的路径。
    */
-  lane: 'attachments' | 'dir' | 'save_dir' | 'reveal_path' | 'fs_write' | 'workspace';
+  lane:
+    | 'attachments' | 'dir' | 'save_dir' | 'reveal_path' | 'fs_write' | 'workspace' | 'forge_source' | 'outside_workdir';
+  sourceTool?: string;
+  operation?: 'read' | 'write';
   items: Array<{
     name: string;
     absPath: string;
@@ -2399,6 +2412,8 @@ export interface SessionChatState {
   taskUpdates?: ReadonlyMap<string, AgentTaskUpdate>;
   isStreaming: boolean;
   agentStatus: AgentStatus;
+  /** A task with an explicit product title must not be auto-renamed from its first message. */
+  autoTitleDisabled?: boolean;
   error: string | null;
   /** 当前 terminal error 是否为可恢复的账号用量限制，以及可识别的重置时刻。 */
   usageLimitRecovery?: UsageLimitRecoveryHint | null;
@@ -3779,7 +3794,42 @@ function retainedWindowKeepsGapCursor(
   return cursorIndex > 0;
 }
 
-function _trimMessagesIfNeeded(sessionId: string): void {
+// A just-closed reading window is still a warm navigation target. Trimming it
+// to the tail forces an around-message IPC/backfill before restoring the reader.
+// Reuse existing session storage, with bounded reservations derived from current
+// state so clear/purge/epoch changes cannot resurrect a separate stale copy.
+const WARM_READING_WINDOWS = 2;
+const WARM_READING_MAX_MESSAGES = 1000;
+const WARM_READING_MAX_CHARACTERS = 32 * 1024 * 1024;
+
+function _trimMessagesIfNeeded(): void {
+  const retained = new Set<string>();
+  let characters = 0;
+  const now = Date.now();
+  // Reverse before sorting so equal timestamps also prefer the latest leave.
+  const recent = [..._lastViewedAt.entries()].reverse().sort((a, b) => b[1] - a[1]);
+  for (const [id, lastViewed] of recent) {
+    if (retained.size >= WARM_READING_WINDOWS) break;
+    const state = sessions.get(id);
+    const scroll = readSessionScroll(id);
+    if (!state?.historyLoaded || _activeViewSessions.has(id) || _isSessionBusy(id, state) ||
+      now - lastViewed >= DEMOTE_IDLE_MS || scroll?.isNearBottom !== false ||
+      state.messages.length <= TRIM_THRESHOLD || state.messages.length > WARM_READING_MAX_MESSAGES) continue;
+    const anchor = scroll.messageClientId ?? scroll.restoreClientId;
+    if (!anchor || !state.messages.some((message) => message.clientId === anchor)) continue;
+    const size = state.messages.reduce((sum, message) => sum + message.content.length, 0);
+    if (characters + size > WARM_READING_MAX_CHARACTERS) continue;
+    characters += size;
+    retained.add(id);
+  }
+  // Admission or a background update can displace another window. Apply the
+  // original guarded/epoch-aware trim to it immediately, not on its next visit.
+  for (const id of sessions.keys()) {
+    if (!retained.has(id)) _trimSessionMessages(id);
+  }
+}
+
+function _trimSessionMessages(sessionId: string): void {
   const state = sessions.get(sessionId);
   if (!state || state.messages.length <= TRIM_THRESHOLD) return;
   if (_isSessionBusy(sessionId, state)) return;
@@ -4039,7 +4089,7 @@ function leaveView(sessionId: string): void {
         : {}),
     }));
   }
-  _trimMessagesIfNeeded(sessionId);
+  _trimMessagesIfNeeded();
 }
 
 function _demoteIdleSessions(): void {
@@ -4471,7 +4521,8 @@ function applyInputProjection(
       ...locallyDispatchedQueueItems,
     ].reduce<ChatMessage[]>((messages, item) => {
       if (messages.some((message) => message.clientId === item.clientId)) return messages;
-      return [...messages, { ...item.chatMessage, isPendingPersist: true }];
+      const row = { ...item.chatMessage, isPendingPersist: true };
+      return [...messages, remoteProjection ? reserveRemoteUser(row, messages) : row];
     }, dedupedMessages);
     // Codex 原生重连已经被 host 接管、进入凭证切换等待或明确回落时，原生进行态行
     // 必须让位给 Cindy 的接管行、凭证切换状态或终态错误。没有这些字段的普通
@@ -6753,6 +6804,7 @@ function applyBackgroundStatus(
       : rawStatus;
   let contextTokens = state.agentStatus.contextTokens;
   let contextWindow = state.agentStatus.contextWindow;
+  let contextWindowFromRuntime = state.agentStatus.contextWindowFromRuntime;
   if (
     typeof data.contextWindow === 'number' &&
     data.contextWindow > 0 &&
@@ -6761,6 +6813,7 @@ function applyBackgroundStatus(
   ) {
     contextTokens = data.contextTokens;
     contextWindow = data.contextWindow;
+    contextWindowFromRuntime = true;
   }
   return {
     ...state,
@@ -6769,6 +6822,7 @@ function applyBackgroundStatus(
       status,
       contextTokens,
       contextWindow,
+      contextWindowFromRuntime,
     },
   };
 }
@@ -6885,6 +6939,7 @@ function handleStatusUpdate(
       costUsd: cu,
       contextTokens: ct,
       contextWindow: cw,
+      contextWindowFromRuntime: hasContextSnapshot || state.agentStatus.contextWindowFromRuntime,
       isRunning: update.isRunning,
       startedAt,
       ...mergeLiveGenerationStatus(isTurnStart, update, state.agentStatus),
@@ -7840,7 +7895,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           : s,
       );
       // MEM-OPT-1: trim non-active sessions after turn completes
-      queueMicrotask(() => _trimMessagesIfNeeded(sessionId));
+      queueMicrotask(_trimMessagesIfNeeded);
     }
     // 视觉桥用户提示事件（source==='vision-bridge' + reason 枚举 + isTerminal:false）：
     // 已在 dispatchStreamEventPayload 的 case 'error' 分流为 toast，不进 error-banner /
@@ -8281,6 +8336,20 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
     clearRemoteOptimisticSend(sessionId, mapped.clientId);
     const current = getOrCreateState(sessionId);
     const existing = current.messages.find((candidate) => candidate.clientId === mapped.clientId);
+    if (mapped.systemCardType?.startsWith('cindy-make')) {
+      // A late update to an older preparation card must not replace the current result.
+      const existingIndex = existing ? current.messages.indexOf(existing) : -1;
+      const newerMessage = current.messages.some(
+        (candidate, index) =>
+          candidate.clientId !== mapped.clientId &&
+          candidate.createdAt &&
+          mapped.createdAt &&
+          (candidate.createdAt > mapped.createdAt ||
+            (candidate.createdAt === mapped.createdAt && existingIndex >= 0 && index > existingIndex)),
+      );
+      if (!newerMessage)
+        applyCindyMakeCardAttention(sessionId, existing, mapped, _activeViewSessions.has(sessionId));
+    }
     const isLiveToolEcho =
       existing?.role === mapped.role &&
       (mapped.role === 'tool_use' || mapped.role === 'tool_result');
@@ -8538,7 +8607,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
         push.channel === 'local-db:messages:created' ||
         (push.channel === 'maker:event' && inboundHasPersistId);
       const inboundEvent = (push.payload as { event?: unknown } | null)?.event as
-        | { type?: unknown; data?: { isFinal?: unknown; isFullText?: unknown } }
+        { type?: unknown; data?: { isFinal?: unknown; isFullText?: unknown } }
         | null
         | undefined;
       const isOrdinaryStreamingTextDelta =
@@ -8659,6 +8728,13 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           }
           break;
         }
+        case 'local-db:task-tags:changed': {
+          if (!push.deviceId) break;
+          const tags = normalizeTaskTags((push.payload as { tags?: unknown })?.tags, 256);
+          remoteProjectsStore.applyTagCatalog(push.deviceId, tags);
+          emitTaskTagCatalog(push.deviceId, tags);
+          break;
+        }
         case 'local-db:sessions:patched': {
           // 被控端会话元数据 / 设置变更 → 就地镜像到远程项目分片(取代乐观覆盖)。
           const p = push.payload as { sessionId?: string; patch?: Record<string, unknown> } | null;
@@ -8681,7 +8757,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
               // controller while this renderer still owns an offline outbox.
               // Retire it at the authoritative push boundary so reconnect
               // cannot dispatch into a task that no longer exists.
-              removeRemoteSessionActivityEntry(p.sessionId);
+              removeRemoteSessionActivityEntry(p.sessionId, push.deviceId);
               _purgeSession(p.sessionId);
               break;
             }
@@ -8689,7 +8765,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
             mirrorSessionFields(p.sessionId, p.patch);
             // 会话在被控端被删除 / 归档 → 同步清掉活动镜像,避免孤儿状态点。
             if (terminal) {
-              removeRemoteSessionActivityEntry(p.sessionId);
+              removeRemoteSessionActivityEntry(p.sessionId, push.deviceId);
             }
           }
           break;
@@ -9498,7 +9574,10 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
     // (远程会话豁免,见 hasBackgroundAgentWork 注释。)
     const bgTaskRunning = hasBackgroundAgentWork(id, state);
 
-    if (state.agentStatus.isRunning || bgTaskRunning) {
+    // Recovery is still unfinished work. Keep the existing running edge alive
+    // so a dispatch failure can settle as error without another vendor turn.
+    const recoveryPending = !state.error && hasSessionRecoveryPending(id);
+    if (state.agentStatus.isRunning || bgTaskRunning || recoveryPending) {
       // Currently running — always include.
       next.set(id, {
         isRunning: true,
@@ -9616,6 +9695,18 @@ function hasSessionTerminalError(sessionId: string): boolean {
   // side-task 结束保留的旧 error 不算「本次 run 的终态失败」(与 transition
   // snapshot 的豁免同口径, 见 lastStopWasSideTask)。
   return !!s?.error && !s.lastStopWasSideTask;
+}
+
+/** Non-creating read: recovery can outlive the one-generation stop snapshot. */
+function hasSessionRecoveryPending(sessionId: string): boolean {
+  const state = sessions.get(sessionId);
+  return !!state && (
+    state.messages.some((message) =>
+      message.clientId === AUTO_RESUME_PENDING_CLIENT_ID ||
+      message.clientId === CODEX_RECONNECT_PENDING_CLIENT_ID,
+    ) ||
+    (!state.queuePaused && state.pendingQueue.some((item) => item.autoResume === true))
+  );
 }
 
 // 远程回执 error 免疫的兜底探针:活动镜像缺条目(推送丢失 / 未达)时,
@@ -10830,6 +10921,10 @@ function createRemoteHistoryView(sessionId: string) {
     view: undefined, intentQueue: { tail: Promise.resolve() }, isCurrent: () => false,
   };
   const owner = getDataOwnerGeneration();
+  // Begin the protected disk read before taking write tokens for remote requests.
+  const cached = readRemoteHistoryCache<HistoryChatMessage>(deviceId, sessionId);
+  let writeCache: ReturnType<typeof remoteHistoryCacheWriter> | undefined;
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const isCurrent = (): boolean => isDataOwnerGenerationCurrent(owner)
     && remoteProjectsStore.getSessionDeviceId(sessionId) === deviceId
     && remoteHistoryViews.get(sessionId)?.view === view;
@@ -10844,12 +10939,16 @@ function createRemoteHistoryView(sessionId: string) {
   };
   const view = new HistoryViewController<HistoryChatMessage>({
     page: async (before) => {
+      const writer = remoteHistoryCacheWriter(deviceId, sessionId);
       const page = await call<HistoryViewPage<Message>>('local-db:messages:view', [sessionId, { before }]);
       if (page == null) throw new Error('[CHANNEL_NOT_ALLOWED] History view is unavailable');
+      writeCache = writer;
       return { ...page, items: mapHistoryViewMessages(page.items, mapRows) };
     },
     details: async (ref, after) => {
+      const writer = remoteHistoryCacheWriter(deviceId, sessionId);
       const page = await call<HistoryDetailPage<Message>>('local-db:messages:work-details', [sessionId, ref, { after }]);
+      writeCache = writer;
       return { ...page, messages: mapRows(page.messages) };
     },
     expanded: async (refs) => {
@@ -10867,8 +10966,18 @@ function createRemoteHistoryView(sessionId: string) {
   remoteHistoryViews.set(sessionId, entry);
   view.setNetworkAvailable(!isRemoteDeviceMarkedDisconnected(deviceId));
   view.subscribe(() => {
+    if (persistTimer) clearTimeout(persistTimer);
     if (!isCurrent() || !sessions.has(sessionId)) return;
     const snapshot = view.getSnapshot();
+    if (isHistoryViewUnavailable(snapshot.error)) {
+      writeCache = undefined;
+      // Keep the last usable mirror until the raw fallback succeeds and replaces it.
+      setState(sessionId, (state) => ({ ...state, messages: confirmRemoteUsers(state.messages,
+        new Set(state.messages.filter((row) => !row.isPendingPersist).map((row) => row.clientId))) }));
+    } else if (snapshot.ready && !snapshot.loading && !snapshot.error && writeCache) {
+      const writer = writeCache;
+      persistTimer = setTimeout(() => { if (isCurrent()) writer(snapshot); }, 1200);
+    }
     if (!snapshot.ready) {
       if (view.isActive() && isHistoryViewUnavailable(snapshot.error)) {
         void reconcileRemoteMessages(sessionId, { force: true }).catch(() => undefined);
@@ -10878,11 +10987,18 @@ function createRemoteHistoryView(sessionId: string) {
     const available = historyViewLeaves(snapshot.items).flatMap((item) => item.type === 'messages' ? item.messages : []);
     for (const detail of snapshot.details.values()) available.push(...detail.messages);
     setState(sessionId, (state) => ({ ...state, historyLoaded: true,
-      messages: mergeMessages(available, state.messages.filter((message) => !message.cacheHydrated), { addOnly: true }),
-      hasMoreMessages: snapshot.hasMore, isLoadingMore: snapshot.loading,
+      messages: confirmRemoteUsers(
+        mergeMessages(available, state.messages.filter((message) => !message.cacheHydrated), { addOnly: true }),
+        new Set(available.filter((message) => message.role === 'user').map((message) => message.clientId)),
+      ),
+      hasMoreMessages: snapshot.hasMore, isLoadingMore: view.isLoadingOlder(),
       oldestMessageId: snapshot.nextCursor,
       historyWindowHasIsland: false,
     }));
+  });
+  void view.restoreCachedView(async () => {
+    const snapshot = await cached;
+    return isCurrent() ? snapshot : null;
   });
   return view;
 }
@@ -10893,6 +11009,7 @@ function ensureInitialMessages(sessionId: string): void {
   if (deviceId && isRemoteDeviceMarkedDisconnected(deviceId)) {
     _historyLoadOrigin.set(sessionId, deviceId);
     noteInputProjectionOrigin(sessionId, deviceId);
+    createRemoteHistoryView(sessionId);
     hydrateRemoteMessagesFromCache(sessionId);
     return;
   }
@@ -10992,6 +11109,7 @@ function ensureInitialMessages(sessionId: string): void {
             costUsd: session.totalCostUsd ?? s.agentStatus.costUsd,
             contextTokens: session.contextTokens || s.agentStatus.contextTokens,
             contextWindow: session.contextWindow || s.agentStatus.contextWindow,
+            // Read projection can supply catalog metadata; only status events prove runtime origin.
           };
         }
         return Object.keys(updates).length > 0 ? { ...s, ...updates } : s;
@@ -11029,9 +11147,7 @@ function ensureInitialMessages(sessionId: string): void {
       const snapshot = view.getSnapshot();
       if (!snapshot.error && snapshot.ready) {
         if (isCurrentHistoryLoad()) {
-          // This path bypasses the raw latest-page cache write. Retire that old
-          // cache instead of persisting an incomplete projection as raw history.
-          clearCachedMessages(historyOriginAtStart!, sessionId);
+          // The structured snapshot is persisted through the same mirror-cache barriers.
           settleCacheHydration(sessionId);
         }
         releaseHistoryFetchIfCurrent(sessionId, historyFetchToken);
@@ -11430,6 +11546,7 @@ async function continuePlanResolutionAfterIdleDiscovery(sessionId: string): Prom
  */
 function reloadMessages(sessionId: string, opts?: { allowCacheHydrate?: boolean }): void {
   discardPendingTextDelta(sessionId);
+  if (!opts?.allowCacheHydrate) invalidateRemoteMessageCache(sessionId);
   // 代际递增:作废 in-flight 的 loadOlderMessages 追页窗口(见 _messagesEpoch 注释)。
   invalidateMessageHistoryWindow(sessionId);
   invalidateHistoryFetch(sessionId);
@@ -11454,7 +11571,6 @@ function reloadMessages(sessionId: string, opts?: { allowCacheHydrate?: boolean 
     // 标记没了而盘上那份还是 rewind 之前的窗口 —— 下次离线冷启动照样 hydrate 出已被软删
     // 的消息(review: codex P1)。所以同时把盘上那份清掉:缓存是纯优化,重载后的首拉
     // 成功时会重新写上。
-    invalidateRemoteMessageCache(sessionId);
   }
   setState(sessionId, (s) => {
     const optimisticRecords = remoteOptimisticSendRecords(sessionId);
@@ -11726,6 +11842,7 @@ function reconcileRemoteMessages(sessionId: string, opts?: {
   const view = getRemoteHistoryView(sessionId);
   if (view && (view.getSnapshot().ready || opts?.freshHistory || opts?.repair)) {
     const runHistoryView = (flight?: HistoryViewForceFlight) => {
+      const syncToken = noteRemoteSessionSyncStarted(sessionId);
       const rowsAtStart = new Map((sessions.get(sessionId)?.messages ?? []).map((row) => [row.clientId, row]));
       const epochAtStart = _messagesEpoch.get(sessionId) ?? 0;
       const noteHydration = (before: readonly ChatMessage[], after: readonly ChatMessage[]) => {
@@ -11739,10 +11856,10 @@ function reconcileRemoteMessages(sessionId: string, opts?: {
           }
         }
       };
-      // Force needs a post-signal page, even when a normal repair is in flight.
-      // Keep this view and its expansion state instead of falling back to raw history.
+      // Read receipts also need a post-signal page: joining a pre-existing read
+      // cannot certify this sync generation. Preserve the view and expansion.
       return Promise.all([
-        view.refresh(false, opts?.freshHistory ?? opts?.force),
+        view.refresh(false, true),
         reconcilePendingInteractions(sessionId),
       ]).then(async () => {
         if (getRemoteHistoryView(sessionId) !== view || !view.isActive()) return false;
@@ -11750,19 +11867,23 @@ function reconcileRemoteMessages(sessionId: string, opts?: {
           releaseRemoteHistoryView(sessionId, view);
           return runRemoteReconcile(sessionId, { ...opts, force: true }, noteHydration);
         }
-        if (opts?.force) {
+        {
           // readPage starts expanded details without awaiting them. Join those
-          // same reads before hydrating; their cached display may still be old.
+          // same reads before certifying receipts; their display may still be old.
+          // Force repair also needs collapsed details to hydrate lost live rows.
           await Promise.all(historyWorkSummaries(view.getSnapshot().items)
-            .map((summary) => view.loadDetails(summary, { allowCollapsed: true })));
+            .filter((summary) => opts?.force || view.getSnapshot().expanded.has(summary.key))
+            .map((summary) => view.loadDetails(summary, { allowCollapsed: opts?.force })));
           if (getRemoteHistoryView(sessionId) !== view || !view.isActive()
             || (_messagesEpoch.get(sessionId) ?? 0) !== epochAtStart) return false;
           const detailsSnapshot = view.getSnapshot();
           const incompleteDetails = historyWorkSummaries(detailsSnapshot.items).some((summary) => {
+            if (!opts?.force && !detailsSnapshot.expanded.has(summary.key)) return false;
             const detail = detailsSnapshot.details.get(summary.key);
             return !detail?.complete || !!detail.error || detail.revision !== summary.revision;
           });
           if (incompleteDetails) {
+            if (!opts?.force) return false;
             // Collapse can cancel a joined detail read without rejecting it.
             // Missing, partial, failed or stale details cannot certify recovery.
             // Use the same authoritative fallback as a transient read failure;
@@ -11797,6 +11918,9 @@ function reconcileRemoteMessages(sessionId: string, opts?: {
             return messages === state.messages ? state : { ...state, messages };
           });
         }
+        // Failed, inactive or superseded views return above without certifying
+        // unread content. Raw-history fallbacks report their own sync generation.
+        if (snapshot.ready) noteRemoteSessionSyncCompleted(sessionId, syncToken);
         return snapshot.ready;
       });
     };
@@ -13046,7 +13170,8 @@ function completeRemoteOptimisticMaterialization(
     const messages = state.messages.map((message) => {
       if (message.clientId !== clientId || message.isPendingPersist !== true) return message;
       changed = true;
-      return { ...queued.chatMessage, isPendingPersist: true };
+      return { ...queued.chatMessage, isPendingPersist: true,
+        ...(message.localSendPrecedingClientIds ? { localSendPrecedingClientIds: message.localSendPrecedingClientIds } : {}) };
     });
     return changed ? { ...state, pendingQueue, messages } : state;
   });
@@ -13423,6 +13548,7 @@ function maybeAutoNameUnnamedSession(
   agentKind: 'claude-code' | 'codex' | 'pi',
 ): void {
   if (!seed?.isUserText) return;
+  if (sessions.get(sessionId)?.autoTitleDisabled === true) return;
   scheduleAutoName(sessionId, seed.text, agentKind, true);
 }
 
@@ -13703,7 +13829,9 @@ async function sendMessageCore(
     setState(sessionId, (s) =>
       s.messages.some((m) => m.clientId === queued.clientId)
         ? s
-        : { ...s, messages: [...s.messages, { ...queued.chatMessage, isPendingPersist: true }] },
+        : { ...s, messages: [...s.messages, deviceLinkRemote
+          ? reserveRemoteUser({ ...queued.chatMessage, isPendingPersist: true }, s.messages)
+          : { ...queued.chatMessage, isPendingPersist: true }] },
     );
   }
 
@@ -14097,7 +14225,7 @@ async function steerMessageCore(
     setState(sessionId, (s) =>
       s.messages.some((message) => message.clientId === queued.clientId)
         ? s
-        : { ...s, messages: [...s.messages, { ...queued.chatMessage, isPendingPersist: true }] },
+        : { ...s, messages: [...s.messages, reserveRemoteUser({ ...queued.chatMessage, isPendingPersist: true }, s.messages)] },
     );
   }
   const rollbackOptimisticSteer = () => {
@@ -14957,12 +15085,14 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
 }
 
 /**
- * F-CMD: Insert a local-only system card into the message stream.
- * Not persisted to the database — purely ephemeral UI.
+ * F-CMD: Insert a local system card into the message stream.
+ * Cindy Make cards are persisted below so the structured card survives reloads;
+ * the other command cards remain local-only UI state.
  */
 function insertSystemCard(
   sessionId: string,
-  cardType: 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'compact' | 'cmd' | 'learn' | 'cindy-make-doctor' | 'cindy-make',
+  cardType:
+    | 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'compact' | 'cmd' | 'learn' | 'cindy-make-doctor' | 'cindy-make',
   data?: Record<string, unknown>,
 ): string | null {
   if (!sessionId) return null;
@@ -14993,7 +15123,49 @@ function insertSystemCard(
       ],
     };
   });
+  if (
+    (cardType === 'cindy-make' || cardType === 'cindy-make-doctor') &&
+    data?.modalOnly !== true
+  ) {
+    enqueueCindyMakeCardPersistence(sessionId, clientId, cardType, data ?? {}, true);
+  }
   return clientId;
+}
+
+const CINDY_MAKE_CARD_MARKER = '__cindyMakeCard';
+const cindyMakeCardQueues = new Map<string, Promise<void>>();
+const cindyMakeNewCards = new Set<string>();
+
+/** Persist Cindy Make's structured card in the same message row that renders it. */
+function enqueueCindyMakeCardPersistence(
+  sessionId: string,
+  clientId: string,
+  cardType: 'cindy-make' | 'cindy-make-doctor',
+  data: Record<string, unknown>,
+  creating = false,
+): void {
+  const key = `${sessionId}:${clientId}`;
+  if (creating) cindyMakeNewCards.add(key);
+  const previous = cindyMakeCardQueues.get(key) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const content = { [CINDY_MAKE_CARD_MARKER]: { type: cardType, data } };
+      if (cindyMakeNewCards.has(key)) {
+        await messageService.create(sessionId, {
+          clientId,
+          role: 'assistant',
+          content,
+        });
+        cindyMakeNewCards.delete(key);
+      } else {
+        await messageService.updateContent(sessionId, clientId, content);
+      }
+    })
+    .catch((error) => {
+      log.warn('Failed to persist Cindy Make card:', error);
+    });
+  cindyMakeCardQueues.set(key, next);
 }
 
 /**
@@ -15057,52 +15229,96 @@ function updateSystemCardData(
     };
     return { ...s, messages };
   });
+  const current = getSnapshot(sessionId).messages.find((message) => message.clientId === clientId);
+  if (
+    current?.systemCardType === 'cindy-make' ||
+    current?.systemCardType === 'cindy-make-doctor'
+  ) {
+    if (current.systemCardData?.modalOnly !== true) {
+      enqueueCindyMakeCardPersistence(
+        sessionId,
+        clientId,
+        current.systemCardType,
+        current.systemCardData ?? {},
+      );
+    }
+  }
 }
 
-/**
- * F7.4/F7.5: Send all user answers for ask-user-question to the main process.
- * Updates the corresponding ask_user message to 'answered' state.
- */
+// Only an accepted Host receipt may commit a question/plan decision. A rejected
+// or lost receipt leaves the existing card and its draft available for retry.
+const questionDecisionsInFlight = new Set<string>();
+
+function submitQuestionDecision(
+  sessionId: string,
+  requestId: string,
+  decision: Record<string, unknown>,
+  onAccepted: () => void,
+): void {
+  const key = JSON.stringify([sessionId, requestId]);
+  if (questionDecisionsInFlight.has(key)) return;
+  questionDecisionsInFlight.add(key);
+  const owner = getDataOwnerGeneration();
+  const epoch = _messagesEpoch.get(sessionId) ?? 0;
+  const authority = _inputProjectionAuthorityEpoch.get(sessionId) ?? 0;
+  const origin = remoteProjectsStore.getSessionDeviceId(sessionId);
+  const isCurrent = () => isDataOwnerGenerationCurrent(owner) &&
+    (_messagesEpoch.get(sessionId) ?? 0) === epoch &&
+    (_inputProjectionAuthorityEpoch.get(sessionId) ?? 0) === authority &&
+    remoteProjectsStore.getSessionDeviceId(sessionId) === origin;
+  bumpInteractionReconcileEpoch(sessionId);
+  void (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const receipt = await Promise.race([
+        makerApiFor(sessionId).resolveInteraction(requestId, decision),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Interaction receipt timeout')), 15_000);
+        }),
+      ]);
+      if (!isCurrent()) return;
+      if (receipt?.accepted !== true) throw new Error('Interaction decision was not accepted');
+      bumpInteractionReconcileEpoch(sessionId);
+      onAccepted();
+    } catch (error) {
+      if (!isCurrent()) return;
+      const state = sessions.get(sessionId);
+      // A winning dismissal from another window/Stop remains authoritative.
+      if (state?.pendingAskUser?.requestId !== requestId &&
+        state?.pendingPlanReview?.requestId !== requestId) return;
+      log.warn('Question decision receipt unavailable', error);
+      toast.warning(i18n.t('newChat.permissionPrompt.submissionFailed'));
+    } finally {
+      if (timer) clearTimeout(timer);
+      questionDecisionsInFlight.delete(key);
+    }
+  })();
+}
+
 function answerUserQuestion(
   sessionId: string,
   requestId: string,
   answers: Record<string, string>,
 ): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingAskUser) return;
-  if (state.pendingAskUser.requestId !== requestId) return;
-  bumpInteractionReconcileEpoch(sessionId);
-
-  // Build a human-readable reply summary
-  const replySummary = formatAskUserReply(answers);
-
-  // Update message to answered + clear pendingAskUser
-  setState(sessionId, (s) => ({
+  if (getOrCreateState(sessionId).pendingAskUser?.requestId !== requestId) return;
+  const submittedAnswers = { ...answers };
+  const replySummary = formatAskUserReply(submittedAnswers);
+  submitQuestionDecision(sessionId, requestId, {
+    kind: 'ask_user_question', answers: submittedAnswers,
+  }, () => setState(sessionId, (s) => ({
     ...s,
-    pendingAskUser: null,
-    // F-AUQ-MIN-5: question resolved — reset viewer for the next one.
-    askUserViewerState: 'expanded',
-    // F-AUQ-DRAFT: question resolved — drop the draft so a future question
-    // (potentially with the same questions[] payload) starts at step 1.
-    askUserDraft: null,
+    pendingAskUser: s.pendingAskUser?.requestId === requestId ? null : s.pendingAskUser,
+    askUserViewerState: s.pendingAskUser?.requestId === requestId ? 'expanded' : s.askUserViewerState,
+    askUserDraft: s.pendingAskUser?.requestId === requestId ? null : s.askUserDraft,
     messages: s.messages.map((m) =>
       m.askUserRequestId === requestId && m.askUserStatus === 'pending'
-        ? {
-            ...m,
-            askUserStatus: 'answered' as const,
-            askUserReply: replySummary,
-            askUserAnswers: answers,
-          }
+        ? { ...m, askUserStatus: 'answered' as const, askUserReply: replySummary, askUserAnswers: submittedAnswers }
         : m,
     ),
-  }));
-
-  // 落库只走 main 的 onInteractionResolved。renderer 先写会让多窗口输家/
-  // Stop-vs-answer 的迟到 updateContent 覆盖赢家或 cancelled。
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, { kind: 'ask_user_question', answers })
-    .catch((err) => log.error('Failed to answer user question:', err));
+  })));
+  // Persistence belongs exclusively to Main's onInteractionResolved, including
+  // local sessions. A late renderer write must not overwrite a winning decision.
 }
 
 function respondToPluginSetup(
@@ -15358,7 +15574,9 @@ function parseGhostGrantConfirmRequest(request: {
     lane !== 'save_dir' &&
     lane !== 'reveal_path' &&
     lane !== 'fs_write' &&
-    lane !== 'workspace'
+    lane !== 'workspace' &&
+    lane !== 'forge_source' &&
+    lane !== 'outside_workdir'
   )
     return null;
   if (typeof request.ghostId !== 'string' || typeof request.ghostName !== 'string') return null;
@@ -15390,6 +15608,10 @@ function parseGhostGrantConfirmRequest(request: {
     ghostId: request.ghostId,
     ghostName: request.ghostName,
     lane,
+    ...(typeof request.sourceTool === 'string' ? { sourceTool: request.sourceTool } : {}),
+    ...(request.operation === 'read' || request.operation === 'write'
+      ? { operation: request.operation }
+      : {}),
     items,
   };
 }
@@ -15429,122 +15651,43 @@ function respondToPlanReview(
   feedback?: string,
 ): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingPlanReview) return;
-  if (state.pendingPlanReview.requestId !== requestId) return;
-
-  const nextStatus = approved ? 'approved' : 'revised';
-  const trimmedFeedback = feedback?.trim() ?? '';
-  bumpInteractionReconcileEpoch(sessionId);
-
-  // Find the clientId for persistence update
-  const planMsg = state.messages.find(
-    (m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending',
-  );
-
-  setState(sessionId, (s) => ({
-    ...s,
-    pendingPlanReview: null,
-    // Reset viewer state so the next review starts fresh
-    planViewerState: 'expanded',
-    lastExpandedPlanViewerState: 'expanded',
-    messages: s.messages.map((m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending'
-        ? {
-            ...m,
-            planReviewStatus: nextStatus as 'approved' | 'revised',
-            planReviewFeedback: approved ? undefined : trimmedFeedback || undefined,
-          }
-        : m,
-    ),
-  }));
-
-  // Persist answered state via PATCH API。远程会话由被控端权威落库(见 answerUserQuestion 注释),
-  // 控制端跳过避免 dead write;本机会话保持原样。
-  if (planMsg && !isRemoteSession(sessionId)) {
-    messageService
-      .updateContent(sessionId, planMsg.clientId, {
-        requestId,
-        plan: planMsg.planReviewPlan ?? '',
-        planFilePath: planMsg.planReviewFilePath ?? '',
-        status: nextStatus,
-        feedback: approved ? null : trimmedFeedback || null,
-      })
-      .catch((err) => log.error('Failed to persist plan_review state:', err));
-  }
-
-  // Send to maker (InteractionDecision kind: 'plan_review')
-  // approved → behavior='allow' + editedPlan = current pending.plan (用户改过的版本)
-  // 拒绝 → behavior='deny' + reason=feedback (模型读到 feedback 知道为什么被拒)
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, {
-      kind: 'plan_review',
-      behavior: approved ? 'allow' : 'deny',
-      editedPlan: approved ? state.pendingPlanReview.plan : undefined,
-      reason: approved ? undefined : trimmedFeedback || undefined,
-    })
-    .catch((err) => log.error('Failed to respond to plan review:', err));
+  const pending = getOrCreateState(sessionId).pendingPlanReview;
+  if (pending?.requestId !== requestId) return;
+  const trimmedFeedback = feedback?.trim() || undefined;
+  submitPlanReviewDecision(sessionId, requestId, {
+    kind: 'plan_review',
+    behavior: approved ? 'allow' : 'deny',
+    editedPlan: approved ? pending.plan : undefined,
+    reason: approved ? undefined : trimmedFeedback,
+  }, approved ? 'approved' : 'revised', approved ? undefined : trimmedFeedback);
 }
 
-/**
- * 取消本次计划审阅(issue #475):与批准/反馈并列的第三条出路。
- * 关闭卡片、气泡标 cancelled;决策发 deny + dismissed 标记 ——
- *   - Codex: 结束本轮计划循环,不发修订 turn(dismissed 语义,见 maker-core;下一条消息回常规模式);
- *   - Claude: ExitPlanMode 以默认理由被拒,模型收到后收尾等待,计划模式不变。
- * 持久化与 respondToPlanReview 同款(远程会话由被控端权威落库,本机 PATCH)。
- */
 function cancelPlanReview(sessionId: string, requestId: string): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingPlanReview) return;
-  if (state.pendingPlanReview.requestId !== requestId) return;
-  bumpInteractionReconcileEpoch(sessionId);
+  if (getOrCreateState(sessionId).pendingPlanReview?.requestId !== requestId) return;
+  submitPlanReviewDecision(sessionId, requestId, {
+    kind: 'plan_review', behavior: 'deny', dismissed: true,
+  }, 'cancelled');
+}
 
-  const planMsg = state.messages.find(
-    (m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending',
-  );
-
-  setState(sessionId, (s) => ({
+function submitPlanReviewDecision(
+  sessionId: string,
+  requestId: string,
+  decision: Record<string, unknown>,
+  status: 'approved' | 'revised' | 'cancelled',
+  feedback?: string,
+): void {
+  submitQuestionDecision(sessionId, requestId, decision, () => setState(sessionId, (s) => ({
     ...s,
-    pendingPlanReview: null,
-    planViewerState: 'expanded',
-    lastExpandedPlanViewerState: 'expanded',
+    pendingPlanReview: s.pendingPlanReview?.requestId === requestId ? null : s.pendingPlanReview,
+    planViewerState: s.pendingPlanReview?.requestId === requestId ? 'expanded' : s.planViewerState,
+    lastExpandedPlanViewerState: s.pendingPlanReview?.requestId === requestId ? 'expanded' : s.lastExpandedPlanViewerState,
     messages: s.messages.map((m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending'
-        ? { ...m, planReviewStatus: 'cancelled' as const, planReviewFeedback: undefined }
+      m.role === 'plan_review' && m.planReviewRequestId === requestId && m.planReviewStatus === 'pending'
+        ? { ...m, planReviewStatus: status, planReviewFeedback: feedback }
         : m,
     ),
-  }));
-
-  if (planMsg && !isRemoteSession(sessionId)) {
-    messageService
-      .updateContent(sessionId, planMsg.clientId, {
-        requestId,
-        plan: planMsg.planReviewPlan ?? '',
-        planFilePath: planMsg.planReviewFilePath ?? '',
-        status: 'cancelled',
-        feedback: null,
-      })
-      .catch((err) => log.error('Failed to persist cancelled plan_review state:', err));
-  }
-
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, {
-      kind: 'plan_review',
-      behavior: 'deny',
-      dismissed: true,
-    })
-    .catch((err) => log.error('Failed to cancel plan review:', err));
+  })));
 }
 
 /**
@@ -16127,6 +16270,8 @@ function setSessionRuntime(
     planModeEnabled?: boolean;
     /** Seed before SessionView hydrates the DB row; sendMessage reads this for SSH routing. */
     remoteHostId?: string | null;
+    /** Disable automatic first-message renaming for product-owned titled sessions. */
+    autoTitleDisabled?: boolean;
   },
 ): void {
   if (!sessionId) return;
@@ -16137,11 +16282,13 @@ function setSessionRuntime(
     const nextRemoteHostId = Object.hasOwn(opts, 'remoteHostId')
       ? (opts.remoteHostId ?? null)
       : s.remoteHostId;
+    const nextAutoTitleDisabled = opts.autoTitleDisabled ?? s.autoTitleDisabled;
     if (
       s.agentKind === nextAgentKind &&
       s.fastMode === nextFastMode &&
       s.planModeEnabled === nextPlanMode &&
-      s.remoteHostId === nextRemoteHostId
+      s.remoteHostId === nextRemoteHostId &&
+      s.autoTitleDisabled === nextAutoTitleDisabled
     )
       return s;
     return {
@@ -16150,6 +16297,7 @@ function setSessionRuntime(
       fastMode: nextFastMode,
       planModeEnabled: nextPlanMode,
       remoteHostId: nextRemoteHostId,
+      autoTitleDisabled: nextAutoTitleDisabled,
       ...(s.planModeEnabled !== nextPlanMode ? { planModeRev: s.planModeRev + 1 } : {}),
     };
   });
@@ -16165,8 +16313,10 @@ function setContextWindow(sessionId: string, contextWindow: number | undefined):
     return;
   const nextContextWindow = Math.floor(contextWindow);
   setState(sessionId, (s) => {
-    // Model-selection metadata must not overwrite Codex's native usage snapshot.
-    if (s.agentKind === 'codex') return s;
+    // Model-selection metadata cannot relabel usage from an applied runtime budget.
+    // Keep Codex unknown until its native total is read, even before its first turn.
+    if (s.agentKind === 'codex' || s.agentStatus.contextWindowFromRuntime ||
+        s.agentStatus.contextTokens > 0) return s;
     if (s.agentStatus.contextWindow === nextContextWindow) return s;
     return {
       ...s,
@@ -16194,6 +16344,7 @@ function mirrorSessionFields(
         fastMode?: unknown;
         planModeEnabled?: unknown;
         agentKind?: unknown;
+        runtimeEffective?: unknown;
         providerId?: unknown;
         agentSwitchIntent?: unknown;
         agentSwitchIntentCanceled?: unknown;
@@ -16215,7 +16366,11 @@ function mirrorSessionFields(
   if (patch.agentKind === 'cc' || patch.agentKind === 'codex' || patch.agentKind === 'pi') {
     const nextKind = dbToMakerAgentKind(patch.agentKind);
     setState(sessionId, (s) => {
-      const intentApplied = s.agentSwitchIntent?.target === nextKind;
+      // New hosts publish the full runtime snapshot before explicitly clearing
+      // the consumed intent with CAS. An agent-kind match alone may belong to
+      // an older switch to the same engine, not the user's latest model choice.
+      const intentApplied = !('runtimeEffective' in patch) &&
+        !('agentSwitchIntent' in patch) && s.agentSwitchIntent?.target === nextKind;
       if (s.agentKind === nextKind && !intentApplied) return s;
       return {
         ...s,
@@ -16293,6 +16448,7 @@ export const makerChatStore = {
   getRunningSnapshot,
   /** F-SB-7: Authoritative terminal-error read, immune to snapshot-generation races. */
   hasSessionTerminalError,
+  hasSessionRecoveryPending,
   wasLastStopSideTask,
   wasLastStopPrivateReply: (sessionId: string): boolean =>
     sessions.get(sessionId)?.lastStopWasPrivateReply === true,
@@ -16691,7 +16847,9 @@ function collapseConsecutiveAutoResumeRows(messages: ChatMessage[]): ChatMessage
       }
       continue;
     }
-    if (isSubstantiveChatRow(message)) sawCardSinceContent = false;
+    // Without a later resume card there is no boundary to resolve. In particular,
+    // refreshing input projection for cached history must not rescan old tool text.
+    if (sawCardSinceContent && isSubstantiveChatRow(message)) sawCardSinceContent = false;
   }
   return changed && out ? out : messages;
 }
@@ -17078,6 +17236,27 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
   const ordered = filtered.sort(compareMessageTimeline);
   const legacyUserTurnCosts = projectLegacyUserTurnCosts(ordered);
   const mapped = ordered.map((m) => {
+    const persistedCindyCard =
+      m.role === 'assistant' && m.content && typeof m.content === 'object'
+        ? (m.content as Record<string, unknown>)[CINDY_MAKE_CARD_MARKER]
+        : undefined;
+    if (persistedCindyCard && typeof persistedCindyCard === 'object') {
+      const card = persistedCindyCard as Record<string, unknown>;
+      const type: 'cindy-make' | 'cindy-make-doctor' =
+        card.type === 'cindy-make' ? 'cindy-make' : 'cindy-make-doctor';
+      const data =
+        card.data && typeof card.data === 'object'
+          ? (card.data as Record<string, unknown>)
+          : {};
+      return {
+        clientId: m.clientId,
+        role: 'assistant' as const,
+        content: '',
+        isStreaming: false,
+        systemCardType: type,
+        systemCardData: data,
+      };
+    }
     if (m.role === 'tool_use' && m.content && typeof m.content === 'object') {
       const c = m.content as Record<string, unknown>;
       const { toolName, input: toolInput, toolUseId } = parseMessageToolUse(m);
@@ -17328,8 +17507,8 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
             : ('bot-session-task' as const),
         systemCardData: {
           ...collaboration,
-          // 插话卡要显示催的是哪句话；锚点卡正文为空。
-          text: typeof m.content === 'string' ? m.content : '',
+          // 旧记录可能含完整执行指令；实时与历史都只投影任务状态，不修改原记录。
+          text: '',
         },
       };
     }
@@ -17405,7 +17584,9 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
       const origin = m.agentMeta?.origin;
       const delivery = m.agentMeta?.delivery;
       const goalObjective = m.agentMeta?.goalObjective;
-      const hookSource = m.agentMeta?.hookSource;
+      // Both ingress paths share the Desktop card, but local IM must not opt
+      // older Mobile clients into legacy Hook/system-card semantics.
+      const hookSource = m.agentMeta?.imSource ?? m.agentMeta?.hookSource;
       return {
         clientId: m.clientId,
         role: m.role,
@@ -17454,6 +17635,17 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
         isStreaming: false,
         systemCardType: 'goal-complete' as const,
         systemCardData: { ...m.agentMeta.goalCompletion },
+      };
+    }
+    // 个人版制作任务完成记录:同 goal-complete,从持久 agentMeta 派生成完成卡片。
+    if (m.role === 'assistant' && m.agentMeta?.cindyMakeCompletion) {
+      return {
+        clientId: m.clientId,
+        role: m.role,
+        content: '',
+        isStreaming: false,
+        systemCardType: 'cindy-make-complete' as const,
+        systemCardData: { ...m.agentMeta.cindyMakeCompletion },
       };
     }
     // /goal 提示记录(usageLimited 到点自动续跑)→ 'goal-resumed' system card,同上派生。

@@ -1,3 +1,14 @@
+import { createAttachmentRecovery } from './oversized-attachment-recovery.js';
+import { clearCodexTextOnlyPolicies, codexTextOnlyRequestGuard, codexTextOnlyWebSocketTransforms, isCodexTextOnly } from './codex-text-only-policy.js';
+import { resolveConversationSessionHeaders, withChatBridgeUserAgent, overrideHeadersCaseInsensitive } from '@cindy/responses-chat-bridge';
+import { providerModelRecord } from '@cindy/model-providers';
+import { createPiProviderFetch, handlePiProviderRequest, invocationModelRecord, nativeBridgeApiKey, readBoundedResponseText, requiresNativeProviderAuth } from './pi-provider-transport.js';
+import { normalizeProviderRequest, normalizeMiniMaxResponsesReasoning } from '@cindy/model-compat';
+import { createCodexResponsesCompatibilityAdapter, sanitizeXaiTools, hasCacheOnlySearchProhibition, sanitizeByteDanceSeedTools, normalizeByteDanceSeedInput, sanitizeByteDanceSeedReasoning, normalizeStrictGatewayHistory, sanitizeDeepSeekV4CustomTools } from '@cindy/model-compat';
+import { peekGrokAccessToken } from './grok-oauth-login.js';
+import { bearerAccessTokenFromHeaders } from './chatgpt-bridge-auth-invalidation.js';
+import { isAppSessionBoundaryPending } from '../appSessionState.js';
+import { isClaudeSubscriptionProviderId, isXaiSubscriptionProviderId } from './subscription-account-auth.js';
 /**
  * Desktop 端 codex-proxy 生命周期管理 ——
  *
@@ -18,6 +29,8 @@ import {
   createActiveStripTransform,
   createEncryptedContentRecoveryRule,
   createImageGenerationIdRecoveryRule,
+  createResponsesItemIdPrefixRecoveryRule,
+  createResponsesItemIdLengthRecoveryRule,
   createInstructionsInjectionTransform,
   createInstructionsRegistry,
   createXaiModelInputRecoveryRule,
@@ -27,6 +40,8 @@ import {
   sanitizeXaiModelInputFromBody,
   stripEncryptedContentFromBody,
   stripImageGenerationItemsWithoutIdFromBody,
+  stripNonCanonicalResponsesItemIdsFromBody,
+  shortenOversizedResponsesItemIdsFromBody,
   stripNonAnthropicFields,
   type ForwardLifecycleFailure,
   type ForwardLifecycleObserver,
@@ -40,7 +55,8 @@ import {
 } from '@cindy/anthropic-compat-proxy';
 import { buildVisionBridgeProxyTransform } from '../vision-bridge/vision-bridge-controller.js';
 import {
-  createResponsesCustomToolFunctionAdapter,
+  chainResponseTransforms,
+  createResponsesNullArrayRepairTransform,
   normalizeResponsesToolItemIds,
   createResponsesChatHandler,
   type ChatBridgeCapabilities,
@@ -71,6 +87,7 @@ import {
   resolveSessionRouteDecision,
   resolvePendingSessionRouteDecision,
   buildLocalHandlerHeaders,
+  buildRouteDecision,
   inferProviderIdForModel,
   isHostInjectedAuthSession,
   isUserProviderSession,
@@ -96,6 +113,8 @@ import { xaiServerSideTools } from './xai-server-side-tools.js';
 import {
   encryptedStripController,
   imageGenerationStripController,
+  responsesItemIdStripController,
+  responsesItemIdLengthStripController,
   xaiModelInputStripController,
 } from './thread-strip-controllers.js';
 import { createMakerLogger } from './logger-adapter.js';
@@ -187,6 +206,12 @@ const encryptedContentRecoveryRule = createEncryptedContentRecoveryRule({
 const imageGenerationIdRecoveryRule = createImageGenerationIdRecoveryRule({
   onRetry: (threadId, model) => imageGenerationStripController.markActive(threadId, model),
 });
+const responsesItemIdPrefixRecoveryRule = createResponsesItemIdPrefixRecoveryRule({
+  onRetry: (threadId, model) => responsesItemIdStripController.markActive(threadId, model),
+});
+const responsesItemIdLengthRecoveryRule = createResponsesItemIdLengthRecoveryRule({
+  onRetry: (threadId, model) => responsesItemIdLengthStripController.markActive(threadId, model),
+});
 const xaiModelInputRecoveryRule = createXaiModelInputRecoveryRule({
   onRetry: (threadId, model) => xaiModelInputStripController.markActive(threadId, model),
 });
@@ -194,6 +219,8 @@ const vllmResponsesCompatibilityRule = createVllmResponsesCompatibilityRule();
 const CODEX_BODY_RECOVERY_RULES = [
   encryptedContentRecoveryRule,
   imageGenerationIdRecoveryRule,
+  responsesItemIdPrefixRecoveryRule,
+  responsesItemIdLengthRecoveryRule,
   xaiModelInputRecoveryRule,
   vllmResponsesCompatibilityRule,
 ] as const;
@@ -202,8 +229,12 @@ const CODEX_BODY_RECOVERY_RULES = [
 function isRepairableToolItemIdError(errorText: string): boolean {
   // Codex additionalDetails may contain an escaped JSON error inside another error envelope.
   const text = errorText.replace(/\\+(?=["'])/g, '');
-  const match = /Invalid\s+["']input\[\d+\]\.id["']:\s*["'](fc|fco|ctc|ctco)_[^"']+["']\.?\s+Expected an ID that begins with ["'](fc|fco|ctc|ctco)_?["']/i.exec(text);
+  const match = /Invalid\s+["']input\[\d+\]\.id["']:\s*["'](fc|fco|ctc|ctco|call)_[^"']+["']\.?\s+Expected an ID that begins with ["'](fc|fco|ctc|ctco)_?["']/i.exec(text);
   if (!match) return false;
+  // Legacy `call_…` item ids (issue #4023) are rewritten to whichever tool dialect the target
+  // asks for, so any of the four expected prefixes is repairable. Case-sensitive like the
+  // normalizer's `startsWith('call_')`: an upper-case prefix would not be rewritten on retry.
+  if (match[1] === 'call') return true;
   return ({ fc: 'ctc', fco: 'ctco', ctc: 'fc', ctco: 'fco' } as Record<string, string>)[match[1]!]
     === match[2]!;
 }
@@ -244,10 +275,12 @@ export function armCodexHttpRecovery(args: {
   }
   httpRecoveryReasonByThread.set(threadId, reason);
   let disconnectedWebSockets = 0;
+  let provenScopedWebSocket = false;
   for (const handle of activeCodexProxyHandles()) {
     disconnectedWebSockets += handle.disconnectWebSocketsForThread?.(threadId) ?? 0;
+    provenScopedWebSocket ||= handle.hasProvenWebSocketForThread?.(threadId) === true;
   }
-  if (disconnectedWebSockets === 0) {
+  if (disconnectedWebSockets === 0 && !provenScopedWebSocket) {
     httpRecoveryReasonByThread.delete(threadId);
     // startup-prewarm 没有稳定 thread header，且 shared app-server 会跨业务 session
     // 复用这些连接。不能为恢复 thread A 而全局断开匿名连接（可能正承载 thread B）；
@@ -259,6 +292,10 @@ export function armCodexHttpRecovery(args: {
     });
     return null;
   }
+  // disconnectedWebSockets === 0 但 provenScopedWebSocket：该 thread 曾成功完成 thread 级
+  // WS 握手，只是 Codex 在收到上游 400 后自己先关掉了连接（client-close），等到这里已无
+  // socket 可断。它的下一次 upgrade 仍带同一 thread 头，resolveWebSocketUpstream 会据
+  // 标记回 426、确定性落回 HTTP；撤销标记反而让同一轮历史每次都先撞 400（#4773）。
   if (sessionId && !existingSessionId) {
     // recovery 只需要让 unregister 能清掉 thread 标记，不能调用 bindThreadToSession：
     // 子 Agent thread 与主 thread 属于同一业务 session，但 bind 会把它当成主 thread
@@ -273,6 +310,7 @@ export function armCodexHttpRecovery(args: {
     threadId,
     reason,
     disconnectedWebSockets,
+    ...(disconnectedWebSockets === 0 ? { scopedSocketAlreadyClosed: true } : {}),
   });
   return reason;
 }
@@ -778,7 +816,7 @@ function createProviderAwareGuardianReviewerTransform(
  * 请求的 `tools`。插件搜索是增强项，不能作为该基础能力的前置条件，因此在明确走
  * Cindy Gateway 的 GPT-5.6 请求中补回标准 `web_search` 工具；已有声明保持原样。
  */
-function createGatewayNativeWebSearchTransform(): RequestTransform {
+function createGatewayNativeWebSearchTransform(frozenAuthInjection?: CodexProxyAuthInjection): RequestTransform {
   return (body, ctx) => {
     if (!isPlainObject(body) || typeof body.model !== 'string') return null;
     if (guardianParentThreadIdFromHeaders(ctx.headers)) return null;
@@ -796,7 +834,9 @@ function createGatewayNativeWebSearchTransform(): RequestTransform {
     const gatewayModel = model.startsWith('codex/') ? model.slice('codex/'.length) : model;
     if (!/^gpt-5\.6(?:$|[-.])/.test(gatewayModel)) return null;
 
-    const authInjection = getCodexProxyAuthInjection();
+    // Match the effective auth context used by this proxy's routing transform. Another
+    // app-server may change the global mode while a frozen OAuth proxy is still active.
+    const authInjection = frozenAuthInjection ?? getCodexProxyAuthInjection();
     const canUseExplicitSessionRoute = Boolean(sessionId && !subagentRoute && (
       authInjection === 'oauth-bearer' ||
       isUserProviderSession(sessionId) ||
@@ -847,7 +887,7 @@ const CHAT_BRIDGE_DEFAULT_CAPABILITIES: ChatBridgeCapabilities = {
   developerRole: 'system',
   parallelToolCalls: true,
   maxTokensField: 'max_tokens',
-  reasoningField: 'none',
+  // Leave reasoning undeclared so provider policy can fill it; translator defaults to none.
   streamUsage: true,
   // Responses fields with direct Chat equivalents. Provider-specific unsupported fields can
   // be removed later when the model capability catalog becomes more granular.
@@ -1039,7 +1079,9 @@ function createChatBridgeDecision(
   requestModelOverride?: string,
   reasoningEffortOverride?: CodexSubagentRouteSnapshot['reasoningEffort'],
 ): RoutingDecision | null {
-  if (!route || route.routing.wireProtocol !== 'openai-chat') return null;
+  if (!route) return null;
+  const nativeModel = getActiveCatalog().providers.find(p => p.id === route.providerId)?.models.codex?.find(m => m.id === (requestModelOverride ?? wireModel));
+  if (route.routing.wireProtocol !== 'openai-chat' && !nativeModel?.api) return null;
   const { headers } = buildLocalHandlerHeaders(route, 'codex');
   const stripPrefix = route.routing.modelIdRewrite?.stripPrefix;
   const realModel = rewriteChatBridgeModel(wireModel, stripPrefix);
@@ -1104,6 +1146,31 @@ function createChatBridgeDecision(
       // 只把入站头快照交给 bridge 解析稳定会话 ID(→ x-opencode-session,#4073);bridge 不透传
       // 这些头,凭证与 Codex 账号头仍由 buildLocalHandlerHeaders 的隔离边界管。
       // ctx 在生产路径恒有;既有测试与旧调用方可能省略,按「无入站头」处理即不附加会话头。
+      const actualModel = isPlainObject(body) && typeof body.model === 'string'
+        ? rewriteChatBridgeModel(body.model, stripPrefix) : realModel;
+      const selected = getActiveCatalog().providers.find(p => p.id === providerId)?.models.codex?.find(m => m.id === actualModel);
+      const standard = selected?.api ? invocationModelRecord(selected, route.routing.upstream) : !route.routing.requestPath
+        ? providerModelRecord(actualModel, route.routing.upstream, 'openai-chat') : undefined;
+      if (standard && isPlainObject(body)) {
+        const nativeHeaders = overrideHeadersCaseInsensitive(withChatBridgeUserAgent(Object.fromEntries(Object.entries(headers).filter(([name]) =>
+          !['authorization', 'x-api-key'].includes(name.toLowerCase())))), resolveConversationSessionHeaders(ctx?.headers));
+        if (standard.execution.pi.api === 'anthropic-messages' && (actualModel.endsWith('[1m]')
+          || (isOfficialAnthropicUpstream(standard.upstream) && standard.contextWindow >= 1_000_000))) {
+          appendCommaSeparatedHeaderToken(nativeHeaders, 'anthropic-beta', 'context-1m-2025-08-07');
+        }
+        const nativeFetch = createPiProviderFetch({ row: standard, providerId,
+          // Keep the catalog adapter while honoring the host assigned to this account.
+          upstream: buildRouteDecision(route.routing, null, 'codex', route.apiKey, route.oauthToken)?.upstreamOverride ?? route.routing.upstream,
+          apiKey: nativeBridgeApiKey(headers),
+          headers: nativeHeaders,
+          fetchImpl: async (url, init) => {
+            const response = await outboundFetch(url, init);
+            if (!response.ok && onUpstreamError) onUpstreamError({ status: response.status, body: await readBoundedResponseText(response.clone()) });
+            return response;
+          },
+        });
+        return handlePiProviderRequest(nativeFetch, { ...body, model: actualModel } as import('@cindy/responses-chat-bridge').ResponsesRequest, res);
+      }
       return handler.handle({ parsedBody: body, res, requestHeaders: ctx?.headers });
     },
   };
@@ -1296,8 +1363,7 @@ function createAnthropicBridgeDecision(
   // For Codex, provider-oauth-header is the subscription-safe route: the host
   // injects the Claude.ai token and never forwards the Codex/OpenAI bearer.
   if (
-    route.providerId === 'anthropic'
-    && route.providerSource === 'builtin'
+    isClaudeSubscriptionProviderId(route.providerId)
     && route.routing.authStrategy === 'provider-oauth-header'
     && !route.oauthToken
   ) {
@@ -1320,8 +1386,7 @@ function createAnthropicBridgeDecision(
   const usesProviderOAuth = route.routing.authStrategy === 'provider-oauth-header';
   const isAnthropicSubscriptionOAuth =
     usesProviderOAuth
-    && route.providerId === 'anthropic'
-    && route.providerSource === 'builtin';
+    && isClaudeSubscriptionProviderId(route.providerId);
   const buildProviderHeaders = (token: string | null): Record<string, string> => {
     const { headers: baseHeaders } = buildLocalHandlerHeaders(
       token === route.oauthToken ? route : { ...route, oauthToken: token },
@@ -1466,7 +1531,8 @@ function createLocalBridgeDecision(
   reasoningEffortOverride?: CodexSubagentRouteSnapshot['reasoningEffort'],
 ): RoutingDecision | null {
   if (!route) return null;
-  if (route.routing.wireProtocol === 'openai-chat') {
+  const nativeModel = getActiveCatalog().providers.find(p => p.id === route.providerId)?.models.codex?.find(m => m.id === (requestModelOverride ?? wireModel));
+  if (route.routing.wireProtocol === 'openai-chat' || (nativeModel?.api && (nativeModel.api !== 'openai-responses' || requiresNativeProviderAuth(invocationModelRecord(nativeModel, route.routing.upstream))))) {
     const decision = createChatBridgeDecision(
       route,
       instructions,
@@ -1550,113 +1616,6 @@ function stripUnsupportedXaiReasoning(body: Record<string, unknown>): Record<str
   return changed ? next : null;
 }
 
-const XAI_SUPPORTED_TOOL_TYPES = new Set([
-  'function',
-  'web_search',
-  'x_search',
-  'collections_search',
-  'file_search',
-  'code_execution',
-  'code_interpreter',
-  'mcp',
-  'shell',
-]);
-
-function xaiToolChoiceAfterSanitize(
-  toolChoice: unknown,
-  tools: readonly unknown[],
-): unknown {
-  if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return toolChoice;
-
-  const referencesSurvivingTool = (choice: Record<string, unknown>) => tools.some((tool) => {
-    if (!isPlainObject(tool) || tool.type !== choice.type) return false;
-    if (choice.type !== 'function') return true;
-    return typeof choice.name === 'string' && tool.name === choice.name;
-  });
-
-  if (toolChoice.type === 'allowed_tools' && Array.isArray(toolChoice.tools)) {
-    const allowedTools = toolChoice.tools.filter(
-      (choice): choice is Record<string, unknown> => isPlainObject(choice) && referencesSurvivingTool(choice),
-    );
-    return allowedTools.length > 0 ? { ...toolChoice, tools: allowedTools } : 'none';
-  }
-
-  // Fail closed: a forced choice that references a removed tool (e.g. a
-  // cache-only web_search that was dropped, or an unsupported namespace tool)
-  // must NOT widen into 'auto', which would let the model call surviving tools
-  // the caller never authorized. Collapse to 'none' so no tool is callable.
-  return referencesSurvivingTool(toolChoice) ? toolChoice : 'none';
-}
-
-function sanitizeXaiTools(
-  body: Record<string, unknown>,
-  options: { preserveNoneToolChoice?: boolean; preserveSerialToolCalls?: boolean } = {},
-): Record<string, unknown> | null {
-  if (!Array.isArray(body.tools)) return null;
-
-  let changed = false;
-  const tools: unknown[] = [];
-  for (const tool of body.tools) {
-    if (!isPlainObject(tool) || typeof tool.type !== 'string' || !XAI_SUPPORTED_TOOL_TYPES.has(tool.type)) {
-      changed = true;
-      continue;
-    }
-    if (tool.type === 'web_search') {
-      // A cache-only request must not silently become a live web-search request
-      // just because xAI/Grok cannot represent external_web_access=false.
-      const toolRecord = tool as Record<string, unknown>;
-      if (toolRecord.external_web_access === false) {
-        changed = true;
-        continue;
-      }
-      const nextTool: Record<string, unknown> = { type: 'web_search' };
-      for (const key of ['filters', 'enable_image_understanding', 'enable_image_search']) {
-        if (key in tool) nextTool[key] = toolRecord[key];
-      }
-      if (Object.keys(nextTool).length !== Object.keys(tool).length) changed = true;
-      tools.push(nextTool);
-      continue;
-    }
-    tools.push(tool);
-  }
-  if (!changed) return null;
-
-  const next: Record<string, unknown> = { ...body };
-  if (tools.length > 0) {
-    next.tools = tools;
-    next.tool_choice = xaiToolChoiceAfterSanitize(next.tool_choice, tools);
-  } else {
-    delete next.tools;
-    // All declared tools were filtered out. When server-side x_search is
-    // re-injected afterwards, a tool_choice that *references a removed tool*
-    // (an object forced choice, an emptied allowed_tools, or 'required') must
-    // collapse to 'none' so the model cannot widen the caller's authorization
-    // by auto-calling the injected search. 'auto' does NOT reference a
-    // specific tool — it means "choose any available tool" — so it stays,
-    // letting Grok use the re-injected x_search as the caller intended; a
-    // request that had no tool_choice (or already 'none') is left untouched.
-    // When nothing is re-injected (Guardian / cache-only search), drop the
-    // control field entirely — a 'none' with no tools is still an invalid xAI
-    // request (PR #2444 Codex P1/P2).
-    if (options.preserveNoneToolChoice) {
-      const choice = next.tool_choice;
-      if (
-        choice !== undefined
-        && choice !== 'none'
-        && choice !== 'auto'
-      ) {
-        next.tool_choice = 'none';
-      }
-    } else {
-      delete next.tool_choice;
-    }
-    if (!options.preserveSerialToolCalls) {
-      delete next.parallel_tool_calls;
-    }
-  }
-  return next;
-}
-
 /**
  * 给 xAI 会话恒定补上 xAI 的服务端搜索工具(当前是 `x_search`,Grok 原生搜 X)。
  *
@@ -1682,16 +1641,6 @@ function narrowXaiForcedToolChoice(
   if (functionTools.length !== 1) return null;
   const only = functionTools[0] as Record<string, unknown>;
   return { ...body, tool_choice: { type: 'function', name: only.name } };
-}
-
-function hasCacheOnlySearchProhibition(body: Record<string, unknown>): boolean {
-  if (!Array.isArray(body.tools)) return false;
-  return body.tools.some(
-    (tool) => {
-      if (!isPlainObject(tool) || tool.type !== 'web_search') return false;
-      return (tool as Record<string, unknown>).external_web_access === false;
-    },
-  );
 }
 
 function ensureXaiServerSideTools(body: Record<string, unknown>): Record<string, unknown> | null {
@@ -1763,298 +1712,12 @@ function isByteDanceSeedRequest(
   return isByteDanceSeedModel(body.model) || isVolcengineArkResponsesRouting(ctx, body.model);
 }
 
-function seedToolChoiceReferencesRemovedTool(
-  toolChoice: unknown,
-  tools: Record<string, unknown>[],
-): boolean {
-  if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return false;
-
-  return !tools.some((tool) => {
-    if (tool.type !== toolChoice.type) return false;
-    if (toolChoice.type !== 'function') return true;
-    return typeof toolChoice.name === 'string' && tool.name === toolChoice.name;
-  });
-}
-
-function sanitizeByteDanceSeedTools(body: Record<string, unknown>): Record<string, unknown> | null {
-  if (!Array.isArray(body.tools)) return null;
-
-  let changed = false;
-  const tools: Record<string, unknown>[] = [];
-  for (const tool of body.tools) {
-    if (!isPlainObject(tool)) {
-      changed = true;
-      continue;
-    }
-    if (tool.type === 'function') {
-      tools.push(tool);
-      continue;
-    }
-    if (tool.type === 'web_search') {
-      // Seed cannot represent Codex's cache-only search policy. Dropping the
-      // tool preserves the caller's explicit prohibition on live web access.
-      if (tool.external_web_access === false) {
-        changed = true;
-        continue;
-      }
-      tools.push({ type: 'web_search' });
-      if (Object.keys(tool).length !== 1) changed = true;
-      continue;
-    }
-    changed = true;
-  }
-  if (!changed) return null;
-
-  const next: Record<string, unknown> = { ...body };
-  if (tools.length > 0) {
-    next.tools = tools;
-    if (seedToolChoiceReferencesRemovedTool(next.tool_choice, tools)) next.tool_choice = 'auto';
-  } else {
-    delete next.tools;
-    delete next.tool_choice;
-    delete next.parallel_tool_calls;
-  }
-  return next;
-}
-
-const STRICT_GATEWAY_TOOL_HISTORY_MODELS = new Set([
-  'moonshot/kimi-k3',
-  'moonshotai/kimi-k3',
-  'deepseek/deepseek-v4-pro',
-  'deepseek/deepseek-v4-flash',
-]);
-// DeepSeek V4's Responses compatibility endpoint accepts the host's patch
-// custom tool, but rejects every other custom tool (notably Codex's `exec`).
-// Keep ordinary function tools untouched: the restriction is specifically on
-// the Responses `custom` tool dialect, not on function calling as a whole.
-const DEEPSEEK_V4_MODELS = new Set([
-  'deepseek/deepseek-v4-pro',
-  'deepseek/deepseek-v4-flash',
-]);
-const DEEPSEEK_V4_SUPPORTED_CUSTOM_TOOL_NAMES = new Set(['apply_patch']);
-const RESPONSE_TOOL_CALL_TYPES = new Set(['function_call', 'custom_tool_call']);
-const RESPONSE_TOOL_OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output']);
-
-function responseToolCallId(item: unknown, output: boolean): string | null {
-  if (!isPlainObject(item)) return null;
-  const supportedTypes = output ? RESPONSE_TOOL_OUTPUT_TYPES : RESPONSE_TOOL_CALL_TYPES;
-  if (!supportedTypes.has(typeof item.type === 'string' ? item.type : '')) return null;
-  return typeof item.call_id === 'string' && item.call_id.length > 0 ? item.call_id : null;
-}
-
-function stripEmptyResponseMessage(item: unknown): { item: unknown; changed: boolean } | null {
-  if (!isPlainObject(item) || item.type !== 'message') return { item, changed: false };
-  if (item.content === '') return null;
-  if (!Array.isArray(item.content)) return { item, changed: false };
-
-  const content = item.content.filter((part) => !(
-    isPlainObject(part) &&
-    (part.type === 'input_text' || part.type === 'output_text') &&
-    part.text === ''
-  ));
-  if (content.length === 0) return null;
-  return content.length === item.content.length
-    ? { item, changed: false }
-    : { item: { ...item, content }, changed: true };
-}
-
-/** Volcengine requires replayed assistant messages to carry their output status and non-empty text. */
-function normalizeByteDanceSeedInput(body: Record<string, unknown>): Record<string, unknown> | null {
-  if (!Array.isArray(body.input)) return null;
-
-  let changed = false;
-  const input: unknown[] = [];
-  for (const item of body.input) {
-    const normalized = stripEmptyResponseMessage(item);
-    if (!normalized) {
-      changed = true;
-      continue;
-    }
-    if (normalized.changed) changed = true;
-
-    const nextItem = normalized.item;
-    if (
-      isPlainObject(nextItem) &&
-      nextItem.type === 'message' &&
-      nextItem.role === 'assistant' &&
-      typeof nextItem.status !== 'string'
-    ) {
-      changed = true;
-      input.push({ ...nextItem, status: 'completed' });
-      continue;
-    }
-    input.push(nextItem);
-  }
-  return changed ? { ...body, input } : null;
-}
-
-/**
- * LiteLLM converts gateway Responses history to Chat Completions for these models.
- * Their native APIs require every assistant tool call to be followed immediately
- * by its tool result, while Codex may persist an assistant progress message between
- * the Responses function_call and function_call_output items. Codex may also persist
- * empty assistant output_text items, which Moonshot rejects after history conversion.
- * Consecutive calls form one parallel assistant group, so their matched outputs must
- * be moved after the whole group rather than inserted between calls.
- */
-function normalizeStrictGatewayHistory(
-  body: Record<string, unknown>,
-  routingModel = typeof body.model === 'string' ? body.model : '',
-): Record<string, unknown> | null {
-  if (
-    !STRICT_GATEWAY_TOOL_HISTORY_MODELS.has(routingModel) ||
-    !Array.isArray(body.input)
-  ) {
-    return null;
-  }
-
-  const originalInput = body.input;
-  const normalizedInput: unknown[] = [];
-  for (const item of originalInput) {
-    const normalized = stripEmptyResponseMessage(item);
-    if (normalized) normalizedInput.push(normalized.item);
-  }
-
-  const matchedOutputs = new Map<number, number>();
-  const usedOutputIndexes = new Set<number>();
-  const outputIndexesByCallId = new Map<string, number[]>();
-  const outputCursorByCallId = new Map<string, number>();
-  for (let index = 0; index < normalizedInput.length; index += 1) {
-    const outputCallId = responseToolCallId(normalizedInput[index], true);
-    if (!outputCallId) continue;
-    const indexes = outputIndexesByCallId.get(outputCallId) ?? [];
-    indexes.push(index);
-    outputIndexesByCallId.set(outputCallId, indexes);
-  }
-
-  for (let callIndex = 0; callIndex < normalizedInput.length; callIndex += 1) {
-    const callId = responseToolCallId(normalizedInput[callIndex], false);
-    if (!callId) continue;
-
-    const outputIndexes = outputIndexesByCallId.get(callId);
-    if (!outputIndexes) continue;
-    let cursor = outputCursorByCallId.get(callId) ?? 0;
-    while (cursor < outputIndexes.length && outputIndexes[cursor] <= callIndex) cursor += 1;
-    if (cursor >= outputIndexes.length) continue;
-
-    const outputIndex = outputIndexes[cursor];
-    outputCursorByCallId.set(callId, cursor + 1);
-    matchedOutputs.set(callIndex, outputIndex);
-    usedOutputIndexes.add(outputIndex);
-  }
-
-  const outputIndexesByGroupEnd = new Map<number, number[]>();
-  for (let groupStart = 0; groupStart < normalizedInput.length;) {
-    if (!responseToolCallId(normalizedInput[groupStart], false)) {
-      groupStart += 1;
-      continue;
-    }
-    let groupEnd = groupStart;
-    while (
-      groupEnd + 1 < normalizedInput.length &&
-      responseToolCallId(normalizedInput[groupEnd + 1], false)
-    ) {
-      groupEnd += 1;
-    }
-    const outputIndexes: number[] = [];
-    for (let callIndex = groupStart; callIndex <= groupEnd; callIndex += 1) {
-      const outputIndex = matchedOutputs.get(callIndex);
-      if (outputIndex !== undefined) outputIndexes.push(outputIndex);
-    }
-    if (outputIndexes.length > 0) {
-      outputIndexesByGroupEnd.set(groupEnd, outputIndexes.sort((a, b) => a - b));
-    }
-    groupStart = groupEnd + 1;
-  }
-
-  const input: unknown[] = [];
-  for (let index = 0; index < normalizedInput.length; index += 1) {
-    if (usedOutputIndexes.has(index)) continue;
-    input.push(normalizedInput[index]);
-    const outputIndexes = outputIndexesByGroupEnd.get(index);
-    if (outputIndexes) {
-      for (const outputIndex of outputIndexes) input.push(normalizedInput[outputIndex]);
-    }
-  }
-  const changed =
-    input.length !== originalInput.length ||
-    input.some((item, index) => item !== originalInput[index]);
-  return changed ? { ...body, input } : null;
-}
-
 function createStrictGatewayHistoryCompatTransform(): RequestTransform {
   return (body, ctx) => {
     if (!isPlainObject(body) || typeof body.model !== 'string') return null;
     const routingModel = providerContextForRequest(ctx.headers, body.model).catalogModel;
     return normalizeStrictGatewayHistory(body, routingModel);
   };
-}
-
-function deepSeekToolChoiceReferencesRemovedCustomTool(
-  toolChoice: unknown,
-  tools: readonly unknown[],
-): boolean {
-  if (!isPlainObject(toolChoice) || toolChoice.type !== 'custom' || typeof toolChoice.name !== 'string') {
-    return false;
-  }
-  return !tools.some((tool) =>
-    tool === toolChoice.name ||
-    (isPlainObject(tool) && tool.type === 'custom' && tool.name === toolChoice.name),
-  );
-}
-
-/**
- * DeepSeek V4 rejects Codex's general-purpose custom `exec` tool before it
- * reaches the model, while accepting `apply_patch`. Filter only that custom
- * tool dialect so function/MCP declarations keep their existing semantics.
- */
-function sanitizeDeepSeekV4CustomTools(body: unknown): Record<string, unknown> | null {
-  if (!isPlainObject(body)) return null;
-  if (!DEEPSEEK_V4_MODELS.has(typeof body.model === 'string' ? body.model : '')) return null;
-  if (!Array.isArray(body.tools)) return null;
-
-  let changed = false;
-  const tools: unknown[] = [];
-  for (const tool of body.tools) {
-    const customToolName =
-      typeof tool === 'string'
-        ? tool
-        : isPlainObject(tool) && tool.type === 'custom' && typeof tool.name === 'string'
-          ? tool.name
-          : null;
-    if (customToolName !== null && !DEEPSEEK_V4_SUPPORTED_CUSTOM_TOOL_NAMES.has(customToolName)) {
-      changed = true;
-      continue;
-    }
-    tools.push(tool);
-  }
-  if (!changed) return null;
-
-  const next: Record<string, unknown> = { ...body };
-  if (tools.length > 0) {
-    next.tools = tools;
-    if (deepSeekToolChoiceReferencesRemovedCustomTool(next.tool_choice, tools)) next.tool_choice = 'auto';
-  } else {
-    delete next.tools;
-    delete next.tool_choice;
-    delete next.parallel_tool_calls;
-  }
-  return next;
-}
-
-/** Seed accepts the reasoning effort, but rejects Responses' summary selector. */
-function sanitizeByteDanceSeedReasoning(body: Record<string, unknown>): Record<string, unknown> | null {
-  if (!isPlainObject(body.reasoning) || !('summary' in body.reasoning)) {
-    return null;
-  }
-
-  const reasoning = { ...body.reasoning };
-  delete reasoning.summary;
-
-  const next: Record<string, unknown> = { ...body };
-  if (Object.keys(reasoning).length > 0) next.reasoning = reasoning;
-  else delete next.reasoning;
-  return next;
 }
 
 function createByteDanceSeedResponsesCompatTransform(): RequestTransform {
@@ -2156,11 +1819,11 @@ function createXaiResponsesCompatTransform(): RequestTransform {
   };
 }
 
-function needsExecFunctionAdapter(
+function responsesCompatibilityRouting(
   body: Record<string, unknown>,
   ctx: RequestTransformCtx,
   frozenAuthInjection?: CodexProxyAuthInjection,
-): boolean {
+) {
   const requestModel = typeof body.model === 'string' ? body.model : '';
   const providerContext = providerContextForRequest(ctx.headers, requestModel);
   const authInjection = frozenAuthInjection ?? getCodexProxyAuthInjection();
@@ -2205,8 +1868,7 @@ function needsExecFunctionAdapter(
     routing = getProviderRoutingDescriptor(defaultProviderId, 'codex', requestModel);
   }
 
-  return (routing?.wireProtocol ?? 'openai-responses') === 'openai-responses'
-    && routing?.supportsResponsesCustomTools === false;
+  return routing;
 }
 
 /**
@@ -2435,19 +2097,7 @@ function createMiniMaxResponsesCompatTransform(): RequestTransform {
       || typeof body.model !== 'string'
       || !isMiniMaxResponsesSession(ctx, body.model)
     ) return null;
-    const reasoning = body.reasoning;
-    if (!isPlainObject(reasoning)) return null;
-    let changed = false;
-    const nextReasoning = { ...reasoning };
-    if (nextReasoning.effort === 'xhigh') {
-      nextReasoning.effort = 'high';
-      changed = true;
-    }
-    if ('summary' in nextReasoning) {
-      delete nextReasoning.summary;
-      changed = true;
-    }
-    return changed ? { ...body, reasoning: nextReasoning } : null;
+    return normalizeMiniMaxResponsesReasoning(body);
   };
 }
 
@@ -2569,7 +2219,11 @@ function isXaiUpstream(upstreamBase: string): boolean {
 
 function maybeRecordXaiRateLimit(ctx: ResponseObserverCtx): void {
   if (ctx.status < 200 || ctx.status >= 300) return;
-  if (!isXaiUpstream(ctx.upstreamBase)) return;
+  if (!isXaiUpstream(ctx.upstreamBase) || isAppSessionBoundaryPending()) return;
+  const { providerId } = providerContextForRequest(ctx.requestHeaders, readRequestMeta(ctx.requestBody).model ?? '');
+  if (!providerId || !isXaiSubscriptionProviderId(providerId)) return;
+  const token = bearerAccessTokenFromHeaders(ctx.outboundHeaders ?? ctx.requestHeaders);
+  if (!token || token !== peekGrokAccessToken(providerId)) return;
   const info = {
     limitRequests: numericHeader(ctx.responseHeaders, 'x-ratelimit-limit-requests'),
     remainingRequests: numericHeader(ctx.responseHeaders, 'x-ratelimit-remaining-requests'),
@@ -2577,7 +2231,7 @@ function maybeRecordXaiRateLimit(ctx: ResponseObserverCtx): void {
     remainingTokens: numericHeader(ctx.responseHeaders, 'x-ratelimit-remaining-tokens'),
   };
   if (Object.values(info).every((v) => v === undefined)) return;
-  recordXaiRateLimitSnapshot(info);
+  recordXaiRateLimitSnapshot(info, providerId);
 }
 
 function tryReadSseEvent(line: string): { event: string | null; data: Record<string, unknown> | null } | null {
@@ -2596,7 +2250,7 @@ function tryReadSseEvent(line: string): { event: string | null; data: Record<str
 
 function createCodexResponseObserver(): ResponseObserver {
   return (ctx) => {
-    maybeRecordXaiRateLimit(ctx);
+    try { maybeRecordXaiRateLimit(ctx); } catch { /* Display-only; preserve successful responses. */ }
     if (ctx.method !== 'POST') return null;
     const path = ctx.url.split('?', 1)[0] ?? ctx.url;
     if (!path.endsWith('/responses') && path !== '/responses') return null;
@@ -3060,11 +2714,13 @@ export function createModelRoutingTransform(
       : sessionId
         ? getSessionRoutingDescriptor(sessionId, 'codex', model || undefined)
         : null;
+    const selectedModel = getActiveCatalog().providers.find(p => p.id === explicitProviderId)?.models.codex?.find(m => m.id === model);
     const selectedUsesLocalBridge =
       ctx.method === 'POST'
       && Boolean(model)
       && (
-        selectedRouting?.wireProtocol === 'openai-chat'
+        (selectedModel?.api && (selectedModel.api !== 'openai-responses' || (selectedRouting && requiresNativeProviderAuth(invocationModelRecord(selectedModel, selectedRouting.upstream)))))
+        || selectedRouting?.wireProtocol === 'openai-chat'
         || selectedRouting?.wireProtocol === 'anthropic-messages'
       );
     if (explicitProviderId === 'cindy-local-ollama') {
@@ -3206,12 +2862,33 @@ export function createModelRoutingTransform(
 
 function createTransformRequestChain(
   frozenAuthInjection?: CodexProxyAuthInjection,
-  execAdapter = createResponsesCustomToolFunctionAdapter(['exec']),
+  execAdapter = createCodexResponsesCompatibilityAdapter(),
 ): RequestTransform[] {
-  const execFunctionAdapterTransform: RequestTransform = (body, ctx) =>
-    isPlainObject(body) && needsExecFunctionAdapter(body, ctx, frozenAuthInjection)
-      ? execAdapter.adaptRequest(body, ctx.reqId)
-      : null;
+  const execFunctionAdapterTransform: RequestTransform = (body, ctx) => {
+    if (!isPlainObject(body)) return null;
+    const routing = responsesCompatibilityRouting(body, ctx, frozenAuthInjection);
+    if ((routing?.wireProtocol ?? 'openai-responses') !== 'openai-responses'
+      || routing?.supportsResponsesCustomTools !== false) return null;
+    const upstreamBase = ctx.upstreamBase ?? routing.upstream;
+    const model = rewriteChatBridgeModel(String(body.model ?? ''), routing.modelIdRewrite?.stripPrefix);
+    // Only known provider endpoints or the existing XD model contract lower namespaces.
+    const endpoint = new URL(upstreamBase);
+    const gateway = new URL(getProviderRoutingDescriptor('xd', 'codex', String(body.model ?? ''))?.upstream ?? upstreamBase);
+    const knownEndpoint = ['api.x.ai', 'cli-chat-proxy.grok.com', 'api.deepseek.com'].includes(endpoint.hostname)
+      || VOLCENGINE_ARK_CHAT_HOST_RE.test(endpoint.hostname);
+    const gatewayDialect = endpoint.origin === gateway.origin && /^(?:x-ai\/grok|deepseek\/|bytedance-seed\/|doubao-seed-)/.test(String(body.model ?? ''));
+    return execAdapter.adaptRequest(body, ctx.reqId,
+      { harness: 'codex', protocol: 'openai-responses', upstreamBase, model }, knownEndpoint || gatewayDialect);
+  };
+  const providerRequestTransform: RequestTransform = (body, ctx) => {
+    if (!isPlainObject(body) || !ctx.upstreamBase) return null;
+    const routing = responsesCompatibilityRouting(body, ctx, frozenAuthInjection);
+    if ((routing?.wireProtocol ?? 'openai-responses') !== 'openai-responses') return null;
+    // This runs after model rewriting and existing fail-closed search policy.
+    const next = normalizeProviderRequest(body, { harness: 'codex', protocol: 'openai-responses', upstreamBase: ctx.upstreamBase, model: String(body.model ?? '') });
+    return next === body ? null : next;
+  };
+  providerRequestTransform.errorMode = 'reject-request';
   execFunctionAdapterTransform.errorMode = 'reject-request';
   execFunctionAdapterTransform.onRequestSettled = (requestId) => {
     execAdapter.releaseResponse(requestId);
@@ -3237,7 +2914,7 @@ function createTransformRequestChain(
     createForcedSubagentRequestTransform(),
     createCodexTransform(),
     createLockedSubagentExecGuardTransform(),
-    createGatewayNativeWebSearchTransform(),
+    createGatewayNativeWebSearchTransform(frozenAuthInjection),
     // 必须先于 xAI/MiniMax 兼容改写:先把供应商绑定的历史项降级成标准 message，
     // 后续针对具体供应商的 input 归一化才能稳定处理。
     createCrossProviderCompactionCompatTransform(),
@@ -3247,6 +2924,19 @@ function createTransformRequestChain(
       controller: xaiModelInputStripController,
       enabled: () => true,
       strip: sanitizeXaiModelInputFromBody,
+    }),
+    // issue #4738: 上游拒绝过一次不合规 message/reasoning id 后, 该 thread 后续每次发送
+    // 前都预洗, 避免每轮先 400 再重试。
+    createActiveStripTransform({
+      controller: responsesItemIdStripController,
+      enabled: () => true,
+      strip: stripNonCanonicalResponsesItemIdsFromBody,
+    }),
+    // issue #4227: 同理, 上游拒绝过一次超长 item id 后, 该 thread 后续发送前预改写。
+    createActiveStripTransform({
+      controller: responsesItemIdLengthStripController,
+      enabled: () => true,
+      strip: shortenOversizedResponsesItemIdsFromBody,
     }),
     // Providers that explicitly lack Responses custom tools still accept ordinary
     // functions. Adapt before provider sanitizers, then restore custom_tool_call
@@ -3262,6 +2952,7 @@ function createTransformRequestChain(
     createByteDanceSeedResponsesCompatTransform(),
     createMiniMaxResponsesCompatTransform(),
     createProviderModelRewriteTransform(),
+    providerRequestTransform,
     // 视觉桥透明替换（层 A，Responses 格式）：controller 未注入时短路透传，零干扰；
     // 注入后把纯文本模型请求 input[] 里的 input_image 转成文字描述。放在 strip 之前与
     // Anthropic 链一致，避免未来 strip 扩展覆盖 Responses input_image 时吃掉图。
@@ -3373,7 +3064,7 @@ function createCodexProxyHandle(
   frozenAuthInjection?: CodexProxyAuthInjection,
   frozenCustomProviderRoutes?: readonly CodexCustomProviderRoute[],
 ): Promise<ProxyHandle> {
-  const execAdapter = createResponsesCustomToolFunctionAdapter(['exec']);
+  const execAdapter = createCodexResponsesCompatibilityAdapter();
   return createAnthropicCompatProxy({
     // 默认上游 = gateway(含 /v1)；普通模型 + oauth 由 routingTransform 覆盖到 ChatGPT。
     upstream: () => buildCodexGatewayBaseUrl(),
@@ -3397,10 +3088,20 @@ function createCodexProxyHandle(
       return path.kind !== 'not-custom-provider-route'
         && !(path.kind === 'route' && path.pathKind === 'responses');
     },
-    transformResponse: (ctx) => execAdapter.createResponseTransform(ctx.reqId, {
-      contentType: ctx.responseHeaders['content-type'] ?? '',
-      contentEncoding: ctx.responseHeaders['content-encoding'] ?? '',
-    }),
+    requestGuard: ctx => codexTextOnlyRequestGuard(isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers)), ctx),
+    webSocketTransforms: ctx => codexTextOnlyWebSocketTransforms(() => isCodexTextOnly(selectedThreadIdFromHeaders(ctx.headers))),
+    transformResponse: (ctx) => {
+      const response = {
+        contentType: ctx.responseHeaders['content-type'] ?? '',
+        contentEncoding: ctx.responseHeaders['content-encoding'] ?? '',
+      };
+      // Repair runs first so items with `null` arrays reach the custom-tool adapter (and Codex)
+      // as valid ResponseItems (#4251). The adapter keeps its own compressed/MIME rejections.
+      return chainResponseTransforms(
+        createResponsesNullArrayRepairTransform(response),
+        execAdapter.createResponseTransform(ctx.reqId, response),
+      );
+    },
     // 常规 session proxy 继续读取当前全局 spawn 形态；control-plane proxy 在创建时
     // 冻结自己的形态，两个 app-server 并行时不会互相改写路由。
     routingTransform: withCodexUpstreamRecording(
@@ -3418,9 +3119,13 @@ function createCodexProxyHandle(
         resolveUserProviderName: (providerId) =>
           getActiveCatalog().providers.find((provider) => provider.id === providerId)?.name ?? null,
       }),
-      createXaiProxyAuthInvalidationObserver(),
+      createXaiProxyAuthInvalidationObserver((ctx) => {
+        const sessionId = sessionIdFromHeaders(ctx.requestHeaders);
+        return sessionId ? getSessionProvider(sessionId) : null;
+      }),
     ),
     maxRequestBodyBytes: CODEX_PROXY_MAX_REQUEST_BODY_BYTES,
+    oversizedRequestRecovery: createAttachmentRecovery(sessionIdFromHeaders),
     debugDumpRequestBody: process.env.XDT_PROXY_DUMP_REQUEST_BODY === '1',
     recoveryRules: [...CODEX_BODY_RECOVERY_RULES],
     logger: log,
@@ -3975,4 +3680,5 @@ export async function disposeCodexProxy(): Promise<void> {
       });
     }
   }));
+  clearCodexTextOnlyPolicies();
 }

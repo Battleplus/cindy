@@ -39,7 +39,7 @@ export const PI_REASONING_EFFORTS = [
 export type PiReasoningEffort = (typeof PI_REASONING_EFFORTS)[number];
 
 /**
- * PI models.json understands these four portable inference protocols. The
+ * PI models.json understands these native inference APIs. The
  * provider-level wireProtocol remains the default for an endpoint; piApi is a
  * sparse per-model override for newly released models or protocol corrections.
  */
@@ -48,12 +48,16 @@ export const PI_MODEL_APIS = [
   "openai-responses",
   "openai-completions",
   "google-generative-ai",
+  "bedrock-converse-stream",
+  "azure-openai-responses",
+  "google-vertex",
+  "mistral-conversations",
 ] as const;
 export type PiModelApi = (typeof PI_MODEL_APIS)[number];
 
 /** Provider runtime 上游实际接受的推理 wire protocol。 */
 export type ProviderWireProtocol =
-  "anthropic-messages" | "openai-responses" | "openai-chat";
+  "anthropic-messages" | "openai-responses" | "openai-chat" | "google-generative-ai";
 
 /** Codex 通过本地 bridge 兼容的两种非原生 Responses wire protocol。 */
 export type CodexCompatibilityWireProtocol = Extract<
@@ -259,6 +263,14 @@ export interface ModelCost {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  /** Pi-compatible rates used when input tokens strictly exceed this threshold. */
+  tiers?: Array<{
+    inputTokensAbove: number;
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  }>;
 }
 
 /**
@@ -273,9 +285,12 @@ export interface ModelCost {
  * 跨 provider(如 gpt-5.5 同时由 openai 与 xd 提供)则必须元数据一致(见 catalog.ts 校验)。
  */
 export interface CatalogModel {
+  supportsToolCalls?: boolean;
+  reasoningRequired?: boolean;
   userModelConfig?: ProviderRuntimeModelConfig;
   catalogPresetId?: string;
   discoveredMetadata?: ModelMetadata;
+  discoveredCost?: ModelCost;
   nameExplicit?: boolean;
   /** Canonical model API from the accepted Registry; null explicitly means unverified. */
   nativeApi?: PiModelApi | null;
@@ -283,7 +298,9 @@ export interface CatalogModel {
   id: string;
   /** Server entitlement state. Paid-locked models remain present for UI but are never routable. */
   availability?: "available" | "requires_payment";
-  /** Sparse PI protocol override; absence means use PI's bundled model catalog. */
+  /** Explicit Pi serializer; missing fields may use the matching native transport fallback. */
+  /** Upstream execution API, shared by Claude Code, Codex and Pi. */
+  api?: PiModelApi;
   piApi?: PiModelApi;
   /** 同一 provider/runtime 内该模型的上游覆盖；缺省使用 provider 级路由。 */
   route?: ProviderModelRouteConfig;
@@ -470,6 +487,8 @@ export interface ProviderMediaModel extends Pick<
   modalities?: { input: string[]; output: string[] };
   officialDocs?: string;
   disabled?: boolean;
+  /** Follows the chat display axis: omitted/true is shown, false waits for an explicit switch. */
+  defaultEnabled?: boolean;
 }
 
 /** 供应商定义。 */
@@ -487,7 +506,7 @@ export interface Provider {
    * OAuth Runner（generic-oauth）；不带描述符的 oauth 供应商 = host bespoke 鉴权
    * （anthropic / openai / xai 现状）。
    */
-  auth: { method: AuthMethod; oauth?: OAuthProviderDescriptor };
+  auth: { method: AuthMethod; oauth?: OAuthProviderDescriptor; native?: "codex" | "claude" | "xai" };
   /** 用户使用该供应商时的额度来源；旧目录可缺省，由 source 从 bundled 同 id 条目补齐。 */
   access?: ProviderAccess;
   /**
@@ -570,10 +589,13 @@ export interface ProviderRuntimeModelConfig extends Pick<
   "mode" | "modalities" | "officialDocs"
 > {
   discoveredMetadata?: ModelMetadata;
+  discoveredCost?: ModelCost;
   nameExplicit?: boolean;
   id: string;
   name: string;
   /** Per-model PI protocol override; provider wireProtocol remains the fallback. */
+  /** Upstream execution API, shared by Claude Code, Codex and Pi. */
+  api?: PiModelApi;
   piApi?: PiModelApi;
   /** 同一 runtime 内该模型的上游覆盖；缺省使用 runtime 级路由。 */
   route?: ProviderModelRouteConfig;
@@ -751,9 +773,10 @@ export interface CustomProviderConfig {
    * Bearer；此形态下不再使用 per-runtime API key。
    */
   auth?:
-    | { method: "apiKey"; oauth?: never }
-    | { method: "oauth"; oauth: OAuthProviderDescriptor }
-    | { method: "none"; oauth?: never };
+    | { method: "apiKey"; oauth?: never; native?: never }
+    | { method: "oauth"; oauth: OAuthProviderDescriptor; native?: never }
+    | { method: "oauth"; native: "codex" | "claude" | "xai"; oauth?: never }
+    | { method: "none"; oauth?: never; native?: never };
   /** per-runtime 独立配置（键为 agent，只含已配置的 runtime；至少一个）。 */
   runtimes: Partial<Record<AgentKind, CustomProviderRuntimeConfig>>;
 }

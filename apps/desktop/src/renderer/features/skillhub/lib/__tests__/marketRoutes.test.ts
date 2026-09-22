@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,8 +12,10 @@ const routerSource = readFileSync(resolve(skillhubDir, '../../router.tsx'), 'utf
 const localDetailSource = readFileSync(resolve(skillhubDir, 'SkillhubDetailView.tsx'), 'utf8');
 
 describe('market route scope', () => {
-  it('has no fullscreen market detail or manage routes (detail and management live in the preview panel)', () => {
-    expect(routerSource).not.toContain('SkillhubMarketDetailView');
+  it('uses one detail route and redirects old detail URLs', () => {
+    expect(routerSource).toContain('<SkillhubDetailRoute />');
+    expect(routerSource).toContain('<LegacySkillDetailRedirect market />');
+    expect(routerSource).toContain('<LegacySkillDetailRedirect />');
     expect(routerSource).not.toContain('SkillhubMarketManageView');
   });
 
@@ -25,9 +27,14 @@ describe('market route scope', () => {
     expect(localDetailSource).not.toContain('marketManagePath');
   });
 
-  it('reads rejected management versions from the native record', () => {
-    expect(localDetailSource).toContain('listPublishedVersions(entry.name)');
-    expect(localDetailSource).not.toContain('listPublishedVersions(entry.name, entry.registryEntry?.catalogScope)');
+  it('reads rejected management feedback through the native-version hook', () => {
+    const feedbackSource = readFileSync(resolve(skillhubDir, 'hooks/useRejectionFeedback.ts'), 'utf8');
+    expect(localDetailSource).toContain('useRejectionFeedback({');
+    expect(localDetailSource).toContain('void rejectionFeedback.open()');
+    const scanRequest = feedbackSource.match(/getScanStatus\(\{([\s\S]*?)\}\)/)?.[1];
+    expect(scanRequest).toContain('slug: scope.name');
+    expect(scanRequest).toContain('version: scope.version');
+    expect(scanRequest).not.toContain('catalogScope');
   });
 
   it('keeps Clone wording for acquisition actions', () => {
@@ -43,13 +50,13 @@ describe('market route scope', () => {
     expect(acceptanceSource).not.toContain('转到团队库');
   });
 
-  it('opens the half-screen cloud preview when a market card is clicked', () => {
+  it('opens the shared detail route with read-only market content', () => {
     const listSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketListView.tsx'), 'utf8');
-    const previewSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketPreviewPanel.tsx'), 'utf8');
+    const previewSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketDetailView.tsx'), 'utf8');
 
-    expect(listSource).toContain('SkillhubMarketPreviewPanel');
-    expect(listSource).toContain('nextMarketPreviewName');
-    expect(listSource).toContain('setMarketSelected(newName ? skill : null);');
+    expect(listSource).toContain('navigate(buildMarketSkillRoute(skill, returnTo))');
+    expect(previewSource).toContain('<SkillDetailPage>');
+    expect(localDetailSource).toContain('<SkillDetailPage>');
     expect(previewSource).toContain('getPublishedFiles');
     expect(previewSource).toContain('readPublishedFile');
     expect(previewSource).toContain('allowPrivilegedLinks={false}');
@@ -127,7 +134,7 @@ describe('market management copy and errors', () => {
   });
 
   it('does not expose an extra published status pill in the market preview panel', () => {
-    const previewSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketPreviewPanel.tsx'), 'utf8');
+    const previewSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketDetailView.tsx'), 'utf8');
 
     expect(previewSource).not.toContain('已发布');
   });
@@ -150,13 +157,13 @@ describe('market management copy and errors', () => {
     expect(cardSource).not.toContain('event.preventDefault();');
   });
 
-  it('keeps the market preview panel out of the window drag region', () => {
+  it('keeps shared detail controls out of the window drag region', () => {
     const listSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketListView.tsx'), 'utf8');
-    const previewSource = readFileSync(resolve(skillhubDir, 'SkillhubMarketPreviewPanel.tsx'), 'utf8');
+    const layoutSource = readFileSync(resolve(skillhubDir, 'components/SkillDetailLayout.tsx'), 'utf8');
 
-    expect(previewSource).toContain('WINDOW_NO_DRAG_STYLE');
-    expect(previewSource).toContain("...WINDOW_NO_DRAG_STYLE");
-    expect(listSource).toContain('previewSkill ? WINDOW_NO_DRAG_STYLE : WINDOW_DRAG_STYLE');
+    expect(layoutSource).toContain('style={WINDOW_NO_DRAG_STYLE}');
+    expect(layoutSource).toContain('style={WINDOW_DRAG_STYLE}');
+    expect(listSource).toContain('...WINDOW_DRAG_STYLE');
   });
 
   it('updates the Hub copy, locale, and Platform tag slugs from the market info editor', () => {

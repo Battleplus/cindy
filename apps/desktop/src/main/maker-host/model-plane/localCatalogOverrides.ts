@@ -1,4 +1,5 @@
 import {
+  BUILTIN_PROVIDERS,
   validModelMetadata,
   type ModelMetadata,
   type BaseModel,
@@ -19,7 +20,7 @@ import {
  *   - RoutingDescriptor / auth / upstream → 永不属于任何 override 面。
  *
  * 形状(v1):key = `${encodeURIComponent(providerId)}:${modelId}`(**不含 agent**),一条记录经
- * base + perAgent(claude-code/codex) 表达跨 root 差异 —— 修 xAI Codex 专属
+ * base + perAgent(claude-code/codex/pi) 表达跨引擎差异 —— 修 xAI Codex 专属
  * 思考档 = 一条 { perAgent: { codex: { efforts } } } patch,不用双写。
  *   - additions:完整新实体(base+perAgent 合成后须能力自洽),同 key 整条
  *     压过 remote/discovery(不做字段混合),且**显式复活**远端 retired;
@@ -85,7 +86,7 @@ export type ModelCatalogPerAgentOverrideFields = Pick<
 >;
 
 export interface ModelCatalogOverrideEntry {
-  /** 消费 membership；缺省 = provider policy 的全部 root + wire bridge，且必须含至少一个 root。 */
+  /** 消费 membership；缺省 = provider policy 的全部 root + wire bridge + 能力完整的 Pi；允许仅指定 Pi。 */
   agents?: AgentKind[];
   base?: ModelCatalogOverrideFields;
   perAgent?: Partial<Record<AgentKind, ModelCatalogPerAgentOverrideFields>>;
@@ -244,7 +245,7 @@ function sanitizeEntry(raw: unknown): ModelCatalogOverrideEntry | null {
         new Set(v).size !== v.length
       )
         return null;
-      out.agents = v as RootAgentKind[];
+      out.agents = v as AgentKind[];
     } else if (k === 'base') {
       const fields = sanitizeFields(v);
       if (!fields) return null;
@@ -263,7 +264,7 @@ function sanitizeEntry(raw: unknown): ModelCatalogOverrideEntry | null {
       return null;
     }
   }
-  const perAgentKeys = Object.keys(out.perAgent ?? {}) as RootAgentKind[];
+  const perAgentKeys = Object.keys(out.perAgent ?? {}) as AgentKind[];
   if (out.agents && perAgentKeys.some((agent) => !out.agents!.includes(agent))) return null;
   if (out.agents === undefined && out.base === undefined && perAgentKeys.length === 0) return null;
   return out;
@@ -281,7 +282,7 @@ function effectiveFields(
 function additionModelFor(
   modelId: string,
   entry: ModelCatalogOverrideEntry,
-  agent: RootAgentKind,
+  agent: AgentKind,
 ): CatalogModel | null {
   const f = effectiveFields(entry, agent);
   if (!f.name || f.contextWindow === undefined || f.efforts === undefined) return null;
@@ -361,7 +362,22 @@ export function sanitizeModelCatalogOverrides(raw: unknown): SanitizeResult {
         invalid.push(`${section}:${key}`);
         continue;
       }
-      const agents = entryRootAgents(entry, parsed.providerId);
+      let agents: AgentKind[] = entryRootAgents(entry, parsed.providerId);
+      // Independent connections may not exist when this file is read. Retain complete
+      // dormant additions; only the actual connection's root policy can materialize them.
+      // Known non-root providers (e.g. the Gateway) remain forbidden.
+      if (section === 'additions' && !BUILTIN_PROVIDERS.some(p => p.id === parsed.providerId)) {
+        const candidates: RootAgentKind[] = ['codex', 'claude-code'];
+        agents = candidates.filter(agent =>
+          (!entry.agents || entry.agents.includes(agent)) &&
+          additionModelFor(parsed.modelId, entry, agent) !== null,
+        );
+      }
+      if (section === 'additions' &&
+        (MODEL_PLANE_POLICIES.has(parsed.providerId) || !BUILTIN_PROVIDERS.some(p => p.id === parsed.providerId)) &&
+        (entry.agents?.includes('pi') || (!entry.agents && additionModelFor(parsed.modelId, entry, 'pi')))) {
+        agents.push('pi');
+      }
       if (section === 'additions' && agents.length === 0) {
         invalid.push(`${section}:${key}`);
         continue;
@@ -459,12 +475,13 @@ export function applyLocalOverridesToRoot(
   models: readonly CatalogModel[],
   overrides: ModelCatalogOverrides,
   warnings: ModelPlaneWarning[] = [],
+  policyProviderId = providerId,
 ): CatalogModel[] {
   let out = [...models];
   for (const [key, entry] of Object.entries(overrides.additions)) {
     const parsed = parseKey(key);
     if (!parsed || parsed.providerId !== providerId) continue;
-    if (!entryRootAgents(entry, providerId).includes(agent)) continue;
+    if (!entryRootAgents(entry, policyProviderId).includes(agent)) continue;
     const model = additionModelFor(parsed.modelId, entry, agent);
     if (!model) continue; // sanitize 已保证自洽;防御留档。
     const index = out.findIndex((m) => m.id === parsed.modelId);
@@ -475,7 +492,7 @@ export function applyLocalOverridesToRoot(
   for (const [key, entry] of Object.entries(overrides.patches)) {
     const parsed = parseKey(key);
     if (!parsed || parsed.providerId !== providerId) continue;
-    if (!entryRootAgents(entry, providerId).includes(agent)) continue;
+    if (!entryRootAgents(entry, policyProviderId).includes(agent)) continue;
     const index = out.findIndex((m) => m.id === parsed.modelId);
     if (index < 0) continue; // dormant:宿主出现当日自动生效。
     // patch 不复活远端 retired(status 字段仍会被 retired 标记流程压回;见
@@ -507,11 +524,12 @@ export function applyLocalConsumerOverrides(
   model: CatalogModel,
   overrides: ModelCatalogOverrides,
   warnings: ModelPlaneWarning[] = [],
+  policyProviderId = providerId,
 ): CatalogModel {
   let out = model;
   for (const section of ['additions', 'patches'] as const) {
-    const entry = overrides[section][`${providerId}:${rootModelId}`];
-    if (!entry || !entryMembershipAgents(entry, providerId).includes(consumer)) continue;
+    const entry = overrides[section][`${encodeURIComponent(providerId)}:${rootModelId}`];
+    if (!entry || !entryMembershipAgents(entry, policyProviderId).includes(consumer)) continue;
     const patched = overlayFields(out, effectiveFields(entry, consumer));
     if (typeof patched === 'string') {
       warnings.push({
@@ -537,15 +555,16 @@ export function resolveLocalBridgeExclusions(
   bridgeAgent: RootAgentKind,
   remoteExcluded: ReadonlySet<string>,
   overrides: ModelCatalogOverrides,
+  policyProviderId = providerId,
 ): Set<string> {
   const out = new Set(remoteExcluded);
   for (const section of ['additions', 'patches'] as const) {
     for (const [key, entry] of Object.entries(overrides[section])) {
       const parsed = parseKey(key);
       if (!parsed || parsed.providerId !== providerId) continue;
-      if (entryRootAgents(entry, providerId).length === 0) continue;
+      if (entryRootAgents(entry, policyProviderId).length === 0) continue;
       if (section === 'patches' && entry.agents === undefined) continue;
-      if (entryMembershipAgents(entry, providerId).includes(bridgeAgent)) {
+      if (entryMembershipAgents(entry, policyProviderId).includes(bridgeAgent)) {
         out.delete(parsed.modelId);
       } else {
         out.add(parsed.modelId);
@@ -561,10 +580,12 @@ export function hasLocalAddition(
   providerId: string,
   modelId: string,
   agent: RootAgentKind,
+  policyProviderId = providerId,
 ): boolean {
   const entry = overrides.additions[`${encodeURIComponent(providerId)}:${modelId}`];
   if (!entry) return false;
-  return entryRootAgents(entry, providerId).includes(agent);
+  return entryRootAgents(entry, policyProviderId).includes(agent) &&
+    additionModelFor(modelId, entry, agent) !== null;
 }
 
 /** A working default must not replace a context value explicitly supplied locally. */
@@ -573,18 +594,32 @@ export function hasLocalContextWindowOverride(
   providerId: string,
   modelId: string,
   agent: AgentKind,
+  policyProviderId = providerId,
 ): boolean {
   return (['additions', 'patches'] as const).some((section) => {
     const entry = overrides[section][`${encodeURIComponent(providerId)}:${modelId}`];
     return (
       entry &&
       (agent === 'pi'
-        // Pi has an independent catalog: only existing-model patches apply to it.
-        // Additions materialize provider roots, even when their membership lists Pi.
-        ? section === 'patches' && (!entry.agents || entry.agents.includes('pi'))
-        : entryMembershipAgents(entry, providerId).includes(agent)) &&
+        ? (!entry.agents || entry.agents.includes('pi'))
+        : entryMembershipAgents(entry, policyProviderId).includes(agent)) &&
       effectiveFields(entry, agent).contextWindow !== undefined
     );
+  });
+}
+
+/** Complete user additions may use an existing subscription's Pi transport. */
+export function localPiAdditionModels(
+  providerId: string,
+  overrides: ModelCatalogOverrides,
+  policyProviderId = providerId,
+): CatalogModel[] {
+  if (!MODEL_PLANE_POLICIES.has(policyProviderId)) return [];
+  return Object.entries(overrides.additions).flatMap(([key, entry]) => {
+    const parsed = parseKey(key);
+    if (!parsed || parsed.providerId !== providerId || (entry.agents && !entry.agents.includes('pi'))) return [];
+    const model = additionModelFor(parsed.modelId, entry, 'pi');
+    return model ? [model] : [];
   });
 }
 
@@ -597,7 +632,11 @@ export function applyExistingModelLocalPatch(
 ): CatalogModel {
   const patch = overrides.patches[`${encodeURIComponent(providerId)}:${model.id}`];
   if (!patch || (patch.agents && !patch.agents.includes(agent))) return model;
-  const result = overlayFields(model, { ...patch.base, ...patch.perAgent?.[agent] });
+  const fields = { ...patch.base, ...patch.perAgent?.[agent] };
+  const source = agent === 'pi' && fields.contextWindow !== undefined
+    ? { ...model, contextWindowMax: model.contextWindowMax ?? model.contextWindow }
+    : model;
+  const result = overlayFields(source, fields);
   return typeof result === 'string'
     ? model
     : model.status === 'retired'

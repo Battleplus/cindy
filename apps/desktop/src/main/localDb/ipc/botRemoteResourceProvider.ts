@@ -1,8 +1,15 @@
+import { getWorkingStatusCopy } from '../../maker-ipc/workingStatus.js';
+import { WORKING_PHASES } from '../../../shared/workingStatus.js';
+import { resolveSystemLocale } from '../../../shared/locale.js';
+import type { botRemoteManagement } from './botRemoteManagement.js';
+import { editorCopy } from './botRemoteEditors.js';
+import { captureDataOwnerBroadcastScope, isDataOwnerBroadcastScopeCurrent } from '../../device-link/broadcast-tap.js';
 import {
   getBotRemoteResourceSource,
   listBotRemoteResourceSources,
 } from './bots.js';
 import { RemoteResourceRegistryError, remoteResourceRegistry } from '../../device-link/remoteResourceRegistry.js';
+import { getBotRemoteMessageService } from '../../maker-ipc/botRemoteMessageReceiver.js';
 import {
   BOT_REMOTE_RESOURCE_KIND,
   TEAMMATES_REMOTE_COLLECTION_ID,
@@ -15,7 +22,7 @@ import {
 let registered = false;
 
 /** Register the Bot module through the same API future host modules use. */
-export function registerBotRemoteResourceProvider(): void {
+export function registerBotRemoteResourceProvider(management?: typeof botRemoteManagement): void {
   if (registered) return;
   remoteResourceRegistry.register({
     collection: {
@@ -24,6 +31,7 @@ export function registerBotRemoteResourceProvider(): void {
       title: TEAMMATES_TITLE,
       placement: 'home-scope',
       icon: { name: 'users', fallbackText: '••' },
+      ...(management ? { actions: [{ id: 'open-create', label: editorCopy.create }] } : {}),
     },
     async list(_context, request) {
       const rawQuery = request.query?.trim().toLocaleLowerCase() ?? '';
@@ -42,14 +50,76 @@ export function registerBotRemoteResourceProvider(): void {
         items,
       };
     },
-    async get(_context, request) {
+    async get(context, request) {
+      if (management && (request.ref.id === 'create' || request.ref.id.startsWith('settings:'))) {
+        return management.getEditor(context, request.ref.id, request.client.locale);
+      }
+      if (request.ref.id.startsWith('working:')) {
+        const [botId, phase, extra] = request.ref.id.slice('working:'.length).split('/');
+        if (extra !== undefined || !botId || !WORKING_PHASES.includes(phase as typeof WORKING_PHASES[number]))
+          throw new RemoteResourceRegistryError('NOT_FOUND', 'Unknown working status');
+        const scope = captureDataOwnerBroadcastScope();
+        const [source] = visibleBotRemoteResourceSources([await getBotRemoteResourceSource(botId)]);
+        if (!source?.canonicalSessionId || !isDataOwnerBroadcastScopeCurrent(scope))
+          throw new RemoteResourceRegistryError('NOT_FOUND', 'Teammate unavailable');
+        const result = await getWorkingStatusCopy({ sessionId: source.canonicalSessionId, phase, locale: resolveSystemLocale(request.client.locale) });
+        if (!isDataOwnerBroadcastScopeCurrent(scope)) throw new RemoteResourceRegistryError('NOT_FOUND', 'Account changed');
+        return { ref: request.ref, revision: String(source.currentVersion), display: { title: source.name }, links: [],
+          blocks: [{ id: 'working', primitive: 'status', fallbackMarkdown: result.text ?? '' }] };
+      }
       const [source] = visibleBotRemoteResourceSources([
         await getBotRemoteResourceSource(request.ref.id),
       ]);
       if (!source) {
         throw new RemoteResourceRegistryError('NOT_FOUND', 'remote resource does not exist');
       }
-      return botRemoteResourceFromSource(source);
+      const resource = management && request.client.primitives.includes('form') ? await management.get(context, source.id) : management && source.invitation ? await management.getInvitation(context, source.id) : botRemoteResourceFromSource(source);
+      if (management && request.client.primitives.includes('form')) {
+        for (const page of ['avatar', 'skills', 'connections'] as const) {
+          const block = resource.blocks?.find(block => block.id === page);
+          const data = { entries: [{ id: page, title: editorCopy[page], resourceId: `settings:${source.id}/${page}` }] };
+          if (block) block.data = data;
+          else resource.blocks?.push({ id: page, primitive: 'list', fallbackMarkdown: '', data });
+        }
+      }
+      return { ...resource, teammateMessaging: { version: 1, available: source.status === 'active' } };
+    },
+    async invoke(context, request) {
+      const scope = captureDataOwnerBroadcastScope();
+      if (request.actionId !== 'send-message' && request.actionId !== 'verify-message' && request.actionId !== 'message-receipt') {
+        if (management) return management.invoke(context, request);
+        throw new RemoteResourceRegistryError('UNSUPPORTED_CAPABILITY', 'Unknown teammate action');
+      }
+      const input = request.input;
+      const validBotId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+      const validMessageId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value);
+      if (!validBotId(request.resourceRef?.id) || !validBotId(request.actionId === 'verify-message' ? input?.targetBotId : input?.senderBotId) || !validMessageId(input?.messageId)
+        || (request.actionId !== 'message-receipt' && (typeof input?.message !== 'string' || !input.message.trim() || input.message.length > 12_000))) {
+        throw new RemoteResourceRegistryError('NOT_FOUND', 'Invalid teammate message');
+      }
+      const [source] = visibleBotRemoteResourceSources([await getBotRemoteResourceSource(request.resourceRef.id)]);
+      if (!source) throw new RemoteResourceRegistryError('NOT_FOUND', 'remote resource does not exist');
+      if (!isDataOwnerBroadcastScopeCurrent(scope)) throw new RemoteResourceRegistryError('NOT_FOUND', 'Account changed');
+      const service = getBotRemoteMessageService();
+      if (!service) throw new RemoteResourceRegistryError('UNSUPPORTED_CAPABILITY', 'Teammate messaging is unavailable');
+      if (request.actionId === 'message-receipt') {
+        const receipt = await service.readRemoteReceipt({ controllerDeviceId: context.controllerDeviceId,
+          senderBotId: input.senderBotId as string, targetBotId: request.resourceRef.id,
+          messageId: input.messageId });
+        return { effects: [], ...receipt };
+      }
+      if (request.actionId === 'verify-message') {
+        const verified = await service.verifyRemoteMessage({ controllerDeviceId: context.controllerDeviceId,
+          senderBotId: request.resourceRef.id, targetBotId: input.targetBotId as string,
+          messageId: input.messageId, message: input.message as string });
+        return { effects: [], verified };
+      }
+      const teammateMessage = await service.receiveRemote({
+        controllerDeviceId: context.controllerDeviceId,
+        senderBotId: input.senderBotId as string, targetBotId: request.resourceRef.id,
+        messageId: input.messageId, message: input.message as string,
+      });
+      return { effects: [], teammateMessage };
     },
   });
   registered = true;

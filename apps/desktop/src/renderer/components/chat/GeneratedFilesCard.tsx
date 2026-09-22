@@ -27,6 +27,7 @@
  * 时间窗约束。远程会话无法读取创建时间,维持远端 stat 的存在性复核。
  */
 
+import { CHAT_FOCUS_CLASS, CHAT_COLOR_TRANSITION_CLASS } from './chatChrome';
 import { memo, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, FileImage, FileText, Globe2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -132,7 +133,7 @@ function DocumentCoverPreview({
             </span>
           )}
         </span>
-        <span className="mt-5 block h-1 w-9 rounded-[9999px] bg-[var(--doc-cover-accent)]" />
+        <span className="mt-5 block h-1 w-9 rounded-full bg-[var(--doc-cover-accent)]" />
         <span className="mt-3 line-clamp-2 text-15 font-semibold leading-5 text-[var(--doc-cover-ink)]">
           {title}
         </span>
@@ -159,7 +160,7 @@ function SlidePreview({ artifact, title }: { artifact: DocumentArtifactMetadata;
       data-document-theme={artifact.theme ?? 'light'}
     >
       <span className="min-w-0">
-        <span className="mx-auto mb-3 block h-1 w-9 rounded-[9999px] bg-[var(--doc-cover-accent)]" />
+        <span className="mx-auto mb-3 block h-1 w-9 rounded-full bg-[var(--doc-cover-accent)]" />
         <span className="block line-clamp-2 text-15 font-semibold leading-5 text-[var(--doc-cover-ink)]">
           {previewTitle}
         </span>
@@ -170,7 +171,7 @@ function SlidePreview({ artifact, title }: { artifact: DocumentArtifactMetadata;
         )}
       </span>
       {artifact.summary && (
-        <span className="absolute bottom-2 right-2 rounded-[9999px] border border-[var(--border-default)] px-2 py-0.5 text-11 text-[var(--doc-cover-muted)]">
+        <span className="absolute bottom-2 right-2 rounded-full border border-[var(--border-default)] px-2 py-0.5 text-11 text-[var(--doc-cover-muted)]">
           {t(`chat.generatedFiles.summary.${artifact.summary.kind}`, {
             count: formatArtifactSummaryValue(artifact.summary),
           })}
@@ -302,19 +303,8 @@ function GeneratedFileChip({
       return;
     }
     if (htmlWithSession) {
-      if (remoteOrigin) {
-        const cachePath = await fetchChatFileWithToasts(
-          remoteOrigin,
-          fileCtx.workingDir,
-          file.path,
-        );
-        if (cachePath && sidebarTargetSessionId) {
-          await openHtmlFileByPreference(sidebarTargetSessionId, cachePath, t);
-        }
-        return;
-      }
       if (sidebarTargetSessionId) {
-        await openHtmlFileByPreference(sidebarTargetSessionId, file.path, t);
+        await openHtmlFileByPreference(sidebarTargetSessionId, file.path, t, fileCtx);
       }
       return;
     }
@@ -356,11 +346,14 @@ function GeneratedFileChip({
         onClick={() => void open()}
         onContextMenu={ctxMenu.onContextMenu}
         className={cn(
-          artifact
-            ? 'group block w-full max-w-[420px] cursor-pointer overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-left transition-colors hover:border-[var(--text-tertiary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]'
-            : presentation === 'bot-primary'
-              ? 'group block min-w-0 flex-1 basis-[220px] cursor-pointer overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-left transition-colors hover:border-[var(--text-tertiary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]'
-              : 'inline-flex h-7 max-w-[280px] items-center gap-1.5 rounded-[9999px] bg-[var(--msg-md-inline-code-bg)] px-2.5 py-1.5 text-13 font-medium text-[var(--msg-assistant-text)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]',
+          CHAT_FOCUS_CLASS,
+          CHAT_COLOR_TRANSITION_CLASS,
+          artifact || presentation === 'bot-primary'
+            ? [
+                'group block cursor-pointer overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-left hover:border-[var(--text-tertiary)]',
+                artifact ? 'w-full max-w-[420px]' : 'min-w-0 flex-1 basis-[220px]',
+              ]
+            : 'inline-flex h-7 max-w-[280px] items-center gap-1.5 rounded-full bg-[var(--msg-md-inline-code-bg)] px-2.5 py-1.5 text-13 font-medium text-[var(--msg-assistant-text)] hover:bg-[var(--cmd-palette-item-hover)]',
         )}
       >
         {artifact ? (
@@ -666,40 +659,51 @@ const MAX_VISIBLE_BOT_ARTIFACTS = 4;
 
 function generatedFilesCardPropsEqual(
   prev: {
+    renderItemKey?: string;
     files: readonly GeneratedFileRef[];
     turnStartMs: number | null;
     turnEndMs: number | null;
     turnSealed?: boolean;
     botArtifacts?: boolean;
+    onVisibilityChange?: (checkKey: string, visible: boolean) => void;
   },
   next: {
+    renderItemKey?: string;
     files: readonly GeneratedFileRef[];
     turnStartMs: number | null;
     turnEndMs: number | null;
     turnSealed?: boolean;
     botArtifacts?: boolean;
+    onVisibilityChange?: (checkKey: string, visible: boolean) => void;
   },
 ): boolean {
   return (
+    prev.renderItemKey === next.renderItemKey &&
     prev.botArtifacts === next.botArtifacts &&
+    prev.onVisibilityChange === next.onVisibilityChange &&
     generatedFilesCheckKey(prev.files, prev.turnStartMs, prev.turnEndMs, prev.turnSealed) ===
       generatedFilesCheckKey(next.files, next.turnStartMs, next.turnEndMs, next.turnSealed)
   );
 }
 
 export const GeneratedFilesCard = memo(function GeneratedFilesCard({
+  renderItemKey,
   files,
   turnStartMs,
   turnEndMs,
   turnSealed = false,
   botArtifacts = false,
+  onVisibilityChange,
 }: {
+  renderItemKey?: string;
   files: readonly GeneratedFileRef[];
   turnStartMs: number | null;
   turnEndMs: number | null;
   turnSealed?: boolean;
   /** 伙伴会话专属：成果优先、辅助文件默认收起。 */
   botArtifacts?: boolean;
+  /** Report the same checked visibility used by the card, never candidate paths. */
+  onVisibilityChange?: (checkKey: string, visible: boolean) => void;
 }) {
   const { t } = useTranslation();
   const fileCtx = useChatSessionFile();
@@ -758,6 +762,9 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
       turnSealed,
     });
     visibleRef.current = plan.visible;
+    // A remounted viewport starts with unknown visibility. Keep the parent's
+    // last confirmation until this check settles instead of reviving prose.
+    if (plan.visible !== null) onVisibilityChange?.(checkKey, plan.visible.length > 0);
     if (plan.visible === null) {
       setExisting(null);
     } else {
@@ -813,6 +820,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
         turnWindowChanged,
       });
       visibleRef.current = merged;
+      onVisibilityChange?.(checkKey, merged.length > 0);
       setExisting((prev) => reuseGeneratedFilesIfUnchanged(prev, merged));
     })();
 
@@ -827,6 +835,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
     turnSealed,
     fileCtx.workingDir,
     remoteVerdictGen,
+    onVisibilityChange,
   ]);
 
   if (!existing || existing.length === 0) return null;
@@ -837,7 +846,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
     const hiddenPrimaryCount = primary.length - visiblePrimary.length;
 
     return (
-      <div className="my-1 flex max-w-[680px] flex-col gap-2" data-testid="bot-generated-artifacts">
+      <div data-render-item-key={renderItemKey} className="my-1 flex max-w-[680px] flex-col gap-2" data-testid="bot-generated-artifacts">
         {primary.length > 0 ? (
           <>
             <span className="text-12 font-medium text-[var(--text-secondary)]">
@@ -852,7 +861,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
               <button
                 type="button"
                 onClick={() => setExpanded(true)}
-                className="flex h-7 w-fit items-center gap-1 rounded-[9999px] px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
+                className="flex h-7 w-fit items-center gap-1 rounded-full px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
               >
                 {t('chat.generatedFiles.showMore', { count: hiddenPrimaryCount })}
                 <ChevronDown size={14} className="shrink-0" />
@@ -862,7 +871,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
               <button
                 type="button"
                 onClick={() => setExpanded(false)}
-                className="flex h-7 w-fit items-center gap-1 rounded-[9999px] px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
+                className="flex h-7 w-fit items-center gap-1 rounded-full px-2.5 py-1.5 text-13 text-[var(--text-secondary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)]"
               >
                 {t('chat.generatedFiles.showLess')}
                 <ChevronUp size={14} className="shrink-0" />
@@ -876,7 +885,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
               type="button"
               onClick={() => setRelatedExpanded((value) => !value)}
               aria-expanded={relatedExpanded}
-              className="flex h-7 items-center gap-1 rounded-[9999px] px-2.5 py-1.5 text-12 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)] hover:text-[var(--text-secondary)]"
+              className="flex h-7 items-center gap-1 rounded-full px-2.5 py-1.5 text-12 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--cmd-palette-item-hover)] hover:text-[var(--text-secondary)]"
             >
               {t('chat.generatedFiles.relatedFiles', { count: related.length })}
               {relatedExpanded ? (
@@ -907,7 +916,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
   const hasOnlyArtifacts = existing.every((file) => file.artifact);
 
   return (
-    <div className="my-1 flex flex-col gap-2">
+    <div data-render-item-key={renderItemKey} className="my-1 flex flex-col gap-2">
       {!hasOnlyArtifacts && (
         <span className="text-12 font-medium text-[var(--text-secondary)]">
           {t('chat.generatedFiles.title')}
@@ -922,7 +931,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
             type="button"
             onClick={() => setExpanded(true)}
             className={cn(
-              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-[9999px]',
+              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-full',
               'text-13 text-[var(--text-secondary)]',
               'hover:bg-[var(--cmd-palette-item-hover)] transition-colors cursor-pointer',
             )}
@@ -936,7 +945,7 @@ export const GeneratedFilesCard = memo(function GeneratedFilesCard({
             type="button"
             onClick={() => setExpanded(false)}
             className={cn(
-              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-[9999px]',
+              'inline-flex items-center gap-1 h-7 px-2.5 py-1.5 rounded-full',
               'text-13 text-[var(--text-secondary)]',
               'hover:bg-[var(--cmd-palette-item-hover)] transition-colors cursor-pointer',
             )}

@@ -1,3 +1,4 @@
+import type { ImMessageSource } from '../../shared/imMessageSource';
 import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 import type { SessionSource } from '../../shared/sessionSource';
 import type { TurnUsageDetails } from '../../shared/turnUsageDetails';
@@ -87,6 +88,10 @@ export interface CcMeta {
    * user bubble was sent as a normal next-turn message or as same-turn 插话.
    */
   delivery?: 'turn' | 'steer';
+  /** Host-owned authorization evidence; IPC callers cannot mint or replace it. */
+  autoReviewUserText?: string
+    | { text: string; acceptedAt: number }
+    | { kind: 'scheduled-continuation' };
 
   /**
    * Host-side origin marker（与 delivery 同类，非 SDK 字段）。
@@ -125,7 +130,9 @@ export interface CcMeta {
    * hook session-runner 注入; renderer 据此渲染 Cindy 署名任务卡片
    * (userText 为卡片正文, 与发给 agent 的完整 prompt 分离)。
    */
-  hookSource?: { im: string; channelName?: string | null; userText?: string; threadContext?: Array<{ author: string; text: string; isBot?: boolean }> };
+  hookSource?: ImMessageSource;
+  /** Local IM metadata stays separate so older clients retain ordinary user actions. */
+  imSource?: ImMessageSource;
 
   /** 历史 per-turn USD；新数据以 turnCost 为区域金额事实。 */
   turnCostUsd?: number;
@@ -179,6 +186,12 @@ export interface CcMeta {
    * 不进 prompt。
    */
   goalNotice?: 'usage-resumed' | 'capacity-resumed';
+
+  /**
+   * Host-side marker:个人版制作任务里 Agent 调用 cindy_make.report_complete 后落的
+   * 完成记录(role:'assistant' + 空 content)。renderer 渲成完成卡片,不进 prompt。
+   */
+  cindyMakeCompletion?: import('../../shared/cindyMakeSession').CindyMakeCompletionMeta;
 
   /** /review 创建的独立只读审查任务及其来源卡状态。 */
   reviewRun?: ReviewRunMeta;
@@ -240,6 +253,7 @@ export interface CcMeta {
 export type AgentMeta = CcMeta;
 
 export interface Session {
+  tags?: import('@cindy/maker-shared').TaskTag[];
   id: string;
   userId: string;
   title: string;
@@ -395,7 +409,8 @@ export interface SessionRuntimePendingProjection {
 // 内存(coordinator projection + store.error),事后点进会话毫无痕迹,红点无从追溯。
 // 'agent_switch':session 内 agent 引擎切换边界行(session-agent-switch,main 落库)。
 // content 为 AgentSwitchContent;渲染成分隔条(可展开查看交接摘要),不是对话正文。
-export type MessageRole = 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'ask_user' | 'plan_review' | 'thinking' | 'error' | 'agent_switch';
+export type MessageRole =
+  | 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'ask_user' | 'plan_review' | 'thinking' | 'error' | 'agent_switch';
 
 /**
  * role='agent_switch' 行的 content 结构(JSON 存于 messages.content)。

@@ -1,4 +1,6 @@
-import { readBotCollaborationMeta, type BotCollaborationMeta } from '@cindy/maker-shared/botCollaboration';
+import { collectPluginInvocations, type PluginInvocation } from './pluginInvocations';
+import { extractPayloadToolResultFiles, extractPayloadToolCardIds, type PayloadToolFile } from '@cindy/maker-shared/payload-summary';
+import { placeBotTaskCardsAfterIntroduction, readBotCollaborationMeta, type BotCollaborationMeta } from '@cindy/maker-shared/botCollaboration';
 import { readBotDirectMessageMeta, type BotDirectMessageMeta } from '@cindy/maker-shared/botDirectMessage';
 import type { RemoteMessage, RemoteMessageRole } from '@/session/types';
 import type { MobileSystemCardType } from '@/session/systemCard';
@@ -50,9 +52,9 @@ import {
   type RemoteMoney,
 } from '@/session/remoteMoney';
 import {
-  localizeToolLoopError,
+  localizeAgentError,
   parseMobileToolLoopErrorDetails,
-} from '@/session/toolLoopErrorI18n';
+} from '@/session/agentErrorI18n';
 import type { MobileToolInputProjection } from '@/session/messageToolPayloadProjection';
 
 export type NormalizedRemoteMessageKind =
@@ -87,6 +89,9 @@ export interface NormalizedRemoteMessage {
   /** user 专用：目标桌面落库的引用范围摘要，不含被引用消息正文。 */
   sessionReferences?: MobilePersistedSessionReferenceMetadata[];
   media?: NormalizedToolMedia[];
+  files?: PayloadToolFile[];
+  cardIds?: string[];
+  pluginInvocations?: PluginInvocation[];
   diff?: NormalizedToolDiff;
   align: 'user' | 'agent';
   createdAt: string;
@@ -159,6 +164,7 @@ export interface NormalizedAttachment {
 export interface NormalizedToolMedia {
   kind: 'image' | 'video' | 'audio';
   url: string;
+  mimeType?: string;
   title?: string;
   previewable: boolean;
   actions?: NormalizedToolMediaActions;
@@ -191,8 +197,28 @@ interface ToolUsePayload extends MessageNormalizeToolUse {
 const toolResultPreviewByContent = new WeakMap<object, { language: string; preview: string }>();
 const toolUsePayloadByMessage = new WeakMap<RemoteMessage, ToolUsePayload>();
 
-export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): NormalizedRemoteMessage[] {
-  const sorted = sortMessagesByCreatedAt(messages);
+export function normalizeRemoteMessages(
+  messages: readonly RemoteMessage[],
+  options: { preserveSourceOrder?: boolean } = {},
+): NormalizedRemoteMessage[] {
+  // History views already place live tails after their persisted prefix. A live
+  // row's provisional timestamp must not undo that order during normalization.
+  const sorted = placeBotTaskCardsAfterIntroduction(
+    options.preserveSourceOrder ? messages : sortMessagesByCreatedAt(messages),
+    (message) => {
+      if (message.role === 'user') {
+        return message.agentMeta?.delivery !== 'steer' || message.agentMeta?.synthetic
+          ? 'boundary' : 'other';
+      }
+      if (message.role !== 'assistant' || message.agentMeta?.parentUuid || message.systemCardType)
+        return 'other';
+      const task = readBotCollaborationMeta(message.agentMeta?.botCollaboration);
+      if (task?.role === 'delegation-request') return 'task';
+      if (task || message.agentMeta?.botDirectMessage || message.agentMeta?.botAuthorization)
+        return 'other';
+      return typeof message.content === 'string' && message.content.trim() ? 'prose' : 'other';
+    },
+  );
   const toolResultPairing = buildMessageToolResultPairing(sorted, {
     contentToPreview: toolResultContentToPreview,
   });
@@ -212,12 +238,14 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
 
       const task = readBotCollaborationMeta(message.agentMeta?.botCollaboration);
       const direct = readBotDirectMessageMeta(message.agentMeta?.botDirectMessage);
-      if (task?.role === 'delegation-request' || task?.role === 'interjection' || direct) {
+      const isTaskTrace = task?.role === 'delegation-request' || task?.role === 'interjection';
+      if (isTaskTrace || direct) {
         result.push({
           key: messageNormalizeKey(message), source: message, kind: 'system', role: message.role,
-          label: 'companion', body: typeof message.content === 'string' ? message.content : '',
+          // Task traces are status-only, including legacy rows containing execution instructions.
+          label: 'companion', body: isTaskTrace ? '' : typeof message.content === 'string' ? message.content : '',
           align: 'agent', createdAt: message.createdAt,
-          companion: task && (task.role === 'delegation-request' || task.role === 'interjection')
+          companion: isTaskTrace
             ? { kind: 'task', meta: task } : { kind: 'direct', meta: direct! },
         });
         continue;
@@ -258,6 +286,8 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
         body: tool.summary,
         secondaryBody,
         media: extractToolResultMedia(secondaryBody ?? ''),
+        files: extractPayloadToolResultFiles(secondaryBody ?? ''),
+        cardIds: extractPayloadToolCardIds(secondaryBody ?? ''),
         diff: tool.diff,
         align: 'agent',
         createdAt: message.createdAt,
@@ -296,7 +326,7 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
       const rawText = typeof c?.message === 'string' ? c.message : contentToPreview(message.content);
       const toolLoop = parseMobileToolLoopErrorDetails(c?.toolLoop);
       const errText =
-        describeAgentAuthError(rawText) ?? localizeToolLoopError(c?.reason, toolLoop) ?? rawText;
+        describeAgentAuthError(rawText) ?? localizeAgentError(c?.reason, toolLoop) ?? rawText;
       result.push({
         key: messageNormalizeKey(message),
         source: message,
@@ -477,6 +507,12 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
     });
   }
 
+  const pluginInvocations = collectPluginInvocations(sorted, toolResultPairing);
+  for (const row of result) {
+    if (row.kind === 'user' && !row.isSyntheticTrigger && !row.hookSource && !row.automationOrigin) {
+      row.pluginInvocations = pluginInvocations.get(row.source.clientId || row.source.id);
+    }
+  }
   dedupeToolImagesAgainstAssistantMarkdown(result);
   return result;
 }
@@ -495,10 +531,15 @@ function dedupeToolImagesAgainstAssistantMarkdown(
       if (message.kind !== 'assistant') continue;
       for (const image of collectMobileMarkdownImages(message.body)) inlineUrls.add(image.url);
     }
-    if (inlineUrls.size === 0) return;
+    const cards = new Set<string>();
     for (const message of messages.slice(lo, hi)) {
-      if (message.kind !== 'tool' || !message.media?.length) continue;
-      message.media = message.media.filter(
+      if (message.kind !== 'tool') continue;
+      message.cardIds = message.cardIds?.filter((id) => {
+        if (cards.has(id)) return false;
+        cards.add(id);
+        return true;
+      });
+      message.media = message.media?.filter(
         (item) => item.kind !== 'image' || !inlineUrls.has(item.url),
       );
     }

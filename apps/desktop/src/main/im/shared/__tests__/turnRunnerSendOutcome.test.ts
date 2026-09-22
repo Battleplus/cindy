@@ -6,20 +6,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  Maker,
+  Session,
   MAIN_OWNED_SEND_CONTEXT,
   TurnPermissionPolicyUnsupportedError,
 } from '@cindy/maker-core';
 import type {
+  AgentSessionHandle,
+  BaseAgent,
+  SessionStorage,
   AgentEvent,
   Capabilities,
   InteractionDecision,
   InteractionRequest,
   MakerEvent,
-  Session,
   SessionSendResult,
   TurnPermissionPolicy,
 } from '@cindy/maker-core';
 import type { ChannelIM } from '@cindy/im';
+import { setMainLocale } from '../../../i18n';
+import { enqueueAskCardPatch } from '../askCardPatchQueue';
+import { createSerializedConnectionLifecycle } from '../../connectionLifecycle';
 
 const mocks = vi.hoisted(() => ({
   logger: {
@@ -64,7 +71,7 @@ const mocks = vi.hoisted(() => ({
   takePendingInteractionsForSession: vi.fn(),
   // 取消不到时返回 null(取消到了返回 { messageId }, 调用方据此收口卡片)。
   cancelPending: vi.fn(() => null),
-  rejectAllPending: vi.fn(),
+  rejectAllPending: vi.fn<(reason: string, owner?: symbol) => Array<{ requestId: string; messageId: string }>>(() => []),
   registerPending: vi.fn(),
   registerPendingExternal: vi.fn(),
   buildPermissionCard: vi.fn(),
@@ -336,6 +343,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 
 function createMakerHarness(session: Session) {
   return {
+    getSession: vi.fn(() => session),
     createSession: vi.fn(async () => session),
     on: vi.fn((listener: (event: MakerEvent) => void) => {
       makerEventListeners.push(listener);
@@ -421,6 +429,7 @@ function setupSessionWithId(
 }
 
 interface TurnOverrides {
+  contextSnapshot?: { groupContext?: string; replyContext?: string };
   userMessageId?: string;
   text?: string;
   agentText?: string;
@@ -444,6 +453,7 @@ async function startDefaultTurn(onTurnComplete = vi.fn(), overrides: TurnOverrid
     userMessageId: overrides.userMessageId ?? 'msg-user',
     text: overrides.text ?? 'PROMPT_SECRET full user message TOKEN_VALUE file body',
     ...(overrides.agentText ? { agentText: overrides.agentText } : {}),
+    contextSnapshot: overrides.contextSnapshot,
     attachments: [],
     onTurnComplete,
     ...(overrides.onRouteResolved ? { onRouteResolved: overrides.onRouteResolved } : {}),
@@ -614,6 +624,71 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     await runDefaultTurn();
 
     expect(mocks.beginTurnChangeSetAtDispatch).toHaveBeenCalledWith(h.session, 'im-anchor-client');
+    expect(mocks.persistUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({ im: 'feishu', contextSnapshot: {} }),
+      }),
+    );
+  });
+
+  it('uses the adapter service identity for both early persistence and accepted enrichment', async () => {
+    fakeAdapter.messageSourceIm = () => 'lark';
+    try {
+      const h = setupSession(async () => ({ accepted: true }));
+      mocks.getMaker.mockReturnValue({
+        ...createMakerHarness(h.session),
+        getSession: () => h.session,
+      });
+      mocks.persistUserMessage.mockResolvedValue({ clientId: 'early-client' });
+      await getRunner().persistInboundUserMessageEarly!({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        text: 'question',
+      });
+      expect(mocks.persistUserMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          source: expect.objectContaining({ im: 'lark', contextSnapshot: {} }),
+        }),
+      );
+
+      await runDefaultTurn(vi.fn(), {
+        prePersistedUserMessage: { sessionId: 'feishu-session', clientId: 'early-client' },
+        contextSnapshot: { groupContext: 'saved background' },
+      });
+      expect(mocks.persistUserMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          existingClientId: 'early-client',
+          source: expect.objectContaining({
+            im: 'lark',
+            contextSnapshot: { groupContext: 'saved background' },
+          }),
+        }),
+      );
+      expect(fakeAdapter.channel).toBe('feishu');
+    } finally {
+      delete fakeAdapter.messageSourceIm;
+    }
+  });
+
+  it('marks early IM rows with an empty snapshot rather than parsing the user body as context', async () => {
+    const h = setupSession(async () => ({ accepted: true }));
+    mocks.getMaker.mockReturnValue({
+      ...createMakerHarness(h.session),
+      getSession: () => h.session,
+    });
+    mocks.persistUserMessage.mockResolvedValue({ clientId: 'early-client' });
+    const text = '<group_chat_context>\n[群里最近的消息]\nuser pasted this\n</group_chat_context>';
+    await getRunner().persistInboundUserMessageEarly!({
+      botContextId: 'cli_test_bot',
+      userId: 'ou_user',
+      text,
+    });
+    expect(mocks.persistUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text,
+        source: { im: 'feishu', userText: text, contentFormat: 'user-text', contextSnapshot: {} },
+      }),
+    );
   });
 
   /**
@@ -622,12 +697,22 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
    */
   it('reuses a pre-persisted user message instead of writing a second row', async () => {
     const h = setupSession(async () => ({ accepted: true }));
+    mocks.persistUserMessage.mockResolvedValue({ clientId: 'early-client' });
 
     await runDefaultTurn(vi.fn(), {
       prePersistedUserMessage: { sessionId: 'feishu-session', clientId: 'early-client' },
+      contextSnapshot: { groupContext: '[Alice] saved background' },
     });
 
-    expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+    expect(mocks.persistUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingClientId: 'early-client',
+        source: expect.objectContaining({
+          im: 'feishu',
+          contextSnapshot: { groupContext: '[Alice] saved background' },
+        }),
+      }),
+    );
     expect(mocks.beginTurnChangeSetAtDispatch).toHaveBeenCalledWith(h.session, 'early-client');
   });
 
@@ -1030,7 +1115,105 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     expect(mocks.persistUserMessage).not.toHaveBeenCalled();
   });
 
-  it('applies a deferred switch and sends the first queued IM message through the refreshed session', async () => {
+  it('sends retirement recovery separately after the personal IM turn has completed', async () => {
+    setMainLocale('zh-CN');
+    const terminal = deferred<void>();
+    const ended = deferred<void>();
+    const closeFailure = deferred<void>();
+    let running = false;
+    const handle = {
+      id: 'pi', agentKind: 'pi', model: 'm',
+      send: vi.fn(async () => { running = true; }),
+      close: vi.fn(async () => { await closeFailure.promise; throw new Error('exit unconfirmed'); }),
+      isTurnRunning: () => running, setInteractionResolver() {},
+      async *events() {
+        await terminal.promise;
+        yield { type: 'text', data: { text: 'saved result', isFinal: true }, source: 'pi' } as AgentEvent;
+        running = false;
+        yield { type: 'done', data: { status: 'completed' }, source: 'pi' } as AgentEvent;
+        await ended.promise;
+      },
+    } as unknown as AgentSessionHandle;
+    const logger = { ...mocks.logger, trace() {}, fatal() {}, child() { return this; } };
+    const session = new Session({ id: 'feishu-session', agentKind: 'pi', workDir: '/repo',
+      handle, capabilities: {} as Capabilities, logger, turnStallMs: 0 });
+    mocks.getMaker.mockReturnValue(createMakerHarness(session));
+    const complete = vi.fn();
+    try {
+      await runDefaultTurn(complete);
+      expect(await session.closeAfterCurrentTurn({ failureEvent: () => ({ type: 'text', data: {
+        text: 'restart-cindy-to-refresh-packages', isFinal: true,
+      } }) })).toBe('deferred');
+      terminal.resolve();
+      await waitForAssertion(() => expect(complete).toHaveBeenCalledOnce());
+      mocks.feishuIm.sendText.mockClear();
+      closeFailure.resolve();
+      await waitForAssertion(() => expect(session.getStatus()).toBe('error'));
+      expect(mocks.feishuIm.sendText).toHaveBeenCalledExactlyOnceWith('ou_user',
+        'Pi 扩展未能完成刷新。请重启 Cindy 后再使用 Pi。', { threadTs: undefined });
+      expect(complete).toHaveBeenCalledOnce();
+      expect(handle.send).toHaveBeenCalledOnce();
+    } finally {
+      closeFailure.resolve();
+      vi.mocked(handle.close).mockImplementation(async () => { ended.resolve(); });
+      await session.close();
+      setMainLocale('en');
+    }
+  });
+
+  it('preserves queued IM input when an explicit switch takes over pending Pi retirement', async () => {
+    function handle(kind: 'pi' | 'claude-code') {
+      let end!: () => void;
+      const ended = new Promise<void>(resolve => { end = resolve; });
+      return {
+        id: kind, agentKind: kind, model: 'm',
+        send: vi.fn(async () => {}), close: vi.fn(async () => { end(); }),
+        isTurnRunning: () => false, setInteractionResolver() {},
+        async *events() { await ended; yield* [] as AgentEvent[]; },
+      } as unknown as AgentSessionHandle;
+    }
+    const oldHandle = handle('pi'), newHandle = handle('claude-code');
+    const agent = (kind: 'pi' | 'claude-code', runtime: AgentSessionHandle) => ({
+      kind, capabilities: {}, startSession: vi.fn(async () => runtime),
+    }) as unknown as BaseAgent;
+    const storage = {
+      get: vi.fn(async () => null),
+      create: vi.fn(async meta => ({ ...meta, createdAt: 1, updatedAt: 1 })),
+      update: vi.fn(async () => {}), list: vi.fn(async () => []), delete: vi.fn(async () => {}),
+    } as unknown as SessionStorage;
+    const logger = { ...mocks.logger, trace() {}, fatal() {}, child() { return this; } };
+    const maker = new Maker({ agents: { pi: agent('pi', oldHandle), 'claude-code': agent('claude-code', newHandle) }, storage, logger });
+    const old = await maker.createSession({ id: 'feishu-session', agentKind: 'pi', workingDir: '/repo', model: 'm' });
+    const closeEvents: MakerEvent[] = [];
+    maker.on(event => { if (event.type === 'session:closed') closeEvents.push(event); });
+    mocks.getMaker.mockReturnValue(maker);
+    const releaseSwitch = vi.fn();
+    const acquirePendingAgentSwitch = vi.fn(async () => {
+      const release = old.acquireTurnLease()!;
+      expect(await maker.closeSessionIfCurrent(old, 'runtime-refresh', { afterCurrentTurn: true })).toBe('deferred');
+      try {
+        await maker.closeSession(old.id, 'agent-switch');
+        await maker.createSession({ id: old.id, agentKind: 'claude-code', workingDir: '/repo', model: 'm' });
+      } finally { release(); }
+      return releaseSwitch;
+    });
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, { acquirePendingAgentSwitch });
+    try {
+      await localRunner.runAgentTurn({ botContextId: 'cli_test_bot', userId: 'ou_user',
+        userMessageId: 'switch-after-retirement', text: 'send to the selected engine', attachments: [] });
+      expect(acquirePendingAgentSwitch).toHaveBeenCalledOnce();
+      expect(newHandle.send).toHaveBeenCalledOnce();
+      expect(oldHandle.send).not.toHaveBeenCalled();
+      expect(closeEvents).toEqual([{ type: 'session:closed', sessionId: old.id, session: old, reason: 'agent-switch' }]);
+      expect(localRunner.getMakerSessionById(old.id)).toBe(maker.getSession(old.id));
+      expect(releaseSwitch).toHaveBeenCalledOnce();
+    } finally {
+      localRunner.disposeAllSessions();
+      await maker.closeSession(old.id);
+    }
+  });
+
+  it.each(['agent-switch', 'runtime-refresh'] as const)('preserves queued IM input across a %s close during send', async (reason) => {
     const order: string[] = [];
     const turnPermissionPolicy: TurnPermissionPolicy = {
       origin: { kind: 'im', channel: 'wechat' },
@@ -1077,7 +1260,7 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
         type: 'session:closed',
         sessionId: 'feishu-session',
         session: oldSession.session,
-        reason: 'agent-switch',
+        reason,
       });
       return releaseAgentSwitchLock;
     });
@@ -1459,6 +1642,267 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
       expect(localRunner.getMakerSessionById('feishu-session')).toBeNull();
     } finally {
       localRunner.disposeAllSessions();
+    }
+  });
+
+  it.each([
+    { reason: 'runtime-refresh', precedingRefresh: false },
+    { reason: 'requested', precedingRefresh: false },
+    { reason: 'unexpected', precedingRefresh: false },
+    { reason: 'runtime-refresh', precedingRefresh: true },
+    { reason: 'requested', precedingRefresh: true },
+    { reason: 'unexpected', precedingRefresh: true },
+  ] as const)(
+    'handles $reason outside switch acquisition with precedingRefresh=$precedingRefresh',
+    async ({ reason, precedingRefresh }) => {
+      vi.useFakeTimers();
+      const oldSession = createSessionHarness(async () => ({ accepted: true }));
+      const replacement = createSessionHarness(async () => ({ accepted: true }));
+      oldSession.isTurnRunning.mockReturnValue(true);
+      let live: Session | undefined = oldSession.session;
+      const maker = {
+        createSession: vi.fn(async () => oldSession.session),
+        getSession: vi.fn(() => live),
+        on: vi.fn((listener: (event: MakerEvent) => void) => {
+          makerEventListeners.push(listener);
+          return () => {
+            makerEventListeners = makerEventListeners.filter((candidate) => candidate !== listener);
+          };
+        }),
+      };
+      mocks.getMaker.mockReturnValue(maker);
+      const acquirePendingAgentSwitch = vi.fn(async () => vi.fn());
+      const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+        acquirePendingAgentSwitch,
+      });
+      const firstComplete = vi.fn();
+      const secondComplete = vi.fn();
+      try {
+        for (const [index, onTurnComplete] of [firstComplete, secondComplete].entries()) {
+          await localRunner.runAgentTurn({
+            botContextId: 'cli_test_bot', userId: 'ou_user',
+            userMessageId: `queued-${index}`, text: `message-${index}`, attachments: [],
+            onTurnComplete,
+          });
+        }
+        expect(acquirePendingAgentSwitch).not.toHaveBeenCalled();
+        oldSession.isTurnRunning.mockReturnValue(false);
+        const intermediate = createSessionHarness(async () => ({ accepted: true }));
+        if (precedingRefresh) {
+          live = undefined;
+          emitMakerEvent({
+            type: 'session:closed', sessionId: 'feishu-session',
+            session: oldSession.session, reason: 'runtime-refresh',
+          });
+          live = intermediate.session;
+          expect(localRunner.getMakerSessionById('feishu-session')).toBe(intermediate.session);
+        }
+        live = undefined;
+        emitMakerEvent({
+          type: 'session:closed', sessionId: 'feishu-session',
+          session: precedingRefresh ? intermediate.session : oldSession.session, reason,
+        });
+        // Model-card effort/permission actions must not target the retired runtime.
+        expect(localRunner.getMakerSessionById('feishu-session')).toBeNull();
+        live = replacement.session;
+        expect(localRunner.getMakerSessionById('feishu-session')).toBe(
+          reason === 'runtime-refresh' ? replacement.session : null,
+        );
+        await vi.advanceTimersByTimeAsync(600);
+        expect(oldSession.send).not.toHaveBeenCalled();
+        expect(intermediate.send).not.toHaveBeenCalled();
+        if (reason !== 'runtime-refresh') {
+          expect(replacement.send).not.toHaveBeenCalled();
+          expect(localRunner.getMakerSessionById('feishu-session')).toBeNull();
+          expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+          expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledTimes(2);
+          return;
+        }
+        expect(replacement.send).toHaveBeenCalledTimes(1);
+        expect(firstComplete).not.toHaveBeenCalled();
+        expect(secondComplete).not.toHaveBeenCalled();
+        expect(localRunner.getMakerSessionById('feishu-session')).toBe(replacement.session);
+        // An old instance's late close cannot cancel the replacement or queued input.
+        emitMakerEvent({
+          type: 'session:closed', sessionId: 'feishu-session',
+          session: oldSession.session, reason: 'unexpected',
+        });
+        replacement.emit({ type: 'done', data: {} });
+        await vi.advanceTimersByTimeAsync(600);
+        expect(replacement.send).toHaveBeenCalledTimes(2);
+        expect(firstComplete).toHaveBeenCalledOnce();
+        expect(secondComplete).not.toHaveBeenCalled();
+        expect(replacement.send.mock.calls.map(([message]) => message)).toEqual([
+          expect.objectContaining({ content: 'message-0' }),
+          expect.objectContaining({ content: 'message-1' }),
+        ]);
+        replacement.emit({ type: 'done', data: {} });
+        await vi.advanceTimersByTimeAsync(600);
+        expect(secondComplete).toHaveBeenCalledOnce();
+      } finally {
+        localRunner.disposeAllSessions();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    { operation: 'stop', queued: true },
+    { operation: 'stop', queued: false },
+    { operation: 'dispose', queued: true },
+    { operation: 'dispose', queued: false },
+  ] as const)(
+    '$operation targets the current runtime after refresh with queued=$queued',
+    async ({ operation, queued }) => {
+      vi.useFakeTimers();
+      const oldSession = createSessionHarness(async () => ({ accepted: true }));
+      const replacement = createSessionHarness(async () => ({ accepted: true }));
+      oldSession.isTurnRunning.mockReturnValue(queued);
+      replacement.isTurnRunning.mockReturnValue(true);
+      let live: Session | undefined = oldSession.session;
+      mocks.getMaker.mockReturnValue({
+        createSession: vi.fn(async () => oldSession.session),
+        getSession: vi.fn(() => live),
+        on: vi.fn((listener: (event: MakerEvent) => void) => {
+          makerEventListeners.push(listener);
+          return () => {
+            makerEventListeners = makerEventListeners.filter((candidate) => candidate !== listener);
+          };
+        }),
+      });
+      const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+        acquirePendingAgentSwitch: vi.fn(async () => vi.fn()),
+      });
+      try {
+        await localRunner.runAgentTurn({
+          botContextId: 'cli_test_bot', userId: 'ou_user',
+          userMessageId: 'queued-control', text: 'queued input', attachments: [],
+        });
+        if (!queued) {
+          oldSession.emit({ type: 'done', data: {} });
+          await vi.advanceTimersByTimeAsync(600);
+          oldSession.send.mockClear();
+        }
+        oldSession.isTurnRunning.mockReturnValue(false);
+        live = undefined;
+        emitMakerEvent({
+          type: 'session:closed', sessionId: 'feishu-session',
+          session: oldSession.session, reason: 'runtime-refresh',
+        });
+        live = replacement.session;
+        if (operation === 'stop') {
+          expect(await localRunner.stopActiveTurn({
+            botContextId: 'cli_test_bot', userId: 'ou_user',
+          })).toEqual({ stopped: true, droppedQueued: queued ? 1 : 0 });
+          expect(replacement.abort).toHaveBeenCalledOnce();
+        } else {
+          await localRunner.disposeOneSession('feishu-session');
+          expect(replacement.session.close).toHaveBeenCalledOnce();
+          expect(localRunner.getMakerSessionById('feishu-session')).toBeNull();
+        }
+        expect(oldSession.abort).not.toHaveBeenCalled();
+        expect(oldSession.session.close).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(600);
+        expect(oldSession.send).not.toHaveBeenCalled();
+        expect(replacement.send).not.toHaveBeenCalled();
+      } finally {
+        await localRunner.disposeAllSessions();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['rich-card', 'chunked-text', 'chunked-final-error'] as const)(
+    'cancels stopped input waiting for the send lock with %s output', async (outputKind) => {
+    const previousOutput = fakeAdapter.output;
+    const beginReply = vi.fn(async () => undefined);
+    const commitFinal = vi.fn(async () => undefined);
+    if (outputKind !== 'rich-card') {
+      fakeAdapter.output = {
+        kind: 'chunked-text', im: mocks.feishuIm as unknown as ChannelIM, beginReply, commitFinal,
+      };
+      if (outputKind === 'chunked-final-error') commitFinal.mockRejectedValueOnce(new Error('disconnected'));
+    }
+    const oldSession = createSessionHarness(async () => ({ accepted: true }));
+    const replacement = createSessionHarness(async () => ({ accepted: true }));
+    let live: Session | undefined = oldSession.session;
+    const lockEntered = deferred<void>();
+    const releaseRefresh = deferred<void>();
+    const releaseLock = vi.fn();
+    mocks.getMaker.mockReturnValue({
+      createSession: vi.fn(async () => oldSession.session),
+      getSession: vi.fn(() => live),
+      on: vi.fn((listener: (event: MakerEvent) => void) => {
+        makerEventListeners.push(listener);
+        return () => {
+          makerEventListeners = makerEventListeners.filter((candidate) => candidate !== listener);
+        };
+      }),
+    });
+    const acquirePendingAgentSwitch = vi.fn(async () => releaseLock);
+    acquirePendingAgentSwitch.mockImplementationOnce(async () => {
+      live = undefined;
+      emitMakerEvent({
+        type: 'session:closed', sessionId: 'feishu-session',
+        session: oldSession.session, reason: 'runtime-refresh',
+      });
+      lockEntered.resolve(undefined);
+      await releaseRefresh.promise;
+      return releaseLock;
+    });
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+      acquirePendingAgentSwitch,
+    });
+    const complete = vi.fn();
+    try {
+      const first = localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot', userId: 'ou_user',
+        userMessageId: 'stop-before-send', text: 'cancel me', attachments: [],
+        onTurnComplete: complete,
+      });
+      await lockEntered.promise;
+      expect(await localRunner.stopActiveTurn({
+        botContextId: 'cli_test_bot', userId: 'ou_user',
+      })).toEqual({ stopped: true, droppedQueued: 0 });
+      live = replacement.session;
+      releaseRefresh.resolve(undefined);
+      await first;
+      expect(oldSession.send).not.toHaveBeenCalled();
+      expect(replacement.send).not.toHaveBeenCalled();
+      expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+      expect(complete).toHaveBeenCalledOnce();
+      expect(releaseLock).toHaveBeenCalledOnce();
+      if (outputKind !== 'rich-card') {
+        expect(beginReply).toHaveBeenCalledOnce();
+        expect(commitFinal).toHaveBeenCalledExactlyOnceWith({
+          userId: 'ou_user', text: fakeAdapter.ui.agent.stopDone(0),
+          terminal: 'aborted', threadTs: undefined,
+        });
+      } else {
+        expect(commitFinal).not.toHaveBeenCalled();
+      }
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot', userId: 'ou_user',
+        userMessageId: 'after-stop', text: 'fresh input', attachments: [],
+      });
+      expect(replacement.send).toHaveBeenCalledOnce();
+      expect(replacement.send).toHaveBeenCalledWith(
+        expect.objectContaining({ content: 'fresh input' }), expect.anything(),
+      );
+      if (outputKind !== 'rich-card') {
+        expect(beginReply).toHaveBeenCalledTimes(2);
+        expect(commitFinal.mock.invocationCallOrder[0]).toBeLessThan(beginReply.mock.invocationCallOrder[1]!);
+        replacement.emit({ type: 'text', data: { text: 'fresh response', isFinal: true } });
+        replacement.emit({ type: 'done', data: {} });
+        await waitForAssertion(() => expect(commitFinal).toHaveBeenCalledTimes(2));
+        expect(commitFinal).toHaveBeenLastCalledWith(expect.objectContaining({
+          text: 'fresh response', terminal: 'done',
+        }));
+      }
+    } finally {
+      fakeAdapter.output = previousOutput;
+      releaseRefresh.resolve(undefined);
+      await localRunner.disposeAllSessions();
     }
   });
 
@@ -2924,6 +3368,106 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     await flushMicrotasks();
     expect(h.send).toHaveBeenCalledTimes(1);
     expect(mocks.persistUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds disposal when an expiry fails and another channel update stalls', async () => {
+    const stalled = deferred<void>();
+    const update = vi.fn()
+      .mockRejectedValueOnce(new Error('channel closing'))
+      .mockImplementationOnce(() => stalled.promise);
+    const card = { body: 'expired', buttons: [] };
+    const localRunner = createTurnRunner({
+      ...fakeAdapter,
+      interactionExpiredNotice: 'expired',
+      output: { kind: 'rich-card', im: { ...mocks.feishuIm, updateInteractiveCard: update } as unknown as ChannelIM },
+    }, fakeRepo, { ...fakeCards, buildResolvedCard: vi.fn(() => card) } as unknown as ImCardBuilders);
+    mocks.rejectAllPending.mockReturnValueOnce([
+      { requestId: 'dispose-first', messageId: 'first' },
+      { requestId: 'dispose-second', messageId: 'second' },
+    ]);
+    await localRunner.disposeAllSessions();
+    await flushMicrotasks();
+    expect(mocks.rejectAllPending).toHaveBeenLastCalledWith('session_disposed', expect.any(Symbol));
+    expect(update).toHaveBeenNthCalledWith(1, 'first', card);
+    expect(update).toHaveBeenNthCalledWith(2, 'second', card);
+    expect(mocks.logger.warn).toHaveBeenCalledWith(expect.stringContaining('channel closing'));
+    stalled.resolve(undefined);
+    await flushMicrotasks();
+  });
+
+  it('finishes expiry before stopping the transport and allowing a reconnect', async () => {
+    const updating = deferred<void>();
+    let connected = false;
+    const events: string[] = [];
+    const update = vi.fn(async () => {
+      expect(connected).toBe(true);
+      events.push('expiry:start');
+      await updating.promise;
+      expect(connected).toBe(true);
+      events.push('expiry:end');
+    });
+    const localRunner = createTurnRunner({
+      ...fakeAdapter,
+      interactionExpiredNotice: 'expired',
+      output: { kind: 'rich-card', im: { ...mocks.feishuIm, updateInteractiveCard: update } as unknown as ChannelIM },
+    }, fakeRepo, fakeCards);
+    const lifecycle = createSerializedConnectionLifecycle({
+      startConnection: async () => { connected = true; events.push('connect'); },
+      beforeStopConnection: () => localRunner.disposeAllSessions(),
+      stopConnection: async () => { connected = false; events.push('disconnect'); },
+      onStartError: vi.fn(),
+    });
+    lifecycle.start();
+    await flushMicrotasks();
+    mocks.rejectAllPending.mockReturnValueOnce([{ requestId: 'order-expiry', messageId: 'old-card' }]);
+    const stopping = lifecycle.stop('logout');
+    lifecycle.start();
+    await waitForAssertion(() => expect(events).toEqual(['connect', 'expiry:start']));
+    updating.resolve(undefined);
+    await stopping;
+    await waitForAssertion(() => expect(events).toEqual(['connect', 'expiry:start', 'expiry:end', 'disconnect', 'connect']));
+    await lifecycle.stop();
+  });
+
+  it('skips an expiry still queued behind a patch when disposal times out', async () => {
+    vi.useFakeTimers();
+    const toggle = deferred<void>();
+    const previous = enqueueAskCardPatch('queued-expiry', () => toggle.promise);
+    const update = vi.fn(async () => undefined);
+    const localRunner = createTurnRunner({
+      ...fakeAdapter,
+      interactionExpiredNotice: 'expired',
+      output: { kind: 'rich-card', im: { ...mocks.feishuIm, updateInteractiveCard: update } as unknown as ChannelIM },
+    }, fakeRepo, fakeCards);
+    try {
+      mocks.rejectAllPending.mockReturnValueOnce([{ requestId: 'queued-expiry', messageId: 'old-card' }]);
+      let disposed = false;
+      const disposing = localRunner.disposeAllSessions().then(() => { disposed = true; });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(disposed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await disposing;
+      expect(disposed).toBe(true);
+      toggle.resolve(undefined);
+      await previous;
+      await flushMicrotasks();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      toggle.resolve(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains optional expiry capability and distinct runner identities', async () => {
+    const first = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+    const second = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+    mocks.rejectAllPending.mockReturnValueOnce([{ requestId: 'no-expiry', messageId: 'legacy' }]);
+    await first.disposeAllSessions();
+    await second.disposeAllSessions();
+    await flushMicrotasks();
+    const calls = mocks.rejectAllPending.mock.calls;
+    expect(calls.at(-2)?.[1]).not.toBe(calls.at(-1)?.[1]);
+    expect(mocks.feishuIm.updateInteractiveCard).not.toHaveBeenCalled();
   });
 
   it('disposeAllSessions aborts and awaits an IM-owned in-flight turn', async () => {

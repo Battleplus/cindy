@@ -48,14 +48,17 @@ import {
   findModelRegistryRoute,
   resolveModelNativeApi,
   projectXaiApiImageModels,
+  isOpenAiSubscriptionProvider,
+  providerCatalogId,
   type AgentKind,
   type Catalog,
   type CatalogCapabilityEvidence,
   type CatalogXdMediaKind,
   type CatalogModel,
   type CustomProviderConfig,
-  type PiModelApi,
+  type PiModelApi as NativePiModelApi,
   type Provider,
+  type ProviderMediaModel,
   type ProviderWireProtocol,
 } from '@cindy/model-providers';
 
@@ -77,6 +80,7 @@ import {
   applyLocalConsumerOverrides,
   hasLocalContextWindowOverride,
   applyLocalOverridesToRoot,
+  localPiAdditionModels,
   hasLocalAddition,
   EMPTY_MODEL_CATALOG_OVERRIDES,
   resolveLocalBridgeExclusions,
@@ -118,6 +122,8 @@ let customConfigs: CustomProviderConfig[] | null = null;
  * **additions-only**:静态 id first-wins,cache 只补未来新增模型,不会覆盖目录的受控能力元数据。
  */
 let discoveredCodex: CatalogModel[] = [];
+/** Mirrors credential presence only; secrets stay in the existing secret store. */
+let openAiImagesApiKeyConfigured = false;
 /**
  * 通用 OAuth 供应商（auth.oauth 描述符）的动态发现模型:providerId → per-agent 增量。
  * 语义同 discoveredCodex:**additions-only**,只补目录里没有的新 id,静态条目 first-wins,
@@ -129,8 +135,8 @@ const discoveredByProvider = new Map<string, Partial<Record<AgentKind, CatalogMo
  * xAI 订阅账号从官方 `/v1/user` → `/v1/models` 读到的权威成员清单。
  *
  * `null` = 当前 owner 尚无成功账号快照，允许公共 Catalog / bundled 只作为启动救急；
- * `[]` = 上游明确返回空清单，仍是权威结果。成员保存为 canonical `xai/grok-*`，
- * 只供 Claude/Codex 消费；Pi 使用自己的本地目录。
+ * `[]` = 本次发现没有条目，不抹除公共声明。成员保存为 canonical `xai/grok-*`，
+ * 补充 Claude/Codex 公共声明；Pi 消费显式的逐 Harness 声明。遗漏不构成禁止。
  */
 export interface XaiDiscoveredModel {
   id: string;
@@ -144,6 +150,7 @@ export interface XaiDiscoveredModel {
 }
 
 let xaiDiscoveredModels: XaiDiscoveredModel[] | null = null;
+const xaiAccountModels = new Map<string, XaiDiscoveredModel[]>();
 /**
  * 供应商媒体模型动态发现快照。成功快照决定当前账号的型号存在性，静态／远端
  * 同 id 条目只提供 first-wins 展示元数据；发现失败不写本 Map，完整回落静态目录。
@@ -156,6 +163,9 @@ const discoveredMediaByProvider = new Map<
     videoModels?: NonNullable<Provider['videoModels']>;
   }
 >();
+/** Gateway supports only its portable HTTP APIs, not native cloud credential APIs. */
+type PiModelApi = Extract<NativePiModelApi, 'anthropic-messages' | 'openai-responses' | 'openai-completions' | 'google-generative-ai'>;
+
 /** 单 tab 能力覆盖块(shared/modelAccess ModelAccessAgentOverride 同形)。 */
 export interface XdGatewayAgentOverride {
   contextWindow?: number;
@@ -354,7 +364,7 @@ function preserveNonGrok46DiscoveryEfforts(
   models: readonly CatalogModel[],
   discovered: readonly XaiDiscoveredModel[],
 ): CatalogModel[] {
-  if ((base ?? BUNDLED_CATALOG).modelRegistry?.schemaVersion === 4) return [...models];
+  if (((base ?? BUNDLED_CATALOG).modelRegistry?.schemaVersion ?? 0) >= 4) return [...models];
   const byId = new Map(discovered.map((entry) => [entry.id, entry]));
   return models.map((model) => {
     const entry = byId.get(model.id) ?? byId.get(`xai/${model.id}`);
@@ -391,7 +401,7 @@ function resolveXdPiGatewayServerModelApi(
   const declared = piGatewayAuthorityCatalog
     ? resolveCatalogPiGatewayModelApi(piGatewayAuthorityCatalog, model.id)
     : undefined;
-  if (declared !== undefined) return declared;
+  if (declared !== undefined) return declared === null || isPiModelApi(declared) ? declared : null;
   // Explicit unknowns can keep an independently declared execution route, but that route
   // must never be presented as canonical. Missing metadata was already filled locally above.
   if ((base?.modelRegistry?.schemaVersion ?? 0) >= 3 || nativeApi === null) {
@@ -434,7 +444,7 @@ function resolveXdPiGatewayModelApi(model: XdGatewayModelInfo): PiModelApi | nul
   const catalogApi = resolveXdPiGatewayServerModelApi(model);
   if (catalogApi !== undefined) return catalogApi;
   const localApi = resolveBundledPiGatewayModelProfile(model.id)?.api;
-  if (localApi !== undefined) return localApi;
+  if (localApi !== undefined) return isPiModelApi(localApi) ? localApi : null;
   return resolveXdPiGatewayHintModelApi(model);
 }
 
@@ -811,6 +821,7 @@ function assembleRoot(
   models: readonly CatalogModel[],
   plan: ModelPlaneRegistryPlan,
   preserveDeclarationOrder = false,
+  connectionId = providerId,
 ): CatalogModel[] {
   const rootPlan = plan.roots.get(rootPlanKey(providerId, agent));
   let out = applyRootRegistryPlan(models, rootPlan);
@@ -832,27 +843,28 @@ function assembleRoot(
     });
   }
   const registry = (base ?? BUNDLED_CATALOG).modelRegistry;
-  if (registry?.schemaVersion === 4) {
+  if ((registry?.schemaVersion ?? 0) >= 4) {
     const live = new Map(models.map((model) => [model.id, model]));
     out = out.map((model) => {
       const upstream = live.get(model.id);
-      const metadata =
-        upstream?.discoveredMetadata ?? (upstream ? catalogModelMetadata(upstream) : undefined);
+      const metadata = upstream?.discoveredMetadata ??
+        (upstream && !upstream.userModelConfig ? catalogModelMetadata(upstream) : undefined);
       return {
         ...applyModelMetadata(
           model,
-          resolveModelMetadata(registry, providerId, model.id, metadata, undefined, agent),
+          resolveModelMetadata(registry, providerId, model.id, metadata,
+            upstream?.userModelConfig ? runtimeUserModelMetadata(upstream.userModelConfig) : undefined, agent),
         ),
         ...(metadata ? { discoveredMetadata: metadata } : {}),
       };
     });
   }
-  out = applyLocalOverridesToRoot(providerId, agent, out, localOverrides, plan.warnings);
+  out = applyLocalOverridesToRoot(connectionId, agent, out, localOverrides, plan.warnings, providerId);
   if (rootPlan && rootPlan.retired.size > 0) {
     out = out.map((m) =>
       rootPlan.retired.has(m.id) &&
       m.status !== 'retired' &&
-      !hasLocalAddition(localOverrides, providerId, m.id, agent)
+      !hasLocalAddition(localOverrides, connectionId, m.id, agent, providerId)
         ? { ...m, status: 'retired' as const }
         : m,
     );
@@ -869,7 +881,7 @@ function applyLayeredConsumer(
 ): CatalogModel {
   const overlaid = applyRegistryConsumerOverlay(model, providerId, agent, model.id, plan);
   const registry = (base ?? BUNDLED_CATALOG).modelRegistry;
-  return registry?.schemaVersion === 4
+  return (registry?.schemaVersion ?? 0) >= 4
     ? applyModelMetadata(
         overlaid,
         resolveModelMetadata(
@@ -877,40 +889,29 @@ function applyLayeredConsumer(
           providerId,
           model.id,
           model.discoveredMetadata,
-          undefined,
+          model.userModelConfig ? runtimeUserModelMetadata(model.userModelConfig) : undefined,
           agent,
         ),
       )
     : overlaid;
 }
 
-function assembleAuthoritativeRoot(
-  providerId: string,
-  agent: RootAgentKind,
-  models: readonly CatalogModel[],
-  plan: ModelPlaneRegistryPlan,
-): CatalogModel[] {
-  const memberIds = new Set(models.map((model) => model.id));
-  return assembleRoot(providerId, agent, models, plan, true).filter((model) =>
-    memberIds.has(model.id),
-  );
-}
-
 function xaiCatalogModelById(
   provider: Provider,
   id: string,
-  agent: RootAgentKind,
+  agent: AgentKind,
 ): CatalogModel | undefined {
   const bundled = BUNDLED_CATALOG.providers.find((entry) => entry.id === 'xai');
+  const catalogId = agent === 'pi' ? normalizePiModelId('xai', id) : id;
   return (
-    provider.models[agent]?.find((model) => model.id === id) ??
-    bundled?.models[agent]?.find((model) => model.id === id)
+    provider.models[agent]?.find((model) => model.id === catalogId) ??
+    bundled?.models[agent]?.find((model) => model.id === catalogId)
   );
 }
 
 function materializeXaiAccountModels(
   provider: Provider,
-  agent: RootAgentKind,
+  agent: AgentKind,
   discovered: readonly XaiDiscoveredModel[],
 ): CatalogModel[] {
   return discovered.map((entry, index) => {
@@ -987,29 +988,49 @@ function normalizePiModelId(providerId: string, modelId: string): string {
 }
 
 /**
- * 本地 Pi 原生目录是基线；服务端/本地覆盖文件只叠加明确给出的 Pi 条目。
- * 缺字段或空数组不会清掉本地名单，所以旧服务端文件可直接与新客户端共存。
+ * Public Pi declarations seed membership; account discovery can add new models.
+ * Explicit empty declarations disable the runtime. Missing fields use the bundled
+ * declaration, while native SDK capabilities remain independent of sibling Harnesses.
  */
-function mergeIndependentPiModels(providerId: string): CatalogModel[] {
+function declaredPiModels(providerId: string, discovered: readonly CatalogModel[] = []): CatalogModel[] {
   const bundled =
     BUNDLED_CATALOG.providers.find((provider) => provider.id === providerId)?.models.pi ?? [];
-  const explicit = piGatewayAuthorityCatalog?.providers.find(
+  const explicit = (piGatewayAuthorityCatalog ?? base)?.providers.find(
     (provider) => provider.id === providerId,
   )?.models.pi;
-  const merged = bundled.map((model) => ({ ...model }));
-  if (!explicit || explicit.length === 0) return merged;
-  const indexes = new Map(merged.map((model, index) => [model.id, index]));
-  for (const remote of explicit) {
-    const id = normalizePiModelId(providerId, remote.id);
-    const index = indexes.get(id);
-    if (index === undefined) {
-      indexes.set(id, merged.length);
-      merged.push({ ...remote, id });
-    } else {
-      merged[index] = { ...merged[index]!, ...remote, id };
-    }
+  const fallbackById = new Map(bundled.map((model) => [normalizePiModelId(providerId, model.id), model]));
+  const declared = (explicit ?? bundled).map((model) => {
+    const id = normalizePiModelId(providerId, model.id);
+    return {
+      ...fallbackById.get(id), ...model, id,
+      // Do not let the fallback SDK's discovery provenance override explicit
+      // server fields when the shared metadata resolver runs below.
+      ...(explicit !== undefined ? {
+        discoveredMetadata: model.discoveredMetadata,
+      } : {}),
+    };
+  });
+  // An explicitly disabled Pi runtime stays disabled. Otherwise subscription
+  // discovery provides new account members independently of the SDK's model list.
+  if (explicit?.length === 0 || discovered.length === 0) return declared;
+  const piApi = providerId === 'openai' ? 'openai-responses' as const
+    : providerId === 'anthropic' ? 'anthropic-messages' as const : undefined;
+  if (!piApi) return declared;
+  const byId = new Map(declared.map(model => [model.id, model]));
+  for (const model of discovered) {
+    const id = normalizePiModelId(providerId, model.id);
+    // Codex/Claude SDK limits describe those Harnesses, not Pi. Discovery adds
+    // membership but cannot overwrite an existing Pi model's transport/capabilities.
+    if (byId.has(id)) continue;
+    if (model.status === 'retired' || findModelRegistryRoute(
+      (base ?? BUNDLED_CATALOG).modelRegistry, providerId, model.id,
+    )?.entry.status === 'retired') continue;
+    byId.set(id, {
+      ...model, id, piApi,
+      discoveredMetadata: model.discoveredMetadata ?? catalogModelMetadata(model),
+    });
   }
-  return merged;
+  return [...byId.values()];
 }
 
 function projectXdGatewayMediaModels(
@@ -1129,7 +1150,7 @@ function computeMerged(): Catalog {
   );
   if (normalized.some((p, index) => p !== providers[index])) providers = normalized;
 
-  // 规范 discovery 只进入 Codex root；Claude bridge 从最终 root 重算，Pi 另读自己的目录。
+  // Codex root 消费其发现快照；Pi 后续独立补新型号，不继承 Codex 专属能力。
   const withCodexDiscovery = providers.map((p) =>
     p.id === 'openai' ? augmentModels(p, 'codex', discoveredCodex, true) : p,
   );
@@ -1139,7 +1160,29 @@ function computeMerged(): Catalog {
 
   // 自定义供应商先追加、再做通用发现 augment——顺序反了的话,自定义 OAuth 供应商
   // 的发现模型永远合不进目录(map 只扫过内置列表)。
-  if (custom.length > 0) providers = [...providers, ...custom];
+  if (custom.length > 0) {
+    // Bind the public image definition before applying any account discovery or overrides.
+    // Copying the final builtin connection would leak its Platform-key membership/preferences.
+    const openaiDefinition = providerSources.find((provider) => provider.id === 'openai');
+    const accounts = custom.map((provider) => {
+      if (!isOpenAiSubscriptionProvider(provider)) return provider;
+      const bindId = (id: string): string => id.replace(/^openai\//, `${provider.id}/`);
+      const defaults = openaiDefinition?.imageDefaults;
+      return {
+        ...provider,
+        imageModels: openaiDefinition?.imageModels?.map((model) => ({
+          ...model,
+          id: bindId(model.id),
+        })),
+        imageDefaults: defaults ? {
+          standard: bindId(defaults.standard),
+          ...(defaults.draft ? { draft: bindId(defaults.draft) } : {}),
+          ...(defaults.best ? { best: bindId(defaults.best) } : {}),
+        } : undefined,
+      };
+    });
+    providers = [...providers, ...accounts];
+  }
 
   // 通用 OAuth 供应商的发现模型(additions-only,per provider × agent;内置与自定义同待遇)。
   if (discoveredByProvider.size > 0) {
@@ -1174,20 +1217,21 @@ function computeMerged(): Catalog {
   // 注:anthropic 的 discovery 快照非空时整表以它为基线(登录态权威);registry
   // 实体化条目在未登录时也保持 presence——能否选中由连接态门控,presence ≠ entitlement。
   providers = providers.map((p) => {
-    if (p.id === 'openai') {
-      const root = assembleRoot('openai', 'codex', p.models.codex ?? [], plan);
+    if (isOpenAiSubscriptionProvider(p)) {
+      const root = assembleRoot('openai', 'codex', p.models.codex ?? [], plan, false, p.id);
       const withRoot: Provider = { ...p, models: { ...p.models, codex: root } };
       const remoteExcluded =
         plan.roots.get(rootPlanKey('openai', 'codex'))?.bridgeExcluded ?? new Set<string>();
       const excluded = resolveLocalBridgeExclusions(
-        'openai',
+        p.id,
         'claude-code',
         remoteExcluded,
         localOverrides,
+        'openai',
       );
       const prepareClaudeModel = (model: CatalogModel): CatalogModel =>
         applyLocalConsumerOverrides(
-          'openai',
+          p.id,
           'claude-code',
           model.id,
           {
@@ -1195,13 +1239,14 @@ function computeMerged(): Catalog {
             ...(model.contextWindowMax !== undefined
               ? { contextWindowMax: model.contextWindowMax }
               : {}),
-            ...((base ?? BUNDLED_CATALOG).modelRegistry?.schemaVersion !== 4 &&
+            ...(((base ?? BUNDLED_CATALOG).modelRegistry?.schemaVersion ?? 0) < 4 &&
             model.supportsFastMode === false
               ? { supportsFastMode: false }
               : {}),
           },
           localOverrides,
           plan.warnings,
+          'openai',
         );
       const projected = projectCodexModelsToClaudeBridge(withRoot, excluded, prepareClaudeModel);
       const appendConsumerAdditions = (
@@ -1212,12 +1257,13 @@ function computeMerged(): Catalog {
           (model) =>
             toChatgptBridgeModel(
               applyLocalConsumerOverrides(
-                'openai',
+                p.id,
                 'claude-code',
                 model.id,
                 model,
                 localOverrides,
                 plan.warnings,
+                'openai',
               ),
             ),
         );
@@ -1233,33 +1279,36 @@ function computeMerged(): Catalog {
             'claude-code',
             projected.models['claude-code'] ?? [],
           ),
-          pi: mergeIndependentPiModels('openai'),
+          pi: declaredPiModels('openai', p.id === 'openai'
+            ? discoveredCodex : discoveredByProvider.get(p.id)?.codex ?? []),
         },
       };
     }
-    if (p.id === 'anthropic') {
-      const seed = anthropicModels.length > 0 ? anthropicModels : (p.models['claude-code'] ?? []);
-      const root = assembleRoot('anthropic', 'claude-code', seed, plan);
+    if (providerCatalogId(p) === 'anthropic') {
+      const seed = p.id === 'anthropic' && anthropicModels.length > 0 ? anthropicModels : (p.models['claude-code'] ?? []);
+      const root = assembleRoot('anthropic', 'claude-code', seed, plan, false, p.id);
       const remoteExcluded =
         plan.roots.get(rootPlanKey('anthropic', 'claude-code'))?.bridgeExcluded ??
         new Set<string>();
       const excluded = resolveLocalBridgeExclusions(
-        'anthropic',
+        p.id,
         'codex',
         remoteExcluded,
         localOverrides,
+        'anthropic',
       );
-      // codex bridge 受 membership 门控且 fast=false(硬约束)；Pi 不镜像 Claude root。
+      // Codex bridge 受 membership 门控且 fast=false；Pi 只用原始发现补新型号。
       const codexBridge = root
         .filter((m) => !excluded.has(m.id))
         .map((model) =>
           applyLocalConsumerOverrides(
-            'anthropic',
+            p.id,
             'codex',
             model.id,
             applyLayeredConsumer(model, 'anthropic', 'codex', plan),
             localOverrides,
             plan.warnings,
+            'anthropic',
           ),
         )
         .map((model) => ({ ...model, supportsFastMode: false }));
@@ -1269,13 +1318,15 @@ function computeMerged(): Catalog {
           ...p.models,
           'claude-code': root,
           codex: codexBridge,
-          pi: mergeIndependentPiModels('anthropic'),
+          pi: declaredPiModels('anthropic', p.id === 'anthropic'
+            ? anthropicModels : discoveredByProvider.get(p.id)?.['claude-code'] ?? []),
         },
       };
     }
-    if (p.id === 'xai') {
-      const useAccountMembership = xaiDiscoveredModels !== null;
-      const accountModels = xaiDiscoveredModels ?? [];
+    if (providerCatalogId(p) === 'xai') {
+      const discovered = p.id === 'xai' ? xaiDiscoveredModels : xaiAccountModels.get(p.id) ?? null;
+      const useAccountMembership = discovered !== null;
+      const accountModels = discovered ?? [];
       // The bundled-only fallback uses the packaged Claude/Codex list as its own membership seed.
       // A loaded server Catalog keeps its legacy static membership for old server compatibility;
       // Pi's separate local list is assembled below and never participates in this choice.
@@ -1290,12 +1341,8 @@ function computeMerged(): Catalog {
       const codexSeed = authoritativeMembers
         ? materializeXaiAccountModels(p, 'codex', authoritativeMembers)
         : (p.models.codex ?? []);
-      const claudeRoot = authoritativeMembers
-        ? assembleAuthoritativeRoot('xai', 'claude-code', claudeSeed, plan)
-        : assembleRoot('xai', 'claude-code', claudeSeed, plan, true);
-      const codexRoot = authoritativeMembers
-        ? assembleAuthoritativeRoot('xai', 'codex', codexSeed, plan)
-        : assembleRoot('xai', 'codex', codexSeed, plan, true);
+      const claudeRoot = assembleRoot('xai', 'claude-code', claudeSeed, plan, true, p.id);
+      const codexRoot = assembleRoot('xai', 'codex', codexSeed, plan, true, p.id);
       const claudeAccountRoot = useAccountMembership
         ? preserveNonGrok46DiscoveryEfforts(claudeRoot, accountModels)
         : claudeRoot;
@@ -1308,7 +1355,30 @@ function computeMerged(): Catalog {
         delete rest.piApi;
         return rest;
       };
-      const piModels = mergeIndependentPiModels('xai');
+      const declaredPi = declaredPiModels('xai');
+      const piWireProtocol = (p.routing.pi ?? bundledXai?.routing.pi)?.wireProtocol;
+      // Discovery is account evidence shared by all Harnesses. Pi's packaged model list
+      // only supplies defaults; new account models can use the declared subscription
+      // transport without waiting for a new Pi binary or a public catalog release.
+      // Keep an explicit empty public declaration disabled and preserve retired entries.
+      const discoveredPi = declaredPi.length > 0 &&
+        (piWireProtocol === 'openai-responses' || piWireProtocol === 'openai-chat')
+        ? materializeXaiAccountModels(
+            { ...p, models: { ...p.models, pi: declaredPi } }, 'pi', accountModels,
+          ).map((model) => ({
+            ...model,
+            id: normalizePiModelId('xai', model.id),
+            piApi: model.piApi ?? (piWireProtocol === 'openai-chat'
+              ? 'openai-completions' as const : 'openai-responses' as const),
+          }))
+        : [];
+      const discoveredPiById = new Map(discoveredPi.map((model) => [model.id, model]));
+      const declaredPiIds = new Set(declaredPi.map((model) => model.id));
+      const piModels = [
+        ...declaredPi.map((model) => model.status === 'retired'
+          ? model : discoveredPiById.get(model.id) ?? model),
+        ...discoveredPi.filter((model) => !declaredPiIds.has(model.id)),
+      ];
       return {
         ...p,
         agents: p.agents.includes('pi') ? p.agents : [...p.agents, 'pi' as AgentKind],
@@ -1380,7 +1450,7 @@ function computeMerged(): Catalog {
         ]);
         const registryDefault = registryEntry ? modelDefaultEffort(registryEntry) : undefined;
         const intent =
-          b.modelRegistry?.schemaVersion === 4
+          (b.modelRegistry?.schemaVersion ?? 0) >= 4
             ? (ov.defaultEffort ?? gm.defaultEffort ?? defaultEffortForCapabilities(efforts))
             : registryDefault !== undefined
               ? registryDefault
@@ -1486,21 +1556,22 @@ function computeMerged(): Catalog {
       Object.entries(provider.models).map(([agent, models]) => [
         agent,
         models?.map((model) => {
-          const nativeApi = nativeApiForRoute(provider.id, model.id);
-          // Pi's independent catalog supplies capabilities, not a separate default.
-          // Membership remains native; a Registry match only contributes model intent.
+          const metadataProviderId = providerCatalogId(provider);
+          const nativeApi = nativeApiForRoute(metadataProviderId, model.id);
+          // Per-Harness declarations own membership; Registry metadata contributes
+          // shared model intent without manufacturing another Harness route.
           const entry =
-            agent === 'pi' && provider.source !== 'user' && provider.id !== 'xd'
+            agent === 'pi' && (provider.source !== 'user' || !!provider.auth.native) && provider.id !== 'xd'
               ? findModelRegistryRoute(
                   b.modelRegistry,
-                  provider.id,
+                  metadataProviderId,
                   provider.id === 'xai' && !model.id.startsWith('xai/')
                     ? `xai/${model.id}`
                     : model.id,
                 )?.entry
               : undefined;
           const intent =
-            b.modelRegistry?.schemaVersion !== 4 && entry ? modelDefaultEffort(entry) : undefined;
+            (b.modelRegistry?.schemaVersion ?? 0) < 4 && entry ? modelDefaultEffort(entry) : undefined;
           const defaultEffort =
             intent !== undefined
               ? model.efforts.length === 0
@@ -1511,17 +1582,19 @@ function computeMerged(): Catalog {
           // Apply to each built-in GPT route, including subscription and discount aliases.
           // Never enlarge smaller models or overwrite BYOM / explicit preference overrides.
           const conservativeGptDefault =
-            provider.source !== 'user' &&
-            ['openai', 'xd'].includes(provider.id) &&
+            (provider.source !== 'user' || !!provider.auth.native) &&
+            ['openai', 'xd'].includes(metadataProviderId) &&
             /^(?:(?:codex|openai|chatgpt)\/)?gpt-/.test(model.id) &&
             model.contextWindow > 272_000 &&
+            model.userModelConfig?.contextWindow === undefined &&
             !(
               (agent === 'codex' || agent === 'claude-code' || agent === 'pi') &&
               hasLocalContextWindowOverride(
                 localOverrides,
                 provider.id,
-                provider.id === 'openai' ? model.id.replace(/^chatgpt\//, '') : model.id,
+                metadataProviderId === 'openai' ? model.id.replace(/^chatgpt\//, '') : model.id,
                 agent,
+                metadataProviderId,
               )
             );
           return {
@@ -1542,7 +1615,9 @@ function computeMerged(): Catalog {
   // Subscription providers use the same small default selection, scoped per harness so
   // chatgpt/ aliases never hide their sibling Codex route. Explicit user visibility stays external.
   providers = providers.map((provider) => {
-    if (provider.source === 'user' || !['openai', 'anthropic', 'xai'].includes(provider.id))
+    const catalogId = providerCatalogId(provider);
+    if (!isOpenAiSubscriptionProvider(provider) &&
+      ((provider.source === 'user' && !provider.auth.native) || !['anthropic', 'xai'].includes(catalogId)))
       return provider;
     return {
       ...provider,
@@ -1581,28 +1656,30 @@ function computeMerged(): Catalog {
         agent,
         models?.map((model) => {
           let next = model;
+          const metadataProviderId = providerCatalogId(provider);
           if (
-            b.modelRegistry?.schemaVersion === 4 &&
-            provider.source !== 'user' &&
+            (b.modelRegistry?.schemaVersion ?? 0) >= 4 &&
+            (provider.source !== 'user' || !!provider.auth.native) &&
             (provider.id === 'xd' || agent === 'pi')
           ) {
             next = applyModelMetadata(
               model,
               resolveModelMetadata(
                 b.modelRegistry,
-                provider.id,
+                metadataProviderId,
                 model.id,
-                model.discoveredMetadata ?? catalogModelMetadata(model),
-                undefined,
+                agent === 'pi' ? model.discoveredMetadata : model.discoveredMetadata ?? catalogModelMetadata(model),
+                model.userModelConfig ? runtimeUserModelMetadata(model.userModelConfig) : undefined,
                 agent,
               ),
             );
           }
           if (
-            provider.source !== 'user' &&
-            ['openai', 'xd'].includes(provider.id) &&
+            (provider.source !== 'user' || !!provider.auth.native) &&
+            ['openai', 'xd'].includes(metadataProviderId) &&
             /^(?:(?:codex|openai|chatgpt)\/)?gpt-/.test(next.id) &&
             next.contextWindow > 272_000 &&
+            next.userModelConfig?.contextWindow === undefined &&
             !(
               (agent === 'codex' || agent === 'claude-code' || agent === 'pi') &&
               hasLocalContextWindowOverride(
@@ -1610,6 +1687,7 @@ function computeMerged(): Catalog {
                 provider.id,
                 next.id.replace(/^chatgpt\//, ''),
                 agent,
+                metadataProviderId,
               )
             )
           ) {
@@ -1622,7 +1700,7 @@ function computeMerged(): Catalog {
           const identity =
             findModelRegistryRoute(
               b.modelRegistry,
-              provider.id,
+              metadataProviderId,
               model.id,
               agent === 'pi' ? undefined : (agent as RootAgentKind),
             )?.entry.modelRef ??
@@ -1659,29 +1737,84 @@ function computeMerged(): Catalog {
       ]),
     ),
   }));
+  // User additions are the highest layer and may explicitly revive a subscription
+  // model. They reuse that connection's transport, never create Gateway/BYOM routes.
+  providers = providers.map(provider => {
+    const catalogId = providerCatalogId(provider);
+    if ((provider.source === 'user' && !provider.auth.native) || !provider.routing.pi) return provider;
+    const additions = localPiAdditionModels(provider.id, localOverrides, catalogId);
+    if (additions.length === 0) return provider;
+    const models = new Map((provider.models.pi ?? []).map(model => [model.id, model]));
+    for (const addition of additions) {
+      const id = normalizePiModelId(catalogId, addition.id);
+      const existing = models.get(id);
+      const wire = provider.routing.pi.wireProtocol;
+      const piApi = existing?.piApi ?? (catalogId === 'openai' ? 'openai-responses'
+        : wire === 'openai-chat' ? 'openai-completions' : wire);
+      if (!isPiModelApi(piApi)) continue;
+      const model: CatalogModel = {
+        ...applyExistingModelLocalPatch(provider.id, 'pi', addition, localOverrides),
+        id, piApi,
+        ...(existing ? { contextWindowMax: Math.max(
+          existing.contextWindowMax ?? existing.contextWindow, addition.contextWindow,
+        ) } : {}),
+      };
+      models.set(id, applyExistingModelLocalPatch(provider.id, 'pi', model, localOverrides));
+    }
+    return { ...provider, models: { ...provider.models, pi: [...models.values()] } };
+  });
   const modelRegistry = b.modelRegistry
     ? { ...b.modelRegistry, localModels: effectiveLocalModels }
     : undefined;
+  const userMediaMetadata = (provider: Provider, modelId: string, mediaModel: ProviderMediaModel) => {
+    const catalogId = providerCatalogId(provider);
+    const catalogModelId = catalogId !== provider.id && modelId.startsWith(`${provider.id}/`)
+      ? `${catalogId}/${modelId.slice(provider.id.length + 1)}` : modelId;
+    const identity =
+      findModelRegistryRoute(b.modelRegistry, catalogId, catalogModelId)?.entry.modelRef ??
+      findBaseModel(b.modelRegistry, catalogModelId)?.id;
+    const key = `${encodeURIComponent(provider.id)}:${modelId}`;
+    const userModel =
+      provider.source === 'user' && mediaModel.sourceAgent
+        ? provider.models[mediaModel.sourceAgent]
+            ?.find((m) => m.id === modelId)?.userModelConfig
+        : undefined;
+    return {
+      ...(identity ? localOverrides.baseModels?.[identity] : {}),
+      ...(userModel ? runtimeUserModelMetadata(userModel) : {}),
+      ...pickModelMetadata(localOverrides.patches[key]?.base),
+    };
+  };
   providers = providers.map((provider) =>
     projectProviderMediaModels(provider, b.modelRegistry, {
-      userMetadata: (modelId, mediaModel) => {
-        const identity =
-          findModelRegistryRoute(b.modelRegistry, provider.id, modelId)?.entry.modelRef ??
-          findBaseModel(b.modelRegistry, modelId)?.id;
-        const key = `${encodeURIComponent(provider.id)}:${modelId}`;
-        const userModel =
-          provider.source === 'user' && mediaModel.sourceAgent
-            ? provider.models[mediaModel.sourceAgent]
-                ?.find((m) => m.id === modelId)?.userModelConfig
-            : undefined;
-        return {
-          ...(identity ? localOverrides.baseModels?.[identity] : {}),
-          ...(userModel ? runtimeUserModelMetadata(userModel) : {}),
-          ...pickModelMetadata(localOverrides.patches[key]?.base),
-        };
-      },
+      userMetadata: (modelId, mediaModel) => userMediaMetadata(provider, modelId, mediaModel),
     }),
   );
+  // Subscription image_generation is one hosted capability, not the Platform model list.
+  // Keep the original ID so saved Art selections and visibility overrides still resolve.
+  providers = providers.map((provider) => {
+    if (!isOpenAiSubscriptionProvider(provider) ||
+        (provider.id === 'openai' && openAiImagesApiKeyConfigured) ||
+        provider.imageModels?.length === 0) return provider;
+    const id = `${provider.id}/gpt-image-2`;
+    const previous = provider.imageModels?.find((model) => model.id === id);
+    const defaults: ProviderMediaModel = {
+      id,
+      name: 'GPT Image Gen',
+      mode: 'image_generation',
+      modalities: { input: ['text', 'image'], output: ['image'] },
+      ...(previous?.defaultEnabled !== undefined ? { defaultEnabled: previous.defaultEnabled } : {}),
+      ...(previous?.disabled !== undefined ? { disabled: previous.disabled } : {}),
+    };
+    return {
+      ...provider,
+      imageModels: [{
+        ...defaults,
+        ...userMediaMetadata(provider, id, previous ?? defaults),
+      }],
+      imageDefaults: provider.imageDefaults ? { standard: id } : undefined,
+    };
+  });
   return { ...b, modelRegistry, providers };
 }
 
@@ -1961,6 +2094,12 @@ export function setDiscoveredCodexModels(
  * 注入通用 OAuth 供应商的发现模型(per provider × agent)。additions-only 合并见
  * computeMerged;传空数组 = 清空该 provider×agent 的 discovery(回纯静态)。
  */
+export function clearDiscoveredProviderModels(): void {
+  discoveredByProvider.clear();
+  xaiAccountModels.clear();
+  markChanged();
+}
+
 export function setDiscoveredProviderModels(
   providerId: string,
   agent: AgentKind,
@@ -1973,8 +2112,20 @@ export function setDiscoveredProviderModels(
 }
 
 /** 成功空数组同样是权威成员快照；null 仅表示当前 owner 尚无成功快照。 */
-export function setXaiDiscoveredModels(models: readonly XaiDiscoveredModel[] | null): void {
-  xaiDiscoveredModels = models === null ? null : models.map((model) => ({ ...model }));
+export function setXaiDiscoveredModels(models: readonly XaiDiscoveredModel[] | null, providerId = 'xai'): void {
+  if (providerId !== 'xai') {
+    if (models === null) xaiAccountModels.delete(providerId);
+    else xaiAccountModels.set(providerId, models.map(model => ({ ...model })));
+  } else {
+    xaiDiscoveredModels = models === null ? null : models.map((model) => ({ ...model }));
+  }
+  markChanged();
+}
+
+/** Switch the builtin image connection using credential presence, including discovery failures. */
+export function setOpenAiImagesApiKeyConfigured(configured: boolean): void {
+  if (openAiImagesApiKeyConfigured === configured) return;
+  openAiImagesApiKeyConfigured = configured;
   markChanged();
 }
 

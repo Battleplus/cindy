@@ -47,9 +47,12 @@ vi.mock('@/lib/composerDraftStore', () => ({
 
 import { makerChatStore } from '@/lib/makerChatStore';
 import * as messageService from '@/lib/messageService';
+import * as sessionService from '@/lib/sessionService';
 import {
   markSessionAutomaticHistoryLoadCompleted,
   restoreSessionAutomaticHistoryLoadAttempts,
+  saveSessionScroll,
+  clearSessionScroll,
 } from '@/lib/sessionScrollStore';
 
 const BASE_TIME = new Date('2026-05-20T00:00:00.000Z');
@@ -169,10 +172,84 @@ describe('makerChatStore active view tracking', () => {
 
   afterEach(() => {
     for (const dispose of [...disposers].reverse()) dispose();
-    for (const sessionId of sessionIds) makerChatStore.purgeSession(sessionId);
+    for (const sessionId of sessionIds) {
+      makerChatStore.purgeSession(sessionId);
+      clearSessionScroll(sessionId);
+    }
     makerChatStore.__teardownGlobalListeners();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  async function readingWindow(label: string, count = 350, contentSize = 1) {
+    const id = sid(label);
+    const leave = enter(id);
+    vi.mocked(messageService.list).mockResolvedValueOnce(Array.from({ length: count }, (_, i) =>
+      dbMessage(id, `${i}`, 'x'.repeat(contentSize), new Date(BASE_TIME.getTime() + i * 1000).toISOString()),
+    ));
+    makerChatStore.ensureInitialMessages(id);
+    await flushPromises();
+    saveSessionScroll(id, { windowAnchorKey: null, viewportTopKey: 'msg-client-0',
+      messageClientId: 'client-0', offset: 0, isNearBottom: false });
+    return { id, leave, messages: makerChatStore.getSnapshot(id).messages };
+  }
+
+  it('keeps a bounded old reading window on a hot return without another history read', async () => {
+    const view = await readingWindow('reading');
+    view.leave();
+    expect(makerChatStore.getSnapshot(view.id).messages).toBe(view.messages);
+    enter(view.id);
+    makerChatStore.ensureInitialMessages(view.id);
+    await flushPromises();
+    expect(makerChatStore.getSnapshot(view.id).messages).toBe(view.messages);
+    expect(messageService.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('cannot resurrect a retained reading window after purge and same-id reopen', async () => {
+    const view = await readingWindow('purged-reading');
+    view.leave();
+    makerChatStore.purgeSession(view.id);
+    vi.mocked(messageService.list).mockResolvedValueOnce([
+      dbMessage(view.id, 'fresh', 'new history', BASE_TIME.toISOString()),
+    ]);
+    enter(view.id);
+    makerChatStore.ensureInitialMessages(view.id);
+    await flushPromises();
+    expect(makerChatStore.getSnapshot(view.id).messages.map((message) => message.clientId))
+      .toEqual(['client-fresh']);
+  });
+
+  it('trims the displaced third reading window immediately and respects final-view ownership', async () => {
+    const a = await readingWindow('reading-a');
+    const extra = enter(a.id);
+    a.leave();
+    expect(makerChatStore.getSnapshot(a.id).messages).toBe(a.messages);
+    extra();
+    const b = await readingWindow('reading-b'); b.leave();
+    const c = await readingWindow('reading-c'); c.leave();
+    expect(makerChatStore.getSnapshot(a.id).messages).toHaveLength(200);
+    expect(makerChatStore.getSnapshot(b.id).messages).toBe(b.messages);
+    expect(makerChatStore.getSnapshot(c.id).messages).toBe(c.messages);
+  });
+
+  it('does not reserve tail views, oversized row counts or oversized text windows', async () => {
+    const tail = await readingWindow('tail');
+    saveSessionScroll(tail.id, { windowAnchorKey: null, viewportTopKey: 'msg-client-0', offset: 0, isNearBottom: true });
+    tail.leave();
+    expect(makerChatStore.getSnapshot(tail.id).messages).toHaveLength(200);
+    const many = await readingWindow('many', 1001); many.leave();
+    expect(makerChatStore.getSnapshot(many.id).messages).toHaveLength(200);
+    const large = await readingWindow('large', 350, 100_000); large.leave();
+    expect(makerChatStore.getSnapshot(large.id).messages).toHaveLength(200);
+  });
+
+  it('bounds the combined text budget and still demotes retained histories after five minutes', async () => {
+    const a = await readingWindow('budget-a', 350, 50_000); a.leave();
+    const b = await readingWindow('budget-b', 350, 50_000); b.leave();
+    expect(makerChatStore.getSnapshot(a.id).messages).toHaveLength(200);
+    expect(makerChatStore.getSnapshot(b.id).messages).toBe(b.messages);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(makerChatStore.getSnapshot(b.id).messages).toHaveLength(0);
   });
 
   it('enterView marks a session active and clears lastViewedAt', () => {
@@ -238,6 +315,20 @@ describe('makerChatStore active view tracking', () => {
     // 非空泛验证:回收确实发生了 —— 最早创建的 idle 会话(非 active)已被 purge,
     // 重新 getSnapshot 只会拿到重建的空 slice。
     expect(makerChatStore.getSnapshot(otherIds[0]).messages).toHaveLength(0);
+  });
+
+  it.each([0, 9_000])('keeps read-projected windows replaceable unless history has %s used tokens', async (contextTokens) => {
+    const sessionId = sid('projected-context');
+    vi.mocked(sessionService.get).mockResolvedValueOnce({
+      agentKind: 'cc', remoteHostId: null, sdkSessionId: null, fastMode: false,
+      contextTokens, contextWindow: 272_000, totalCostUsd: 0,
+    } as Awaited<ReturnType<typeof sessionService.get>>);
+    makerChatStore.ensureInitialMessages(sessionId);
+    await flushPromises();
+    expect(makerChatStore.getSnapshot(sessionId).agentStatus.contextWindow).toBe(272_000);
+    makerChatStore.setContextWindow(sessionId, 1_000_000);
+    expect(makerChatStore.getSnapshot(sessionId).agentStatus.contextWindow)
+      .toBe(contextTokens > 0 ? 272_000 : 1_000_000);
   });
 
   it('initial history load backfills to the latest plan boundary', async () => {

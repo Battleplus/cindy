@@ -9,6 +9,11 @@ const chatInputSource = normalizeSourceText(
 );
 
 describe('ChatInput model source switching wiring', () => {
+  it('preserves an explicit connection for submission even when its catalog row is unavailable', () => {
+    expect(chatInputSource).toContain('const sendProviderId = activeProviderId || null;');
+    expect(chatInputSource).toContain('providerId: sendProviderId');
+    expect(chatInputSource).not.toContain('effectiveSourceIdForModel(sendProviders, activeProviderId');
+  });
   it('normalizes Windows checkout line endings before matching guard order', () => {
     const windowsCheckoutSource = chatInputSource.replace(/\n/g, '\r\n');
     expect(normalizeSourceText(windowsCheckoutSource)).toBe(chatInputSource);
@@ -347,9 +352,10 @@ describe('ChatInput model source switching wiring', () => {
     expect(selectorBlock).toContain(
       'engineMarkVendor={unifiedPanelActive ? composerEngineMarkVendor : null}',
     );
-    expect(chatInputSource).toContain(
-      'resolveModelSelectorAgentIdentity(runtimeAgentKind, composerSelection.pending ? composerSelection.display.agentKind : null)?.vendorKey ??',
-    );
+    expect(chatInputSource.includes('runtimeAgentKind ? composerSelection.current.agentKind : runtimeAgentKind')).toBe(true);
+    expect(chatInputSource.includes('composerSelection.pending ? composerSelection.display.agentKind : null')).toBe(true);
+    expect(chatInputSource.includes('composerAgentIdentity?.vendorKey ?? null')).toBe(true);
+    expect(selectorBlock).toContain('? composerAgentIdentity');
     // 草稿没有 session 身份可言,当前引擎就是 vendorKey。
     expect(chatInputSource).toContain(': (vendorKey ?? null);');
   });
@@ -485,6 +491,29 @@ describe('ChatInput model source switching wiring', () => {
     expect(draftBlock).toContain('!selection.resetToRecommended');
     expect(draftBlock).toContain(
       '...(selection.resetToRecommended ? { resetToRecommended: true as const } : {})',
+    );
+  });
+
+  it('keeps a new conversation model pick on the draft path', () => {
+    const draftStart = chatInputSource.indexOf('const handleUnifiedDraftSelect = useCallback(');
+    const draftEnd = chatInputSource.indexOf(
+      '[sessionId, settingsLocked, modelMemory, onUnifiedDraftSelect]',
+      draftStart,
+    );
+    const draftHandler = chatInputSource.slice(draftStart, draftEnd);
+
+    expect(draftHandler).toContain('if (sessionId || settingsLocked) return;');
+    expect(draftHandler).toContain('onUnifiedDraftSelect?.({');
+    expect(draftHandler).not.toContain('maker.setModel(');
+    expect(draftHandler).not.toContain('confirmModelSwitchContextGuard(');
+
+    const selectorStart = chatInputSource.lastIndexOf('<ModelSelector');
+    const selectorBlock = chatInputSource.slice(
+      selectorStart,
+      chatInputSource.indexOf('/>', selectorStart) + 2,
+    );
+    expect(selectorBlock).toContain(
+      '!sessionId && unifiedPanelActive && onUnifiedDraftSelect\n                        ? handleUnifiedDraftSelect',
     );
   });
 

@@ -1,5 +1,6 @@
 import {
   DEFAULT_NEAR_BOTTOM_THRESHOLD,
+  historyPrefetchThreshold,
   isNearMessageListBottom,
   type MessageScrollMetrics,
 } from '@cindy/maker-shared/message-window';
@@ -29,7 +30,12 @@ export const MOBILE_MESSAGE_LIST_BOTTOM_PADDING = 132;
 export const MOBILE_NEAR_BOTTOM_THRESHOLD =
   DEFAULT_NEAR_BOTTOM_THRESHOLD + MOBILE_MESSAGE_LIST_BOTTOM_PADDING;
 
-export function mobileMessageListBottomPadding(bottomOverlayHeight?: number): number {
+export function mobileMessageListBottomPadding(bottomOverlayHeight?: number, contentBottomInset?: number): number {
+  // An inline interaction replaces the composer; an explicit inset must not
+  // retain the fallback space reserved for that now-hidden composer.
+  if (typeof contentBottomInset === 'number' && Number.isFinite(contentBottomInset)) {
+    return Math.max(0, Math.ceil(contentBottomInset));
+  }
   if (typeof bottomOverlayHeight !== 'number' || !Number.isFinite(bottomOverlayHeight)) {
     return MOBILE_MESSAGE_LIST_BOTTOM_PADDING;
   }
@@ -438,8 +444,7 @@ export function mobileTopPaddingCompensationOffset(input: MobileTopPaddingCompen
  * 且有 loadingEarlier 门禁串行化,最坏是多拉一页,不会失控循环。
  */
 export function mobileLoadEarlierPrefetchThreshold(viewportHeight: number): number {
-  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 96;
-  return Math.max(96, Math.ceil(viewportHeight * 2));
+  return historyPrefetchThreshold(viewportHeight);
 }
 
 export interface MobileAutoLoadEarlierDecisionInput {

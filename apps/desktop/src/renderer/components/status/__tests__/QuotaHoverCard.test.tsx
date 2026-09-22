@@ -19,6 +19,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'quotaCard.usageWarning') return '用量偏高';
       if (key === 'quotaCard.limitRejected') return '已触发套餐限额，请求可能被拒绝';
       if (key === 'quotaCard.limitWarning') return '接近套餐限额';
+      if (key === 'quotaCard.resetIn') return `${options.duration}后重置`;
+      if (key === 'quotaCard.resetPending') return '等待重置数据更新';
+      if (key === 'todaySpend.unit.day') return '天';
+      if (key === 'todaySpend.unit.hour') return '小时';
+      if (key === 'todaySpend.unit.minute') return '分钟';
       if (key === 'quotaCard.resetAt') return `${options.at} 重置`;
       if (key === 'quotaCard.paceTrendFast') return '按当前平均速度偏快（粗略趋势）';
       if (key === 'quotaCard.paceTrendNormal') return '按当前平均速度正常（粗略趋势）';
@@ -86,6 +91,44 @@ function weeklyAtProgress(utilization: number, progress: number) {
 }
 
 describe('QuotaHoverCard', () => {
+  it.each([undefined, null, 0, NaN, Infinity, 1e20])(
+    'omits the disclosure when windows have no displayable details (reset=%s)',
+    (resetsAt) => {
+      render(<UsageCard variant="embedded" nowMs={NOW_MS} account={{
+        windows: [{ key: 'weekly', title: 'Weekly', window: { utilization: 20, resetsAt }, breakdown: [] }],
+        details: ['Balance available'],
+      }} />);
+      expect(screen.getByRole('progressbar')).toBeTruthy();
+      expect(screen.getByText('Balance available')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'quotaCard.usageTitle' })).toBeNull();
+    },
+  );
+
+  it.each(['detail', 'breakdown'] as const)('discloses %s without a reset date', (kind) => {
+    render(<UsageCard variant="embedded" account={{ windows: [
+      { key: 'plain', title: 'Plain', window: { utilization: 10 } },
+      { key: 'detailed', title: 'Detailed', window: { utilization: 20 },
+        ...(kind === 'detail' ? { detail: 'Extra usage' } : { breakdown: [{ label: 'Extra usage', value: '10' }] }),
+      },
+    ] }} />);
+    expect(screen.queryByText('Extra usage')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'quotaCard.usageTitle' }));
+    expect(screen.getByText('Extra usage')).toBeTruthy();
+  });
+
+  it('hides duplicate identity without windows and only makes the popover region focusable', () => {
+    const account = { title: 'ChatGPT', planLabel: 'Pro', windows: [], emptyText: 'Waiting for usage' };
+    const { rerender } = render(<UsageCard variant="embedded" hideIdentity account={account} />);
+    expect(screen.queryByText('ChatGPT')).toBeNull();
+    expect(screen.queryByText('Pro')).toBeNull();
+    expect(screen.getByText('Waiting for usage')).toBeTruthy();
+    expect(screen.getByRole('region').hasAttribute('tabindex')).toBe(false);
+    rerender(<UsageCard hideIdentity account={account} />);
+    expect(screen.getByText('ChatGPT')).toBeTruthy();
+    expect(screen.getByText('Pro')).toBeTruthy();
+    expect(screen.getByRole('region').tabIndex).toBe(0);
+  });
+
   it('keeps the provider header while waiting for quota data', () => {
     render(<QuotaHoverCard snapshot={null} nowMs={NOW_MS} />);
 
@@ -104,6 +147,7 @@ describe('QuotaHoverCard', () => {
   it('renders five-hour, weekly, and every scoped window with percentages and reset labels', () => {
     render(
       <QuotaHoverCard
+        variant="embedded"
         nowMs={NOW_MS}
         snapshot={makeSnapshot({
           fiveHour: {
@@ -139,14 +183,68 @@ describe('QuotaHoverCard', () => {
     expect(screen.getByText('周限')).toBeTruthy();
     expect(screen.getByText('Fable 周限')).toBeTruthy();
     expect(screen.getByText('Opus 周限')).toBeTruthy();
-    expect(screen.getByText('已用 1%')).toBeTruthy();
+    expect(screen.getByText('剩余 99%')).toBeTruthy();
     expect(screen.getByText('剩余 96%')).toBeTruthy();
     expect(screen.getByText('剩余 100%')).toBeTruthy();
     expect(screen.getByText('剩余 24%')).toBeTruthy();
+    expect(screen.getByText('7小时 5分钟后重置')).toBeTruthy();
+    expect(screen.queryByText('17:05 重置')).toBeNull();
+    const detailsButton = screen.getByRole('button', { name: 'quotaCard.usageTitle' });
+    expect(detailsButton.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(detailsButton);
+    expect(detailsButton.getAttribute('aria-expanded')).toBe('true');
     expect(screen.getByText('17:05 重置')).toBeTruthy();
     expect(screen.getByText('8月7日 00:00 重置')).toBeTruthy();
     expect(screen.getByText('8月6日 23:59 重置')).toBeTruthy();
     expect(screen.getByText('18:30 重置')).toBeTruthy();
+  });
+
+  it('keeps balances, alerts and stale data visible while embedded details are collapsed', () => {
+    render(
+      <UsageCard
+        variant="embedded"
+        hideIdentity
+        nowMs={NOW_MS}
+        account={{
+          title: 'ChatGPT',
+          planLabel: 'Pro',
+          updatedAt: NOW_MS - 10 * 60_000,
+          windows: [
+            {
+              key: 'weekly',
+              title: 'Weekly',
+              window: weeklyAtProgress(92, 0.5),
+              paceWindowMinutes: 10_080,
+            },
+          ],
+          details: ['0.00 credits', 'Balance depleted'],
+          notices: [{ text: 'Limit reached', tone: 'crit' }],
+        }}
+      />,
+    );
+    expect(screen.queryByText('ChatGPT')).toBeNull();
+    expect(screen.getByText('0.00 credits')).toBeTruthy();
+    expect(screen.getByText('Balance depleted')).toBeTruthy();
+    expect(screen.getByText('Limit reached')).toBeTruthy();
+    expect(screen.getByText('quotaCard.staleData:10')).toBeTruthy();
+    expect(screen.queryByTestId('quota-pace')).toBeNull();
+    expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('8');
+    const button = screen.getByRole('button', { name: 'quotaCard.usageTitle' });
+    fireEvent.click(button);
+    expect(screen.getByTestId('quota-pace')).toBeTruthy();
+    fireEvent.click(button);
+    expect(screen.queryByTestId('quota-pace')).toBeNull();
+  });
+
+  it('prioritizes countdown in compact cards and updates to pending after reset', () => {
+    const snapshot = makeSnapshot({
+      sevenDay: { utilization: 30, resetsAt: (NOW_MS + 65 * 60_000) / 1000 },
+    });
+    const { rerender } = render(<QuotaHoverCard nowMs={NOW_MS} snapshot={snapshot} />);
+    expect(screen.getByText('1小时 5分钟后重置')).toBeTruthy();
+    expect(screen.queryByText('11:05 重置')).toBeNull();
+    rerender(<QuotaHoverCard nowMs={NOW_MS + 65 * 60_000} snapshot={snapshot} />);
+    expect(screen.getByText('等待重置数据更新')).toBeTruthy();
   });
 
   it('accepts the unified-headers shape without scoped windows or severity', () => {
@@ -234,15 +332,15 @@ describe('QuotaHoverCard', () => {
     expect(screen.queryByText(/重置$/)).toBeNull();
   });
 
-  it('clamps dirty utilization for both the bar and used-percent text', () => {
+  it('clamps dirty utilization for both the bar and remaining-percent text', () => {
     render(
       <QuotaHoverCard nowMs={NOW_MS} snapshot={makeSnapshot({ fiveHour: { utilization: 250 } })} />,
     );
 
     const bar = screen.getByRole('progressbar');
-    expect(bar.getAttribute('aria-valuenow')).toBe('100');
-    expect((bar.firstElementChild as HTMLElement | null)?.style.width).toBe('100%');
-    expect(screen.getByText('已用 100%')).toBeTruthy();
+    expect(bar.getAttribute('aria-valuenow')).toBe('0');
+    expect((bar.firstElementChild as HTMLElement | null)?.style.width).toBe('0%');
+    expect(screen.getByText('剩余 0%')).toBeTruthy();
   });
 
   it.each([

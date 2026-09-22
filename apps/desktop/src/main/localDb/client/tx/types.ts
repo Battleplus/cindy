@@ -1,4 +1,7 @@
+import type { TaskTagRequest, TaskTagResult } from '@cindy/maker-shared';
+
 export type DbTxName =
+  | 'taskTags.execute'
   | 'codex.importMessages'
   | 'claude.importMessages'
   | 'rewind.commit'
@@ -19,6 +22,9 @@ export type DbTxName =
   | 'orca.reconcileInactiveTeamWorkersForLead'
   | 'sessions.renameTitles'
   | 'sessions.setStatus'
+  | 'recentWorkdirs.mergeWindowsIdentity'
+  | 'recentWorkdirs.removeWindowsIdentity'
+  | 'projectAliases.replaceIdentity'
   | 'toolResults.compactSession'
   | 'session.agentSwitchFallback'
   | 'context.rebuild'
@@ -108,6 +114,12 @@ export interface RewindCommitArgs {
   preserveMessageUuid?: string;
   /** Replacement SDK session/thread id to persist atomically with rewind. */
   sdkSessionId?: string;
+  /**
+   * Codex thread/rollback 或分页 fork 换出新 thread 时,把保留消息 agent_meta 里
+   * `nativeForkAnchor.sdkSessionId` 从旧 thread 重映射到新 thread(pairs,语义同
+   * fork.session 的同名字段),否则后续回退/fork 会把这些锚点当异线程丢弃。
+   */
+  nativeForkAnchorSessionMap?: Array<[string, string]>;
   now: number;
 }
 
@@ -150,6 +162,7 @@ export interface ForkSessionArgs {
     totalCostUsd: number;
     contextTokens: number;
     contextWindow: number;
+    contextWindowRuntime?: number | null;
     fastMode: boolean | number;
     clearedAt: number | null;
     pinnedAt: number | null;
@@ -436,7 +449,26 @@ export interface SessionsSetStatusResultItem {
   title: string | null;
   workingDir: string | null;
   workspaceKind: string | null;
+  remoteHostId: string | null;
+  source: string | null;
   status: 'active' | 'archived';
+}
+
+export interface RecentWorkdirsMergeWindowsIdentityArgs {
+  path: string;
+  lastUsedAt: number;
+}
+
+export interface RecentWorkdirsRemoveWindowsIdentityArgs {
+  path: string;
+}
+
+export interface ProjectAliasesReplaceIdentityArgs {
+  projectKey: string;
+  comparisonKey: string;
+  foldCase: boolean;
+  alias: string | null;
+  updatedAt: number;
 }
 
 export interface CompactSessionToolResultsArgs {
@@ -581,6 +613,8 @@ export interface BotsCreateProfileArgs {
 
 export interface BotsUpdateProfileArgs {
   id: string;
+  /** Explicit settings changes also update the permanent chat in this transaction. */
+  canonicalPermissionMode?: 'ask' | 'auto' | 'bypassPermissions';
   displayName?: string;
   description?: string;
   avatar?: string;
@@ -592,6 +626,10 @@ export interface BotsUpdateProfileArgs {
   capabilitiesJson: string;
   profileContentChanged: boolean;
   expectedCurrentVersion: number;
+  /** Avatar-only edits do not advance the profile version; migrations also compare the address. */
+  expectedAvatar?: string;
+  /** Storage-only compatibility changes must not reorder the teammate list. */
+  preserveUpdatedAt?: boolean;
   /** Inserted and made authoritative in the same tx as the avatar address. */
   botAvatarRef?: { id: string; hash: string; createdAt: number };
   clearBotAvatarRefs?: boolean;
@@ -638,7 +676,13 @@ export interface BotsReconcileCanonicalLinkArgs {
 }
 
 export interface BotsReconcileCanonicalLinkResult {
-  status: 'unchanged' | 'repaired-mirror' | 'migrated' | 'missing-pointer' | 'missing-session' | 'conflict';
+  status:
+    | 'unchanged'
+    | 'repaired-mirror'
+    | 'migrated'
+    | 'missing-pointer'
+    | 'missing-session'
+    | 'conflict';
   canonicalSessionId: string | null;
 }
 
@@ -650,8 +694,15 @@ export interface BotsReplaceCanonicalSessionResult {
 
 export interface BotsPrepareRuntimeArgs {
   snapshot: {
-    id: string; botId: string; sessionId: string; profileVersion: number; agentKind: string;
-    workingDir: string; memoryScopeKey: string | null; configuredJson: string; resolvedJson: string;
+    id: string;
+    botId: string;
+    sessionId: string;
+    profileVersion: number;
+    agentKind: string;
+    workingDir: string;
+    memoryScopeKey: string | null;
+    configuredJson: string;
+    resolvedJson: string;
     preparedAt: number;
   };
   eventId: string;
@@ -670,6 +721,8 @@ export interface BotsFinishRuntimeArgs {
   eventPayloadJson: string;
 }
 export interface BotsFinishDelegationArgs {
+  expectedRunSequence?: number;
+  expectedExecution?: { instanceId: string; generation: number };
   delegationId: string;
   status: 'completed' | 'failed' | 'cancelled' | 'timed-out';
   resultSummary: string | null;
@@ -681,6 +734,8 @@ export interface BotsFinishDelegationArgs {
 
 export interface BotsFinishDelegationResult {
   id: string;
+  targetBotId: string | null;
+  runSequence: number;
   parentSessionId: string | null;
   childSessionId: string | null;
   status: 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled' | 'timed-out';
@@ -700,15 +755,24 @@ export interface BotsReparentDelegationsResult {
 export interface BotsCreateDelegationArgs {
   maxActiveChildren: number;
   delegation: {
-    id: string; requestingBotId: string; targetBotId: string | null; parentSessionId: string;
-    childSessionId: string; objective: string; contextRefsJson: string;
-    permissionSnapshotJson: string; lineageJson: string; targetProfileVersion: number | null;
-    depth: number; createdAt: number;
+    id: string;
+    requestingBotId: string;
+    targetBotId: string | null;
+    parentSessionId: string;
+    childSessionId: string;
+    objective: string;
+    contextRefsJson: string;
+    permissionSnapshotJson: string;
+    lineageJson: string;
+    targetProfileVersion: number | null;
+    depth: number;
+    createdAt: number;
   };
   session: BotsReplaceCanonicalSessionArgs['session'];
 }
 
 export interface BotsReopenDelegationArgs {
+  worktreePath?: string | null;
   maxActiveChildren: number;
   delegationId: string;
   requestingBotId: string;
@@ -729,11 +793,15 @@ export interface BotsReopenDelegationResult {
 }
 
 export interface BotsLifecycleTransitionArgs {
-  botId: string; canonicalSessionId: string | null; expectedProfileStatus: string;
-  at: number; eventId: string;
+  botId: string;
+  canonicalSessionId: string | null;
+  expectedProfileStatus: string;
+  at: number;
+  eventId: string;
 }
 export interface BotsArchiveLifecycleArgs extends BotsLifecycleTransitionArgs {
-  expectedProfileStatus: string; worktreeDisposition: string;
+  expectedProfileStatus: string;
+  worktreeDisposition: string;
 }
 export interface BotsDeleteProfileArgs {
   botId: string;
@@ -1110,6 +1178,10 @@ export type DbTxArgsByName = {
   'orca.reconcileInactiveTeamWorkersForLead': OrcaReconcileInactiveTeamWorkersForLeadArgs;
   'sessions.renameTitles': SessionsRenameTitlesArgs;
   'sessions.setStatus': SessionsSetStatusArgs;
+  'recentWorkdirs.mergeWindowsIdentity': RecentWorkdirsMergeWindowsIdentityArgs;
+  'recentWorkdirs.removeWindowsIdentity': RecentWorkdirsRemoveWindowsIdentityArgs;
+  'taskTags.execute': TaskTagRequest & { newId?: string; callerSessionId?: string };
+  'projectAliases.replaceIdentity': ProjectAliasesReplaceIdentityArgs;
   'toolResults.compactSession': CompactSessionToolResultsArgs;
   'session.agentSwitchFallback': SessionAgentSwitchFallbackArgs;
   'context.rebuild': ContextRebuildArgs;
@@ -1179,6 +1251,14 @@ export type DbTxResultByName = {
   'orca.reconcileInactiveTeamWorkersForLead': string[];
   'sessions.renameTitles': SessionsRenameTitleResult[];
   'sessions.setStatus': SessionsSetStatusResultItem[];
+  'recentWorkdirs.mergeWindowsIdentity': undefined;
+  'recentWorkdirs.removeWindowsIdentity': { changes: number };
+  'taskTags.execute': TaskTagResult;
+  'projectAliases.replaceIdentity': {
+    projectKey: string;
+    alias: string;
+    updatedAt: number;
+  } | null;
   'toolResults.compactSession': CompactSessionToolResultsResult;
   'session.agentSwitchFallback': undefined;
   'context.rebuild': undefined;

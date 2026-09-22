@@ -5,11 +5,7 @@
       "id": "xai",
       "name": "xAI",
       "source": "builtin",
-      "agents": [
-        "claude-code",
-        "codex",
-        "pi"
-      ],
+      "agents": ["claude-code", "codex", "pi"],
       "auth": {
         "method": "oauth"
       },
@@ -37,9 +33,7 @@
         "claude-code": {
           "upstream": "https://api.x.ai/v1",
           "authStrategy": "oauth-passthrough",
-          "modelPrefixes": [
-            "xai/"
-          ]
+          "modelPrefixes": ["xai/"]
         },
         "codex": {
           "upstream": "https://api.x.ai/v1",
@@ -54,9 +48,7 @@
             "originator",
             "session_id"
           ],
-          "modelPrefixes": [
-            "xai/"
-          ]
+          "modelPrefixes": ["xai/"]
         },
         "pi": {
           "upstream": "https://api.x.ai/v1",
@@ -73,17 +65,29 @@
       "models": {
         "claude-code": [
           {
+            "id": "xai/grok-4.7",
+            "name": "Grok 4.7",
+            "group": "grok",
+            "sortOrder": 47,
+            "contextWindow": 500000,
+            "efforts": [
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "defaultEffort": "high",
+            "status": "active",
+            "supportsImageInput": true
+          },
+          {
             "id": "xai/grok-4.6",
             "name": "Grok 4.6",
             "group": "grok",
             "sortOrder": 48,
             "description": "xAI Grok 4.6 旗舰,编码/agent 任务,500k 上下文(SuperGrok 订阅直连)",
             "contextWindow": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -94,11 +98,7 @@
             "sortOrder": 49,
             "description": "xAI Grok 4.5,编码/agent 任务,500k 上下文(SuperGrok 订阅直连)",
             "contextWindow": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -109,11 +109,7 @@
             "sortOrder": 51,
             "description": "xAI Grok 4.3 通用旗舰,1M 上下文(SuperGrok 订阅直连)",
             "contextWindow": 1000000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -172,12 +168,7 @@
             "sortOrder": 98,
             "description": "旧版兼容 alias;新会话请使用明确的 Grok 4.20 model ID",
             "contextWindow": 1000000,
-            "efforts": [
-              "low",
-              "medium",
-              "high",
-              "xhigh"
-            ],
+            "efforts": ["low", "medium", "high", "xhigh"],
             "defaultEffort": "high",
             "status": "deprecated",
             "defaultEnabled": false
@@ -197,17 +188,29 @@
         ],
         "codex": [
           {
+            "id": "xai/grok-4.7",
+            "name": "Grok 4.7",
+            "group": "grok",
+            "sortOrder": 47,
+            "contextWindow": 500000,
+            "efforts": [
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "defaultEffort": "high",
+            "status": "active",
+            "supportsImageInput": true
+          },
+          {
             "id": "xai/grok-4.6",
             "name": "Grok 4.6",
             "group": "grok",
             "sortOrder": 48,
             "description": "xAI Grok 4.6 旗舰,编码/agent 任务,500k 上下文(SuperGrok 订阅直连)",
             "contextWindow": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -218,11 +221,7 @@
             "sortOrder": 49,
             "description": "xAI Grok 4.5,编码/agent 任务,500k 上下文(SuperGrok 订阅直连)",
             "contextWindow": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -233,11 +232,7 @@
             "sortOrder": 51,
             "description": "xAI Grok 4.3 通用旗舰,1M 上下文(SuperGrok 订阅直连)",
             "contextWindow": 1000000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "active"
           },
@@ -296,11 +291,7 @@
             "sortOrder": 98,
             "description": "旧版兼容 alias;新会话请使用明确的 Grok 4.20 model ID",
             "contextWindow": 1000000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "high",
             "status": "deprecated",
             "defaultEnabled": false
@@ -320,6 +311,39 @@
         ],
         "pi": [
           {
+            "id": "grok-4.7",
+            "name": "Grok 4.7",
+            "piApi": "openai-responses",
+            "group": "grok",
+            "sortOrder": 47,
+            "contextWindow": 500000,
+            "maxOutput": 500000,
+            "efforts": [
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "defaultEffort": "high",
+            "status": "active",
+            "supportsImageInput": true,
+            "cost": {
+              "input": 2,
+              "output": 6,
+              "cacheRead": 0.5,
+              "cacheWrite": 0,
+              "tiers": [
+                {
+                  "inputTokensAbove": 199999,
+                  "input": 4,
+                  "output": 12,
+                  "cacheRead": 1,
+                  "cacheWrite": 0
+                }
+              ]
+            }
+          },
+          {
             "id": "grok-4.3",
             "name": "Grok 4.3",
             "piApi": "openai-responses",
@@ -327,11 +351,7 @@
             "sortOrder": 49,
             "contextWindow": 1000000,
             "maxOutput": 30000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "medium",
             "status": "active",
             "supportsImageInput": true,
@@ -350,11 +370,7 @@
             "sortOrder": 50,
             "contextWindow": 500000,
             "maxOutput": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high"
-            ],
+            "efforts": ["low", "medium", "high"],
             "defaultEffort": "medium",
             "status": "active",
             "supportsImageInput": true,
@@ -373,12 +389,7 @@
             "sortOrder": 51,
             "contextWindow": 500000,
             "maxOutput": 500000,
-            "efforts": [
-              "low",
-              "medium",
-              "high",
-              "xhigh"
-            ],
+            "efforts": ["low", "medium", "high", "xhigh"],
             "defaultEffort": "high",
             "status": "active",
             "supportsImageInput": true,
@@ -521,11 +532,7 @@
               "name": "DeepSeek V4 Flash",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -534,11 +541,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -546,10 +549,7 @@
               "name": "DeepSeek V4 Pro",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             }
           ]
@@ -765,11 +765,7 @@
               "contextWindow": 1048576,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "max"
             }
           ]
@@ -883,11 +879,7 @@
               "contextWindow": 1048576,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "max"
             }
           ]
@@ -906,8 +898,9 @@
           "models": [
             {
               "id": "kimi-for-coding",
-              "name": "Kimi for Coding",
-              "contextWindow": 262144
+              "name": "Kimi K2.8 Preview",
+              "contextWindow": 1048576,
+              "supportsImageInput": true
             },
             {
               "id": "kimi-for-coding-highspeed",
@@ -927,8 +920,9 @@
           "models": [
             {
               "id": "kimi-for-coding",
-              "name": "Kimi for Coding",
-              "contextWindow": 262144
+              "name": "Kimi K2.8 Preview",
+              "contextWindow": 1048576,
+              "supportsImageInput": true
             },
             {
               "id": "kimi-for-coding-highspeed",
@@ -953,11 +947,7 @@
               "contextWindow": 1048576,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -966,18 +956,17 @@
               "contextWindow": 262144,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
               "id": "kimi-for-coding",
-              "name": "Kimi K2.7 Code",
-              "contextWindow": 262144,
-              "supportsImageInput": true
+              "name": "Kimi K2.8 Preview",
+              "contextWindow": 1048576,
+              "supportsImageInput": true,
+              "reasoning": true,
+              "reasoningEfforts": ["low", "high", "max"],
+              "reasoningDefaultEffort": "max"
             },
             {
               "id": "kimi-for-coding-highspeed",
@@ -1276,10 +1265,7 @@
               "name": "DeepSeek V4 Flash",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1287,10 +1273,7 @@
               "name": "DeepSeek V4 Flash 0731",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1298,10 +1281,7 @@
               "name": "DeepSeek V4 Pro",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1309,10 +1289,7 @@
               "name": "DeepSeek V4 Pro 0813",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1320,10 +1297,7 @@
               "name": "GLM-5",
               "contextWindow": 202752,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1331,10 +1305,7 @@
               "name": "GLM-5.1",
               "contextWindow": 202752,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1342,10 +1313,7 @@
               "name": "GLM-5.2",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1395,11 +1363,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "medium",
-                "xhigh"
-              ],
+              "reasoningEfforts": ["low", "medium", "xhigh"],
               "reasoningDefaultEffort": "medium"
             },
             {
@@ -1408,11 +1372,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "medium",
-                "xhigh"
-              ],
+              "reasoningEfforts": ["low", "medium", "xhigh"],
               "reasoningDefaultEffort": "medium"
             }
           ]
@@ -1611,10 +1571,7 @@
               "name": "DeepSeek V4 Flash",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1622,10 +1579,7 @@
               "name": "DeepSeek V4 Flash 0731",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1633,10 +1587,7 @@
               "name": "DeepSeek V4 Pro",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1644,10 +1595,7 @@
               "name": "DeepSeek V4 Pro 0813",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1655,10 +1603,7 @@
               "name": "GLM-5",
               "contextWindow": 202752,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1666,10 +1611,7 @@
               "name": "GLM-5.1",
               "contextWindow": 202752,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1677,10 +1619,7 @@
               "name": "GLM-5.2",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -1730,11 +1669,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "medium",
-                "xhigh"
-              ],
+              "reasoningEfforts": ["low", "medium", "xhigh"],
               "reasoningDefaultEffort": "medium"
             },
             {
@@ -1743,11 +1678,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "medium",
-                "xhigh"
-              ],
+              "reasoningEfforts": ["low", "medium", "xhigh"],
               "reasoningDefaultEffort": "medium"
             }
           ]
@@ -2015,10 +1946,7 @@
               "name": "GLM-5.2",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2026,10 +1954,7 @@
               "name": "GLM-5.2 Highspeed",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2037,11 +1962,7 @@
               "name": "GLM-5.3",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2050,11 +1971,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2062,11 +1979,7 @@
               "name": "GLM-5.3 Highspeed",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2142,10 +2055,7 @@
               "name": "GLM-5.2",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2153,10 +2063,7 @@
               "name": "GLM-5.2 Highspeed",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2164,11 +2071,7 @@
               "name": "GLM-5.3",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2177,11 +2080,7 @@
               "contextWindow": 1000000,
               "supportsImageInput": true,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             },
             {
@@ -2189,11 +2088,7 @@
               "name": "GLM-5.3 Highspeed",
               "contextWindow": 1000000,
               "reasoning": true,
-              "reasoningEfforts": [
-                "low",
-                "high",
-                "max"
-              ],
+              "reasoningEfforts": ["low", "high", "max"],
               "reasoningDefaultEffort": "high"
             }
           ]

@@ -2,13 +2,37 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { BotProfile } from '../botStore';
 import {
+  botEntryTarget,
   BotCanonicalSessionCreateTimeoutError,
   createBotCanonicalSessionWithRetry,
   isRetryableBotCanonicalSessionCreateError,
   shouldDeferCanonicalBotSessionNavigation,
   withBotCanonicalSessionReadTimeout,
 } from '../botNavigation';
+
+describe('botEntryTarget', () => {
+  const profile = (id: string, extra: Partial<BotProfile> = {}) => ({ id, name: id, status: 'active', createdAt: 1, ...extra }) as BotProfile;
+  it.each(['active', 'paused', 'error'] as const)('falls back to the oldest available teammate (%s) without reordering the roster', (status) => {
+    const bots = [profile('new', { createdAt: 20 }), profile('old', { status, createdAt: 1 }), profile('middle', { createdAt: 10 })];
+    expect(botEntryTarget(bots, 'deleted')?.id).toBe('old');
+    expect(botEntryTarget(bots)?.id).toBe('old');
+    expect(bots.map(bot => bot.id)).toEqual(['new', 'old', 'middle']);
+  });
+  it('uses an existing built-in Cindy only as a fallback, without matching names or avatars', () => {
+    const bots = [profile('ordinary', { name: 'Cindy' }), profile('builtin', { templateId: 'cindy', name: 'Renamed' })];
+    expect(botEntryTarget(bots)?.id).toBe('builtin');
+    expect(botEntryTarget(bots, 'ordinary')?.id).toBe('ordinary');
+  });
+  it('keeps a remembered paused teammate available for recovery', () => {
+    expect(botEntryTarget([profile('active'), profile('paused', { status: 'paused' })], 'paused')?.id).toBe('paused');
+  });
+  it('excludes archived and deleting teammates even if remembered or built-in', () => {
+    expect(botEntryTarget([profile('archived', { status: 'archived' }), profile('cindy', { status: 'deleting', templateId: 'cindy' })], 'cindy')).toBeNull();
+    expect(botEntryTarget([])).toBeNull();
+  });
+});
 
 describe('shouldDeferCanonicalBotSessionNavigation', () => {
   it.each([
@@ -82,7 +106,7 @@ describe('Bot canonical Session creation retry', () => {
   });
 });
 
-describe('伙伴创建统一使用弹窗，并兼容旧创建链接', () => {
+describe('伙伴创建兼容旧创建链接', () => {
   const router = readFileSync(resolve(__dirname, '..', '..', '..', 'router.tsx'), 'utf8');
   const home = readFileSync(resolve(__dirname, '..', 'BotsHomeView.tsx'), 'utf8');
   const sidebar = readFileSync(resolve(__dirname, '..', 'BotsSidebar.tsx'), 'utf8');
@@ -92,8 +116,7 @@ describe('伙伴创建统一使用弹窗，并兼容旧创建链接', () => {
     expect(router.indexOf("path: 'roster'")).toBeLessThan(router.indexOf("path: ':botId'"));
   });
 
-  it('没有伙伴时提供创建弹窗入口，不堆叠卖点卡', () => {
-    expect(home).toContain("<BotCreateMenu label={t('bots.add')} />");
+  it('空态不堆叠卖点卡', () => {
     // 四张功能卖点卡整体删除:它用产品内部术语介绍一个靠「挑一个合拍的」就能懂的东西。
     expect(home).not.toContain('emptyBenefits');
     expect(home).not.toContain('AddBotDialog');
@@ -103,7 +126,7 @@ describe('伙伴创建统一使用弹窗，并兼容旧创建链接', () => {
     expect(home).toContain("navigate('/bots/roster', { replace: true })");
   });
 
-  it('侧栏加号与空态复用同一个创建弹窗入口', () => {
+  it('侧栏加号复用同一个创建弹窗入口', () => {
     expect(sidebar).not.toContain('?add=1');
     expect(sidebar).toContain('<BotCreateMenu compact />');
     expect(sidebar).toContain('<BotCreateMenu />');
@@ -153,7 +176,7 @@ describe('Bot task route recovery', () => {
     // 只读历史也带头像与伙伴 lockup:这个视图本来就已经查过 history(botId) 确认归属。
     expect(history).toMatch(/window\.electronAPI\.localDb\.bots\s*\.get\(botId\)/);
     expect(history).toContain(
-      '<CCAgentSessionView readOnly {...(identity ? { botIdentity: identity } : {})} />',
+      "botIdentity={{ ...(identity ?? { id: botId, name: '' }), sessionId }}",
     );
   });
 

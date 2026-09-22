@@ -2,6 +2,7 @@ import Constants from 'expo-constants';
 import { isHistoryViewUnavailable } from '@cindy/maker-shared/message-window';
 import { findRemoteHistoryView } from '@/session/remoteHistoryView';
 import { createBackgroundConnection } from './backgroundConnection';
+import { invokeWithHistoryViewCapability } from './historyViewCapability';
 import { createRecoveryDiagnostics, settleMeasuredSnapshot, type RecoveryPhase } from './recoveryDiagnostics';
 import { confirmTrackedSubscription, SubscriptionAcknowledgements } from './subscriptionAcknowledgements';
 import { AppState, Platform } from 'react-native';
@@ -41,18 +42,19 @@ import {
 import {
   clearAllDeviceProviders,
   evictDeviceProviders,
-  fetchDeviceProviders,
-  markDeviceFetchEpoch,
   type DeviceProvidersPayload,
 } from '@/device-link/deviceProvidersCache';
 import {
-  commitAgentCapabilities,
   evictAgentCapabilitiesForDevice,
-  getAgentCapabilitiesGeneration,
   resetAgentCapabilitiesCache,
 } from '@/session/agentCapabilitiesCache';
-import { normalizeMobileAgentCapabilities } from '@/session/agentCapabilities';
+import { createDeviceCatalogRefresh } from '@/device-link/deviceCatalogRefresh';
 import { evictComposerPaletteCacheForDevice, resetComposerPaletteCache } from '@/session/composerPaletteCache';
+import {
+  evictTaskTagCatalog,
+  resetTaskTagCatalogCache,
+  writeTaskTagCatalog,
+} from '@/session/taskTagCatalogCache';
 import { clearAllDeviceModelMeta, evictDeviceModelMeta } from '@/device-link/deviceModelMetaCache';
 import { dispatchFileBrowserWatchEvent } from '@/device-link/fileBrowserWatch';
 import {
@@ -144,6 +146,7 @@ import {
   schedulePresenceWipeTimer,
   updatePresenceAvailability,
 } from '@/device-link/presenceRecovery';
+import { createOfflineMirrorWipeQueue } from '@/device-link/offlineMirrorWipeQueue';
 import { hasMoreOlderMessages } from '@/session/messagePaging';
 import type { InputProjection, PendingInteraction, RemoteMessage } from '@/session/types';
 import { createVisualMockDeviceLinkContext, seedVisualMockStore } from '@/debug/visualMock';
@@ -166,6 +169,8 @@ export interface DeviceLinkContextValue {
   /** 丢弃已结算的开链缓存并真正重开；并发重开仍按设备单飞。 */
   reopenLink(deviceId: string): Promise<LinkAcceptPayload>;
   closeLink(deviceId: string): void;
+  /** Acquire before background grace ends; always release on settlement/cancellation. Hard deadline enforced by lifecycle. */
+  beginBackgroundTransition?(): () => void;
   /**
    * opts.preSend:在连接就绪之后、真正 client.invoke 之前的最后同步检查点。抛错即
    * 中止本次发送(错误原样上抛)。供写序敏感的调用方(patchHomeSession 的 isLatest
@@ -212,6 +217,20 @@ const CONTROLLER_CAPABILITIES = [
 const remoteResponseEvidenceEpochs = createPresenceAvailabilityEpochs();
 const remoteResponseEvidenceListeners = new Set<(deviceId: string) => void>();
 const remoteAgentRosterListeners = new Set<(deviceId: string) => void>();
+const remoteTaskTagsChangedListeners = new Set<(deviceId: string, tags: unknown) => void>();
+export function subscribeRemoteTaskTagsChanged(
+  listener: (deviceId: string, tags: unknown) => void,
+): () => void {
+  remoteTaskTagsChangedListeners.add(listener);
+  return () => {
+    remoteTaskTagsChangedListeners.delete(listener);
+  };
+}
+const remoteFavoritesChangedListeners = new Set<(deviceId: string) => void>();
+export function subscribeRemoteFavoritesChanged(listener: (deviceId: string) => void): () => void {
+  remoteFavoritesChangedListeners.add(listener);
+  return () => { remoteFavoritesChangedListeners.delete(listener); };
+}
 const remoteBotChangedListeners = new Set<(deviceId: string, channel: string, payload: unknown) => void>();
 export function subscribeRemoteBotChanges(listener: (deviceId: string, channel: string, payload: unknown) => void): () => void {
   remoteBotChangedListeners.add(listener);
@@ -378,6 +397,16 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   // 后台释放 heavy session 订阅期间仍保留 registry 所有权;此时 unsubscribe ack
   // 可以修正 stale offline verdict,但不能顺带触发 rehydrate 把刚释放的订阅加回来。
   const backgroundReleaseInFlightRef = useRef(false);
+  const backgroundTransitions = useRef(new Set<Promise<void>>());
+  const beginBackgroundTransition = useCallback(() => {
+    let settle!: () => void;
+    const pending = new Promise<void>((resolve) => { settle = resolve; });
+    backgroundTransitions.current.add(pending);
+    return () => {
+      backgroundTransitions.current.delete(pending);
+      settle();
+    };
+  }, []);
   // 每次后台释放都翻代。subscribe 即使跨 background→active 才收到 ACK,也只能在
   // 发起代仍为当前代时登记远端 ACK,避免迟到成功覆盖较新的 unsubscribe。
   const backgroundReleaseGenerationRef = useRef(0);
@@ -419,6 +448,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     clearAllDeviceModelMeta();
     resetAgentCapabilitiesCache();
     resetComposerPaletteCache();
+    resetTaskTagCatalogCache();
     setLastPresenceSnapshot(null);
     setPresenceVersion((version) => version + 1);
   }, []);
@@ -839,6 +869,22 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       },
     });
     clientRef.current = client;
+    const catalogRefresh = createDeviceCatalogRefresh({
+      connectionEpoch: () => connectionEpochRef.current,
+      readProviders: (deviceId) => sendInvokeWithAccessHandling<DeviceProvidersPayload>(
+        client, deviceId, 'maker:provider:list',
+        [{ capabilities: [CONTROLLER_CAPABILITY_PROVIDER_LOGO_KINDS_V2] }],
+      ),
+      readCapabilities: (deviceId, agent) => sendInvokeWithAccessHandling<unknown>(
+        client, deviceId, 'maker:get-capabilities', [agent],
+      ),
+    });
+    mobileDebugLog('debug', 'device-link', 'runtime identity', {
+      commit: /^[a-f0-9]{7,40}$/i.test(process.env.EXPO_PUBLIC_XDT_GIT_COMMIT ?? '')
+        ? process.env.EXPO_PUBLIC_XDT_GIT_COMMIT : 'unknown',
+      version: Constants.nativeAppVersion ?? 'unknown',
+      build: Constants.nativeBuildVersion ?? 'unknown',
+    });
     const diagnostics = createRecoveryDiagnostics(
       (event) => mobileDeviceLinkLogger.info('recovery phase', event),
       () => connectionEpochRef.current,
@@ -849,6 +895,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     const offStatus = client.onStatusChange((next) => {
       setStatus(next);
       if (next !== 'online') {
+        catalogRefresh.clear();
         openLinkInFlightRef.current.clear();
         remoteSubscribedTopicsRef.current.clear();
         // 掉线:所有会话的实时行都可能从此漏收,窗口连续性结论的上界不再可续算。
@@ -995,11 +1042,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     const offFrame = client.onFrame((env) => routeFrame(env, {
       currentDataOwnerId: currentDataOwnerIdRef.current,
       onAccessRevoked: (deviceId) => {
+        catalogRefresh.cancel(deviceId);
         remoteSubscribedTopicsRef.current.delete(deviceId);
         forcedPeerRecoveryIntentRef.current.cancel(deviceId);
         peerRecoverySchedulerRef.current?.cancel(deviceId);
       },
       onLinkClosed: (deviceId, reason) => {
+        catalogRefresh.cancel(deviceId);
         resetRemoteProjectOrderPushFence(deviceId);
         updateRehydrateSuppressionOnLinkClose(
           rehydrateSuppressedDeviceIds,
@@ -1048,30 +1097,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         }
       },
       onProviderChanged: (deviceId) => {
-        // provider 目录与 capabilities.availableModels 是同一份 active catalog 的两种视图。
-        // 同时驱逐并后台重拉；页面保留旧画面，当前代完整快照提交后由订阅一次性更新。
-        evictDeviceProviders(deviceId);
-        evictAgentCapabilitiesForDevice(deviceId);
-        const epochAtWrite = connectionEpoch;
-        void fetchDeviceProviders(deviceId, () =>
-          sendInvokeWithAccessHandling<DeviceProvidersPayload>(
-            client,
-            deviceId,
-            'maker:provider:list',
-            [{ capabilities: [CONTROLLER_CAPABILITY_PROVIDER_LOGO_KINDS_V2] }],
-          )
-        )
-          .then(() => {
-            // 无挂载 hook 的后台缓存写入也要标记所属连接代际(codex review P1):
-            // 不 mark 则 deviceFetchEpoch 保持 undefined,断线前旧目录在重连后被
-            // 当「首次挂载缓存命中」采信、永不刷新——选择器无限期展示已删供应商。
-            // fetch 期间重连(epoch 变化)则 mark 的是捕获时的旧代际 → 下次 effect
-            // 判 reconnected → 强制 fresh(保守正确)。失败不 mark(evict 已清缓存,
-            // 无旧目录可被误采信)。
-            markDeviceFetchEpoch(deviceId, epochAtWrite);
-          })
-          .catch(() => { /* 下次进入选择器或重连补齐时继续重试。 */ });
-        void refreshDeviceCapabilities(client, deviceId);
+        catalogRefresh.notify(deviceId);
       },
       onAgentsChanged: (deviceId) => {
         for (const listener of remoteAgentRosterListeners) listener(deviceId);
@@ -1174,11 +1200,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     const backgroundConnection = createBackgroundConnection({
       isBackground: () => AppState.currentState === 'background',
       releaseTopics: releaseHeavyTopics,
+      pendingTransitions: () => [...backgroundTransitions.current],
       stop: () => client.stop(),
       connect: () => client.connectNow('appstate-active', { overrideCongestionCooldown: true }),
       graceMs: BACKGROUND_STOP_GRACE_MS,
       releaseWaitMs: BACKGROUND_FINAL_UNSUBSCRIBE_WAIT_MS,
       suspendMs: BACKGROUND_SUSPEND_SUSPECT_MS,
+      report: (event) => mobileDebugLog('debug', 'device-link', 'background lifecycle', event),
     });
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') {
@@ -1189,6 +1217,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         // overrideCongestionCooldown:用户显式回前台是拥塞冷却的合法豁免——
         // 冷却默认只拦请求路径的 un-park(waitUntilOnline),不拦真人操作。
         backgroundConnection.active();
+        // A short background stay can preserve a socket whose route changed.
+        // Probe without the ordinary hint cooldown; never delay content recovery.
+        if (client.getStatus() === 'online') client.notifyNetworkChanged({ urgent: true });
         // 快速切换(连接被宽限保住、始终 online)不会有 online 状态转换,这条显式
         // 补齐就是断档回填的唯一触发点;其余路径下它因 status 未 online 而空转。
         void rehydrateWithClient(client);
@@ -1213,12 +1244,19 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     // existing heartbeat fallback if the optional runtime module is unavailable.
     let disposed = false;
     let networkSubscription: { remove(): void } | undefined;
+    let previousNetwork: { type?: string; isConnected?: boolean; isInternetReachable?: boolean } | undefined;
     void import('expo-network').then(({ addNetworkStateListener }) => {
       if (disposed) return;
       networkSubscription = addNetworkStateListener((network) => {
-        mobileDebugLog('debug', 'device-link', 'network changed', { type: network.type, connected: network.isConnected, reachable: network.isInternetReachable, appState: AppState.currentState });
+        const urgent = previousNetwork !== undefined && (
+          previousNetwork.type !== network.type
+          || previousNetwork.isConnected !== network.isConnected
+          || previousNetwork.isInternetReachable !== network.isInternetReachable
+        );
+        previousNetwork = network;
+        mobileDebugLog('debug', 'device-link', 'network path notification', { type: network.type, connected: network.isConnected, reachable: network.isInternetReachable, appState: AppState.currentState, urgent });
         if (AppState.currentState !== 'active' || network.isConnected === false) return;
-        client.notifyNetworkChanged();
+        client.notifyNetworkChanged({ urgent });
       });
     }).catch(() => {
       console.warn('[device-link] network listener unavailable; using heartbeat recovery');
@@ -1231,10 +1269,12 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       networkSubscription?.remove();
       sub.remove();
       backgroundConnection.dispose();
+      backgroundTransitions.current.clear();
       offUnresponsive();
       offResponseEvidence();
       offBeforeLink();
       offFrame();
+      catalogRefresh.dispose();
       offPresence();
       offPeerTransportReset();
       offStatus();
@@ -1308,8 +1348,23 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       opts?.preSend?.();
     };
     preSend();
-    return sendInvokeWithAccessHandling<T>(requireClient(clientRef.current), deviceId, channel, args, { preSend });
-  }, []);
+    const client = requireClient(clientRef.current);
+    return invokeWithHistoryViewCapability(
+      channel,
+      async () => {
+        // Reuse the existing peer-scoped handshake cache and its invalidation.
+        // A late accept from an obsolete link must not declare a downgrade.
+        const tracked = sendOpenLinkOnce(client, deviceId);
+        const accepted = await tracked.request;
+        if (clientRef.current !== client || openLinkInFlightRef.current.get(deviceId) !== tracked) {
+          throw new DeviceLinkError('NOT_CONNECTED', 'history link was superseded');
+        }
+        preSend();
+        return accepted;
+      },
+      () => sendInvokeWithAccessHandling<T>(client, deviceId, channel, args, { preSend }),
+    );
+  }, [sendOpenLinkOnce]);
 
   const subscribe = useCallback(async (owner: string, deviceId: string, topics: string[]) => {
     // `owner` is the stable id of the mounted consumer (e.g. `session:<id>`). Tracking is
@@ -1349,6 +1404,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   ), []);
 
   const value = useMemo<DeviceLinkContextValue>(() => ({
+    beginBackgroundTransition,
     status,
     recoveringDeviceIds,
     connectionIssue,
@@ -1367,6 +1423,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     onAgentsChanged: subscribeRemoteAgentRoster,
     onRemoteResourceChanged: subscribeRemoteResourceChanged,
   }), [
+    beginBackgroundTransition,
     closeLink,
     recoveringDeviceIds,
     connectionEpoch,
@@ -1415,6 +1472,19 @@ export function routeFrame(env: Envelope, handlers: {
   if (peerLinkClosed) return;
   if (env.kind !== 'push' || !env.src) return;
   const push = env.payload as PushPayload;
+  if (push.channel === 'local-db:task-tags:changed') {
+    writeTaskTagCatalog(
+      handlers.currentDataOwnerId,
+      env.src,
+      (push.payload as { tags?: unknown })?.tags,
+    );
+    for (const listener of remoteTaskTagsChangedListeners)
+      listener(env.src, (push.payload as { tags?: unknown })?.tags);
+  }
+  if (push.channel === 'maker:model-favorites:changed') {
+    for (const listener of remoteFavoritesChangedListeners) listener(env.src);
+    return;
+  }
   if (push.channel === 'maker:provider:changed') {
     handlers.onProviderChanged?.(env.src);
     return;
@@ -1476,28 +1546,6 @@ export function routeFrame(env: Envelope, handlers: {
     remoteSessionStore.invalidateSessionMessageWindow(historySessionId as string, env.src);
     historyView.reset();
   } else if (historyView?.getSnapshot().ready && (push.channel === 'local-db:messages:created' || push.channel === 'maker:status-changed')) historyView.invalidate();
-}
-
-/** provider revision 后并行重拉所有 agent 的能力；旧代或异常结果都不触碰当前页面。 */
-async function refreshDeviceCapabilities(
-  client: DeviceLinkClient,
-  deviceId: string,
-): Promise<void> {
-  const generation = getAgentCapabilitiesGeneration(deviceId);
-  await Promise.allSettled(
-    (['claude-code', 'codex', 'pi'] as const).map(async (agentKind) => {
-      const raw = await sendInvokeWithAccessHandling<unknown>(
-        client,
-        deviceId,
-        'maker:get-capabilities',
-        [agentKind],
-      );
-      const normalized = normalizeMobileAgentCapabilities(raw);
-      if (normalized) {
-        commitAgentCapabilities(deviceId, agentKind, generation, normalized);
-      }
-    }),
-  );
 }
 
 async function rebuildSessionSnapshot(
@@ -1927,19 +1975,28 @@ function requireClient(client: DeviceLinkClient | null): DeviceLinkClient {
   return client;
 }
 
-function markOfflineDeviceMirror(deviceId: string): void {
+function markOfflineDeviceMirrors(deviceIds: readonly string[]): void {
   // 普通离线只清依赖在线连接的 live 投影,保留 session/messages。这样用户切回
   // 刚看过的会话时先看到 last-known 内容,恢复后 marker 失效会触发后台窗口对账。
-  remoteSessionStore.markDeviceOffline(deviceId);
-  invalidateScheduleIndexForDevice(deviceId);
-  remoteScheduleEventStore.invalidateDeviceMirror(deviceId);
-  evictDeviceProviders(deviceId);
-  evictDeviceModelMeta(deviceId);
-  evictAgentCapabilitiesForDevice(deviceId);
-  evictComposerPaletteCacheForDevice(deviceId);
+  // 批量入口:同一波离线两个 store 各 notify 一次,而不是每台各 notify 一轮——
+  // 逐台通知时设备数超过 React 嵌套更新上限即致命退出(2026-09-10)。
+  remoteSessionStore.markDevicesOffline(deviceIds);
+  for (const deviceId of deviceIds) {
+    invalidateScheduleIndexForDevice(deviceId);
+    evictDeviceProviders(deviceId);
+    evictDeviceModelMeta(deviceId);
+    evictAgentCapabilitiesForDevice(deviceId);
+    evictComposerPaletteCacheForDevice(deviceId);
+  }
+  remoteScheduleEventStore.invalidateDeviceMirrors(deviceIds);
+}
+
+function markOfflineDeviceMirror(deviceId: string): void {
+  markOfflineDeviceMirrors([deviceId]);
 }
 
 function wipeUnavailableDeviceMirror(deviceId: string): void {
+  evictTaskTagCatalog(deviceId);
   resetRemoteProjectOrderPushFence(deviceId);
   invalidateScheduleIndexForDevice(deviceId);
   remoteSessionStore.removeDevice(deviceId);
@@ -1955,12 +2012,16 @@ function wipeUnavailableDeviceMirror(deviceId: string): void {
   evictComposerPaletteCacheForDevice(deviceId);
 }
 
+// 离线 wipe 的通知合并:同一 task 内到期/调度的多台设备收拢成一次批量清理。
+// 逐台通知时设备数超过 React 嵌套更新上限即致命退出(2026-09-10 Android)。
+const offlineMirrorWipeQueue = createOfflineMirrorWipeQueue(markOfflineDeviceMirrors);
+
 const basePresenceWipeTimerDeps = {
   now: Date.now,
   setTimer: (callback: () => void, delayMs: number) =>
     setTimeout(callback, delayMs),
   clearTimer: clearTimeout,
-  wipe: markOfflineDeviceMirror,
+  wipe: offlineMirrorWipeQueue.enqueue,
 };
 
 function scheduleUnavailableDeviceMirrorWipe(

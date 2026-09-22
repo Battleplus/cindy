@@ -3,6 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BotCapabilities, BotModelRoute, BotProfile } from '../botStore';
+import { MainViewHistoryContext, type MainViewHistory } from '@/contexts/MainViewHistoryContext';
 import type { CustomMcpListContext, CustomMcpListResult } from '../../../../shared/customMcp';
 import { beginProvidersRefresh, commitProvidersSnapshot } from '@/lib/providersSnapshotStore';
 
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => {
   listAgentSkills: vi.fn(),
   listToolsets: vi.fn(),
   profiles: [] as BotProfile[],
+  profilesLoaded: true,
   params: {} as { botId?: string },
   availableVendors: new Set(['cc', 'codex', 'pi']),
   defaultModelChain: [] as BotModelRoute[],
@@ -80,6 +82,7 @@ vi.mock('../botStore', () => ({
   chooseBotAvatar: mocks.chooseBotAvatar,
   setCanonicalBotSession: vi.fn(),
   useBotProfiles: () => mocks.profiles,
+  hasLoadedBotProfiles: () => mocks.profilesLoaded,
   canonicalBotSessionId: (bot: BotProfile) => bot.canonicalSessionId,
   getEffectiveBotModelChain: () => mocks.defaultModelChain,
   subscribeBotGlobalModel: (listener: () => void) => {
@@ -206,6 +209,7 @@ beforeEach(() => {
   mocks.openPath.mockResolvedValue({ success: true });
   mocks.initialSearch = '';
   mocks.profiles = [];
+  mocks.profilesLoaded = true;
   mocks.params = {};
   mocks.availableVendors = new Set(['cc', 'codex', 'pi']);
   mocks.defaultModelChain = [];
@@ -243,6 +247,49 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+});
+
+describe('Bot entry after deletion', () => {
+  it('opens an ordinary teammate when Cindy is absent without flashing creation', () => {
+    mocks.profiles = [bot()];
+    render(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+    expect(screen.queryByRole('textbox')).toBeNull();
+  });
+
+  it('prefers the last viewed ID over Cindy, independent of renamed profiles', () => {
+    mocks.profiles = [bot({ id: 'cindy', name: 'Renamed', templateId: 'cindy' }), bot()];
+    const history = { current: { lastMatchedKey: 'bots', paths: {}, lastBotId: 'bot-1' } as MainViewHistory };
+    render(<MainViewHistoryContext.Provider value={history}><BotsHomeView /></MainViewHistoryContext.Provider>);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+  });
+
+  it('waits for hydration before recovering a stale deep link', () => {
+    mocks.profilesLoaded = false;
+    mocks.params = { botId: 'deleted' };
+    const view = render(<BotsHomeView />);
+    expect(mocks.navigate).not.toHaveBeenCalled();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    mocks.profiles = [bot()];
+    mocks.profilesLoaded = true;
+    view.rerender(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+  });
+
+  it('skips a deleting current profile and opens recovery settings for the remaining paused one', () => {
+    mocks.params = { botId: 'deleted' };
+    mocks.profiles = [bot({ id: 'deleted', status: 'deleting' }), bot({ status: 'paused' })];
+    render(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1?settings=1', { replace: true });
+    expect(mocks.readSession).not.toHaveBeenCalled();
+  });
+
+  it('only shows creation once the loaded roster is empty', () => {
+    mocks.params = { botId: 'deleted' };
+    render(<BotsHomeView />);
+    expect(screen.getByRole('textbox')).toBeTruthy();
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots', { replace: true });
+  });
 });
 
 describe('Bot settings profile consolidation', () => {
@@ -385,6 +432,7 @@ describe('Bot settings profile consolidation', () => {
     expect(screen.getByText('bots.homeFolder.title')).toBeTruthy();
     expect(screen.getByTestId('model-selector')).toBeTruthy();
     expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
+    expect(screen.getByTestId('bot-lifecycle-settings').closest('details')).toBeNull();
     expect(screen.queryByText('bots.settingsTabs.growth')).toBeNull();
     expect(screen.queryByText('bots.persona.adjustButton')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -400,6 +448,7 @@ describe('Bot settings profile consolidation', () => {
 
   it('opens the managed advanced folder without exposing a second editor', async () => {
     renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
     fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.open' }));
     await waitFor(() => expect(mocks.openPath).toHaveBeenCalledWith('/managed/bots/bot-1'));
   });
@@ -407,16 +456,39 @@ describe('Bot settings profile consolidation', () => {
   it('shows the open-folder failure in place', async () => {
     mocks.openPath.mockResolvedValue({ success: false, error: 'missing' });
     renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
     fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.open' }));
     expect((await screen.findByRole('alert')).textContent).toContain('missing');
   });
 
-  it('ignores retired tab deep links and keeps every setting on the same page', () => {
+  it('starts at grouped settings and opens real inner pages without exposing hidden inputs', async () => {
     renderSettings({}, 'settings=1&tab=growth');
-    expect(screen.queryByRole('tab')).toBeNull();
-    expect(screen.getByLabelText('bots.nameLabel')).toBeTruthy();
-    expect(screen.getByTestId('model-selector')).toBeTruthy();
-    expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.getByRole('button', { name: 'routines.title' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    expect(screen.getByRole('textbox', { name: 'bots.nameLabel' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'bots.profile.changeAvatar' })).toBeTruthy();
+    fireEvent.change(screen.getByRole('textbox', { name: 'bots.nameLabel' }), { target: { value: 'New name' } });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'bots.settingsTabs.model' })).toBeTruthy());
+    expect(mocks.updateBotProfile).toHaveBeenCalledWith('bot-1', { name: 'New name' });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsTabs.model' }));
+    expect(screen.getByRole('region', { name: 'bots.settingsTabs.model' })).toBeTruthy();
+    expect(screen.queryByRole('textbox', { name: 'bots.nameLabel' })).toBeNull();
+  });
+
+  it('keeps the current inner page and its draft when saving before navigation fails', async () => {
+    mocks.updateBotProfile.mockRejectedValue(new Error('offline'));
+    const beforeCloseRef = { current: null as (() => Promise<boolean>) | null };
+    render(<BotSettings bot={bot()} onBack={vi.fn()} onOpenSession={vi.fn()} beforeCloseRef={beforeCloseRef} />);
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'bots.nameLabel' }), { target: { value: 'Keep this draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    await screen.findByRole('button', { name: 'bots.autosave.retry' });
+    expect((screen.getByRole('textbox', { name: 'bots.nameLabel' }) as HTMLInputElement).value).toBe('Keep this draft');
+    let allowed = true;
+    await act(async () => { allowed = await beforeCloseRef.current!(); });
+    expect(allowed).toBe(false);
   });
 
   it('does not duplicate the chat action inside the settings panel', () => {
@@ -527,10 +599,31 @@ describe('Bot settings unified autosave', () => {
     });
   });
 
-  it('changes the avatar through the host-owned image picker', async () => {
+  it('saves Cindy from the settings gallery without changing the name or persona', async () => {
+    vi.stubGlobal('Image', class { src = ''; width = 256; height = 256; decode = async () => {}; });
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+    const output = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG9ydHJhaXQ=');
+    try {
+      renderSettings();
+      fireEvent.click(screen.getByRole('button', { name: 'bots.profile.changeAvatar' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Cindy' }));
+      await waitFor(() => expect(mocks.chooseBotAvatar).toHaveBeenCalledWith('bot-1', 'cG9ydHJhaXQ='));
+      expect(mocks.updateBotProfile).not.toHaveBeenCalled();
+      expect((screen.getByLabelText('bots.nameLabel') as HTMLInputElement).value).toBe('PR steward');
+    } finally {
+      context.mockRestore();
+      output.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the current avatar until uploading through the shared gallery', async () => {
     vi.useFakeTimers();
     renderSettings();
     fireEvent.click(screen.getByRole('button', { name: 'bots.profile.changeAvatar' }));
+    expect(screen.getByRole('button', { name: 'Cindy' })).toBeTruthy();
+    expect(mocks.chooseBotAvatar).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.guided.upload' }));
     await act(async () => {
       await vi.runAllTimersAsync();
     });
@@ -543,6 +636,7 @@ describe('Bot settings unified autosave', () => {
   it('offers one recovery action only for a legacy profile with memory disabled', async () => {
     vi.useFakeTimers();
     renderSettings({ capabilities: capabilities({ memory: false }) });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
     fireEvent.click(screen.getByRole('button', { name: 'bots.memoryRecovery.action' }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
@@ -559,7 +653,9 @@ describe('same-Bot capability updates while editing settings', () => {
     mocks.defaultModelChain = capabilities().modelChain;
   });
   async function openCapabilities() {
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
+    const entry = screen.queryByRole('button', { name: 'bots.capabilities.title' });
+    if (entry) await act(async () => { fireEvent.click(entry); });
+    const details = screen.getByTestId('bot-capability-editor') as HTMLDetailsElement;
     await act(async () => {
       details.open = true;
       fireEvent(details, new Event('toggle'));
@@ -684,8 +780,8 @@ describe('same-Bot capability updates while editing settings', () => {
     await waitFor(() => expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { capabilities: { mcpServers: [] }, capabilityBaseline: { mcpServers: ['events'] } }));
     if (change === 'unavailable') expect(checkbox.disabled).toBe(true);
     else expect(screen.queryByRole('checkbox', { name: /events/ })).toBeNull();
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
-    await act(async () => { details.open = false; fireEvent(details, new Event('toggle')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' })); });
+    expect(screen.queryByTestId('bot-capability-editor')).toBeNull();
     expect(off).toHaveBeenCalledOnce();
   });
 
@@ -701,8 +797,8 @@ describe('same-Bot capability updates while editing settings', () => {
     renderSettings();
     await openCapabilities();
     expect(screen.getByRole('checkbox', { name: 'old-skill' })).toBeTruthy();
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
-    await act(async () => { details.open = false; fireEvent(details, new Event('toggle')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' })); });
+    expect(screen.queryByTestId('bot-capability-editor')).toBeNull();
     disk = ['new-skill'];
     await openCapabilities();
     expect(screen.queryByRole('checkbox', { name: 'old-skill' })).toBeNull();
@@ -839,6 +935,7 @@ describe('same-Bot capability updates while editing settings', () => {
     expect((screen.getByLabelText('bots.nameLabel') as HTMLInputElement).value).toBe('Second name');
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { name: 'Second name' });
+    await openCapabilities();
     expect((screen.getByRole('checkbox', { name: /release-check/ }) as HTMLInputElement).checked).toBe(true);
   });
 

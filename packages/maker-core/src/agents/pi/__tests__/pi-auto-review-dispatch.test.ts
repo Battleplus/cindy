@@ -12,6 +12,7 @@
  */
 
 import {
+  promises as fs,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -23,12 +24,14 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as subagentRuns from '../pi-subagent-runs.js';
 import type { AutoReviewRequest } from '../../shared/auto-review-decision.js';
 
 const captured = vi.hoisted(() => ({
   args: [] as string[],
   env: {} as Record<string, string | undefined>,
   onEvent: null as ((event: unknown) => void) | null,
+  onExit: null as ((exit: { code: number | null; signal: string | null }) => void) | null,
   requests: [] as Array<Record<string, unknown>>,
   sent: [] as Array<Record<string, unknown>>,
   runnerLaunches: [] as Array<{
@@ -96,8 +99,10 @@ vi.mock('../rpc-client.js', () => ({
   PiRpcProcess: class {
     isClosed = false;
     constructor(opts: {
-      onEvent: (event: unknown) => void }) {
+      onEvent: (event: unknown) => void;
+      onExit: (exit: { code: number | null; signal: string | null }) => void }) {
       captured.onEvent = opts.onEvent;
+      captured.onExit = opts.onExit;
     }
     async request(
       cmd: Record<string, unknown> & { type: string },
@@ -437,6 +442,47 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     }) as Promise<PiTestSessionHandle>;
   }
 
+  it('toggles welcome policy without filesystem writes or extra prompt RPCs', async () => {
+    const handle = await start('bypassPermissions');
+    const token = captured.env.CINDY_PI_TURN_TOOL_POLICY;
+    captured.onEvent?.({ type: 'extension_ui_request', method: 'notify', message: 'cindy:text-only-ready:' + token });
+    const write = vi.spyOn(fs, 'writeFile').mockRejectedValue(new Error('storage unavailable'));
+    const remove = vi.spyOn(fs, 'rm').mockRejectedValue(new Error('storage unavailable'));
+    const begin = captured.requests.length;
+    try {
+      await handle.send({ type: 'user', content: 'Welcome.' }, { toolsDisabled: true });
+      expect(captured.requests.at(-1)?.message).toBe('[CINDY_TEXT_ONLY_INPUT]:' + token + '\nWelcome.');
+      await expect(handle.send({ type: 'user', content: 'Too soon.' })).rejects.toThrow('tool policy');
+      captured.onEvent?.({ type: 'agent_start' });
+      captured.onEvent?.({ type: 'agent_end', messages: [] });
+      captured.onEvent?.({ type: 'agent_settled' });
+      await handle.send({ type: 'user', content: 'Ordinary.' });
+      expect(captured.requests.at(-1)?.message).toBe('Ordinary.');
+      expect(captured.requests.slice(begin).map(frame => frame.type)).toEqual(['prompt', 'prompt']);
+      expect(write).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore(); remove.mockRestore();
+      await handle.close();
+    }
+  });
+
+  it.each(['missing', 'closed'] as const)('rejects only welcome input when the policy boundary is %s', async (state) => {
+    const handle = await start('bypassPermissions');
+    const token = captured.env.CINDY_PI_TURN_TOOL_POLICY;
+    if (state === 'closed') {
+      captured.onEvent?.({ type: 'extension_ui_request', method: 'notify', message: 'cindy:text-only-ready:' + token });
+      captured.onEvent?.({ type: 'extension_ui_request', method: 'notify', message: 'cindy:text-only-unavailable:' + token });
+    }
+    const begin = captured.requests.length;
+    try {
+      await expect(handle.send({ type: 'user', content: 'Welcome.' }, { toolsDisabled: true })).rejects.toThrow('policy is unavailable');
+      expect(captured.requests).toHaveLength(begin);
+      await handle.send({ type: 'user', content: 'Ordinary.' });
+      expect(captured.requests.slice(begin)).toEqual([expect.objectContaining({ type: 'prompt', message: 'Ordinary.' })]);
+    } finally { await handle.close(); }
+  });
+
   /**
    * 等某个权限请求的回帧落地。用「等信号 + 有界超时」而不是固定 flush ——
    * 档位热切换会多经一次串行写入队列,靠 setTimeout(0) 的轮数猜等待就是计时型脆弱用例。
@@ -459,6 +505,7 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       resolvedCredentialPaths?: unknown;
       resolvedWritePath?: unknown;
       resolvedWritableRoots?: unknown;
+      controlPlaneWrite?: unknown;
     },
   ): void {
     const writeEvidence = toolName === 'write' || toolName === 'edit'
@@ -695,6 +742,188 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       if (previousLegacy === undefined) delete process.env.CINDY_PI_SUBAGENT_NODE;
       else process.env.CINDY_PI_SUBAGENT_NODE = previousLegacy;
     }
+  });
+
+  it.each([false, true])('backs off an empty root and wakes a launch (scan in flight: %s)', async (inFlight) => {
+    const realInterval = globalThis.setInterval;
+    let tick: (() => void) | undefined;
+    const interval = vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, ms: number, ...args: unknown[]) => {
+      if (ms === 500) {
+        tick = callback;
+        return realInterval(() => {}, 2_000_000_000);
+      }
+      return realInterval(callback, ms, ...args);
+    }) as typeof setInterval);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const realScan = subagentRuns.scanPiSubagentRuns;
+    let scansFinished = 0;
+    let releaseScan: (() => void) | undefined;
+    let holdScan = false;
+    const scan = vi.spyOn(subagentRuns, 'scanPiSubagentRuns').mockImplementation(async function* (root, options) {
+      try {
+        yield* realScan(root, options);
+        if (holdScan && root.startsWith(agentHome + path.sep)) {
+          await new Promise<void>((resolve) => { releaseScan = resolve; });
+        }
+      } finally { if (root.startsWith(agentHome + path.sep)) scansFinished++; }
+    });
+    const pollCount = () => scan.mock.calls.filter(([root]) => root.startsWith(agentHome + path.sep)).length;
+    let handle: PiTestSessionHandle | undefined;
+    try {
+      handle = await start();
+      // Wait for the initial filesystem iterator to finish before sampling cadence.
+      await vi.waitFor(() => expect(scansFinished).toBe(1));
+      await flush();
+      const initial = pollCount();
+      expect(initial).toBeGreaterThan(0);
+      now += 500; tick!();
+      await flush();
+      expect(pollCount()).toBe(initial);
+      now += 2_000; tick!();
+      await vi.waitFor(() => expect(pollCount()).toBeGreaterThan(initial));
+      await vi.waitFor(() => expect(scansFinished).toBe(2));
+      await flush();
+      if (inFlight) {
+        holdScan = true;
+        now += 2_000; tick!();
+        await vi.waitFor(() => expect(releaseScan).toBeTypeOf('function'));
+      }
+      const afterIdle = pollCount();
+      const runId = '123e4567-e89b-42d3-a456-4266141740ad';
+      const runDir = path.join(captured.env.CINDY_PI_SUBAGENT_RUN_ROOT!, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(path.join(runDir, 'runner.cjs'), '');
+      writeFileSync(path.join(runDir, 'config.json'), '{}');
+      writeFileSync(path.join(runDir, 'status.json'), JSON.stringify({
+        version: 1, runId, taskId: 'poll-wake', parentSessionId: 's1',
+        runtimeOwnerId: captured.env.CINDY_PI_SUBAGENT_OWNER_ID,
+        runnerInstanceId: `launch-pending-${runId}`, state: 'queued',
+        startedAt: now, updatedAt: now, tasks: [],
+      }));
+      fireSubagentRunnerRequest('poll-launch', 'launch', runId);
+      await waitForResponse('poll-launch');
+      if (inFlight) {
+        expect(pollCount()).toBe(afterIdle);
+        holdScan = false; releaseScan!();
+        await vi.waitFor(() => expect(scansFinished).toBe(3));
+        await flush();
+        now += 500; tick!();
+        await vi.waitFor(() => expect(scansFinished).toBe(4));
+        await flush();
+      }
+      expect(pollCount()).toBeGreaterThan(afterIdle);
+      await vi.waitFor(() => expect(scansFinished).toBe(inFlight ? 4 : 3));
+      await flush();
+      expect(handle.listBackgroundTasks?.()).toEqual(expect.arrayContaining([expect.objectContaining({ taskId: 'poll-wake' })]));
+      const active = pollCount();
+      now += 500; tick!();
+      await vi.waitFor(() => expect(pollCount()).toBeGreaterThan(active));
+    } finally {
+      holdScan = false; releaseScan?.();
+      clock.mockRestore();
+      await handle?.close();
+      interval.mockRestore(); scan.mockRestore();
+    }
+  });
+
+  it.each(['success', 'native-failure'] as const)('consumes the %s package tool result and replies before Session retirement', async (outcome) => {
+    const deps = buildDeps();
+    let session!: Session;
+    let convergenceReceipt: import('../../../types/events.js').AgentEvent | undefined;
+    deps.mutatePiManagedPackage = vi.fn(async () => {
+      if (outcome === 'native-failure') throw new PiManagedPackageMutationFailedError(true, 'native-command-failed');
+      return { changed: true, affectedPackage: { source: 'npm:example-extension', enabled: true } };
+    });
+    deps.onPiManagedPackageMutationSettled = vi.fn(async (_id, publish, createFailureEvent) => {
+      const failure = createFailureEvent();
+      expect(failure).not.toBe(createFailureEvent());
+      expect(failure).toMatchObject({ type: 'text', source: 'pi', data: {
+        isFinal: true, text: expect.stringContaining('restart-cindy-to-refresh-packages'),
+      } });
+      const result = await session.closeAfterCurrentTurn();
+      convergenceReceipt = publish({ runtimeConvergence: result === 'deferred' ? 'deferred' : 'complete' });
+    });
+    const agent = new PiAgent(deps);
+    const handle = await agent.startSession({ sessionId: 'mutation-caller', workingDir: cwd, model: 'm' });
+    session = new Session({ id: 'mutation-caller', agentKind: 'pi', workDir: cwd,
+      handle, capabilities: agent.capabilities, logger: deps.logger, turnStallMs: 0 });
+    session.setInteractionListener(async () => ({ kind: 'permission', behavior: 'allow' }));
+    const seen: import('../../../types/events.js').AgentEvent[] = [];
+    session.onEvent((event) => seen.push(event));
+    try {
+      await session.send('Update Pi and explain the result', { turnAttemptToken: 21 });
+      captured.onEvent?.({ type: 'agent_start' });
+      fireManagedPackageRequest('mutation-result', 'update', 'npm:example-extension');
+      const response = await waitForResponse('mutation-result');
+      expect(JSON.parse(String(response.value)).ok).toBe(outcome === 'success');
+      await vi.waitFor(() => expect(deps.onPiManagedPackageMutationSettled).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(seen).toContain(convergenceReceipt));
+      expect(captured.closed).toBe(false);
+      expect(session.getStatus()).toBe('active');
+      captured.onEvent?.({ type: 'tool_execution_end', toolCallId: 'mutation-result',
+        toolName: 'cindy_pi_extension', isError: outcome === 'native-failure',
+        result: { content: [{ type: 'text', text: String(response.value) }] } });
+      captured.onEvent?.({ type: 'message_end', message: { role: 'assistant',
+        content: [{ type: 'text', text: 'The package operation finished; here is its result.' }],
+        stopReason: 'stop' } });
+      captured.onEvent?.({ type: 'agent_settled' });
+      await vi.waitFor(() => expect(session.getStatus()).toBe('closed'));
+      expect(seen.some((event) => event.type === 'text'
+        && (event.data as { text?: string }).text?.includes('here is its result'))).toBe(true);
+      expect(seen.filter((event) => event.type === 'done')).toEqual([
+        expect.objectContaining({ turnAttemptToken: 21, data: expect.objectContaining({ status: 'completed' }) }),
+      ]);
+      expect(deps.mutatePiManagedPackage).toHaveBeenCalledOnce();
+      expect(captured.requests.filter((request) => request.type === 'prompt')).toHaveLength(1);
+    } finally { await session.close(); }
+  });
+
+  it.each([{ code: 0, stopped: false }, { code: 1, stopped: false }, { code: 0, stopped: true }, { code: 1, stopped: true }])('settles Pi exit $code after Stop=$stopped without replay', async ({ code, stopped }) => {
+    const deps = buildDeps();
+    const agent = new PiAgent(deps);
+    const handle = await agent.startSession({ sessionId: 'exit-caller', workingDir: cwd, model: 'm' });
+    const session = new Session({ id: 'exit-caller', agentKind: 'pi', workDir: cwd,
+      handle, capabilities: agent.capabilities, logger: deps.logger, turnStallMs: 0 });
+    const seen: import('../../../types/events.js').AgentEvent[] = [];
+    session.onEvent((event) => seen.push(event));
+    await session.send('perform work');
+    captured.onEvent?.({ type: 'agent_start' });
+    if (stopped) await session.abort();
+    captured.onExit?.({ code, signal: null });
+    await vi.waitFor(() => expect(session.getStatus()).toBe('closed'));
+    expect(seen.filter((event) => event.type === 'error')).toEqual(stopped ? [] : [
+      expect.objectContaining({ data: expect.objectContaining({ isTerminal: true }) }),
+    ]);
+    expect(seen.filter((event) => event.type === 'done')).toEqual(stopped ? [
+      expect.objectContaining({ data: { status: 'cancelled' } }),
+    ] : []);
+    expect(captured.requests.filter((request) => request.type === 'prompt')).toHaveLength(1);
+    await handle.close();
+  });
+
+  it.each([0, 1])('preserves a delivered successful reply when Pi subsequently exits with %s', async (code) => {
+    const deps = buildDeps();
+    const agent = new PiAgent(deps);
+    const handle = await agent.startSession({ sessionId: 'success-before-exit', workingDir: cwd, model: 'm' });
+    const session = new Session({ id: 'success-before-exit', agentKind: 'pi', workDir: cwd,
+      handle, capabilities: agent.capabilities, logger: deps.logger, turnStallMs: 0 });
+    const seen: import('../../../types/events.js').AgentEvent[] = [];
+    session.onEvent((event) => seen.push(event));
+    await session.send('perform work');
+    captured.onEvent?.({ type: 'agent_start' });
+    captured.onEvent?.({ type: 'message_end', message: { role: 'assistant',
+      content: [{ type: 'text', text: 'Work finished.' }], stopReason: 'stop' } });
+    captured.onEvent?.({ type: 'agent_settled' });
+    await vi.waitFor(() => expect(seen.some((event) => event.type === 'done')).toBe(true));
+    captured.onExit?.({ code, signal: null });
+    await vi.waitFor(() => expect(session.getStatus()).toBe('closed'));
+    expect(seen.filter((event) => event.type === 'error')).toEqual([]);
+    expect(seen.filter((event) => event.type === 'done')).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({ status: 'completed', result: 'Work finished.' }) }),
+    ]);
+    expect(captured.requests.filter((request) => request.type === 'prompt')).toHaveLength(1);
+    await handle.close();
   });
 
   it.each([['desktop', 'new-root-tasks'], ['tool', 'new-root-tasks'], ['desktop', 'new-pi-processes'], ['tool', 'new-pi-processes']] as const)('updates core and preserves the %s caller with %s activation', async (origin, activation) => {
@@ -1194,8 +1423,9 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     }
   });
 
-  it('presents Pi extension notifications in the Cindy transcript', async () => {
+  it('stamps Pi notifications before delayed delivery so clear can reject old notices', async () => {
     const handle = await start();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
     const events: Array<Record<string, unknown>> = [];
     void (async () => {
       for await (const event of handle.events()) {
@@ -1210,17 +1440,22 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
         message: '## context-mode stats (Pi)\n\n- Events captured: 0',
         notifyType: 'info',
       });
+      clock.mockReturnValue(2000); // Simulate a clear/delivery boundary after emission.
       await flush();
       expect(events).toContainEqual({
         type: 'text',
         data: {
           text: '## context-mode stats (Pi)\n\n- Events captured: 0',
-          isFinal: false,
+          isFinal: true,
         },
         source: 'pi',
+        standaloneText: true,
+        turnScope: 'background',
+        backgroundTurnStartedAt: 1000,
       });
       expect(captured.sent.find((message) => message.id === 'context-mode-stats')).toBeUndefined();
     } finally {
+      clock.mockRestore();
       await handle.close();
     }
   });
@@ -1311,38 +1546,117 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     }
   });
 
-  it('surfaces Pi UI requests that Cindy cannot safely adapt at runtime', async () => {
+  it('passes a typed custom answer for a select dialog through and keeps an empty answer as cancel (#4273)', async () => {
+    const handle = await start();
+    const answers: Record<string, string> = {
+      'Pick a color': 'teal',
+      'Pick a size': '',
+    };
+    handle.setInteractionResolver(async (request) => {
+      if (request.kind !== 'ask_user_question') throw new Error(`unexpected interaction ${request.kind}`);
+      const question = request.questions[0]?.question ?? '';
+      expect(request.questions[0]?.options).toEqual([{ label: 'Red' }, { label: 'Blue' }]);
+      return { kind: 'ask_user_question', answers: { [question]: answers[question] ?? '' } };
+    });
+    try {
+      // The card's "type your own" entry yields an answer that is not one of `options`.
+      captured.onEvent!({
+        type: 'extension_ui_request',
+        id: 'select-custom',
+        method: 'select',
+        title: 'Pick a color',
+        options: ['Red', 'Blue'],
+      });
+      expect(await waitForResponse('select-custom')).toEqual({
+        type: 'extension_ui_response',
+        id: 'select-custom',
+        value: 'teal',
+      });
+
+      // An empty answer is still a skip/cancel, not a value.
+      captured.onEvent!({
+        type: 'extension_ui_request',
+        id: 'select-empty',
+        method: 'select',
+        title: 'Pick a size',
+        options: ['Red', 'Blue'],
+      });
+      expect(await waitForResponse('select-empty')).toEqual({
+        type: 'extension_ui_response',
+        id: 'select-empty',
+        cancelled: true,
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('filters unsupported extension UI across runtimes while preserving real notifications', async () => {
+    // Actual RPC wire methods plus defensive TUI/unknown frames. Reopening a
+    // runtime must stay silent too, not merely reset a per-process warning Set.
+    const methods = [
+      'setStatus', 'setWidget', 'setTitle', 'set_editor_text',
+      'setWorkingMessage', 'setWorkingVisible', 'setWorkingIndicator',
+      'setHiddenThinkingLabel', 'setFooter', 'setHeader', 'setToolsExpanded',
+      'getToolsExpanded', 'setEditorText', 'getEditorText', 'pasteToEditor',
+      'setEditorComponent', 'getEditorComponent', 'addAutocompleteProvider',
+      'custom', 'getAllThemes', 'getTheme', 'setTheme', 'theme',
+      'onTerminalInput', 'registerShortcut', 'registerFlag',
+      'registerMessageRenderer', 'registerMarkdownTransformer', 'registerEntryRenderer',
+      'future_display_feature', '__proto__', 'constructor',
+    ];
+    for (let run = 0; run < 2; run += 1) {
+      const handle = await start();
+      const events: Array<Record<string, unknown>> = [];
+      const resolver = vi.fn();
+      handle.setInteractionResolver(resolver);
+      void (async () => {
+        for await (const event of handle.events()) events.push(event as unknown as Record<string, unknown>);
+      })();
+      try {
+        const sentBefore = captured.sent.length;
+        for (const method of methods) {
+          for (let repeat = 0; repeat < 2; repeat += 1) {
+            captured.onEvent!({
+              type: 'extension_ui_request', id: `${run}-${method}-${repeat}`, method,
+              statusText: 'background status', widgetLines: ['background widget'], text: 'editor text',
+            });
+          }
+        }
+        captured.onEvent!({
+          type: 'extension_ui_request', id: `notify-${run}`, method: 'notify', message: 'Extension command result',
+        });
+        await flush();
+        expect(resolver).not.toHaveBeenCalled();
+        expect(captured.sent).toHaveLength(sentBefore);
+        expect(events.filter((event) => event.type === 'text')).toEqual([
+          { type: 'text', data: { text: 'Extension command result', isFinal: true }, source: 'pi', standaloneText: true, turnScope: 'background', backgroundTurnStartedAt: expect.any(Number) },
+        ]);
+      } finally {
+        await handle.close();
+      }
+    }
+  });
+
+  it('settles timed extension dialogs silently so the extension does not hang', async () => {
     const handle = await start();
     const events: Array<Record<string, unknown>> = [];
+    const resolver = vi.fn();
+    handle.setInteractionResolver(resolver);
     void (async () => {
       for await (const event of handle.events()) events.push(event as unknown as Record<string, unknown>);
     })();
     try {
-      captured.onEvent!({
-        type: 'extension_ui_request',
-        id: 'timed-select',
-        method: 'select',
-        title: 'Pick quickly',
-        options: ['A', 'B'],
-        timeout: 1_000,
-      });
-      expect(await waitForResponse('timed-select')).toMatchObject({
-        cancelled: true,
-      });
-      captured.onEvent!({
-        type: 'extension_ui_request',
-        id: 'status-1',
-        method: 'setStatus',
-      });
-      captured.onEvent!({
-        type: 'extension_ui_request',
-        id: 'status-2',
-        method: 'setStatus',
-      });
+      for (const method of ['select', 'confirm', 'input', 'editor']) {
+        captured.onEvent!({
+          type: 'extension_ui_request', id: `timed-${method}`, method,
+          title: 'Pick quickly', options: ['A', 'B'], timeout: 1_000,
+        });
+        expect(await waitForResponse(`timed-${method}`)).toMatchObject({ cancelled: true });
+      }
       await flush();
-      const notices = events.filter((event) => event.type === 'text');
-      expect(notices.some((event) => JSON.stringify(event).includes('timed select dialog'))).toBe(true);
-      expect(notices.filter((event) => JSON.stringify(event).includes('setStatus'))).toHaveLength(1);
+      expect(resolver).not.toHaveBeenCalled();
+      expect(events.filter((event) => event.type === 'text')).toEqual([]);
     } finally {
       await handle.close();
     }
@@ -1681,7 +1995,7 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     }
   });
 
-  it('deterministically handles an exact pi install user command before prompting the model', async () => {
+  it.each(['ask', 'auto', 'bypassPermissions'] as const)('installs an exact user command without additional confirmation in %s', async (permissionMode) => {
     const mutatePiManagedPackage = vi.fn(async () => ({
       changed: true,
       affectedPackage: {
@@ -1706,16 +2020,20 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     deps.mutatePiManagedPackage = mutatePiManagedPackage;
     deps.onPiManagedPackageMutationSettled = onPiManagedPackageMutationSettled;
     const handle = await new PiAgent(deps).startSession({
+      permissionMode,
       sessionId: 'managed-package-command-session',
       workingDir: cwd,
       model: 'm',
     });
+    const resolver = vi.fn(async () => ({ kind: 'permission' as const, behavior: 'deny' as const }));
+    handle.setInteractionResolver(resolver);
     try {
       captured.requests = [];
       await handle.send(
         { type: 'user', content: 'pi install npm:context-mode' },
         desktopCommandOptions('pi install npm:context-mode'),
       );
+      expect(resolver).not.toHaveBeenCalled();
       expect(mutatePiManagedPackage).toHaveBeenCalledWith({
         action: 'install',
         source: 'npm:context-mode',
@@ -1726,9 +2044,9 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       expect(prompt?.message).toContain('"compatibility":"partial"');
       expect(prompt?.message).toContain('"status-display"');
       expect(prompt?.message).toContain('installed and enabled');
-      expect(prompt?.message).toContain('requested active local Pi tasks including this task to stop');
-      expect(prompt?.message).toContain('do not claim every task has already stopped');
-      expect(prompt?.message).toContain('available after starting a new Pi task');
+      expect(prompt?.message).toContain('package changes apply after the current work finishes');
+      expect(prompt?.message).toContain('Active work, including this reply, continues');
+      expect(prompt?.message).toContain('its runtime refreshes');
       expect(prompt?.message).not.toContain('keeps its startup snapshot');
       expect(prompt?.message).toContain('Do not enumerate non-blocking compatibility notices');
       expect(prompt?.message).not.toContain('Settings > General');
@@ -1853,8 +2171,8 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       const prompt = captured.requests.find((request) => request.type === 'prompt')?.message;
       if (typeof prompt !== 'string') throw new Error('expected prompt message');
       expect(prompt).toContain('"ok":true');
-      expect(prompt).toContain('do not claim every task has already stopped');
-      expect(prompt).toContain('this task remains active');
+      expect(prompt).toContain('Active work, including this reply, continues');
+      expect(prompt).toContain('If runtimeConvergence is partial,');
       expect(prompt).toContain('restart Cindy to finish refreshing Pi packages');
       await vi.waitFor(() => expect(events.some((event) => (
         event.type === 'text'
@@ -3405,6 +3723,70 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     rmSync(replacementWritableDir, { recursive: true, force: true });
   });
 
+  it('forces an explicit decision for agent-home writes even under Full Access', async () => {
+    const review = vi.fn(async () => ({ verdict: 'allow' as const }));
+    const handle = await start('bypassPermissions', review);
+    const resolver = vi.fn(async (): Promise<{ kind: 'permission'; behavior: 'allow' | 'deny' }> => ({
+      kind: 'permission',
+      behavior: 'allow',
+    }));
+    handle.setInteractionResolver?.(resolver as never);
+
+    firePermissionRequest(
+      'control-plane-bypass',
+      'write',
+      { path: path.join(cwd, 'models.json') },
+      { controlPlaneWrite: true },
+    );
+    expect(await waitForResponse('control-plane-bypass')).toMatchObject({ confirmed: true });
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(review).not.toHaveBeenCalled();
+
+    resolver.mockResolvedValueOnce({ kind: 'permission', behavior: 'deny' });
+    firePermissionRequest(
+      'control-plane-deny',
+      'write',
+      { path: path.join(cwd, 'models.json') },
+      { controlPlaneWrite: true },
+    );
+    expect(await waitForResponse('control-plane-deny')).toMatchObject({ confirmed: false });
+    await handle.close();
+  });
+
+  it('does not settle a pending agent-home write when switching to Full Access', async () => {
+    const handle = await start('ask');
+    handle.setInteractionResolver?.(async () => await new Promise(() => {}));
+    firePermissionRequest(
+      'control-plane-pending',
+      'write',
+      { path: path.join(cwd, 'models.json') },
+      { controlPlaneWrite: true },
+    );
+    await flush();
+    expect(captured.sent.find((m) => m.id === 'control-plane-pending')).toBeUndefined();
+    await handle.setPermissionMode?.('bypassPermissions');
+    expect(await waitForResponse('control-plane-pending')).toMatchObject({ confirmed: false });
+    await handle.close();
+  });
+
+  it('does not let Auto-review silently allow agent-home writes', async () => {
+    const review = vi.fn(async () => ({ verdict: 'allow' as const }));
+    const handle = await start('auto', review);
+    const resolver = vi.fn(async () => ({ kind: 'permission', behavior: 'allow' as const }));
+    handle.setInteractionResolver?.(resolver as never);
+
+    firePermissionRequest(
+      'control-plane-auto',
+      'write',
+      { path: path.join(cwd, 'models.json') },
+      { controlPlaneWrite: true },
+    );
+    expect(await waitForResponse('control-plane-auto')).toMatchObject({ confirmed: true });
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(review).not.toHaveBeenCalled();
+    await handle.close();
+  });
+
   it('reviews evidence for remote Pi destructive paths instead of using controller realpath', async () => {
     const localSafeTarget = path.join(cwd, 'controller-safe-target');
     const remoteLink = path.join(cwd, 'remote-link');
@@ -3859,6 +4241,29 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
   });
 
 
+  it('passes flat task history and actual blocked plugin actions after a natural steer, then invalidates on revocation', async () => {
+    const review = vi.fn(async (_request: AutoReviewRequest) => ({ verdict: 'block' as const }));
+    const handle = await start('auto', review);
+    const exercise = 'For this writing test, use no tools and modify no data.';
+    const search = 'Now search for the latest portable chargers.';
+    const action = { kind: 'other' as const, description: JSON.stringify({ toolName: 'mcp__cindy__ghost_market_install', input: { plugin_id: 'official-search', release_id: 'selected-release' } }) };
+    try {
+      await handle.send({ type: 'user', content: exercise });
+      await handle.steer!({ type: 'user', content: search });
+      await handle.reviewAutoPermissionAction!(action);
+      await handle.steer!({ type: 'user', content: '没事儿，你可以用' });
+      await handle.reviewAutoPermissionAction!(action);
+      expect(review.mock.calls[1][0]).toMatchObject({
+        userIntent: { earlierUserMessages: [exercise, search], currentUserMessage: '没事儿，你可以用' },
+        precedingBlockedActions: [action],
+      });
+      await handle.steer!({ type: 'user', content: 'Do not install anything. Only inspect.' });
+      await handle.reviewAutoPermissionAction!(action);
+      expect(review).toHaveBeenCalledTimes(3);
+      expect(review.mock.calls[2][0].userIntent).toMatchObject({ currentUserMessage: 'Do not install anything. Only inspect.' });
+    } finally { await handle.close(); }
+  });
+
   it.each(['allow', 'ask'] as const)('invalidates old %s when identical text refers to a new attachment', async (verdict) => {
     let release!: (decision: { verdict: 'allow' | 'ask' }) => void;
     const reviewer = vi.fn().mockImplementationOnce(() => new Promise<{ verdict: 'allow' | 'ask' }>((resolve) => { release = resolve; }))
@@ -3908,8 +4313,8 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     });
     firePermissionRequest('raw-channel', 'unknown_sender', { action: 'send' });
     await waitForResponse('raw-channel');
-    expect(review.mock.calls[0]?.[0].userIntent).toContain('Do not send.');
-    expect(review.mock.calls[0]?.[0].userIntent).not.toContain('SEND THE REPORT');
+    expect(JSON.stringify(review.mock.calls[0]?.[0].userIntent)).toContain('Do not send.');
+    expect(JSON.stringify(review.mock.calls[0]?.[0].userIntent)).not.toContain('SEND THE REPORT');
     await handle.close();
   });
 
@@ -4700,10 +5105,9 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
   });
 
   /**
-   * 放宽档位不得替用户批准他还没表态的**高风险**调用:prompt-each-time 的挂起卡在切到
-   * Full access 时仍按 fail-closed 拒绝(与 CC / Codex 的 forcePrompt 语义一致)。
+   * MCP 逐次审批不能覆盖 Full access；已挂起的操作审批也按新档位结算。
    */
-  it('keeps a pending prompt-each-time card fail-closed even when the mode widens', async () => {
+  it('allows a pending prompt-each-time card when switching to Full access', async () => {
     const handle = await start('ask', undefined, false, {
       serverNames: ['cindy_ssh'],
       policy: () => 'prompt-each-time',
@@ -4717,7 +5121,7 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
     expect(await waitForResponse('r27')).toEqual({
       type: 'extension_ui_response',
       id: 'r27',
-      confirmed: false,
+      confirmed: true,
     });
   });
 
@@ -4731,8 +5135,6 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       policy: () => 'prompt-each-time',
     });
     handle.setInteractionResolver?.(async () => {
-      // 用户点「拒绝」的同一时刻切到 Full access。
-      await handle.setPermissionMode?.('bypassPermissions');
       return { kind: 'permission', behavior: 'deny' } as never;
     });
     firePermissionRequest('r25', 'mcp__cindy_ssh__ssh_exec', {
@@ -4743,6 +5145,8 @@ describe('pi auto-review dispatch & spawn config (mocked pi process)', () => {
       id: 'r25',
       confirmed: false,
     });
+    await handle.setPermissionMode?.('bypassPermissions');
+    expect(await waitForResponse('r25')).toMatchObject({ confirmed: false });
   });
 
   /**

@@ -166,6 +166,8 @@ export type PreRunHookDecision = 'run' | 'skip' | 'block';
  * 之前就失败，也可能通过后继续得到正常的 agent 结果。
  */
 export interface PreRunHookRunResult {
+  /** Explicit successful check, including a healthy no-work skip. Optional for old hooks. */
+  checkSucceeded?: true;
   status: PreRunHookRunStatus;
   decision: PreRunHookDecision;
   exitCode: number | null;
@@ -239,6 +241,7 @@ export interface Schedule {
   workspaceKind: ScheduleWorkspaceKind;
   workingDir?: string;
   useWorktree: boolean;
+  /** Script mode: lifecycle owner and sole dispatch target; no agent turn is started by the runner. */
   targetSessionId?: string;
   /**
    * 持续会话模式：true → runner 在第一次 fire 成功创建 session 后自动把 sessionId

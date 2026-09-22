@@ -23,8 +23,68 @@ const log = createLogger('maker-ipc:send-to-session-lock');
  * tolerate lock-external UI sends. Every bail escalates via `log.warn` with
  * the holder's stage so the original hang point (getSessionMeta /
  * getSessionRowSnapshot / ensureQueueRestored / …) is identifiable from logs.
+ * Exception: an acquired explicit restart never bails while native close is
+ * unresolved; its fence rejects later work until the real operation settles.
  */
 export const sendToSessionLocks = new Map<string, Promise<unknown>>();
+
+// A native close cannot be cancelled by a Promise timeout. Until it settles,
+// reject new work rather than allowing the ordinary stale-lock watchdog to
+// overlap a new runtime with that close. Only this session is fenced.
+const restarts = new Map<string, { token: symbol; acquired: boolean }>();
+const lockWaiters = new Map<string, Set<(error: Error) => void>>();
+
+export function assertSessionNotRestarting(sessionId: string, token?: symbol): void {
+  const restart = restarts.get(sessionId);
+  if (restart && restart.token !== token) {
+    throw new Error(
+      'Session restart is still in progress; retry after the previous runtime closes',
+    );
+  }
+}
+
+export async function waitForSendToSessionLock(
+  sessionId: string,
+  previous: Promise<unknown> | undefined,
+  token?: symbol,
+): Promise<void> {
+  assertSessionNotRestarting(sessionId, token);
+  const waiters = lockWaiters.get(sessionId) ?? new Set<(error: Error) => void>();
+  lockWaiters.set(sessionId, waiters);
+  let rejectWait!: (error: Error) => void;
+  const interrupted = new Promise<never>((_, reject) => {
+    rejectWait = reject;
+  });
+  waiters.add(rejectWait);
+  try {
+    await Promise.race([Promise.resolve(previous).catch(() => undefined), interrupted]);
+    assertSessionNotRestarting(sessionId, token);
+  } finally {
+    waiters.delete(rejectWait);
+    if (waiters.size === 0 && lockWaiters.get(sessionId) === waiters) lockWaiters.delete(sessionId);
+  }
+}
+
+export async function withSessionRestartLock<T>(
+  sessionId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  assertSessionNotRestarting(sessionId);
+  const restart = { token: Symbol(sessionId), acquired: false };
+  restarts.set(sessionId, restart);
+  for (const reject of lockWaiters.get(sessionId) ?? []) {
+    reject(new Error('Session restart is in progress'));
+  }
+  let release: (() => void) | undefined;
+  try {
+    release = await acquireSendToSessionLock(sessionId, restart.token);
+    restart.acquired = true;
+    return await task();
+  } finally {
+    restarts.delete(sessionId);
+    release?.();
+  }
+}
 
 const SEND_LOCK_WARN_MS = 30_000;
 const SEND_LOCK_BAIL_MS = 5 * 60_000;
@@ -67,6 +127,7 @@ function installSendToSessionLockEntry(
       }, SEND_LOCK_WARN_MS);
       warnTimer.unref?.();
       bailTimer = setTimeout(() => {
+        if (restarts.get(sessionId)?.acquired) return;
         log.warn(
           'sendToSession lock bailed out; later senders proceed while the stuck holder finishes',
           {
@@ -83,10 +144,7 @@ function installSendToSessionLockEntry(
   // only as a legacy guard, and a rejecting entry would surface as an unhandled
   // rejection once the bail gate races it.
   const entry = Promise.race([
-    run.then(
-      () => undefined,
-      () => undefined,
-    ),
+    Promise.all([Promise.resolve(previous).catch(() => undefined), run.catch(() => undefined)]),
     bailGate,
   ]);
   void entry.finally(() => {
@@ -106,9 +164,16 @@ function installSendToSessionLockEntry(
  *
  * Direct-send callers need this lease form because applying a deferred agent switch,
  * refreshing the resulting live Session, and calling Session.send happen in different
- * modules but must remain one atomic route decision.
+ * modules but must remain one atomic route decision. `getStage` is sampled when
+ * a watchdog fires, so callers can identify the current await without logging
+ * task content. Keep the getter alive until release, including lease handoffs.
  */
-export async function acquireSendToSessionLock(sessionId: string): Promise<() => void> {
+export async function acquireSendToSessionLock(
+  sessionId: string,
+  restartToken?: symbol,
+  getStage?: () => string | undefined,
+): Promise<() => void> {
+  assertSessionNotRestarting(sessionId, restartToken);
   const previous = sendToSessionLocks.get(sessionId);
   const waitPrevious = previous ? previous.catch(() => undefined) : Promise.resolve();
   let releaseGate!: () => void;
@@ -116,8 +181,14 @@ export async function acquireSendToSessionLock(sessionId: string): Promise<() =>
     releaseGate = resolve;
   });
   const run = waitPrevious.then(() => gate);
-  installSendToSessionLockEntry(sessionId, run);
-  await waitPrevious;
+  installSendToSessionLockEntry(sessionId, run, getStage);
+  try {
+    await waitForSendToSessionLock(sessionId, previous, restartToken);
+  } catch (error) {
+    // Cancel this waiter, but its queue entry still waits for its predecessor.
+    releaseGate();
+    throw error;
+  }
   let released = false;
   return () => {
     if (released) return;
@@ -130,8 +201,9 @@ export async function acquireSendToSessionLock(sessionId: string): Promise<() =>
 export async function withSendToSessionLock<T>(
   sessionId: string,
   task: () => Promise<T>,
+  getStage?: () => string | undefined,
 ): Promise<T> {
-  const release = await acquireSendToSessionLock(sessionId);
+  const release = await acquireSendToSessionLock(sessionId, undefined, getStage);
   try {
     return await task();
   } finally {

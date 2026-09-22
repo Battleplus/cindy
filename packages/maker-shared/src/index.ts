@@ -57,3 +57,7 @@ export * from './updateChannel.js';
 export * from './urlTextBoundary.js';
 export * from './workActivityProjection.js';
 export * from './worktreePaths.js';
+export * from './sessionPrRefs.js';
+export * from './taskTags';
+
+export * from './workingStatus.js';

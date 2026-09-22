@@ -1,3 +1,5 @@
+import { isOpenAiSubscriptionProvider } from '@cindy/model-providers';
+import { useProviders } from '@/hooks/useProviders';
 /**
  * ErrorBanner — 错误横幅 + Retry / Cancel
  * ---------------------------------------------------------------------------
@@ -213,7 +215,11 @@ export function ErrorBanner({
     (errorSourceProviderId?.trim() || null) === 'xd' &&
     Boolean(onViewBalance) &&
     isQuotaExhaustedErrorMessage(error);
-  const hasExplicitOpenAiProvider = normalizedProviderId === 'openai';
+  const { providers: errorProviders, refetch: refreshErrorProviders } = useProviders();
+  const selectedOpenAiAccount = errorProviders.find((provider) => provider.id === normalizedProviderId);
+  const independentOpenAiAccount = selectedOpenAiAccount?.auth.native === 'codex';
+  const [accountReconnecting, setAccountReconnecting] = useState(false);
+  const hasExplicitOpenAiProvider = normalizedProviderId === 'openai' || isOpenAiSubscriptionProvider(selectedOpenAiAccount);
   const hasImplicitOpenAiProvider =
     normalizedProviderId === null &&
     codexAuthInjection !== 'provider-oauth' &&
@@ -233,7 +239,7 @@ export function ErrorBanner({
   // env-key，再把错误渲染到会话；继续依赖 route 会把真实失效原因漏成原始英文报错。
   // Claude 的 chatgpt/* 模型复用同一份连接，bridge 鉴权不可用时也走同一恢复入口。
   const isClaudeChatgptBridgeModel =
-    agentKind === 'cc' &&
+    (agentKind === 'cc' || agentKind === 'pi') &&
     (hasExplicitOpenAiProvider || normalizedProviderId === null) &&
     !!modelId &&
     modelId.startsWith('chatgpt/');
@@ -251,17 +257,17 @@ export function ErrorBanner({
     recoveryCheck: openAiRecoveryCheck,
     refresh: refreshOpenAiAuth,
   } = useCodexAuth({
-    enabled: isOpenAiConnectionExpired,
+    enabled: isOpenAiConnectionExpired && !independentOpenAiAccount,
     recoveryHint: isOpenAiConnectionExpired ? { reason: error } : undefined,
   });
   const openAiConnectionRecoveredSinceError =
-    isOpenAiConnectionExpired && isChatGptConnectionConnected(openAiAuthState, false);
+    isOpenAiConnectionExpired && (independentOpenAiAccount ? selectedOpenAiAccount?.connected === true : isChatGptConnectionConnected(openAiAuthState, false));
   const openAiReconnectRequired = isOpenAiConnectionExpired && !openAiConnectionRecoveredSinceError;
   const openAiAuthLoading = openAiAuthState.kind === 'loading';
   const openAiLoginPending = openAiAuthState.kind === 'login-pending';
   const openAiRecoveryBusy =
-    openAiAuthLoading || openAiRecoveryCheck === 'checking' || openAiLoginPending;
-  const openAiCredentialScope =
+    independentOpenAiAccount ? accountReconnecting : openAiAuthLoading || openAiRecoveryCheck === 'checking' || openAiLoginPending;
+  const openAiCredentialScope = independentOpenAiAccount ? 'instance-isolated' :
     openAiAuthState.kind === 'reconnect-required'
       ? (openAiAuthState.credentialScope ?? 'unknown')
       : (reconnectCredentialScope ?? 'unknown');
@@ -481,6 +487,21 @@ export function ErrorBanner({
 
   const handleOpenAiRecovery = async (): Promise<void> => {
     if (openAiRecoveryBusy) return;
+    if (independentOpenAiAccount && normalizedProviderId) {
+      setAccountReconnecting(true);
+      try {
+        const result = await window.electronAPI.maker.providerOAuthLogin(normalizedProviderId);
+        if (result.ok) refreshErrorProviders();
+        else if (result.reason !== 'login_cancelled') {
+          toast.error(t('settings.providers.wizard.authorizeFailed', { name: 'OpenAI' }));
+        }
+      } catch {
+        toast.error(t('settings.providers.wizard.authorizeFailed', { name: 'OpenAI' }));
+      } finally {
+        setAccountReconnecting(false);
+      }
+      return;
+    }
     if (openAiRecoveryCheck === 'failed') {
       await refreshOpenAiAuth();
       return;
@@ -557,7 +578,7 @@ export function ErrorBanner({
         'mx-auto flex items-start gap-2 border px-3 py-2',
         isOpenAiConnectionExpired
           ? 'rounded-xl bg-[var(--surface-elevated)] border-[var(--border-default)]'
-          : 'rounded-md bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800',
+          : 'rounded-lg bg-[var(--error-bg)] border-[var(--error-border)]',
         className,
       )}
       style={style}
@@ -571,7 +592,7 @@ export function ErrorBanner({
             'mt-[2px] shrink-0',
             isOpenAiConnectionExpired
               ? 'text-[var(--settings-integration-warning)]'
-              : 'text-red-500',
+              : 'text-[var(--error-fg)]',
           )}
         />
       )}
@@ -581,7 +602,7 @@ export function ErrorBanner({
             'block break-all text-xs',
             isOpenAiConnectionExpired
               ? 'text-[var(--text-secondary)]'
-              : 'text-red-600 dark:text-red-400',
+              : 'text-[var(--error-fg)]',
           )}
         >
           {displayError}
@@ -597,7 +618,7 @@ export function ErrorBanner({
           isGatewayProxyTokenInvalid) && (
           // 网络类与过载类的原始错误折叠可查:友好文案替换了原文,但排障(端口/URL/
           // errno/上游原话)仍需要原文,点击展开。新增控件走 --error-fg token(规则 16;
-          // 本组件其余 red-600/400 为历史存量,error 属语义豁免色但新代码仍走 token)。
+          // 普通错误表面同样消费 error 语义色)。
           <>
             <button
               type="button"
@@ -687,7 +708,7 @@ export function ErrorBanner({
           disabled={syncing}
           className={cn(
             'shrink-0 flex items-center gap-1 text-xs font-medium',
-            'text-red-600 dark:text-red-400',
+            'text-[var(--error-fg)]',
             'hover:opacity-70 transition-opacity',
             'disabled:opacity-50 disabled:cursor-not-allowed',
           )}
@@ -703,7 +724,7 @@ export function ErrorBanner({
           onClick={onSilentStopContinue}
           className={cn(
             'shrink-0 flex items-center gap-1 text-xs font-medium',
-            'text-red-600 dark:text-red-400',
+            'text-[var(--error-fg)]',
             'hover:opacity-70 transition-opacity',
           )}
           title={t('chat.errorBanner.silentStopContinueTitle')}
@@ -736,7 +757,7 @@ export function ErrorBanner({
             'shrink-0 flex items-center gap-1 text-xs font-medium',
             isOpenAiConnectionExpired
               ? 'text-[var(--text-primary)]'
-              : 'text-red-600 dark:text-red-400',
+              : 'text-[var(--error-fg)]',
             'hover:opacity-70 transition-opacity',
           )}
           title={t('chat.errorBanner.retryTitle')}
@@ -753,7 +774,7 @@ export function ErrorBanner({
           disabled={forkStripEncryptedRunning}
           className={cn(
             'shrink-0 flex items-center gap-1 text-xs font-medium',
-            'text-red-600 dark:text-red-400',
+            'text-[var(--error-fg)]',
             'hover:opacity-70 transition-opacity',
             'disabled:opacity-50 disabled:cursor-not-allowed',
           )}

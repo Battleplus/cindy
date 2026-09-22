@@ -8,6 +8,7 @@ import { CCAgentSessionView } from '@/features/cc-agent/CCAgentSessionView';
 import type { ComposerBotMention } from '@/lib/fileTypes';
 import { getBotLastReadAt, markBotRead } from './botReadState';
 import type { BotChatIdentity } from './BotSessionContentHeader';
+import type { BotChatBinding } from './botChatPresentation';
 import { useBotIslandVisibleSession } from './useBotIslandVisibleSession';
 
 type BotSessionGate =
@@ -15,7 +16,7 @@ type BotSessionGate =
   | {
       kind: 'ready';
       mentions: ComposerBotMention[];
-      identity: BotChatIdentity;
+      identity: BotChatBinding;
       /** True only for the Bot's own canonical chat (not a mounted channel route). */
       isCanonical: boolean;
       /** Read position captured before opening advances it; null when entry had no unread replies. */
@@ -25,9 +26,10 @@ type BotSessionGate =
   | { kind: 'error'; message: string };
 
 function readBotChatIdentity(bot: unknown, botId: string): BotChatIdentity {
-  const candidate = (bot ?? {}) as { name?: unknown; avatar?: unknown; avatarColor?: unknown };
+  const candidate = (bot ?? {}) as { name?: unknown; avatar?: unknown; avatarColor?: unknown; templateId?: unknown };
   return {
     id: botId,
+    templateId: typeof candidate.templateId === 'string' ? candidate.templateId : undefined,
     name: typeof candidate.name === 'string' ? candidate.name : '',
     avatar: typeof candidate.avatar === 'string' ? candidate.avatar : null,
     avatarColor: typeof candidate.avatarColor === 'string' ? candidate.avatarColor : null,
@@ -138,7 +140,7 @@ function BotSessionGateView() {
           isCanonical: activeProjection?.role === 'canonical',
           unreadBoundaryAt:
             activeProjection?.role === 'canonical' && unreadCount > 0 ? lastReadAt : null,
-          identity: readBotChatIdentity(bot, botId),
+          identity: { ...readBotChatIdentity(bot, botId), sessionId },
           mentions: Array.isArray(bots)
             ? bots
                 .map((candidate) => readBotMention(candidate, botId))
