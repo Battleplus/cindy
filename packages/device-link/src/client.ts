@@ -1,4 +1,7 @@
 import { isPeerResetRetryableReadChannel } from './invokePolicy.js';
+import { encodeSharedTaskEnvelope, decodeSharedTaskEnvelope } from './sharedTaskEnvelope.js';
+import { isSharedTaskPeer } from './sharedTaskPeer.js';
+import { SHARED_TASK_RELAY_CAPABILITY } from '@cindy/device-link-protocol';
 import {
   requestSessionTagCatalog,
   decodeSessionTagCatalog,
@@ -605,6 +608,13 @@ interface PeerTransportState {
   lastReplayEpoch: number;
   /** 上次真正 replay 时对端的 stream。对端重启换 stream 时不能当重复 open。 */
   lastReplayRemoteStreamId: string | null;
+  /** Latest duplicate accept whose confirmation may prove a receive gap. */
+  duplicateOpenRepair: { requestId: string; headSeq: number; throughSeq: number } | null;
+  /** ACK-paced repair, bounded to the backlog captured by the accepted open. */
+  confirmedGapRepair: { awaitingSeq: number; throughSeq: number } | null;
+  /** One extra repair per sequence, retained across link resets of this stream. */
+  lastDuplicateOpenRepairSeq: number;
+  lastDuplicateOpenRepairAt: number;
   /**
    * 恢复探测：link 刚恢复或刚被 DEVICE_OFFLINE 刹停后为 true。
    * 此间出站不超过 transportRetryPassBudget，直到收到可靠 ACK。
@@ -735,6 +745,7 @@ export class DeviceLinkClient {
   private staleLinkNotifiedAt = new Map<string, number>();
   private presenceHandlers = new Set<(snap: PresenceSnapshot) => void>();
   private frameHandlers = new Set<InboundFrameHandler>();
+  private peerStreamAcceptedHandlers = new Set<(peer: string, streamId: string) => void>();
   private issueHandlers = new Set<(issue: DeviceLinkConnectionIssue | null) => void>();
   private peerRouteStateHandlers = new Set<
     (change: DeviceLinkPeerRouteStateChanged) => void
@@ -987,6 +998,12 @@ export class DeviceLinkClient {
 
   getStatus(): DeviceLinkStatus {
     return this.status;
+  }
+
+  /** Verified outbound handshake, before recovered business frames are delivered. */
+  onPeerStreamAccepted(cb: (peer: string, streamId: string) => void): () => void {
+    this.peerStreamAcceptedHandlers.add(cb);
+    return () => this.peerStreamAcceptedHandlers.delete(cb);
   }
 
   /** 目标设备是否已完成 link-open / link-accept，可安全进入 streaming tier。 */
@@ -1338,19 +1355,38 @@ export class DeviceLinkClient {
   sendInvokeResult(dst: string, requestId: string, payload: InvokeResultPayload): void {
     const peer = this.peerTransport.get(dst);
     const env: Envelope = { v: PROTOCOL_VERSION, kind: 'invoke-result', id: requestId, dst, payload };
-    // 死锁绕行:relay 在线但控制链路未就绪时,result 不进可靠队列等一个可能永远
+    // 死锁绕行:relay 在线但控制链路未就绪时,result 不能只进可靠队列等一个可能永远
     // 不来的 link-accept(2026-08-03 线上实锤:队列冻结 30+ 分钟,每个执行成功的
     // 结果都等 120s 过期丢弃),改为 legacy 裸帧即时直发 —— 控制端按 id 配对
-    // 不依赖可靠层。送达失败(对端恰好离线)时对端本来就会超时,不比旧行为差。
-    // 超过单帧上限的大 result 只能靠可靠层分片,回落入队等 link 重建。
+    // 不依赖可靠层。同时先保留有界可靠副本：原 invoke 可能已 ACK，若直发时
+    // 对端刚好离线，请求不会重发，必须能在 link 重建后补回结果。
+    // 超过单帧上限的大 result 只靠可靠层分片。重复结果按 requestId 配对，
+    // 不会重新执行原操作；副本仍受原队列容量、过期和重放预算约束。
     if (peer?.reliable && !this.isPeerSendReady(peer) && this.status === 'online') {
+      try {
+        this.sendPeerEnvelope(env);
+      } catch (err) {
+        if (!(err instanceof DeviceLinkError && err.code === 'BACKPRESSURE')) throw err;
+        // 保留副本不能堵住既有死锁绕行；容量耗尽时仍尝试直发，不扩容或驱逐 live 帧。
+        try {
+          this.sendBestEffortRoutedEnvelope(env);
+        } catch (directError) {
+          // 可分片的大结果只是不适合裸帧；保留队列拥塞错误，让上层 outbox 重试原结果。
+          if (directError instanceof DeviceLinkError && directError.code === 'PAYLOAD_TOO_LARGE') throw err;
+          throw directError;
+        }
+        peer.unlinkedLegacyResponseIds.delete(requestId);
+        return;
+      }
       try {
         this.sendBestEffortRoutedEnvelope(env);
         peer.unlinkedLegacyResponseIds.delete(requestId);
-        return;
       } catch (err) {
-        if (!(err instanceof DeviceLinkError && err.code === 'PAYLOAD_TOO_LARGE')) throw err;
+        if (!(err instanceof DeviceLinkError && err.code === 'PAYLOAD_TOO_LARGE')) {
+          this.log.debug('unlinked result direct send failed; reliable copy retained', err);
+        }
       }
+      return;
     }
     const allowClosedLegacyResponse = peer?.unlinkedLegacyResponseIds.has(requestId) === true;
     this.sendPeerEnvelope(env, allowClosedLegacyResponse);
@@ -1421,6 +1457,7 @@ export class DeviceLinkClient {
       );
     }
     peer.linkAcceptedInbound = true;
+    peer.duplicateOpenRepair = null;
     if (peerSupportsReliable) {
       const resume = this.planReliableSendResume(peer);
       this.commitReliableReceiveReady(dst, peer);
@@ -2054,7 +2091,8 @@ export class DeviceLinkClient {
       this.log.warn('dropping invalid device-link frame');
       return;
     }
-    const env = parsed;
+    const env = decodeSharedTaskEnvelope(parsed, this.hasServerCapability(SHARED_TASK_RELAY_CAPABILITY));
+    if (!env) { this.log.warn('dropping invalid device-link routing scope'); return; }
     const validForHeartbeat = isValidInboundEnvelope(env);
     // 畸形 invoke / link-close 仍须进入 Desktop 业务层：前者生成结构化拒绝，后者
     // 走既有 fail-generic 的 peer teardown；但两者都不能因此喂活 heartbeat。
@@ -2247,6 +2285,8 @@ export class DeviceLinkClient {
         // 配对要 id + kind 双重命中:仅 id 撞而 kind 不符(如 invoke-result 撞到一个
         // 等 link-accept 的 pending)的帧不得错误 resolve —— 留它超时,本帧当未知帧交 host。
         const p = env.id ? this.pending.get(env.id) : undefined;
+        // A request ID alone cannot authorize a reply from another device or task scope.
+        if (p?.dst && env.src !== p.dst) return true;
         if (p && p.expectKind === env.kind) {
           if (env.kind === 'link-accept' && env.src) {
             const accepted = env.payload as LinkAcceptPayload | undefined;
@@ -2276,6 +2316,12 @@ export class DeviceLinkClient {
             // link),两个方向共享同一份 PeerTransportState——覆盖会让入站方向
             // 的重试耗尽误拆整条共享 relay(字段注释有完整语义)。
             if (peer.reliable) {
+              if (env.src === p.dst && peer.remoteStreamId) {
+                for (const cb of this.peerStreamAcceptedHandlers) {
+                  try { cb(env.src, peer.remoteStreamId); }
+                  catch (error) { this.log.error('peer stream accepted handler threw', error); }
+                }
+              }
               const resume = this.planReliableSendResume(peer);
               this.commitReliableReceiveReady(env.src, peer);
               this.commitReliableSendResume(env.src, peer, resume);
@@ -2303,6 +2349,8 @@ export class DeviceLinkClient {
           || payload.code === 'REMOTE_DISABLED'
         );
         const pending = env.id ? this.pending.get(env.id) : undefined;
+        if (pending && ((payload.dst !== undefined && payload.dst !== pending.dst)
+          || (isSharedTaskPeer(pending.dst) && env.sharedTask === undefined))) return true;
         const routeDeviceId = payload.dst ?? pending?.dst;
         const rememberedGeneration = env.id
           ? this.consumeOutboundRouteGeneration(env.id, routeDeviceId)
@@ -3031,7 +3079,7 @@ export class DeviceLinkClient {
         // pending 可在 link down 时入队，并在后续 link generation 才首次上网；
         // 路由错误必须归属每次真实物理发送，而不是逻辑消息的入队代次。
         this.sendRoutedEnvelope(frame, peer.linkGeneration);
-        writtenBytes += byteLength(JSON.stringify(frame));
+        writtenBytes += byteLength(JSON.stringify(encodeSharedTaskEnvelope(frame, true)));
         pending.sent = true;
         sent += 1;
       }
@@ -3106,7 +3154,8 @@ export class DeviceLinkClient {
   }
 
   private measureReliableFrames(frames: readonly Envelope[]): number {
-    return frames.reduce((sum, frame) => sum + byteLength(JSON.stringify(frame)), 0);
+    // Budget the physical wire envelope, not the local scoped connection handle.
+    return frames.reduce((sum, frame) => sum + byteLength(JSON.stringify(encodeSharedTaskEnvelope(frame, true))), 0);
   }
 
   /**
@@ -3134,7 +3183,7 @@ export class DeviceLinkClient {
   private sendEnvelope(env: Envelope): void {
     const ws = this.ws;
     if (!ws) throw new DeviceLinkError('NOT_CONNECTED', 'no active connection');
-    const text = JSON.stringify(env);
+    const text = JSON.stringify(encodeSharedTaskEnvelope(env, this.hasServerCapability(SHARED_TASK_RELAY_CAPABILITY)));
     // 按 UTF-8 字节数判定,与服务端 MAX_FRAME_BYTES(Buffer.byteLength)一致。
     // 用 text.length(UTF-16 码元)会与服务端不符:CJK 等多字节内容客户端自检通过、
     // 服务端却 PAYLOAD_TOO_LARGE 丢帧,invoke 只能等 30s 超时而非快速失败。
@@ -3385,6 +3434,8 @@ export class DeviceLinkClient {
   }
 
   private markPeerLinkDown(peer: PeerTransportState): void {
+    peer.duplicateOpenRepair = null;
+    peer.confirmedGapRepair = null;
     if (peer.pendingLinkConfirmation?.timer) {
       clearTimeout(peer.pendingLinkConfirmation.timer);
     }
@@ -3422,6 +3473,10 @@ export class DeviceLinkClient {
         highestAckSeq: 0,
         lastReplayEpoch: this.connEpoch,
         lastReplayRemoteStreamId: null,
+        duplicateOpenRepair: null,
+        confirmedGapRepair: null,
+        lastDuplicateOpenRepairSeq: 0,
+        lastDuplicateOpenRepairAt: Number.NEGATIVE_INFINITY,
         recoveryNeedsAck: false,
         recoveryFramesSent: 0,
         recoveryTrace: null,
@@ -3539,6 +3594,8 @@ export class DeviceLinkClient {
       : 1;
     if (peer.remoteStreamId !== nextRemoteStreamId) {
       peer.receive.clear();
+      peer.duplicateOpenRepair = null;
+      peer.confirmedGapRepair = null;
     }
     if (peer.reliable && !reliable) {
       this.abandonReliablePending(dst, 'peer no longer supports reliable transport');
@@ -3706,6 +3763,7 @@ export class DeviceLinkClient {
       this.commitReliableSendResume(src, peer, confirmation.resume);
     }
     if (!this.isPeerSendReady(peer)) return;
+    this.repairConfirmedReceiveGap(src, peer, ackSeq, linkRequestId);
     // 迟到/陈旧 ACK 幂等无害（含指向已被驱逐 seq 的 ACK）：驱逐后该 seq 已不在
     // map 里，累计删除循环遇到更高的队头 live seq 直接 break，不会误删、不抛错、
     // 不错误推进状态；高于 nextSeq-1 的未知 ACK 与倒退的 ACK 直接忽略。
@@ -3721,11 +3779,16 @@ export class DeviceLinkClient {
       peer.pendingBytes -= pending.bytes;
     }
     if (peer.recoveryNeedsAck) {
+      peer.confirmedGapRepair = null;
       peer.recoveryNeedsAck = false;
       peer.recoveryFramesSent = 0;
       this.logRecoveryStage(src, 'recovery-probe-acked', ` ack=${ackSeq}`);
       this.retryPending(src, { ignoreInterval: true });
     } else {
+      const repair = peer.confirmedGapRepair;
+      if (repair && ackSeq >= repair.awaitingSeq) {
+        this.sendConfirmedGapHead(src, peer, repair.throughSeq);
+      }
       // Release locally queued first sends promptly, without replaying already
       // in-flight large responses every time a partial ACK arrives.
       this.retryPending(src, { ignoreInterval: false, onlyUnsent: true });
@@ -3738,6 +3801,53 @@ export class DeviceLinkClient {
     if (peer.pending.size === 0 && peer.retryTimer) {
       clearInterval(peer.retryTimer);
       peer.retryTimer = null;
+    }
+  }
+
+  /** A controller can reconnect without changing its reliable stream or our
+   * relay epoch. Its current accept confirmation can still report a missing
+   * head. Repair one head at a time, advancing only after its cumulative ACK,
+   * bounded to the captured backlog and one extra copy per sequence. Normal
+   * ACKs and legacy peers cannot start this path. Slow heads may get a copy. */
+  private repairConfirmedReceiveGap(
+    dst: string,
+    peer: PeerTransportState,
+    ackSeq: number,
+    linkRequestId?: string,
+  ): void {
+    const repair = peer.duplicateOpenRepair;
+    if (!repair || repair.requestId !== linkRequestId) return;
+    peer.duplicateOpenRepair = null;
+    if (peer.confirmedGapRepair) return; // Repeated opens cannot extend the snapshot.
+    const head = peer.pending.values().next().value;
+    const now = this.monotonicNow();
+    if (!head?.sent || head.seq !== repair.headSeq
+      || ackSeq !== head.seq - 1 || ackSeq < peer.highestAckSeq
+      || now - peer.lastDuplicateOpenRepairAt < normalizeTransportRetryInterval(this.timing.transportRetryIntervalMs)) return;
+    this.sendConfirmedGapHead(dst, peer, repair.throughSeq);
+  }
+
+  private sendConfirmedGapHead(dst: string, peer: PeerTransportState, throughSeq: number): void {
+    // A blocked/oversize head falls back to the existing retry/drain policy.
+    // It must not allow a later ACK or duplicate open to spend a fresh budget.
+    peer.confirmedGapRepair = null;
+    const head = peer.pending.values().next().value;
+    const frameCount = head ? this.estimateReliableFrameCount(head) : 0;
+    if (!head?.sent || head.seq > throughSeq
+      || peer.lastDuplicateOpenRepairSeq >= head.seq
+      || head.attempts >= this.timing.transportMaxRetryAttempts
+      || frameCount > this.recoveryPassBudget()
+      || this.shouldHoldRecoverySend(peer, frameCount)) return;
+    try {
+      const frames = this.sendReliableFrames(peer, head);
+      if (frames === 0) return; // Existing retry/drain owns local backpressure.
+      peer.lastDuplicateOpenRepairSeq = head.seq;
+      peer.lastDuplicateOpenRepairAt = this.monotonicNow();
+      if (head.seq < throughSeq) peer.confirmedGapRepair = { awaitingSeq: head.seq, throughSeq };
+      this.noteRecoveryFrames(peer, frames);
+      this.log.debug(`device-link confirmed gap repair dst=${dst.slice(0, 8)} seq=${head.seq} frames=${frames}`);
+    } catch (err) {
+      this.log.debug(`device-link confirmed gap repair deferred dst=${dst.slice(0, 8)}`, err);
     }
   }
 
@@ -4133,6 +4243,13 @@ export class DeviceLinkClient {
     // 同 stream 重复 open：发送方向已经 ready 时绝不能再打回 awaiting-confirm，
     // 否则 ACK/重试被暂停，pending 只涨不消，对端超时后再 open，形成死循环。
     if (resume.duplicateOpen && this.isPeerSendReady(peer)) {
+      const head = peer.pending.values().next().value;
+      let throughSeq = 0;
+      for (const pending of peer.pending.values()) {
+        if (!pending.sent) break;
+        throughSeq = pending.seq;
+      }
+      peer.duplicateOpenRepair = head?.sent ? { requestId, headSeq: head.seq, throughSeq } : null;
       // sendLinkAccept 已把这次 accept 记进 active 路由账本；确认分支才会
       // discard。这里保持 ready、不进 awaiting-confirm，但仍要结算该记录，
       // 否则每次重复 open 泄漏一条，满 1024 后后续 accept 全 BACKPRESSURE。
@@ -4213,6 +4330,7 @@ export class DeviceLinkClient {
     }
     peer.lastReplayEpoch = this.connEpoch;
     peer.lastReplayRemoteStreamId = peer.remoteStreamId;
+    peer.confirmedGapRepair = null;
     // 真正恢复不依赖当时队列是否有积压:abandon / transport-timeout 可能已清空
     // pending。首次建链(还没 resume 过)保持原语义,空队列不进探测。
     if (resume.enterRecovery) {

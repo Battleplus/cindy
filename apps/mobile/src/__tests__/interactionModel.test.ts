@@ -397,14 +397,16 @@ describe('interactionModel', () => {
     ])).toBe(false);
   });
 
-  it('keeps read-only pending interactions as a short desktop-style blocker', () => {
+  it('keeps shared-task guest pending interactions as a short desktop-style blocker', () => {
     const interactionPanelSource = readFileSync(resolve(process.cwd(), 'src/session/InteractionPanel.tsx'), 'utf8');
-    const readOnlyStart = interactionPanelSource.indexOf('if (readOnlyReason) {');
+    const readOnlyStart = interactionPanelSource.indexOf('if (isSharedTaskPeer(deviceId)) {');
     const readOnlyEnd = interactionPanelSource.indexOf('return (', interactionPanelSource.indexOf('}', readOnlyStart));
     const readOnlySource = interactionPanelSource.slice(readOnlyStart, readOnlyEnd);
 
     expect(readOnlySource).toContain("t('interaction.panel.readOnlyTitle')");
-    expect(readOnlySource).toContain('{readOnlyReason}');
+    expect(readOnlySource).toContain("{t('sharedTask.waitingHost')}");
+    expect(interactionPanelSource).not.toContain('readOnlyReason');
+    expect(readOnlySource).toContain('JSON.stringify(activeInteraction.request, null, 2)');
     expect(readOnlySource).not.toContain('当前请求类型');
     expect(readOnlySource).not.toContain('不会回传协作编排决定');
     expect(readOnlySource).not.toContain('手机版会保留会话显示');
