@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   resolveLenientSessionRoute: vi.fn(),
   applyRuntimeSetModelChange:
     vi.fn<(input: unknown) => Promise<{ status: 'applied' | 'deferred' }>>(),
+  actualApplyRuntimeSetModelChange: null as null | ((input: never) => Promise<unknown>),
   registerPendingCredentialSwitchForSession: vi.fn(),
   clearPendingCredentialSwitchForSession: vi.fn(),
   wakeSessionInputAfterCredentialSwitch: vi.fn(),
@@ -33,13 +34,12 @@ const mocks = vi.hoisted(() => ({
   readPermissionMode: vi.fn(async () => 'auto'),
   updatePermissionMode: vi.fn(async () => {}),
   updateModelEffort: vi.fn(async () => {}),
+  markManualOverride: vi.fn(async () => {}),
   getSessionProvider: vi.fn<() => string | null>(() => null),
   setSessionProvider: vi.fn(),
   isSessionInTurn: vi.fn(() => false),
   cancelPendingAgentSwitchForSession: vi.fn(),
-  withSendToSessionLock: vi.fn(
-    async (_sessionId: string, task: () => Promise<unknown>) => task(),
-  ),
+  withSendToSessionLock: vi.fn(async (_sessionId: string, task: () => Promise<unknown>) => task()),
   // 禁止回落 cwd:TEMP 是 Windows 独有变量,macOS 上回落 cwd 会让传递 import 的
   // 写盘副作用落进仓库工作区(见 authAdaptersImportPurity.test.ts 记录的事故)。
   userDataDir: process.env.TMPDIR ?? process.env.TEMP ?? '/tmp',
@@ -85,15 +85,20 @@ vi.mock('../sessionRepo', () => ({
   updateModelEffort: mocks.updateModelEffort,
   updatePermissionMode: mocks.updatePermissionMode,
 }));
+vi.mock('../manualRouteOverride', () => ({
+  markImSessionManualRouteOverride: mocks.markManualOverride,
+}));
 vi.mock('../../../maker-host/session-provider-store', () => ({
   getSessionProvider: mocks.getSessionProvider,
   normalizeSessionProviderId: (providerId: string | null | undefined) =>
     providerId === undefined ? undefined : providerId?.trim() || null,
   setSessionProvider: mocks.setSessionProvider,
 }));
-vi.mock('../../../maker-ipc/runtimeSetModel', () => ({
-  applyRuntimeSetModelChange: mocks.applyRuntimeSetModelChange,
-}));
+vi.mock('../../../maker-ipc/runtimeSetModel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../maker-ipc/runtimeSetModel')>();
+  mocks.actualApplyRuntimeSetModelChange = actual.applyRuntimeSetModelChange as never;
+  return { applyRuntimeSetModelChange: mocks.applyRuntimeSetModelChange };
+});
 vi.mock('../../../maker-ipc/register', () => ({
   cancelPendingAgentSwitchForSession: mocks.cancelPendingAgentSwitchForSession,
   isSessionInTurn: mocks.isSessionInTurn,
@@ -121,6 +126,10 @@ import {
 import type { ImCardBuilders } from '../cardBuilders';
 import type { ImChannelAdapter } from '../types';
 import type { ImTurnRunner } from '../turnRunner';
+import {
+  setCodexAppliedCustomProviderRoutes,
+  type CodexCustomProviderRoute,
+} from '../../../maker-host/codex-custom-provider-route';
 
 function makeIm() {
   const im = {
@@ -203,6 +212,7 @@ async function pressSessionPick(
 }
 
 beforeEach(() => {
+  setCodexAppliedCustomProviderRoutes([]);
   vi.clearAllMocks();
   activateImAccountBoundary();
   (resolvePending as ReturnType<typeof vi.fn>).mockReturnValue(false);
@@ -218,11 +228,7 @@ beforeEach(() => {
     createSession: vi.fn(async () => ({ id: 'sess-new' })),
     closeSession: mocks.closeSession,
     getCapabilities: vi.fn(() => ({
-      permissionModes: [
-        { id: 'ask' },
-        { id: 'auto' },
-        { id: 'bypassPermissions' },
-      ],
+      permissionModes: [{ id: 'ask' }, { id: 'auto' }, { id: 'bypassPermissions' }],
     })),
   });
   mocks.getDesktopCcPrefs.mockReturnValue(null);
@@ -613,10 +619,7 @@ describe('model:pick 持久化失败', () => {
 
     const pickPromise = pressModelPick(im);
     await vi.waitFor(() => {
-      expect(mocks.withSendToSessionLock).toHaveBeenCalledWith(
-        'sess-target',
-        expect.any(Function),
-      );
+      expect(mocks.withSendToSessionLock).toHaveBeenCalledWith('sess-target', expect.any(Function));
     });
     expect(mocks.updateModelEffort).not.toHaveBeenCalled();
     expect(mocks.applyRuntimeSetModelChange).not.toHaveBeenCalled();
@@ -642,6 +645,75 @@ describe('model:pick 持久化失败', () => {
     );
     expect(mocks.applyRuntimeSetModelChange).toHaveBeenCalledWith(
       expect.objectContaining({ providerId: 'anthropic' }),
+    );
+  });
+
+  it('IM 模型卡片跨 dynamic Provider 时关闭旧 thread，下一次发送再按新路由创建', async () => {
+    const routeA: CodexCustomProviderRoute = {
+      providerId: 'provider-a',
+      routeId: 'a'.repeat(20),
+      modelProviderId: `cindy_custom_${'a'.repeat(20)}`,
+      capabilities: { imageGeneration: true },
+      responseModels: ['shared-model'],
+      routing: {
+        upstream: 'https://a.invalid/v1',
+        wireProtocol: 'openai-responses',
+        authStrategy: 'none',
+      },
+      responseRoutingByModel: {},
+      responseEffortsByModel: {},
+      credentialRevision: 1,
+    };
+    const routeB: CodexCustomProviderRoute = {
+      ...routeA,
+      providerId: 'provider-b',
+      routeId: 'b'.repeat(20),
+      modelProviderId: `cindy_custom_${'b'.repeat(20)}`,
+      capabilities: { imageGeneration: true },
+      responseModels: ['claude-opus-4-7'],
+    };
+    setCodexAppliedCustomProviderRoutes([routeA, routeB]);
+    let livePresent = true;
+    const live = {
+      id: 'sess-target',
+      agentKind: 'codex' as const,
+      remoteHostId: null,
+      codexProxyActive: true,
+      codexThreadModelProviderId: routeA.modelProviderId,
+      model: 'shared-model',
+      setModel: vi.fn(async () => {}),
+      setEffort: vi.fn(async () => {}),
+      isTurnRunning: () => false,
+    };
+    const closeSession = vi.fn(async () => {
+      livePresent = false;
+    });
+    mocks.getSessionProvider.mockReturnValue('provider-a');
+    mocks.getMaker.mockReturnValue({
+      getSession: () => (livePresent ? live : undefined),
+      listActiveSessions: () => (livePresent ? [live] : []),
+      closeSession,
+      getCapabilities: vi.fn(() => ({ permissionModes: [] })),
+    });
+    (turnRunner.getMakerSessionById as ReturnType<typeof vi.fn>).mockImplementation(() =>
+      livePresent ? live : null,
+    );
+    mocks.applyRuntimeSetModelChange.mockImplementationOnce(async (input: unknown) => {
+      if (!mocks.actualApplyRuntimeSetModelChange) throw new Error('actual runtime switch missing');
+      return mocks.actualApplyRuntimeSetModelChange(input as never) as Promise<{
+        status: 'applied' | 'deferred';
+      }>;
+    });
+    const im = makeIm();
+
+    await pressModelPick(im, 'provider-b');
+
+    expect(closeSession).toHaveBeenCalledWith('sess-target', 'runtime-refresh');
+    expect(live.setModel).not.toHaveBeenCalled();
+    expect(mocks.setSessionProvider).toHaveBeenCalledWith('sess-target', 'provider-b');
+    expect(im.updateInteractiveCard).toHaveBeenCalledWith(
+      'model-card',
+      expect.objectContaining({ body: slackUi.cards.model.resolved('Opus 4.7', 'high') }),
     );
   });
 
@@ -756,6 +828,62 @@ describe('model:pick 持久化失败', () => {
       expect.objectContaining({ body: slackUi.cards.model.failed('runtime rejected') }),
     );
     expect(mocks.cancelPendingAgentSwitchForSession).not.toHaveBeenCalled();
+  });
+
+  it('选择落地后才写「脱离跟随」手动墓碑', async () => {
+    // 「单独改过」按选择行为判定、不看取值相等(同值重选也永久脱离),
+    // 但必须在选择真正落地后写(PR #5155 review P2)。
+    const im = makeIm();
+
+    await pressModelPick(im);
+
+    expect(mocks.markManualOverride).toHaveBeenCalledWith('sess-target');
+    expect(mocks.cancelPendingAgentSwitchForSession).toHaveBeenCalledWith('sess-target');
+  });
+
+  it('失败回滚的选择不写手动墓碑', async () => {
+    // 若在 updateModelEffort 里立碑, 失败回滚(同一函数)会让失败的选择永久脱离
+    // 默认跟随(PR #5155 review P2)。
+    mocks.readModelRouteSnapshot.mockResolvedValueOnce({
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+      providerId: 'openrouter',
+    });
+    mocks.applyRuntimeSetModelChange.mockRejectedValueOnce(new Error('runtime rejected'));
+    const im = makeIm();
+
+    await pressModelPick(im);
+
+    expect(mocks.markManualOverride).not.toHaveBeenCalled();
+    expect(mocks.cancelPendingAgentSwitchForSession).not.toHaveBeenCalled();
+  });
+
+  it('墓碑写失败按选择失败处理: 整体回滚并报错', async () => {
+    mocks.readModelRouteSnapshot.mockResolvedValueOnce({
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+      providerId: 'openrouter',
+    });
+    mocks.markManualOverride.mockRejectedValueOnce(new Error('db closed'));
+    const im = makeIm();
+
+    await pressModelPick(im);
+
+    expect(mocks.updateModelEffort).toHaveBeenNthCalledWith(
+      2,
+      'sess-target',
+      'claude-sonnet-4-6',
+      'medium',
+      'openrouter',
+    );
+    // 延迟凭证切换登记也要一并撤销, 否则 turn 收口仍会应用已报失败的选择
+    // (PR #5155 review P2)。
+    expect(mocks.clearPendingCredentialSwitchForSession).toHaveBeenCalledWith('sess-target');
+    expect(mocks.cancelPendingAgentSwitchForSession).not.toHaveBeenCalled();
+    expect(im.updateInteractiveCard).toHaveBeenCalledWith(
+      'model-card',
+      expect.objectContaining({ body: slackUi.cards.model.failed('db closed') }),
+    );
   });
 
   it('live setEffort 失败时恢复 route store 和 live model', async () => {

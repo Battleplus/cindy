@@ -1,27 +1,7 @@
 /**
- * sessionOutbox.ts — 会话页本地待发队列(outbox)的纯状态模型。
- * ---------------------------------------------------------------------------
- * 带附件消息的乐观发送:点发送时附件可能仍在上传,消息不再卡在 composer 等
- * waitForPendingUploads,而是立刻以「outbox 条目」形态进消息流(InlineQueueSection
- * 尾部,气泡带上传进度),后台等附件落定后按 FIFO 逐条真正 enqueue 给被控端。
- *
- * 不变量:
- * - FIFO:只有队首条目可以 dispatch(附件齐 + 无失败),后发消息(含纯文本)在
- *   outbox 非空时必须排在其后,保证到达被控端的顺序与用户发送顺序一致;
- * - 失败阻塞:任一条目失败(附件上传失败 / enqueue 失败)时它留在队首挡住后续,
- *   用户重试或删除后队列继续——静默跳过会打乱顺序预期;
- * - 附件槽位:发送时刻已就绪的附件占前段槽位,在途上传按托盘顺序占后段,
- *   onUploaded 按 localId 填槽,全部就位后按槽序组装,附件顺序与用户所见一致。
- *
- * 本模块只做纯数据变换(node 可单测);上传路由、enqueue RPC、React state 接线
- * 在 [sessionId].tsx。
- *
- * 生命周期边界：队列只拥有尚未开始 enqueue、或能证明请求尚未发出的条目，并在当前
- * 会话页存活期间自动重连续发。正常切任务 / 退屏由页面 cleanup 把这些正文接回草稿；
- * 一旦 enqueue 已开始，所有权转给既有在线发送 / optimistic projection 路径，回执不确定
- * 的写请求绝不重新降级成会丢 clientId 的草稿。若未来要跨页面或跨进程继续自动重试，
- * 必须单独设计可对账的 outbox owner，不能把草稿库当 write-ahead log（它没有消息边界、
- * 附件任务或远端 acceptance 状态）。
+ * Mobile message snapshots and presentation helpers. App-level persistence and delivery
+ * live in durableOutbox.ts / durableOutboxDelivery.ts; this module has no page ownership.
+ * Recovery helpers remain for legacy direct sends and composer editing.
  */
 import { i18n } from '@/i18n';
 import type { MobileSessionReference } from '@/session/sessionReferences';
@@ -126,6 +106,8 @@ export interface MobileOutboxItem {
    * store 拿到的已是恢复后的值,消息本身必须仍按发送时刻的档位派发。
    */
   permissionModeAtSend: string;
+  /** 新协议的单条 Plan 快照；旧记录缺失时保留原协议语义。 */
+  planModeAtSend?: boolean;
   /** 附件槽位(按用户可见顺序);null = 对应上传任务尚未落定。 */
   attachmentSlots: ReadonlyArray<RemoteSerializedAttachment | null>;
   /**
@@ -133,7 +115,7 @@ export interface MobileOutboxItem {
    * (图片 = 缩略图方块,文件 = 计数行),previewUri 为本地预览(file://,
    * 上传中即可显示——乐观语义下图从第一帧就该以图的形态出现,不做「附件→图片」跳变)。
    */
-  slotMeta: ReadonlyArray<{ kind: 'image' | 'file'; previewUri: string | null }>;
+  slotMeta: ReadonlyArray<{ kind: 'image' | 'file'; previewUri: string | null; name?: string }>;
   /** 上传任务 localId → 槽位下标。 */
   slotByLocalId: Readonly<Record<string, number>>;
   /** 尚未落定的上传任务。 */
@@ -152,6 +134,8 @@ export interface MobileOutboxThumb {
   uri: string | null;
   /** 已落定槽位的 OSS 引用(sentAttachmentThumbStore 兜底查询键);未落定为 null。 */
   ossRef: string | null;
+  /** Original upload ref, retained when the host materializes ossRef. */
+  previewRef?: string;
   /** 对应上传任务尚未落定(渲染转圈遮罩)。 */
   uploading: boolean;
 }
@@ -169,6 +153,7 @@ export interface MobileOutboxDisplayItem {
   thumbnails: MobileOutboxThumb[];
   /** 非图片附件数(pdf / office 等,渲染「N 个文件」计数行)。 */
   fileCount: number;
+  fileNames?: string[];
   failed: boolean;
   /** 失败原因(附件失败给统一文案,enqueue 失败给 RPC 错误)。 */
   errorText: string | null;
@@ -203,6 +188,7 @@ export function buildOutboxItem(input: {
   pastedTextRanges?: Array<{ start: number; end: number; display: string }>;
   slashCommandRanges?: Array<{ start: number; end: number }>;
   permissionModeAtSend: string;
+  planModeAtSend?: boolean;
   /** 发送时刻已就绪的附件(占前段槽位)。 */
   readyAttachments: readonly RemoteSerializedAttachment[];
   /** 就绪附件的本地预览 uri(与 readyAttachments 对齐;缺失传 null)。 */
@@ -213,12 +199,14 @@ export function buildOutboxItem(input: {
     failed: boolean;
     kind?: 'image' | 'file';
     previewUri?: string;
+    name?: string;
   }>;
 }): MobileOutboxItem {
   const slots: Array<RemoteSerializedAttachment | null> = [...input.readyAttachments];
-  const slotMeta: Array<{ kind: 'image' | 'file'; previewUri: string | null }> =
+  const slotMeta: Array<{ kind: 'image' | 'file'; previewUri: string | null; name?: string }> =
     input.readyAttachments.map((attachment, index) => ({
       kind: attachment.category === 'image' ? 'image' : 'file',
+      name: attachment.name,
       previewUri: input.readyPreviews?.[index] ?? null,
     }));
   const slotByLocalId: Record<string, number> = {};
@@ -227,7 +215,7 @@ export function buildOutboxItem(input: {
   for (const upload of input.claimedUploads) {
     slotByLocalId[upload.localId] = slots.length;
     slots.push(null);
-    slotMeta.push({ kind: upload.kind ?? 'image', previewUri: upload.previewUri ?? null });
+    slotMeta.push({ kind: upload.kind ?? 'image', previewUri: upload.previewUri ?? null, name: upload.name });
     if (upload.failed) failedIds.push(upload.localId);
     else waitingIds.push(upload.localId);
   }
@@ -243,6 +231,7 @@ export function buildOutboxItem(input: {
     pastedTextRanges: input.pastedTextRanges ?? [],
     slashCommandRanges: input.slashCommandRanges ?? [],
     permissionModeAtSend: input.permissionModeAtSend,
+    ...(input.planModeAtSend !== undefined ? { planModeAtSend: input.planModeAtSend } : {}),
     attachmentSlots: slots,
     slotMeta,
     slotByLocalId,
@@ -416,10 +405,12 @@ export function outboxDisplayItem(item: MobileOutboxItem): MobileOutboxDisplayIt
   const uploadedCount = item.attachmentSlots.filter((slot) => slot !== null).length;
   const thumbnails: MobileOutboxThumb[] = [];
   let fileCount = 0;
+  const fileNames: string[] = [];
   item.attachmentSlots.forEach((slot, index) => {
     const meta = item.slotMeta[index];
     if (meta?.kind !== 'image') {
       fileCount += 1;
+      fileNames.push(slot?.name ?? meta?.name ?? i18n.t('message.queue.attachmentMessage'));
       return;
     }
     thumbnails.push({
@@ -439,6 +430,7 @@ export function outboxDisplayItem(item: MobileOutboxItem): MobileOutboxDisplayIt
     uploadedCount,
     thumbnails,
     fileCount,
+    fileNames,
     failed: item.phase === 'failed',
     errorText: item.phase !== 'failed'
       ? null

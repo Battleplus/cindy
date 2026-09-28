@@ -24,7 +24,9 @@ describe('ChatInput voice input Enter-to-send contract', () => {
     );
     expect(chatInputSource).toContain('const voiceInputCanStopAndSendRef = useRef(false);');
     expect(chatInputSource).toContain('voiceInputStopAndSendRef.current = handleClickSend;');
-    expect(chatInputSource).toContain('voiceInputCanStopAndSendRef.current = !sendButtonDisabled;');
+    expect(chatInputSource).toContain(
+      'voiceInputCanStopAndSendRef.current = !queueEditActive && !sendButtonDisabled;',
+    );
     expect(keydownBlock).toContain("currentState === 'listening'");
     expect(keydownBlock).toContain('voiceInputCanStopAndSendRef.current');
     expect(keydownBlock).toContain('isVoiceInputEnterTarget(event.target)');
@@ -195,7 +197,7 @@ describe('ChatInput voice input Enter-to-send contract', () => {
     );
     expect(chatInputSource).toContain('dispatchSendInFlightKeysRef');
     expect(chatInputSource).toContain('lockCurrentComposer');
-    expect(chatInputSource).toContain('lockComposerForEffort');
+    expect(chatInputSource).not.toContain('lockComposerForEffort');
     const planCommandSendBlock = extractBetween(
       chatInputSource,
       'isPlanModeComposerCommandText(',
@@ -266,16 +268,25 @@ describe('ChatInput voice input Enter-to-send contract', () => {
     expect(restoreEffectBlock).toContain('latestStorageKeyRef.current === storageKey');
     expect(restoreEffectBlock).toContain('if (!isCurrentTransition()) return;');
     expect(restoreEffectBlock).toContain('restoreNextDraft();');
-    expect(restoreEffectBlock).toContain('setSendDispatchInFlight(false);');
+    expect(restoreEffectBlock).toContain(
+      'dispatchSendInFlightKeysRef.current.has(nextSendKey)',
+    );
+    expect(restoreEffectBlock).toContain('setSendDispatchInFlight(nextSendInFlight);');
+    expect(restoreEffectBlock).toContain(
+      'setAllowTypeDuringSend(nextSendInFlight && nextSendCleared);',
+    );
+    expect(restoreEffectBlock).toContain(
+      'dispatchSendClearedKeysRef.current.has(nextSendKey)',
+    );
     expect(restoreEffectBlock).toContain('wasBusyWithoutSend');
     expect(restoreEffectBlock.indexOf('restoreNextDraft();')).toBeLessThan(
-      restoreEffectBlock.indexOf('setSendDispatchInFlight(false);'),
+      restoreEffectBlock.indexOf('setSendDispatchInFlight(nextSendInFlight);'),
     );
 
     const waitForBusyCompletionBlock = extractBetween(
       voiceInputSource,
       'const waitForBusyCompletion = useCallback((waitForRefinement: boolean) => {',
-      'const stop = useCallback(async (options?: VoiceInputStopOptions) => {',
+      'const cancel = useCallback(async () => {',
     );
     expect(voiceInputSource).toContain('type StopCompletionWaiter = {');
     expect(voiceInputSource).toContain(
@@ -299,7 +310,7 @@ describe('ChatInput voice input Enter-to-send contract', () => {
     const stopBlock = extractBetween(
       voiceInputSource,
       'const stop = useCallback(async (options?: VoiceInputStopOptions) => {',
-      'const cancel = useCallback(async () => {',
+      'stopWithGateRef.current = stopWithGate;',
     );
     expect(stopBlock).toContain("if (stateRef.current === 'error')");
     expect(stopBlock).toContain("throw new Error(lastErrorRef.current ?? 'Voice input failed.')");

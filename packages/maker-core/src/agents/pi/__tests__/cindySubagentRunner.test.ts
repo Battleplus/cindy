@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -39,6 +39,26 @@ import {
 
 const roots: string[] = [];
 
+async function launchRunnerWithNode(request: {
+  runnerFile: string;
+  configFile: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const child = spawn(process.execPath, [request.runnerFile, request.configFile], {
+    cwd: request.cwd,
+    env: request.env,
+    detached: true,
+    windowsHide: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  await new Promise<void>((resolve, reject) => {
+    child.once('spawn', resolve);
+    child.once('error', reject);
+  });
+}
+
 /**
  * `runner.cjs` is byte-identical for every fixture and by far the biggest file
  * each one writes. Writing it once for the suite keeps ~30 real file creations
@@ -70,7 +90,7 @@ function sharedRunnerFile(): Promise<string> {
  */
 async function readCommandsIfPresent(
   file: string,
-): Promise<Array<{ type?: string; message?: string }> | null> {
+): Promise<Array<{ type?: string; message?: string; id?: string }> | null> {
   let text: string;
   try {
     text = await readFile(file, 'utf8');
@@ -80,7 +100,36 @@ async function readCommandsIfPresent(
   }
   const trimmed = text.trim();
   if (!trimmed) return null;
-  return trimmed.split('\n').map((line) => JSON.parse(line) as { type?: string; message?: string });
+  return trimmed.split('\n').map((line) => JSON.parse(line) as { type?: string; message?: string; id?: string });
+}
+
+/**
+ * Publish a set of controls so that no runner scan can observe a subset of
+ * them: the controls are written into a staging directory and the whole
+ * directory is swapped over the runner-created (still empty) `controls` dir.
+ * While the swap is in flight a scan reads ENOENT, which both scan sites
+ * treat as "no controls" — so the first scan that sees anything sees every
+ * control, and a shared batch is guaranteed by construction instead of by
+ * the timing of individual writes.
+ */
+async function publishControlsAtomically(
+  runDir: string,
+  controls: Array<Record<string, unknown>>,
+): Promise<void> {
+  const controlsDir = path.join(runDir, 'controls');
+  const stagingDir = path.join(runDir, `controls-staging-${randomUUID()}`);
+  const retiredDir = path.join(runDir, `controls-retired-${randomUUID()}`);
+  await mkdir(stagingDir, { recursive: true });
+  for (const control of controls) {
+    const requestId = randomUUID();
+    await writeFile(
+      path.join(stagingDir, `${requestId}.json`),
+      `${JSON.stringify({ version: 1, requestId, ...control })}\n`,
+      { mode: 0o600 },
+    );
+  }
+  await rename(controlsDir, retiredDir);
+  await rename(stagingDir, controlsDir);
 }
 
 async function tempRoot(): Promise<string> {
@@ -169,12 +218,19 @@ async function makeFixture(options: {
   outputText?: string;
   chain?: boolean;
   approval?: boolean;
+  /**
+   * Emit several approval requests from one prompt, the way a turn whose
+   * parallel tool calls each ask before running does. The fake child only
+   * settles once every id has been answered, so a runner that drops one leaves
+   * the fixture running instead of turning the assertion into a timeout.
+   */
+  approvalIds?: string[];
   approvalMethod?: 'confirm' | 'input';
   modelError?: boolean;
   retryThenSucceed?: boolean;
   outputThenHang?: boolean;
   hangOnMessage?: string;
-  delayExitAfterInputEndMs?: number;
+  holdExitAfterInputEnd?: boolean;
   runtimeOwnerId?: string;
   /** Point this task's sessionDir at an existing *file* so launchTask throws. */
   poisonSessionDirIndex?: number;
@@ -228,6 +284,7 @@ async function makeFixture(options: {
   const promptsFile = path.join(root, 'prompts.jsonl');
   const commandsFile = path.join(root, 'commands.jsonl');
   const stdinEndedFile = path.join(root, 'stdin-ended');
+  const exitReleaseFile = path.join(root, 'release-exit');
   const tokensFile = path.join(root, 'tokens.jsonl');
   const pidsFile = path.join(root, 'child-pids.jsonl');
   const poisonedSessionDir = path.join(root, 'poisoned-session-dir');
@@ -266,6 +323,7 @@ setTimeout(() => process.exit(0), 60000).unref();
   await writeFile(permissionFile, '{"mode":"ask"}\n');
   const fixtureOutput = JSON.stringify(options.outputText ?? 'fixture result');
   const approvalMethod = options.approvalMethod ?? 'confirm';
+  const approvalIds = options.approvalIds ?? (options.approval ? ['approval-1'] : []);
   const fixtureLifecycle = options.outputThenHang
     ? `process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: ${fixtureOutput} }], usage: { input: 3, output: 2, cost: { total: 0.01 } } } }) + '\\n');`
     : options.hang
@@ -303,7 +361,15 @@ if (!process.env.PI_CODING_AGENT_DIR ||
   process.exit(13);
 }
 const subagentRunDir = process.env.CINDY_PI_SUBAGENT_RUN_DIR;
-if (!subagentRunDir || path.dirname(subagentRunDir) !== ${JSON.stringify(root)} ||
+// A resumed run may reach this same fixture root through a directory link when
+// the host-side test models two Cindy instances. Compare filesystem identity,
+// not the spelling of the path: a Windows junction keeps the alias in the env
+// value even though it points at this exact directory.
+let canonicalSubagentRoot = null;
+try {
+  canonicalSubagentRoot = subagentRunDir ? fs.realpathSync(path.dirname(subagentRunDir)) : null;
+} catch (_) { /* rejected by the validation below */ }
+if (!subagentRunDir || canonicalSubagentRoot !== fs.realpathSync(${JSON.stringify(root)}) ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(path.basename(subagentRunDir))) {
   process.exit(12);
 }
@@ -332,6 +398,9 @@ function waitForPidCount(count) {
   }
 }
 let buffer = '';
+const expectedApprovals = ${JSON.stringify(approvalIds)};
+const answeredApprovals = new Set();
+let allowedApprovals = 0;
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
@@ -346,21 +415,27 @@ process.stdin.on('data', (chunk) => {
     if (command.type === 'prompt') {
       fs.appendFileSync(process.env.CINDY_TEST_PI_PROMPTS, JSON.stringify(command.message) + '\\n');
       process.stdout.write(JSON.stringify({ type: 'response', command: 'prompt', success: true }) + '\\n');
-      ${options.approval
-    ? `process.stdout.write(JSON.stringify({ type: 'extension_ui_request', id: 'approval-1', method: ${JSON.stringify(approvalMethod)}, title: 'cindy:permission', ${approvalMethod === 'input' ? 'placeholder' : 'message'}: JSON.stringify({ toolName: 'write', input: { path: 'a.txt' } }) }) + '\\n');`
+      ${approvalIds.length > 0
+    ? `for (const id of expectedApprovals) {
+        process.stdout.write(JSON.stringify({ type: 'extension_ui_request', id, method: ${JSON.stringify(approvalMethod)}, title: 'cindy:permission', ${approvalMethod === 'input' ? 'placeholder' : 'message'}: JSON.stringify({ toolName: 'write', input: { path: 'a.txt' } }) }) + '\\n');
+      }`
     : `${options.hangOnMessage ? `if (command.message !== ${JSON.stringify(options.hangOnMessage)}) {` : ''}
       ${options.gateFinishOnPidCount ? `waitForPidCount(${options.gateFinishOnPidCount});` : ''}
       process.stdout.write(JSON.stringify({ type: 'tool_execution_start', toolName: 'read' }) + '\\n');
       ${fixtureLifecycle}
       ${options.hangOnMessage ? '}' : ''}`}
     }
-    if (command.type === 'extension_ui_response' && command.id === 'approval-1') {
-      if (command.confirmed || command.value === 'allow') {
-        process.stdout.write(JSON.stringify({ type: 'tool_execution_start', toolName: 'write' }) + '\\n');
-        process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: ${fixtureOutput} }], usage: { input: 3, output: 2, cost: { total: 0.01 } } } }) + '\\n');
+    if (command.type === 'extension_ui_response' && expectedApprovals.includes(command.id)) {
+      answeredApprovals.add(command.id);
+      if (command.confirmed || command.value === 'allow') allowedApprovals += 1;
+      if (answeredApprovals.size === expectedApprovals.length) {
+        if (allowedApprovals === expectedApprovals.length) {
+          process.stdout.write(JSON.stringify({ type: 'tool_execution_start', toolName: 'write' }) + '\\n');
+          process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: ${fixtureOutput} }], usage: { input: 3, output: 2, cost: { total: 0.01 } } } }) + '\\n');
+        }
+        process.stdout.write(JSON.stringify({ type: 'agent_end' }) + '\\n');
+        process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\\n');
       }
-      process.stdout.write(JSON.stringify({ type: 'agent_end' }) + '\\n');
-      process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\\n');
     }
   }
 });
@@ -368,9 +443,17 @@ process.stdin.on('end', () => {
   if (process.env.CINDY_TEST_PI_STDIN_ENDED) {
     fs.writeFileSync(process.env.CINDY_TEST_PI_STDIN_ENDED, '1');
   }
-  ${options.surviveStdinEnd
-    ? 'setInterval(() => {}, 1000);'
-    : `setTimeout(() => process.exit(0), ${Math.max(0, options.delayExitAfterInputEndMs ?? 0)});`}
+  ${options.holdExitAfterInputEnd
+    ? `const releaseExit = () => {
+      if (!process.env.CINDY_TEST_PI_EXIT_RELEASE || !fs.existsSync(process.env.CINDY_TEST_PI_EXIT_RELEASE)) return;
+      clearInterval(releaseExitInterval);
+      process.exit(0);
+    };
+    const releaseExitInterval = setInterval(releaseExit, 10);
+    releaseExit();`
+    : options.surviveStdinEnd
+      ? 'setInterval(() => {}, 1000);'
+      : 'process.exit(0);'}
 });
 `, { mode: 0o700 });
   await chmod(fakePiFile, 0o700);
@@ -431,6 +514,7 @@ process.stdin.on('end', () => {
       CINDY_TEST_PI_PROMPTS: promptsFile,
       CINDY_TEST_PI_COMMANDS: commandsFile,
       CINDY_TEST_PI_STDIN_ENDED: stdinEndedFile,
+      CINDY_TEST_PI_EXIT_RELEASE: exitReleaseFile,
       CINDY_TEST_PI_TOKENS: tokensFile,
       CINDY_PI_SESSION_TOKEN: 'parent-session-token-must-not-reach-direct-child',
       CINDY_PI_REMOTE_MCP_SECRET_FIXTURE: 'must-not-reach-child',
@@ -441,7 +525,7 @@ process.stdin.on('end', () => {
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk) => { stderr += chunk; });
   const fixture = {
-    root, runId, runDir, runnerFile, argsFile, promptsFile, commandsFile, stdinEndedFile,
+    root, runId, runDir, runnerFile, argsFile, promptsFile, commandsFile, stdinEndedFile, exitReleaseFile,
     tokensFile, pidsFile,
     child, stderr: () => stderr,
   };
@@ -573,25 +657,35 @@ describe('Cindy durable PI Subagent runner', () => {
   });
 
   it('rejects controls after the child RPC input has closed but before process exit', async () => {
-    const fixture = await makeFixture({ delayExitAfterInputEndMs: 750 });
-    await waitFor(async () => {
-      try {
-        await readFile(fixture.stdinEndedFile, 'utf8');
-        return true;
-      } catch {
-        return null;
-      }
-    });
-    const [closing] = await listPiSubagentRuns(fixture.root);
-    expect(closing && closing.state !== 'completed' && closing.state !== 'failed').toBe(true);
-    await expect(controlPiSubagentRuns(fixture.root, closing!.runId, 'follow_up', {
-      message: 'too late for this generation',
-    })).resolves.toBe(0);
-    await waitFor(async () => {
-      const [run] = await listPiSubagentRuns(fixture.root);
-      return run?.state === 'completed' ? run : null;
-    });
-    await waitForClose(fixture.child, fixture.stderr);
+    const fixture = await makeFixture({ holdExitAfterInputEnd: true });
+    try {
+      await waitFor(async () => {
+        try {
+          await readFile(fixture.stdinEndedFile, 'utf8');
+          return true;
+        } catch {
+          return null;
+        }
+      });
+      // The child marker is independent of the runner's status publication;
+      // listPiSubagentRuns may omit a temporarily unreadable snapshot on Windows.
+      const closing = await waitFor(async () => {
+        const [run] = await listPiSubagentRuns(fixture.root);
+        return run ?? null;
+      }, undefined, 'readable status after child RPC input closes');
+      expect(closing.state !== 'completed' && closing.state !== 'failed').toBe(true);
+      await expect(controlPiSubagentRuns(fixture.root, closing.runId, 'follow_up', {
+        message: 'too late for this generation',
+      })).resolves.toBe(0);
+      await writeFile(fixture.exitReleaseFile, '1');
+      await waitFor(async () => {
+        const [run] = await listPiSubagentRuns(fixture.root);
+        return run?.state === 'completed' ? run : null;
+      });
+      await waitForClose(fixture.child, fixture.stderr);
+    } finally {
+      await writeFile(fixture.exitReleaseFile, '1').catch(() => undefined);
+    }
   });
 
   it('feeds each durable chain result into the next isolated child', async () => {
@@ -630,7 +724,7 @@ describe('Cindy durable PI Subagent runner', () => {
 
     function resumeLaunch(fixture: Awaited<ReturnType<typeof makeFixture>>) {
       return {
-        nodeExecutable: process.execPath,
+        launchRunner: launchRunnerWithNode,
         runtimeOwnerId: 'resume-owner',
         runnerFallbackFile: fixture.runnerFile,
         env: {
@@ -843,27 +937,35 @@ describe('Cindy durable PI Subagent runner', () => {
         outcome.status === 'rejected'
         && !/already resuming this Subagent generation/i.test(String(outcome.reason?.message ?? ''))
       ));
-      expect(unexpectedRejections, `resume outcomes: ${describeOutcomes()}`).toHaveLength(0);
-      expect(started, `resume outcomes: ${describeOutcomes()}`).toHaveLength(1);
-      expect(refusedTheResume, `resume outcomes: ${describeOutcomes()}`).toHaveLength(1);
-      // Whoever got through, there is never a second live generation over the
-      // same PI child session — that is what a lost claim has to prevent.
-      const runs = await listPiSubagentRuns(fixture.root);
-      const resumedRuns = runs.filter((run) => run.taskId === first.taskId && run.runId !== first.runId);
-      expect(resumedRuns).toHaveLength(started.length);
+      const startedRunIds = started.map((outcome) => (
+        (outcome as PromiseFulfilledResult<string>).value
+      ));
+      try {
+        expect(unexpectedRejections, `resume outcomes: ${describeOutcomes()}`).toHaveLength(0);
+        expect(started, `resume outcomes: ${describeOutcomes()}`).toHaveLength(1);
+        expect(refusedTheResume, `resume outcomes: ${describeOutcomes()}`).toHaveLength(1);
+        // Whoever got through, there is never a second live generation over the
+        // same PI child session — that is what a lost claim has to prevent.
+        const runs = await listPiSubagentRuns(fixture.root);
+        const resumedRuns = runs.filter((run) => run.taskId === first.taskId && run.runId !== first.runId);
+        expect(resumedRuns).toHaveLength(started.length);
 
-      if (started.length === 1) {
-        const resumedRunId = (started[0] as PromiseFulfilledResult<string>).value;
-        await controlPiSubagentRuns(fixture.root, resumedRunId, 'stop');
-        await waitFor(
-          async () => {
-            const settledRuns = await listPiSubagentRuns(fixture.root);
-            const resumed = settledRuns.find((run) => run.runId === resumedRunId);
-            return resumed && isPiSubagentTerminal(resumed.state) ? resumed : null;
-          },
-          undefined,
-          'the hung resumed generation to stop',
-        );
+      } finally {
+        // Keep a failed assertion from leaking a detached fake runner. On
+        // Windows its cwd pins the temporary directory and turns the useful
+        // mutual-exclusion failure into a secondary EBUSY teardown failure.
+        await Promise.all(startedRunIds.map(async (resumedRunId) => {
+          await controlPiSubagentRuns(fixture.root, resumedRunId, 'stop');
+          await waitFor(
+            async () => {
+              const settledRuns = await listPiSubagentRuns(fixture.root);
+              const resumed = settledRuns.find((run) => run.runId === resumedRunId);
+              return resumed && isPiSubagentTerminal(resumed.state) ? resumed : null;
+            },
+            undefined,
+            'the hung resumed generation to stop',
+          );
+        }));
       }
     });
   });
@@ -897,7 +999,7 @@ describe('Cindy durable PI Subagent runner', () => {
       first.runId,
       'continue from the prior result',
       {
-        nodeExecutable: process.execPath,
+        launchRunner: launchRunnerWithNode,
         runtimeOwnerId: 'resume-owner',
         runnerFallbackFile: fixture.runnerFile,
         env: {
@@ -946,7 +1048,7 @@ describe('Cindy durable PI Subagent runner', () => {
       resumedRunId!,
       'continue for a second resumed generation',
       {
-        nodeExecutable: process.execPath,
+        launchRunner: launchRunnerWithNode,
         runtimeOwnerId: 'resume-owner',
         runnerFallbackFile: fixture.runnerFile,
         env: {
@@ -975,7 +1077,7 @@ describe('Cindy durable PI Subagent runner', () => {
     expect(resumedPrompts.at(-1)).toBe('continue for a second resumed generation');
   });
 
-  it.skipIf(process.platform === 'win32')('refuses a resume catalog redirected through a symlink', async () => {
+  it('refuses a resume catalog redirected through a symlink', async () => {
     const fixture = await makeFixture();
     const first = await waitFor(async () => {
       const runs = await listPiSubagentRuns(fixture.root);
@@ -986,14 +1088,18 @@ describe('Cindy durable PI Subagent runner', () => {
     await mkdir(outside);
     await writeFile(path.join(outside, 'models.json'), '{"providers":{"redirected":{}}}\n');
     await rm(path.join(fixture.runDir, 'pi-home'), { recursive: true });
-    await symlink(outside, path.join(fixture.runDir, 'pi-home'), 'dir');
+    await symlink(
+      outside,
+      path.join(fixture.runDir, 'pi-home'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
 
     await expect(resumePiSubagentRun(
       fixture.root,
       first.runId,
       'continue from redirected catalog',
       {
-        nodeExecutable: process.execPath,
+        launchRunner: launchRunnerWithNode,
         runtimeOwnerId: 'resume-owner',
         runnerFallbackFile: fixture.runnerFile,
         env: process.env,
@@ -1016,7 +1122,7 @@ describe('Cindy durable PI Subagent runner', () => {
       first.runId,
       'continue without leaving partial staging',
       {
-        nodeExecutable: process.execPath,
+        launchRunner: launchRunnerWithNode,
         runtimeOwnerId: 'resume-owner',
         runnerFallbackFile: fixture.runnerFile,
         env: process.env,
@@ -1038,7 +1144,7 @@ describe('Cindy durable PI Subagent runner', () => {
     });
     await waitForClose(fixture.child, fixture.stderr);
     const launch = {
-      nodeExecutable: process.execPath,
+      launchRunner: launchRunnerWithNode,
       runtimeOwnerId: 'resume-owner',
       runnerFallbackFile: fixture.runnerFile,
       env: {
@@ -1135,26 +1241,24 @@ describe('Cindy durable PI Subagent runner', () => {
       const [run] = await listPiSubagentRuns(fixture.root);
       return run?.tasks[0]?.pendingApproval ? run : null;
     });
-    const controlsDir = path.join(fixture.runDir, 'controls');
-    await mkdir(controlsDir, { recursive: true });
-    const write = async (control: Record<string, unknown>): Promise<void> => {
-      const requestId = randomUUID();
-      await writeFile(
-        path.join(controlsDir, `${requestId}.json`),
-        `${JSON.stringify({ version: 1, requestId, ...control })}\n`,
-        { mode: 0o600 },
-      );
-    };
-    // Approval first by every ordering key the runner sorts on.
-    await write({
-      seq: 1,
-      requestedAt: 1,
-      action: 'approval',
-      childId: pending.tasks[0]?.childId,
-      approvalId: 'approval-1',
-      confirmed: true,
-    });
-    await write({ seq: 2, requestedAt: 2, action: 'stop' });
+    // Approval first by every ordering key the runner sorts on. Both controls
+    // are published in one atomic directory swap, so no control scan can ever
+    // observe the approval without the stop: the shared batch this case is
+    // about is guaranteed by construction, not by the timing of two separate
+    // writes. (Two direct writes raced a poll that consumed the approval
+    // alone, which forwarded it, let the child finish, and completed the run
+    // before the stop was ever seen — once, on a slow Windows runner.)
+    await publishControlsAtomically(fixture.runDir, [
+      {
+        seq: 1,
+        requestedAt: 1,
+        action: 'approval',
+        childId: pending.tasks[0]?.childId,
+        approvalId: 'approval-1',
+        confirmed: true,
+      },
+      { seq: 2, requestedAt: 2, action: 'stop' },
+    ]);
 
     const stopped = await waitFor(async () => {
       const [run] = await listPiSubagentRuns(fixture.root);
@@ -1188,29 +1292,21 @@ describe('Cindy durable PI Subagent runner', () => {
       const [run] = await listPiSubagentRuns(fixture.root);
       return run?.tasks[0]?.pendingApproval ? run : null;
     });
-    const controlsDir = path.join(fixture.runDir, 'controls');
-    await mkdir(controlsDir, { recursive: true });
-    const stopId = randomUUID();
-    await writeFile(
-      path.join(controlsDir, `${stopId}.json`),
-      `${JSON.stringify({ version: 1, requestId: stopId, seq: 2, requestedAt: 2, action: 'stop' })}\n`,
-      { mode: 0o600 },
-    );
-    const approvalId = randomUUID();
-    await writeFile(
-      path.join(controlsDir, `${approvalId}.json`),
-      `${JSON.stringify({
-        version: 1,
-        requestId: approvalId,
+    // Same atomic publication as the previous case: one directory swap makes
+    // the stop and the approval visible to the same scan by construction, so
+    // the partition's "approval first by ordering key" premise holds without
+    // relying on write timing.
+    await publishControlsAtomically(fixture.runDir, [
+      { seq: 2, requestedAt: 2, action: 'stop' },
+      {
         seq: 1,
         requestedAt: 1,
         action: 'approval',
         childId: pending.tasks[0]?.childId,
         approvalId: 'approval-1',
         confirmed: true,
-      })}\n`,
-      { mode: 0o600 },
-    );
+      },
+    ]);
 
     const stopped = await waitFor(async () => {
       const [run] = await listPiSubagentRuns(fixture.root);
@@ -1247,6 +1343,95 @@ describe('Cindy durable PI Subagent runner', () => {
       return run?.state === 'completed' ? run : null;
     });
     expect(completed.tasks[0]?.output).toBe('fixture result');
+    await waitForClose(fixture.child, fixture.stderr);
+  });
+
+  it('queues concurrent child approvals instead of overwriting the earlier request', async () => {
+    // Parallel tool calls raise their approvals in the same turn. With a single
+    // replacement slot the second request displaced the first, the Host only
+    // ever saw the second, and the child waited forever on the first: a live
+    // run sat with zero CPU and a frozen transcript for fifty minutes. Every
+    // request must stay answerable, oldest first.
+    const fixture = await makeFixture({ approvalIds: ['approval-1', 'approval-2'] });
+    const pending = await waitFor(async () => {
+      const [run] = await listPiSubagentRuns(fixture.root);
+      return run?.tasks[0]?.pendingApproval ? run : null;
+    });
+    expect(pending.tasks[0]?.pendingApproval?.id).toBe('approval-1');
+
+    await expect(controlPiSubagentRuns(fixture.root, 'tool-fixture', 'approval', {
+      childId: pending.tasks[0]?.childId,
+      approvalId: 'approval-1',
+      confirmed: true,
+    })).resolves.toBe(1);
+
+    const second = await waitFor(async () => {
+      const [run] = await listPiSubagentRuns(fixture.root);
+      return run?.tasks[0]?.pendingApproval?.id === 'approval-2' ? run : null;
+    });
+    await expect(controlPiSubagentRuns(fixture.root, 'tool-fixture', 'approval', {
+      childId: second.tasks[0]?.childId,
+      approvalId: 'approval-2',
+      confirmed: true,
+    })).resolves.toBe(1);
+
+    const completed = await waitFor(async () => {
+      const [run] = await listPiSubagentRuns(fixture.root);
+      return run?.state === 'completed' ? run : null;
+    });
+    expect(completed.tasks[0]?.output).toBe('fixture result');
+    const commands = (await readCommandsIfPresent(fixture.commandsFile)) ?? [];
+    expect(commands
+      .filter((command) => command.type === 'extension_ui_response')
+      .map((command) => command.id))
+      .toEqual(['approval-1', 'approval-2']);
+    await waitForClose(fixture.child, fixture.stderr);
+  });
+
+  it('accepts an answer for a queued request that is no longer the published head', async () => {
+    // Two surfaces can read the same status (a second Desktop instance sharing
+    // userData, or a status read that raced the previous answer) and answer
+    // different ids. Refusing the non-head answer because the published head
+    // moved on would strand a request the other surface already recorded as
+    // handed over. Matching by id anywhere in the queue keeps it deliverable;
+    // a control for an id that is not pending stays refused, so replays cannot
+    // answer the same request twice.
+    const fixture = await makeFixture({ approvalIds: ['approval-1', 'approval-2'] });
+    const pending = await waitFor(async () => {
+      const [run] = await listPiSubagentRuns(fixture.root);
+      return run?.tasks[0]?.pendingApproval?.id === 'approval-1' ? run : null;
+    });
+    // Straight into the mailbox: `controlPiSubagentRuns` filters by the
+    // published head, which is the very restriction this case exists to test
+    // beyond.
+    await publishControlsAtomically(fixture.runDir, [
+      {
+        requestedAt: 1,
+        action: 'approval',
+        childId: pending.tasks[0]?.childId,
+        approvalId: 'approval-2',
+        confirmed: true,
+      },
+    ]);
+
+    // approval-1 is still the published head, and approval-2 is gone from the
+    // queue rather than waiting to be asked again.
+    await expect(controlPiSubagentRuns(fixture.root, 'tool-fixture', 'approval', {
+      childId: pending.tasks[0]?.childId,
+      approvalId: 'approval-1',
+      confirmed: true,
+    })).resolves.toBe(1);
+    const completed = await waitFor(async () => {
+      const [run] = await listPiSubagentRuns(fixture.root);
+      return run?.state === 'completed' ? run : null;
+    });
+    expect(completed.tasks[0]?.output).toBe('fixture result');
+    const commands = (await readCommandsIfPresent(fixture.commandsFile)) ?? [];
+    expect(commands
+      .filter((command) => command.type === 'extension_ui_response')
+      .map((command) => command.id)
+      .sort())
+      .toEqual(['approval-1', 'approval-2']);
     await waitForClose(fixture.child, fixture.stderr);
   });
 
@@ -1315,7 +1500,18 @@ describe('Cindy durable PI Subagent runner', () => {
       childId: running.tasks[0]?.childId,
       message: 'continue from the completed result',
     })).resolves.toBe(1);
-    const commands = (await readCommandsIfPresent(fixture.commandsFile)) ?? [];
+    const commands = await waitFor(
+      async () => {
+        const parsed = await readCommandsIfPresent(fixture.commandsFile);
+        return parsed?.some((command) => (
+          command.type === 'follow_up' && command.message === 'continue from the completed result'
+        ))
+          ? parsed
+          : null;
+      },
+      undefined,
+      'the exact follow-up command to reach the child',
+    );
     expect(commands).not.toContainEqual(expect.objectContaining({ type: 'steer', message: 'late correction' }));
     expect(commands).toContainEqual(expect.objectContaining({
       type: 'follow_up', message: 'continue from the completed result',
@@ -1555,7 +1751,27 @@ describe('Cindy durable PI Subagent runner', () => {
         undefined,
         'the runner to launch its hanging child',
       );
-      const childPid = Number((await readFile(fixture.pidsFile, 'utf8')).trim().split('\n')[0]);
+      // The runner publishes `running` once the lane dispatches the task, but
+      // the freshly spawned child has not necessarily booted far enough to
+      // have recorded its pid yet — the same spawn/write window that
+      // `gateFinishOnPidCount` closes for the multi-lane cases. Wait for the
+      // pid to land on disk instead of racing the first read, or this flakes
+      // as an ENOENT under a loaded CI runner. The file must also carry a
+      // positive pid: an empty or newline-only file parses as 0, and
+      // `process.kill(0, 0)` probes the caller's process group, which stays
+      // alive for the whole suite and turns the race into a timeout.
+      const childPid = await waitFor(
+        async () => {
+          try {
+            const pid = Number((await readFile(fixture.pidsFile, 'utf8')).trim().split('\n')[0]);
+            return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+          } catch {
+            return null;
+          }
+        },
+        undefined,
+        'the hanging child to record its pid',
+      );
       expect(Number.isSafeInteger(childPid)).toBe(true);
 
       process.kill(fixture.child.pid!, 'SIGTERM');

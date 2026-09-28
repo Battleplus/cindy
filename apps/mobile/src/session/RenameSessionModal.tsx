@@ -1,4 +1,5 @@
 import { Modal, Pressable, StyleSheet } from 'react-native';
+import { ModalContentArea } from '@/platform/ModalContentArea';
 import { useTranslation } from 'react-i18next';
 import { Text, TextInput } from '@/components/AppText';
 import { MainWindowActionGroup } from '@/components/MobilePrimitives';
@@ -26,8 +27,9 @@ export function RenameSessionModal({
   const { t } = useTranslation();
   const canSave = draft.trim().length > 0 && !saving;
   return (
-    <Modal animationType="fade" transparent visible={visible} onRequestClose={onCancel}>
+    <Modal supportedOrientations={["portrait", "portrait-upside-down", "landscape-left", "landscape-right"]} animationType="fade" transparent visible={visible} onRequestClose={onCancel}>
       <Pressable style={styles.backdrop} onPress={onCancel} testID="home.renameSession.backdrop">
+        <ModalContentArea>
         <Pressable style={styles.card} onPress={() => undefined} testID="home.renameSession.modal">
           <Text style={styles.title}>{t('devices.list.renameSession.title')}</Text>
           <TextInput
@@ -39,7 +41,7 @@ export function RenameSessionModal({
               if (canSave) onConfirm();
             }}
             placeholder={t('devices.list.renameSession.placeholder')}
-            placeholderTextColor={colors.textTertiary}
+            placeholderTextColor={colors.textPlaceholder}
             returnKeyType="done"
             selectTextOnFocus
             style={styles.input}
@@ -66,6 +68,7 @@ export function RenameSessionModal({
             testID="home.renameSession.actions"
           />
         </Pressable>
+        </ModalContentArea>
       </Pressable>
     </Modal>
   );
@@ -92,8 +95,8 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   title: {
     color: colors.textPrimary,
     fontSize: typeScale.title,
-    fontWeight: fontWeight.medium,
-    lineHeight: lineHeight.subtitle,
+    fontWeight: fontWeight.semibold,
+    lineHeight: lineHeight.title,
   },
   input: {
     backgroundColor: colors.surface,

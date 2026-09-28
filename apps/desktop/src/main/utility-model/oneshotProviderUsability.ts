@@ -1,3 +1,4 @@
+import { codexAccountState } from '../maker-host/codex-account-auth.js';
 /**
  * oneshotProviderUsability.ts — 快问快答钉档的「已配置凭证」同步探测。
  *
@@ -9,7 +10,6 @@
 import { storedCustomProviderId, type AgentKind, type Provider } from '@cindy/model-providers';
 
 import { readClaudeApiKey } from '../maker-host/auth-adapters.js';
-import { getClaudeAiOAuthForSpawn } from '../maker-host/claude-oauth-refresh.js';
 import { hasChatgptOneshotReadiness } from '../maker-host/codex-oauth-readiness.js';
 import { readCachedGenericOAuthAccessToken } from '../maker-host/generic-oauth.js';
 import { hasGrokOAuthLogin } from '../maker-host/grok-oauth-login.js';
@@ -21,12 +21,18 @@ import { readCustomProviderKey } from '../secrets/providerSecretStore.js';
  * 自定义供应商分支)的凭证判读逐一对应;内置只认执行侧可执行的四家。
  */
 export function hasOneshotProviderCredential(provider: Provider, agentKind: AgentKind): boolean {
+  // Claude 订阅只供内置 Claude Code CLI 用它自己的登录;快问快答等 Cindy 直连调用不可用。
+  if (provider.source !== 'builtin') {
+    if (provider.auth.native === 'claude') return false;
+    if (provider.auth.native === 'xai') return hasGrokOAuthLogin(provider.id);
+    if (provider.auth.native === 'codex') return codexAccountState(provider.id).authenticated;
+  }
   if (provider.source === 'builtin') {
     switch (provider.id) {
       case 'xd':
         return Boolean(readClaudeApiKey()) && effectiveXdGatewayBaseUrl().trim().length > 0;
       case 'anthropic':
-        return getClaudeAiOAuthForSpawn() !== null;
+        return false;
       case 'openai':
         return hasChatgptOneshotReadiness();
       case 'xai':

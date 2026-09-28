@@ -1,3 +1,5 @@
+import { Button } from '@/components/ui/button';
+import { shouldShowOpenPathError } from '../../../shared/openPathResult';
 /**
  * SchedulerPage — /schedules 主路由（master-detail 改版）
  * ---------------------------------------------------------------------------
@@ -29,6 +31,7 @@ import { Plus, Timer } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 
+import { scheduleToUserCreateInput } from './lib/scheduleFormLogic';
 import { cn } from '@/lib/utils';
 import { WINDOW_DRAG_STYLE, WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
 import { toast } from '@/lib/toast';
@@ -46,7 +49,6 @@ import { useHorizontalResize } from '@/hooks/useHorizontalResize';
 import { useSchedules } from './hooks/useSchedules';
 import { useDeleteScheduleWithSessions } from './hooks/useDeleteScheduleWithSessions';
 import { useScheduleUnreadRunCounts } from './hooks/useScheduleUnreadRunCounts';
-import { useScheduleCostSummaries } from './hooks/useScheduleCostSummaries';
 import { useRunNowBusyGuard } from './hooks/useRunNowBusyGuard';
 import { ScheduleFormDialog } from './components/ScheduleFormDialog';
 import { TemplateGallery } from './components/TemplateGallery';
@@ -69,30 +71,6 @@ import {
   readPluginScheduleCreateIntent,
 } from './lib/pluginScheduleCreateIntent';
 
-function scheduleToUserCreateInput(
-  schedule: Schedule,
-  overrides: Partial<CreateScheduleInput> = {},
-): CreateScheduleInput {
-  return {
-    name: schedule.name,
-    prompt: schedule.prompt,
-    kind: schedule.kind,
-    cronExpr: schedule.cronExpr,
-    timezone: schedule.timezone,
-    recurring: schedule.recurring,
-    manual: schedule.manual,
-    intervalMs: schedule.intervalMs,
-    agentKind: schedule.agentKind,
-    model: schedule.model,
-    effort: schedule.effort,
-    workspaceKind: schedule.workspaceKind,
-    workingDir: schedule.workingDir,
-    useWorktree: schedule.useWorktree,
-    persistentSession: schedule.persistentSession,
-    notify: schedule.notify,
-    ...overrides,
-  };
-}
 
 /**
  * 排序：active 与 expired 同 rank（一次性已跑完的任务不再单独沉底，
@@ -339,8 +317,6 @@ export function SchedulerPage() {
     [sorted, selectedId],
   );
   const unreadRunCounts = useScheduleUnreadRunCounts(sorted);
-  const { summaries: costSummaries, loaded: costSummariesLoaded } =
-    useScheduleCostSummaries(sorted);
 
   // 仅用户在 TaskListFilterPopover 主动切换时持久化;focus 同步 / 新建任务的
   // 程序性 setStatusFilter 不写入,避免覆盖用户偏好(详见 statusFilterStorage)。
@@ -482,7 +458,7 @@ export function SchedulerPage() {
       const filePath = projectAutomationConfigPath(workingDir);
       try {
         const result = await window.electronAPI.openPath(filePath);
-        if (!result.success)
+        if (shouldShowOpenPathError(result))
           toast.error(result.error || t('scheduler.list.section.openConfigFailed'));
       } catch (e) {
         toast.error(e instanceof Error ? e.message : String(e));
@@ -581,6 +557,9 @@ export function SchedulerPage() {
 
   const handleDelete = useCallback(
     (s: Schedule) => {
+      // Bot automation has a dedicated lifecycle/API. Keep this defensive
+      // guard even though the generic list filters bot-owned schedules.
+      if (s.source === 'bot') return;
       requestDeleteSchedule({
         id: s.id,
         name: s.name,
@@ -653,8 +632,6 @@ export function SchedulerPage() {
               schedules={sorted}
               selectedId={selectedId}
               unreadRunCounts={unreadRunCounts}
-              costSummaries={costSummaries}
-              costSummariesLoaded={costSummariesLoaded}
               onSelect={(s) => setSelectedId(s.id)}
               statusFilter={statusFilter}
               onStatusFilterChange={handleStatusFilterChange}
@@ -718,19 +695,10 @@ export function SchedulerPage() {
 function NewAutomationButton({ onClick }: { onClick: () => void }) {
   const { t } = useTranslation();
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'inline-flex h-9 items-center gap-1.5 rounded-full px-5 text-sm font-medium',
-        'bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)] hover:bg-[var(--lightbox-cta-hover)]',
-        'transition-colors',
-        '[&>svg]:-translate-y-px',
-      )}
-    >
+    <Button variant="cta" size="lg" type="button" onClick={onClick}>
       <Plus size={14} strokeWidth={2.5} />
       {t('scheduler.button.newAutomation')}
-    </button>
+    </Button>
   );
 }
 

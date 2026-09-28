@@ -1,11 +1,9 @@
 /**
  * registerMakerTitleIpc — maker:generate-title / maker:regenerate-title
  *
- * 给会话起一个 ≤ 20 字标题。标题 oneShot 已统一为「单次 HTTP 请求」:按本会话所属 provider
- * (WYSIWYG,与模型选择器高亮同口径:DB 显式选中优先,无则取已连接供应商的原生默认)
- * 取 catalog 配的 `titleModel`(最经济模型),用该 provider 自家凭证直起
- * (见 maker-host/title-one-shot)。无标题 wire 的会话供应商回落官方 `xd`。
- * 起不出来(零已连接 / 官方也不可用 / 凭证缺失 / HTTP 失败 / 超时)
+ * 给会话起一个 ≤ 20 字标题。自动起名与 Magic 重命名都走辅助模型链
+ * (`generateTitleWithAuxiliaryModel`)，不再按当前任务供应商目录捡最便宜的
+ * `titleModel`。起不出来(链上模型都不可用 / 凭证缺失 / HTTP 失败 / 超时)
  * → 返回 null,renderer 回落「消息前 40 字」启发式。fire-and-forget,
  * 不阻塞主流程,也不向用户暴露失败。
  *
@@ -26,11 +24,11 @@ import { getResolvedMainLocale } from '../i18n.js';
 import { getDbClient } from '../localDb/client/current.js';
 import { sessions } from '../localDb/schema.js';
 import { getDesktopProviderService } from '../maker-host/createDesktopProviderService.js';
+import type { TitleOneShotResult } from '../maker-host/title-one-shot.js';
 import {
-  generateTitleViaProvider,
-  generateTitleViaProviderResult,
-  type TitleOneShotResult,
-} from '../maker-host/title-one-shot.js';
+  generateTitleWithAuxiliaryModel,
+  generateTitleWithAuxiliaryModelResult,
+} from '../maker-host/auxiliary-title-one-shot.js';
 import { validateTitleOutput } from '../maker-host/title-output-validation.js';
 import {
   regenerateTitleMaterial,
@@ -111,7 +109,7 @@ export async function generateMakerSessionTitle(
   // "请提供用户消息内容"式回复当标题返回。直接放弃,调用方保留默认名。
   const trimmed = message.trim();
   if (!trimmed) return null;
-  return generateTitleViaProvider(
+  return generateTitleWithAuxiliaryModel(
     {
       sessionId: sessionId ?? '',
       agentKind,
@@ -157,9 +155,12 @@ async function readSessionAgentKindFromDb(sessionId: string): Promise<AgentKind 
 
 const defaultRegenerateDeps: RegenerateTitleDeps = {
   readSessionAgentKind: readSessionAgentKindFromDb,
-  collectMaterial: regenerateTitleMaterial,
+  collectMaterial: (sessionId, recentLimit, latestTurnIsInFlight) =>
+    regenerateTitleMaterial(sessionId, recentLimit, latestTurnIsInFlight, {
+      preferHookUserText: true,
+    }),
   generateTitle: (sessionId, agentKind, prompt) =>
-    generateTitleViaProviderResult(
+    generateTitleWithAuxiliaryModelResult(
       { sessionId, agentKind, prompt },
       {
         readSessionProviderId: readSessionProviderIdFromDb,
@@ -286,7 +287,7 @@ function parseAgentKind(raw: unknown): AgentKind {
 }
 
 /**
- * `generate-title` / `regenerate-title` 可经 device-link allowlist 从受控设备调用。
+ * 标题与输入推荐可经 device-link allowlist 从控制设备调用。
  * 远程来源只信主进程 AsyncLocalStorage 上下文,不信 payload 自报；本机调用仍要求真实
  * Electron 顶层 Renderer sender。
  */
@@ -354,6 +355,7 @@ interface PredictPromptRequest {
   agentKind: AgentKind;
   turnGen: number;
   completionRevision: number;
+  cacheOnly?: boolean;
 }
 
 interface PromptPredictionCacheEntry {
@@ -369,7 +371,10 @@ function parsePredictPromptRequest(raw: unknown): PredictPromptRequest {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throwIpcError('INVALID_PARAMS', 'predict-prompt request must be a non-null object');
   }
-  const { sessionId, agentKind, turnGen, completionRevision } = raw as Record<string, unknown>;
+  const { sessionId, agentKind, turnGen, completionRevision, cacheOnly } = raw as Record<string, unknown>;
+  if (cacheOnly !== undefined && typeof cacheOnly !== 'boolean') {
+    throwIpcError('INVALID_PARAMS', 'cacheOnly must be a boolean');
+  }
   if (typeof sessionId !== 'string' || !sessionId || sessionId.length > SESSION_ID_MAX) {
     throwIpcError('INVALID_PARAMS', 'invalid or missing sessionId for predict-prompt');
   }
@@ -398,6 +403,7 @@ function parsePredictPromptRequest(raw: unknown): PredictPromptRequest {
     agentKind: agentKind as AgentKind,
     turnGen,
     completionRevision,
+    cacheOnly,
   };
 }
 
@@ -461,6 +467,9 @@ async function predictPromptForCompletedRevision(
     if (cached.workingDir !== (sessionRow.workingDir ?? null)) return null;
     return cached.promise;
   }
+  // Opening a completed remote task may reuse a live host prediction, but must
+  // not turn historical navigation into a new paid model request.
+  if (request.cacheOnly) return null;
   if (cached && cached.revision > completionRevision) {
     return null;
   }
@@ -623,7 +632,7 @@ export function registerMakerTitleIpc(options: RegisterMakerTitleIpcOptions = {}
   );
   // 输入框推荐提示词:turn 结束后预测用户下一步输入,复用 title one-shot 基础设施。
   // 本 handler 会触发一次付费模型调用,按 electron-security-and-process-boundaries §5
-  // 做 sender 断言 + 运行期 payload 校验 + DB 防御纵深(远程会话拒绝)。
+  // 本机校验 sender，远程校验 dispatch 持有的身份上下文；素材与完成轮次仍由 DB 复核。
   // TODO: promptPrediction.ts 中新增的 system prompt 固定指令进入模型 system 段，
   // 按 docs/dev-rules/maker-core-and-agent-behavior.md §4 需在合并前取得维护者确认。
   // 跟踪: PR #1965 review thread #3791318742
@@ -633,7 +642,7 @@ export function registerMakerTitleIpc(options: RegisterMakerTitleIpcOptions = {}
       event: Electron.IpcMainInvokeEvent,
       request: unknown,
     ): Promise<{ prompt: string | null }> => {
-      assertTrustedAppRendererEvent(event);
+      assertTitleIpcCaller(event);
       const parsed = parsePredictPromptRequest(request);
       try {
         return {

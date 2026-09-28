@@ -1,3 +1,15 @@
+import { remotePluginSetupErrorCode, type PluginSetupCommandError } from './pluginSetupCommandError';
+export type { PluginSetupCommandError } from './pluginSetupCommandError';
+import { emitTaskTagCatalog } from '@/features/task-tags/taskTagEvents';
+import { normalizeTaskTags } from '@cindy/maker-shared';
+import type { ImMessageSource } from '../../shared/imMessageSource';
+import { sharedTaskAuthorName } from '@cindy/maker-shared';
+import { readBotAuthorizationCard } from '../../shared/botAuthorization';
+import { applyCindyMakeCardAttention } from './cindyMakeAttention';
+import { confirmRemoteUsers, reserveRemoteUser } from './remoteUserHandoff';
+import { readRemoteHistoryCache, remoteHistoryCacheWriter } from './remoteHistoryCache';
+import { createPluginSecretPresentation, createPluginConnectionPresentation } from '../../shared/pluginOauth';
+import { parsePluginConnectionInput } from '@cindy/device-link';
 /**
  * makerChatStore — Module-level store for Maker chat (Claude / Codex), sharded by sessionId.
  * ---------------------------------------------------------------------------
@@ -21,7 +33,11 @@
  * - User-initiated stopSession (NOT called on session switch anymore)
  */
 
+import { HistoryViewController, isHistoryViewUnavailable, mapHistoryViewMessages, historyViewLeaves, historyWorkSummaries, type HistoryViewPage, type HistoryDetailPage } from '@cindy/maker-shared/message-window';
 import type { CindyRegion } from '@cindy/maker-shared/brand-identity';
+import { SESSION_SYNC_CHANNEL } from '@cindy/device-link';
+import { isRemoteTextDelta, readRemoteTextSnapshot, reconcileRemoteText, consumeRemoteSessionSync } from '@cindy/maker-shared/message-window';
+import { parseMessageToolUse } from '@cindy/maker-shared/message-normalize';
 import {
   getDataOwnerGeneration,
   isDataOwnerGenerationCurrent,
@@ -35,6 +51,7 @@ import {
   isCindyGatewayProviderId,
   isGatewayProxyTokenInvalidError,
   redactSensitiveText,
+  parseAgentErrorCode,
 } from '@cindy/maker-shared/error-redaction';
 import {
   formatRemoteError,
@@ -59,8 +76,15 @@ import {
   isTurnContinuationBoundaryEvent,
 } from '@cindy/maker-shared/turn-continuation';
 import { normalizeAutoTitle } from '@cindy/maker-shared/session-title';
-import type { MessageRole, Message, MessageAutomationOrigin } from '@/lib/ccAgent.types';
-import type { AttachedFile, MentionedResource, SerializedAttachedFile } from '@/lib/fileTypes';
+import { parseToolLoopErrorDetails } from '@cindy/maker-shared/tool-loop-error';
+import type { ToolLoopErrorDetails } from '@cindy/maker-core';
+import type { AgentMeta, MessageRole, Message, MessageAutomationOrigin } from '@/lib/ccAgent.types';
+import { toMessageAutomationOrigin } from '@/lib/messageAutomationOrigin';
+import {
+  type AttachedFile,
+  type MentionedResource,
+  type SerializedAttachedFile,
+} from '@/lib/fileTypes';
 import type {
   AgentInputCreateOpts,
   AgentInputProjection,
@@ -72,6 +96,8 @@ import type {
 import { normalizeAgentInputClearBoundaryMs } from '../../shared/agentInputQueue';
 import { hasUserVisibleText } from '../../shared/visibleText';
 import { readReviewRunMeta } from '../../shared/reviewRun';
+import { readBotCollaborationMeta } from '../../shared/botCollaboration';
+import { readBotDirectMessageMeta } from '../../shared/botDirectMessage';
 import {
   deriveAutoTitleSeed,
   reconcileSessionRefsForText,
@@ -96,6 +122,9 @@ import * as sessionService from '@/lib/sessionService';
 // device-link 透明传输:远程(被控设备)会话的操作/读取走隧道,本地会话零变化。
 import {
   makerApiFor,
+  assistRemotePluginOauth,
+  submitRemotePluginSecret,
+  submitRemotePluginConnection,
   makerApiForDevice,
   getSessionFor,
   listMessagesFor,
@@ -109,6 +138,7 @@ import {
 } from '@/lib/makerTransport';
 import {
   remoteProjectsStore,
+  isRemoteDeviceMarkedDisconnected,
   requestRemoteReseed,
 } from '@/features/device-link/remoteProjectsStore';
 import { getStickySessionDeviceId } from '@/features/device-link/stickySessionOrigin';
@@ -130,9 +160,14 @@ import { clearSessionStarting, markSessionStarting } from '@/lib/sessionStarting
 import { createLogger } from '@/lib/logger';
 import {
   markSessionAutomaticHistoryLoadCompleted,
+  readSessionScroll,
   resetSessionAutomaticHistoryLoadCompletion,
 } from '@/lib/sessionScrollStore';
-import { HISTORY_GAP_SPLIT_MS } from '@/lib/historyGap';
+import {
+  isInsideMainContiguousRun,
+  mainContiguousRunStartIndex,
+  type LoadedWindowIsland,
+} from '@/lib/searchJumpTargeting';
 import { extractIpcError } from '@/utils/ipcError';
 import { tryBeginAgentSendDispatch } from '@/lib/agentSwitchCoordinator';
 import { getUserPrompt } from '@/lib/userPromptStore';
@@ -142,13 +177,17 @@ import {
   resetRemoteDataOwnerPushFence,
 } from '@/lib/remoteDataOwnerPushFence';
 import { buildUserMessageAttachmentPayload } from '@/lib/messageAttachmentPayload';
+import { cleanupStagedChatAttachmentFiles } from '@/lib/chatAttachmentStageCleanup';
 import {
+  parseIssueEnvHarness,
+  parseIssueEnvModelId,
   parseIssueEnvRegion,
   parseOptionalGithubUserIdentity,
   parseIssueSuggestedPublicName,
   parseIssueSubmissionIdentity,
   type IssueSubmissionIdentity,
 } from '@/lib/issueConfirmPayload';
+import type { IssueHarness } from '../../shared/issueRuntimeMetadata';
 import { resolveStaleCodexSubscriptionValueEstimate } from '../../shared/codexSubscriptionValue';
 import { normalizeTurnUsageDetails, type TurnUsageDetails } from '../../shared/turnUsageDetails';
 import {
@@ -169,9 +208,15 @@ import {
 import { parseReconnectAttemptMessage } from '@/utils/networkError';
 
 import {
+  isAnnotationBurnInError,
   materializeAnnotatedAttachmentsForSend,
   needsAnnotationMaterialize,
 } from '@/lib/annotationBurnIn';
+import {
+  annotationStrokesEqual,
+  queuedAnnotationEditMeta,
+  toEditableAnnotatedAttachment,
+} from '@/lib/annotationRestore';
 
 const log = createLogger('CcAgentChatStore');
 // perf-baseline(与 MessageStream / sidebar 的 perf/session-switch 探针同通道):
@@ -185,29 +230,8 @@ const MAX_REMOTE_AUTH_RETRIES = 2;
 const CLEAR_SESSION_GUARD_TIMEOUT_MS = 500;
 const REMOTE_CONTENT_TRUNCATED_PLACEHOLDER = '[remote content truncated: payload too large]';
 
-/**
- * maker-core 远端分支把不可恢复的远端错误编码成 `[REMOTE_*] 英文兜底文案` 的
- * message(见 packages/maker-core/src/agents/claude-code/index.ts)。renderer
- * 直接显示会裸露英文 code,这里把已知 code 映射成 i18n 文案(规则 17)。未知
- * code / 漏翻时回退到去掉 `[CODE]` 前缀的英文原文,绝不把 `[REMOTE_*]` 显给用户。
- */
-const BRACKET_ERROR_CODE_RE = /(?:^|: Error: )\[([A-Z0-9_]+)\]\s*([\s\S]*)$/;
-const REMOTE_ERROR_CODE_RE = /(?:^|: Error: )\[(REMOTE_[A-Z_]+)\]\s*([\s\S]*)$/;
-const DEVICE_LINK_CHAT_ERROR_CODES: ReadonlySet<string> = new Set([
-  'DEVICE_LINK_CONTROL_DISABLED',
-  'DEVICE_LINK_MEDIA_TRANSFER_FAILED',
-] as const);
-/**
- * 非 `REMOTE_*` / 非 device-link 的会话级提示码 —— agent runtime 用同一套
- * `[CODE] fallback text` 约定把「这件事用户该知道」告诉 renderer,不新增事件类型。
- * 未登记的 code 仍然回退到英文兜底文案(绝不把 `[CODE]` 裸露给用户)。
- */
-const AGENT_RUNTIME_CHAT_ERROR_CODES: ReadonlySet<string> = new Set([
-  // Auto 档下审阅器没跑起来(与「模型判定动作危险」不同,后者刻意保持静默)。
-  'AUTO_REVIEW_UNAVAILABLE',
-  'AUTO_REVIEW_CONFIRM_UNDELIVERED',
-] as const);
 const REMOTE_HEAVY_INBOUND_CHANNELS: ReadonlySet<string> = new Set([
+  SESSION_SYNC_CHANNEL,
   'maker:event',
   'maker:status-changed',
   'maker:input:projection',
@@ -293,22 +317,24 @@ function resolveEstimatedTurnCostUsd(
     : rawCostUsd;
 }
 
+/** Translation candidate only; callers must check their active i18n resources.
+ * Unknown-code fallback text is diagnostic content, not curated guidance. */
+export function remoteErrorI18nKey(msg: string): string | undefined {
+  const parsed = parseAgentErrorCode(msg);
+  return parsed ? `chat.remoteError.${parsed.code}` : undefined;
+}
+
 export function decodeRemoteErrorMessage(msg: string): string {
-  const bracketMatch = BRACKET_ERROR_CODE_RE.exec(msg);
-  const bracketCode = bracketMatch?.[1];
-  if (
-    bracketCode &&
-    (DEVICE_LINK_CHAT_ERROR_CODES.has(bracketCode) ||
-      AGENT_RUNTIME_CHAT_ERROR_CODES.has(bracketCode))
-  ) {
-    return i18n.t(`chat.remoteError.${bracketCode}`, {
-      defaultValue: bracketMatch[2] || msg,
-    });
-  }
-  const m = REMOTE_ERROR_CODE_RE.exec(msg);
-  if (!m) return msg;
-  const fallback = m[2] || msg;
-  return i18n.t(`chat.remoteError.${m[1]}`, { defaultValue: fallback });
+  const parsed = parseAgentErrorCode(msg);
+  return parsed
+    ? i18n.t(`chat.remoteError.${parsed.code}`, { defaultValue: parsed.fallback })
+    : msg;
+}
+
+/** Keep known codes for the banner's active locale; retain unknown-code fallback behavior. */
+export function remoteErrorMessageForBanner(msg: string): string {
+  const key = remoteErrorI18nKey(msg);
+  return key && i18n.exists(key) ? msg : decodeRemoteErrorMessage(msg);
 }
 // 专门给"出现在用户面前的红色 ErrorBanner"打日志,scope 以 `maker/` 开头
 // 是为了让它落在统一 agent 流(agent-*.ndjson,跟 agent runtime 抛出的底层错误同一份,
@@ -353,6 +379,8 @@ export interface AskUserQuestionItem {
 }
 
 export interface ChatMessage {
+  /** Private Bot reply provenance, projected from persisted/live agent metadata. */
+  botPrivateReply?: boolean;
   clientId: string;
   /** Server message id when this row came from history; used as a pagination cursor. */
   id?: string;
@@ -422,6 +450,8 @@ export interface ChatMessage {
    * UI 可以据此显示 spinner / 灰色态（本轮不做，留给后续）。
    */
   isPendingPersist?: boolean;
+  /** Renderer-only position; DB acknowledgement does not yet transfer ownership to history. */
+  localSendPrecedingClientIds?: readonly string[];
   /**
    * 意识拦截(订阅槽①):本条用户消息被某意识钩子拦下(未入库、未起 turn)。
    * 气泡照常显示(未发出),其下渲一条 error 红条,内容 = 意识返回的文本
@@ -437,19 +467,15 @@ export interface ChatMessage {
    */
   ghostReplyPending?: boolean;
   /**
-   * scheduler 注入的 user 消息来源标记(读自 agentMeta.origin),UserMessage
-   * 据此在气泡上方渲染"由自动化任务发送"标签。手动输入的消息无此字段。
+   * scheduler / 其他任务注入的 user 消息来源标记(读自 agentMeta.origin),UserMessage
+   * 据此在气泡上方渲染可点击的来源标签。手动输入的消息无此字段。
    */
   automationOrigin?: MessageAutomationOrigin;
+  sharedAuthorName?: string;
   /** user 消息投递方式:普通新 turn 或运行中 steer。 */
   delivery?: 'turn' | 'steer';
   /** Hook 来源元数据(IM 平台 + 用户干净原文 + thread 上下文),UserMessage 据此渲染 Cindy 任务卡片。 */
-  hookSource?: {
-    im: string;
-    channelName?: string | null;
-    userText?: string;
-    threadContext?: Array<{ author: string; text: string; isBot?: boolean }>;
-  };
+  hookSource?: ImMessageSource;
   /** /goal 目标设定/更新标记:该 user 消息是目标文案,renderer 在气泡上方渲「目标 / 目标已更新」徽标。 */
   goalBadge?: { updated: boolean };
   /** F7.2: ask_user message fields */
@@ -469,6 +495,8 @@ export interface ChatMessage {
    * agentMeta.goalCompletion 派生(仿 fork divider 从 session 元数据派生),重开会话仍在。
    */
   systemCardType?:
+    | 'cindy-make-doctor'
+    | 'cindy-make'
     | 'help'
     | 'cost'
     | 'context'
@@ -478,6 +506,8 @@ export interface ChatMessage {
     | 'cmd'
     | 'goal-complete'
     | 'goal-resumed'
+    /** 个人版制作任务的完成记录,由持久化的 agentMeta.cindyMakeCompletion 派生,重开仍在。 */
+    | 'cindy-make-complete'
     | 'learn'
     | 'review'
     | 'auto-resume'
@@ -488,6 +518,17 @@ export interface ChatMessage {
      */
     | 'auto-resume-pending'
     | 'agent-switch'
+    /** 对进行中后台任务的补充消息留痕。 */
+    | 'bot-session-task-message'
+    /** 伙伴发起的可追踪后台任务。 */
+    | 'bot-session-task'
+    | 'bot-session-task-result'
+    /**
+     * 伙伴之间的私聊入口：消息正文单独存储，这里只投影一枚可打开的时间线痕迹。
+     * 它不进入左栏，也不与后台任务卡混用。
+     */
+    | 'bot-direct-message'
+    | 'bot-authorization'
     | 'context-rebuild';
   systemCardData?: Record<string, unknown>;
   /** FP-3: plan_review message fields */
@@ -502,6 +543,8 @@ export interface ChatMessage {
    * 里的原始 message 文案。live 报错仍走 ErrorBanner(store.error),与本字段无关。
    */
   errorReason?: string;
+  /** Structured details for a tool-loop terminal error. */
+  toolLoop?: ToolLoopErrorDetails;
   /**
    * 产生这条 error 行的 provider(错误发生时刻的快照,main 侧 onTurnErrorEvent
    * 从 session-provider-store 同步取值落进 content.providerId)。错误分类必须绑
@@ -638,6 +681,8 @@ export interface AgentStatus {
   contextTokens: number;
   /** Context window size from SDK modelUsage (0 = not yet known). */
   contextWindow: number;
+  /** Model-picker metadata is replaceable until a runtime snapshot arrives. */
+  contextWindowFromRuntime?: boolean;
   isRunning: boolean;
   startedAt: number | null;
   /** Turn-cumulative output tokens for live TPS. */
@@ -666,6 +711,9 @@ export interface PendingPermission {
   description?: string;
   suggestions?: unknown[];
   autoReviewUnavailable?: boolean;
+  /** Renderer-only delivery state; never part of the permission decision. */
+  submitting?: boolean;
+  submissionFailed?: boolean;
 }
 
 function parsePendingPermissionRequest(
@@ -700,6 +748,10 @@ export type PluginSetupAction = GhostSetupAllowedAction;
 type PluginSetupInlineFormAction = Extract<GhostSetupAllowedAction, { kind: 'inline_form' }>;
 
 export interface PendingPluginSetup {
+  remoteOauth?: true;
+  remoteSecret?: true;
+  remoteConnection?: true;
+  reopenActionId?: string;
   requestId: string;
   revision: number;
   /** Settled but retained briefly so the card can show terminal feedback. */
@@ -749,6 +801,7 @@ export interface PluginSetupCommandInFlight {
 
 export interface PluginSetupInlineFormValues {
   value: string;
+  host?: string;
 }
 
 /**
@@ -801,6 +854,8 @@ export interface PendingIssueConfirm {
     platform: string;
     arch: string;
     osVersion: string;
+    harness?: IssueHarness;
+    modelId?: string;
     region?: CindyRegion;
   };
   /**
@@ -826,11 +881,17 @@ export interface PendingGhostGrantConfirm {
   ghostName: string;
   /**
    * attachments = 媒体文件交给意识;dir = 上传目录/文件;save_dir = 允许意识
-   * 往目录里存文件;fs_write = 意识申请写工作目录文件(会话 permission 为
+   * 往目录里存文件;reveal_path = 允许当前 Agent 获得单个媒体仓本机路径;
+   * fs_write = 意识申请写工作目录文件(会话 permission 为
    * 逐条确认档时逐次弹,同目录本会话批一次);workspace = 意识申请以该目录
-   * 为工作区在侧边栏创建/复用会话入口(不过户字节)。
+   * 为工作区在侧边栏创建/复用会话入口(不过户字节);
+   * forge_source = Forge 打包/骨架/安装的源码目录在工作目录外;
+   * outside_workdir = 文档/电脑等内置工具读写工作目录外的路径。
    */
-  lane: 'attachments' | 'dir' | 'save_dir' | 'fs_write' | 'workspace';
+  lane:
+    | 'attachments' | 'dir' | 'save_dir' | 'reveal_path' | 'fs_write' | 'workspace' | 'forge_source' | 'outside_workdir';
+  sourceTool?: string;
+  operation?: 'read' | 'write';
   items: Array<{
     name: string;
     absPath: string;
@@ -1984,8 +2045,16 @@ function clearRemoteOptimisticSendsForSession(sessionId: string): void {
  * 恢复尚未确认受理的正文/附件，再清账本与 UI；之后任何迟到 invoke / projection
  * 都会同时被 Map identity 与 data-owner generation 挡住，不能跨账号继续投递或恢复。
  */
-export function cancelRemoteOptimisticSendsForDataOwnerBoundary(): void {
+export function cancelRemoteOptimisticSendsForDataOwnerBoundary(
+  options: { finalizeSessions?: boolean } = {},
+): void {
   invalidateLiveIngressForDataOwnerBoundary();
+  // A committed account teardown intentionally stops the outgoing runtime. Its
+  // closed status push carries the old owner stamp and is therefore dropped by
+  // the owner fence; apply the same finalization used by the Stop/closed path.
+  // AuthContext passes finalizeSessions=false for the pre-commit invalidation
+  // so a failed switch can restore the still-running current owner.
+  if (options.finalizeSessions !== false) finalizeSessionsForDataOwnerBoundary();
   // Invalidate standalone projection reads/operations before restoring drafts
   // or publishing the next owner. Their promises may settle independently of
   // the optimistic outbox and must not write old-owner state into the new slice.
@@ -2077,6 +2146,61 @@ export function cancelRemoteOptimisticSendsForDataOwnerBoundary(): void {
       }));
     }
   }
+}
+
+/**
+ * Finalize every cached session when its data owner is being torn down.
+ * This is the owner-boundary equivalent of accepting `status=closed`: keep
+ * the session history in memory, but stop the turn clock, streaming flags,
+ * interactions, and running background tasks so a later owner re-entry
+ * cannot revive the outgoing task snapshot.
+ */
+function finalizeSessionsForDataOwnerBoundary(): void {
+  for (const sessionId of sessions.keys()) {
+    // The local Maker teardown cannot stop a device-link session; its runtime
+    // remains authoritative on the controlled Desktop. Keep the cached remote
+    // state intact until that device reports its own terminal event.
+    if (isRemoteSessionSticky(sessionId)) continue;
+    const state = sessions.get(sessionId);
+    if (!state || !hasActiveTurnStateForOwnerBoundary(state)) continue;
+    bumpInteractionReconcileEpoch(sessionId);
+    supersedeInputProjectionRequests(sessionId, { supersedeOperations: true });
+    flushPendingTextDelta(sessionId);
+    setState(sessionId, forceFinalizeOnSessionClosed);
+  }
+}
+
+function hasActiveTurnStateForOwnerBoundary(state: SessionChatState): boolean {
+  return (
+    state.agentStatus.isRunning ||
+    state.agentStatus.startedAt !== null ||
+    state.streamingClientId !== null ||
+    state.isStreaming ||
+    state.messages.some((message) => message.isStreaming) ||
+    state.pendingPermission !== null ||
+    state.pendingAskUser !== null ||
+    state.pendingPluginSetup !== null ||
+    state.pendingPluginSetupQueue.length > 0 ||
+    state.pendingPlanReview !== null ||
+    state.pendingIssueConfirm !== null ||
+    state.pendingRenameSessionsConfirm !== null ||
+    state.pendingGhostGrantConfirm !== null ||
+    state.pendingRemoteDesktopConfirmation !== null ||
+    state.pendingRemoteDesktopConfirmationQueue.length > 0 ||
+    state.queueAbortPending ||
+    state.steeringQueueClientIds.length > 0 ||
+    state.continuationInFlightClientId !== null ||
+    state.continuationTurnClientId !== null ||
+    state.pendingTaskWake > 0 ||
+    state.messages.some(
+      (message) =>
+        message.clientId === CODEX_RECONNECT_PENDING_CLIENT_ID ||
+        message.clientId === AUTO_RESUME_PENDING_CLIENT_ID,
+    ) ||
+    [...(state.taskUpdates?.values() ?? [])].some((task) => task.status === 'running')
+    || state.inputRecovery !== null
+    || hasSessionRecoveryPendingState(state)
+  );
 }
 
 /** Clear deferred live ingress work before AuthContext publishes a new owner. */
@@ -2377,6 +2501,8 @@ export interface SessionChatState {
   taskUpdates?: ReadonlyMap<string, AgentTaskUpdate>;
   isStreaming: boolean;
   agentStatus: AgentStatus;
+  /** A task with an explicit product title must not be auto-renamed from its first message. */
+  autoTitleDisabled?: boolean;
   error: string | null;
   /** 当前 terminal error 是否为可恢复的账号用量限制，以及可识别的重置时刻。 */
   usageLimitRecovery?: UsageLimitRecoveryHint | null;
@@ -2386,6 +2512,8 @@ export interface SessionChatState {
    * 仅在 error 非空时有意义,error 被清/被无 reason 的错误覆盖时同步清。
    */
   errorReason?: string | null;
+  /** Structured details for a tool-loop terminal error; null when no such error is active. */
+  toolLoop?: ToolLoopErrorDetails | null;
   recoverableError: string | null;
   /**
    * 输入投影自带的 recovery 镜像（main 的 retry 权威状态）。renderer 侧人工
@@ -2417,6 +2545,18 @@ export interface SessionChatState {
    */
   errorRetryText: string | null;
   /**
+   * 当前 live 终态错误预留的持久化 error 行 clientId。广播 payload.persistId
+   * 写入;无可靠恢复依据(计划内升级关闭 / 自愈压住)时为 null。同一 turn 的重复
+   * 终态 error 往往因 main dedup 不再带 persistId,缺失时必须保留已有绑定,
+   * 否则点关闭/重试无法 dismiss 即将落库的那一行。
+   */
+  errorPersistId: string | null;
+  /**
+   * 本视图已对这次 live 错误点过重试或关闭。尾部横幅跳过该 id,避免同一错误再弹。
+   * 离开视图不清这个字段——点过才算处置;未点就离开,回来仍应看到持久化卡。
+   */
+  disposedErrorPersistId: string | null;
+  /**
    * 凭证切换等待态(main projection 透传):发送需重启共享 codex 进程,被列出的
    * 会话挡住;队首保留、结束后 main 自动重发。渲染为等待横幅(非错误)。
    */
@@ -2442,25 +2582,31 @@ export interface SessionChatState {
   isLoadingMore: boolean;
   hasMoreMessages: boolean;
   /**
-   * 窗口里是否掺进过"孤岛" —— 跳转补齐失败时 merge 的 around 窗口,它与已加载的尾部窗口
-   * 之间隔着没加载的历史。
+   * 窗口里掺进过的孤岛区间(显式建模的"已加载窗口")—— 跳转补齐失败时 merge 的 around
+   * 窗口,每座孤岛与已加载的尾部窗口(主连续段)之间都隔着没加载的历史。
    *
-   * 为什么需要它:补齐的快速通道原来只判 `messages.some(clientId === target)`,那是**成员**
-   * 判定而不是**连续覆盖**判定。孤岛一旦落进窗口,再跳同一个目标就会命中 some()、直接返回
-   * covered 而不补齐,于是"中间缺失"再也修不好(#676 review)。有孤岛时快速通道失效,
-   * 每次跳转都重新从最新翻页,让这个状态可自愈。
+   * 为什么不是 boolean:单个标记无法回答"目标落在哪一段"。补齐快速通道与搜索落点判定都
+   * 需要"目标是否在主连续段里"(最新 → 目标的整段历史已确认连续)—— 那要求把已加载区间
+   * 显式建模(见 searchJumpTargeting 的 TODO 与 MessageStream 锚定窗口双向有界的 TODO,
+   * 同一条后续改动)。孤岛按时间升序(最老在前),主段就是最后一个孤岛最新边界行之后的
+   * 全部行;孤岛被向上翻页跨过(接回主段)时从本数组移除,于是"孤岛 + 已翻到历史起点"的
+   * 会话在窗口真正完整后不再每次搜索都白打一轮 around + list。
    *
-   * 只由**把窗口清空、从最新重新拉起**的路径清回 false:reloadMessages(rewind / origin
+   * 只由**把窗口清空、从最新重新拉起**的路径清回空:reloadMessages(rewind / origin
    * 漂移重载)、clearSessionAfterGuard(/clear)、_demoteIdleSessions(空闲降级)、
-   * _purgeSession(整条移除,重建后回到默认 false)。
+   * _purgeSession(整条移除,重建后回到默认空)。
    *
    * 反过来,这几处**刻意不清**(都在 #676 review 里逐条确认过):
    *  - `covered`:到达本次目标只证明"尾部 → 本目标"连续,不证明更早的孤岛都被跨过;
    *  - `_trimMessagesIfNeeded`:`slice(-TRIM_TARGET)` 只保证"最新 200 行",不保证连续;
    *  - 首拉落地:它只是把最新一页 merge 进来,孤岛与尾段之间的洞还在(游标交还给最新页
    *    下沿,好让往上翻能穿过去)。
+   *
+   * 边界行 clientId 恒在 messages 里:孤岛行全部来自 merge,不会被改名;裁剪、删除等
+   * 会动窗口形状的路径必须同步收口本模型(见 pruneIslandsForTrimmedWindow /
+   * conservativeIslandsFor 与各处调用)。
    */
-  historyWindowHasIsland?: boolean;
+  historyWindowIslands: readonly LoadedWindowIsland[];
   isFirstMessage: boolean;
   streamingClientId: string | null;
   streamingText: string;
@@ -2491,6 +2637,7 @@ export interface SessionChatState {
   pluginSetupViewerState: PluginSetupViewerState;
   /** Prevents duplicate commands until Main publishes a newer snapshot/dismissal. */
   pluginSetupCommandInFlight: PluginSetupCommandInFlight | null;
+  pluginSetupCommandError: PluginSetupCommandError | null;
   /**
    * F-AUQ-MIN-1: AskUserQuestion viewer display state. Only meaningful while
    * pendingAskUser != null. Reset to 'expanded' every time a new
@@ -2606,6 +2753,10 @@ export interface SessionChatState {
    * review)。transition snapshot 与 hasSessionTerminalError 都按此豁免。
    */
   lastStopWasSideTask: boolean;
+  /** Successful automatic private replies remain in history without completion alerts. */
+  lastStopWasPrivateReply?: boolean;
+  /** The last turn ran in a hidden Bot group lane; the group chat owns its alerts. */
+  lastStopWasGroupLane?: boolean;
   /**
    * 后台 subagent「唤醒桥接」标记(claude-code 专用)。
    *
@@ -2696,15 +2847,17 @@ export type SessionChatLightState = Pick<
   | 'error'
   | 'usageLimitRecovery'
   | 'errorReason'
+  | 'toolLoop'
   | 'recoverableError'
   | 'errorRetryText'
+  | 'errorPersistId'
+  | 'disposedErrorPersistId'
   | 'credentialSwitchWait'
   | 'continuationInFlightClientId'
   | 'continuationTurnClientId'
   | 'continuationInFlightProjectionCapability'
   | 'isLoadingMore'
   | 'hasMoreMessages'
-  | 'historyWindowHasIsland'
   | 'isFirstMessage'
   | 'historyLoaded'
   | 'pendingPermission'
@@ -2712,6 +2865,7 @@ export type SessionChatLightState = Pick<
   | 'pendingPluginSetup'
   | 'pluginSetupViewerState'
   | 'pluginSetupCommandInFlight'
+  | 'pluginSetupCommandError'
   | 'askUserViewerState'
   | 'askUserDraft'
   | 'pendingPlanReview'
@@ -2731,7 +2885,13 @@ export type SessionChatLightState = Pick<
   | 'pendingTaskWake'
   | 'pendingTaskWakeStarted'
   | 'turnStoppedByUser'
->;
+> & {
+  /** 窗口是否掺进过孤岛(由 historyWindowIslands 派生,给 UI / 判定用)。 */
+  historyWindowHasIsland: boolean;
+};
+
+/** 没有孤岛的空模型(共享只读实例,避免无谓分配)。 */
+const EMPTY_WINDOW_ISLANDS: readonly LoadedWindowIsland[] = [];
 
 function createInitialState(): SessionChatState {
   return {
@@ -2754,17 +2914,20 @@ function createInitialState(): SessionChatState {
     error: null,
     usageLimitRecovery: null,
     errorReason: null,
+    toolLoop: null,
     recoverableError: null,
     inputRecovery: null,
     activeTurnRetryText: null,
     errorRetryText: null,
+    errorPersistId: null,
+    disposedErrorPersistId: null,
     credentialSwitchWait: null,
     continuationInFlightClientId: null,
     continuationTurnClientId: null,
     continuationInFlightProjectionCapability: 'unknown',
     isLoadingMore: false,
     hasMoreMessages: true,
-    historyWindowHasIsland: false,
+    historyWindowIslands: EMPTY_WINDOW_ISLANDS,
     isFirstMessage: true,
     streamingClientId: null,
     streamingText: '',
@@ -2775,6 +2938,7 @@ function createInitialState(): SessionChatState {
     pendingPluginSetupQueue: [],
     pluginSetupViewerState: 'expanded',
     pluginSetupCommandInFlight: null,
+    pluginSetupCommandError: null,
     askUserViewerState: 'expanded',
     askUserDraft: null,
     pendingPlanReview: null,
@@ -2799,6 +2963,8 @@ function createInitialState(): SessionChatState {
     planModeEnabled: false,
     planModeRev: 0,
     lastStopWasSideTask: false,
+    lastStopWasPrivateReply: false,
+    lastStopWasGroupLane: false,
     pendingTaskWake: 0,
     pendingTaskWakeDuringTurn: 0,
     pendingTaskWakeStarted: false,
@@ -2830,17 +2996,20 @@ export const EMPTY_SESSION_STATE: SessionChatState = Object.freeze({
   error: null,
   usageLimitRecovery: null,
   errorReason: null,
+  toolLoop: null,
   recoverableError: null,
   inputRecovery: null,
   activeTurnRetryText: null,
   errorRetryText: null,
+  errorPersistId: null,
+  disposedErrorPersistId: null,
   credentialSwitchWait: null,
   continuationInFlightClientId: null,
   continuationTurnClientId: null,
   continuationInFlightProjectionCapability: 'unknown',
   isLoadingMore: false,
   hasMoreMessages: false,
-  historyWindowHasIsland: false,
+  historyWindowIslands: EMPTY_WINDOW_ISLANDS,
   isFirstMessage: true,
   streamingClientId: null,
   streamingText: '',
@@ -2854,6 +3023,7 @@ export const EMPTY_SESSION_STATE: SessionChatState = Object.freeze({
   pendingPluginSetupQueue: [],
   pluginSetupViewerState: 'expanded',
   pluginSetupCommandInFlight: null,
+  pluginSetupCommandError: null,
   askUserViewerState: 'expanded',
   askUserDraft: null,
   pendingPlanReview: null,
@@ -2884,11 +3054,23 @@ export const EMPTY_SESSION_STATE: SessionChatState = Object.freeze({
   lastAgentMeta: null,
 }) as SessionChatState;
 
+/** Stable empty light snapshot (sessionless callers; derived boolean off). */
+export const EMPTY_LIGHT_STATE: SessionChatLightState = Object.freeze({
+  ...EMPTY_SESSION_STATE,
+  historyWindowHasIsland: false,
+});
+
 // ---------------------------------------------------------------------------
 // Store internals
 // ---------------------------------------------------------------------------
 
 const sessions = new Map<string, SessionChatState>();
+// Keep a stable token for each cached session incarnation. A rollback query
+// may outlive a purge/recreate of the same session id; comparing this token
+// prevents an old query from finalizing the replacement while still allowing
+// ordinary state updates to proceed.
+let nextSessionIncarnation = 1;
+const sessionIncarnations = new Map<string, number>();
 /**
  * Session-scoped permission response guard.
  * Prevents double-click / key-repeat from approving the newly promoted permission
@@ -3431,6 +3613,7 @@ function _purgeSession(sessionId: string): void {
   backgroundTaskStaleRetrySessions.delete(sessionId);
   // 代际递增(bump 而非 delete,原因见 _messagesEpoch 注释):作废 in-flight 翻页,
   // 避免其提交把旧窗口 merge 进 purge 后重建的空 slice。
+  releaseRemoteHistoryView(sessionId);
   invalidateMessageHistoryWindow(sessionId);
   invalidateInputProjectionRequests(sessionId);
   // 删除 / 归档 / LRU 都是 renderer owner 边界。作废仍在附件物化或 composer
@@ -3463,6 +3646,10 @@ function _purgeSession(sessionId: string): void {
   _cacheHydrateSuppressed.delete(sessionId);
   _lastViewedAt.delete(sessionId);
   _lastInboundEventAt.delete(sessionId);
+  _pendingErrorClearOnLeave.delete(sessionId);
+  _deferredTurnErrorPersist.delete(sessionId);
+  _liveErrorEpoch.delete(sessionId);
+  _staleDeferredErrorPersistIds.delete(sessionId);
   const i = _accessOrder.indexOf(sessionId);
   if (i !== -1) _accessOrder.splice(i, 1);
 }
@@ -3537,28 +3724,240 @@ function _isSessionBusy(sessionId: string, s: SessionChatState): boolean {
 }
 
 /**
- * 已加载窗口里最新连续段的最老一行。
+ * 在 messages 里按 clientId 定位一行;找不到返回 -1。
  *
- * `messages` 是 oldest-first。窗口可能是「更老的孤岛 + 缺口 + 最新连续尾段」，
- * 此时 `messages[0]` 是孤岛边缘，不是向上翻页该用的游标。切段尺子与渲染层相同
- * (`HISTORY_GAP_SPLIT_MS`)；没有超过该阈值的空洞时，整窗都算最新连续段。
+ * 孤岛边界行恒在窗口里(模型不变量),找不到只可能是模型被破坏 —— 调用方一律按
+ * 保守方向处理(返回原集合或整窗不连续),绝不让快速通道把孤岛行当成主段。
  */
-function oldestMessageOfNewestContiguousRun(messages: ChatMessage[]): ChatMessage | null {
-  if (messages.length === 0) return null;
-  let runStart = 0;
-  for (let i = 1; i < messages.length; i++) {
-    const prev = messageTime(messages[i - 1].createdAt);
-    const next = messageTime(messages[i].createdAt);
-    if (!Number.isFinite(prev) || !Number.isFinite(next)) continue;
-    if (next - prev > HISTORY_GAP_SPLIT_MS) runStart = i;
-  }
-  return messages[runStart] ?? null;
+function messageIndexByClientId(
+  messages: readonly { clientId: string }[],
+  clientId: string,
+): number {
+  return messages.findIndex((message) => message.clientId === clientId);
 }
 
-function messageMatchesHistoryCursor(
-  message: ChatMessage,
-  cursorId: string,
-): boolean {
+/**
+ * 主连续段(最新尾段)最老一行的位置,用于向上翻页的 beforeTs 游标。
+ *
+ * `messages` 是 oldest-first。窗口可能是「更老的孤岛 + 缺口 + 最新连续尾段」,
+ * 此时 `messages[0]` 是孤岛边缘,不是向上翻页该用的游标。主段由显式孤岛模型推导
+ * (最后一个孤岛最新边界行之后的全部行),不再用时间阈值近似 —— 见 searchJumpTargeting
+ * 的 mainContiguousRunStartIndex 与 canFocusWithoutJumpLoad 的说明。
+ */
+function oldestMessageOfMainContiguousRun(
+  messages: ChatMessage[],
+  islands: readonly LoadedWindowIsland[],
+): ChatMessage | null {
+  return messages[mainContiguousRunStartIndex(messages, islands)] ?? null;
+}
+
+/**
+ * 分页把窗口从游标向更老一侧推进后,按"孤岛是否真的被翻页跨过"逐座收口孤岛集合。
+ *
+ * 翻页从主段游标一路取更老的行,凡是整座落在 [新边界, 游标] 区间里的孤岛都被接回主段
+ * (它的行本来就在库里,list 会原样带回、由 mergeMessages 去重)→ 从模型移除;只被跨过
+ * 最新一侧的孤岛存活部分的最老边界不变、最新边界换成新边界前一行(B-1 是存活部分的
+ * 最新一行,必然在窗口里);完全没被碰到的保持原样。
+ *
+ * 这就是「孤岛 + 已翻到历史起点」的会话恢复零成本跳转的通道:翻页把洞填上之后,
+ * 窗口内搜索不再需要每次白打一轮 around + list。
+ */
+function absorbIslandsCrossedByPaging(
+  islands: readonly LoadedWindowIsland[],
+  messages: ChatMessage[],
+  newOldestBoundaryId: string | null,
+): readonly LoadedWindowIsland[] {
+  if (islands.length === 0 || !newOldestBoundaryId) return islands;
+  // 游标可能是 DB row id(调用方传 oldestId / cursorId 等分页游标)也可能是
+  // clientId,统一按"clientId 或 server id 命中"匹配,与 retainedWindowKeepsGapCursor
+  // 同一口径 —— 只按 clientId 找会让生产里的边界永远落空、孤岛收口失效。
+  const boundaryIdx = messages.findIndex((message) =>
+    messageMatchesHistoryCursor(message, newOldestBoundaryId),
+  );
+  if (boundaryIdx < 0) return islands;
+  const next: LoadedWindowIsland[] = [];
+  for (const island of islands) {
+    const oldestIdx = messageIndexByClientId(messages, island.oldestClientId);
+    const newestIdx = messageIndexByClientId(messages, island.newestClientId);
+    if (oldestIdx >= boundaryIdx) continue; // 整座孤岛被翻页覆盖 → 接回主段
+    if (newestIdx >= boundaryIdx) {
+      // 只跨过最新一侧:存活部分 = [oldest, B-1],B-1 就在窗口里(孤岛连续块的一部分)。
+      next.push({
+        oldestClientId: island.oldestClientId,
+        newestClientId: messages[boundaryIdx - 1].clientId,
+      });
+      continue;
+    }
+    next.push(island);
+  }
+  return next;
+}
+
+/**
+ * around 行 merge 进窗口后,按"around 块与窗口里既有行 / 既有孤岛的重叠关系"重算孤岛集合。
+ *
+ * around 块是库里的一段连续行。它与窗口里某段已加载区间**重叠**(哪怕重叠一行)就说明它
+ * 和那段连成一片:重叠落在主段 → 主段向更老/更新延伸、不产生新洞;重叠落在既有孤岛 →
+ * 孤岛延伸(两座孤岛经 around 块连通后合并成一座)。完全不重叠才是新孤岛,边界取 around
+ * 块在窗口里的最老/最新行。
+ *
+ * 块与主段重叠时的保守口径:返回原集合 —— 即使块顺带接住了更深处的一座孤岛,多留一座
+ * 标记只是多做补齐尝试,方向安全(#676 的既有口径,见 commitAroundWindow 的 covered 注)。
+ *
+ * "块是否连上主段"必须在**合并前**的窗口(prevMessages)上判定:合并后主段起点会被新插入
+ * 的行顶到块自己身上,「无孤岛窗口 + 首座失败跳转孤岛」会退化成主段吸收,孤岛永远记不上
+ * (T / Y3 回归)。判据是"块里至少有一行本来就躺在 prevMessages 的主段里" —— 块是库里
+ * 一段连续行,它跨过主段边界时,边界两侧都必须已经在窗口里才算连上。
+ */
+function updateIslandsAfterAroundMerge(
+  islands: readonly LoadedWindowIsland[],
+  prevMessages: ChatMessage[],
+  messages: ChatMessage[],
+  aroundRows: readonly Message[],
+): readonly LoadedWindowIsland[] {
+  if (aroundRows.length === 0) return islands;
+  // around 块在窗口里的下标范围:只统计真的进了窗口的行(hidden thinking 行会被
+  // mapServerMessages 过滤掉,不进窗口,但不影响块的连通范围判定)。
+  let blockStart = -1;
+  let blockEnd = -1;
+  // 主段起点在合并前的窗口上算(见函数注释):无孤岛时整窗都算主段,合并后算会把
+  // 刚插进来的孤岛行也圈进主段。
+  const prevMainStart = mainContiguousRunStartIndex(prevMessages, islands);
+  let touchesPrevMainRun = false;
+  for (const row of aroundRows) {
+    const idx = messageIndexByClientId(messages, row.clientId);
+    if (idx < 0) continue;
+    if (blockStart < 0 || idx < blockStart) blockStart = idx;
+    if (idx > blockEnd) blockEnd = idx;
+    if (messageIndexByClientId(prevMessages, row.clientId) >= prevMainStart) {
+      touchesPrevMainRun = true;
+    }
+  }
+  if (blockStart < 0) return islands;
+  // 块里任何一行本来就躺在主段里 → 块经它连上主段,主段向更老/更新延伸,孤岛集合不动。
+  if (touchesPrevMainRun) return islands;
+
+  // 块完全落在主段更老一侧:与既有孤岛合并(经块连通的孤岛合并成一座)或新建一座。
+  let mergedOldestClientId: string | null = null;
+  let mergedNewestClientId: string | null = null;
+  let mergedAny = false;
+  const next: LoadedWindowIsland[] = [];
+  for (const island of islands) {
+    const oldestIdx = messageIndexByClientId(messages, island.oldestClientId);
+    const newestIdx = messageIndexByClientId(messages, island.newestClientId);
+    const overlaps =
+      oldestIdx >= 0 && newestIdx >= 0 && oldestIdx <= blockEnd && newestIdx >= blockStart;
+    if (!overlaps) {
+      next.push(island);
+      continue;
+    }
+    mergedAny = true;
+    if (mergedOldestClientId === null || oldestIdx < blockStart) {
+      mergedOldestClientId = island.oldestClientId;
+    }
+    if (mergedNewestClientId === null || newestIdx > blockEnd) {
+      mergedNewestClientId = island.newestClientId;
+    }
+  }
+  next.push({
+    oldestClientId: mergedOldestClientId ?? messages[blockStart].clientId,
+    newestClientId: mergedNewestClientId ?? messages[blockEnd].clientId,
+  });
+  // 块可能插在两座孤岛之间 → 按窗口位置重排(孤岛很少,排序开销可忽略)。
+  next.sort(
+    (a, b) =>
+      messageIndexByClientId(messages, a.oldestClientId) -
+      messageIndexByClientId(messages, b.oldestClientId),
+  );
+  return next;
+}
+
+/**
+ * 裁剪后按保留窗口收口孤岛集合。
+ *
+ * `slice(-TRIM_TARGET)` 从最老一侧裁。整座被裁掉的孤岛随洞一起消失;被拦腰裁断的那座
+ * 存活部分的最老边界换成本窗口最老行 —— 孤岛按时间升序、裁剪只会先切最老的孤岛,所以
+ * 窗口最老行就是那座被裁孤岛存活部分的最老一行,精确而非近似。
+ */
+function pruneIslandsForTrimmedWindow(
+  islands: readonly LoadedWindowIsland[],
+  retained: ChatMessage[],
+): readonly LoadedWindowIsland[] {
+  if (islands.length === 0) return islands;
+  const retainedIds = new Set(retained.map((message) => message.clientId));
+  const fallbackOldest = retained[0]?.clientId ?? null;
+  const next: LoadedWindowIsland[] = [];
+  for (const island of islands) {
+    if (!retainedIds.has(island.newestClientId)) continue;
+    next.push({
+      oldestClientId:
+        retainedIds.has(island.oldestClientId) || fallbackOldest === null
+          ? island.oldestClientId
+          : fallbackOldest,
+      newestClientId: island.newestClientId,
+    });
+  }
+  return next;
+}
+
+/**
+ * 保守的"整窗不连续"建模:主段置空(孤岛边界行取窗口最新行),任何目标都不会命中
+ * 主段快速通道,一律走补齐尝试 —— 与旧 boolean=true 同语义。
+ */
+function conservativeIslandsFor(messages: ChatMessage[]): readonly LoadedWindowIsland[] {
+  const newest = messages[messages.length - 1];
+  if (!newest) return EMPTY_WINDOW_ISLANDS;
+  return [{ oldestClientId: newest.clientId, newestClientId: newest.clientId }];
+}
+
+/**
+ * 删除行后重算孤岛集合:删除落在某座孤岛的区间内会把它拦腰截断,剩余部分的连通性
+ * 不再可判 → 保守按整窗不连续建模。删在主段里与旧 boolean 同口径(不另记孤岛)。
+ */
+function conservativeIfIslandRowRemoved(
+  islands: readonly LoadedWindowIsland[],
+  prevMessages: ChatMessage[],
+  removedIds: ReadonlySet<string>,
+  nextMessages: ChatMessage[],
+): readonly LoadedWindowIsland[] {
+  if (islands.length === 0) return islands;
+  for (const island of islands) {
+    const oldestIdx = messageIndexByClientId(prevMessages, island.oldestClientId);
+    const newestIdx = messageIndexByClientId(prevMessages, island.newestClientId);
+    if (oldestIdx < 0 || newestIdx < 0) return conservativeIslandsFor(nextMessages);
+    for (const message of prevMessages) {
+      if (!removedIds.has(message.clientId)) continue;
+      const idx = messageIndexByClientId(prevMessages, message.clientId);
+      if (idx >= oldestIdx && idx <= newestIdx) return conservativeIslandsFor(nextMessages);
+    }
+  }
+  return islands;
+}
+
+/**
+ * 从最新一侧截断(edit-last)后重算孤岛集合:整座落在截断区里的孤岛随洞消失;被拦腰
+ * 截断的那座存活部分的最老边界仍在、最新边界未知 → 保守按整窗不连续建模。
+ */
+function pruneIslandsAfterNewestTruncation(
+  islands: readonly LoadedWindowIsland[],
+  prevMessages: ChatMessage[],
+  truncateFromIdx: number,
+): readonly LoadedWindowIsland[] {
+  if (islands.length === 0) return islands;
+  const next: LoadedWindowIsland[] = [];
+  for (const island of islands) {
+    const oldestIdx = messageIndexByClientId(prevMessages, island.oldestClientId);
+    const newestIdx = messageIndexByClientId(prevMessages, island.newestClientId);
+    if (oldestIdx >= truncateFromIdx) continue;
+    if (newestIdx >= truncateFromIdx) {
+      return conservativeIslandsFor(prevMessages.slice(0, truncateFromIdx));
+    }
+    next.push(island);
+  }
+  return next;
+}
+
+function messageMatchesHistoryCursor(message: ChatMessage, cursorId: string): boolean {
   return message.clientId === cursorId || message.id === cursorId;
 }
 
@@ -3573,7 +3972,42 @@ function retainedWindowKeepsGapCursor(
   return cursorIndex > 0;
 }
 
-function _trimMessagesIfNeeded(sessionId: string): void {
+// A just-closed reading window is still a warm navigation target. Trimming it
+// to the tail forces an around-message IPC/backfill before restoring the reader.
+// Reuse existing session storage, with bounded reservations derived from current
+// state so clear/purge/epoch changes cannot resurrect a separate stale copy.
+const WARM_READING_WINDOWS = 2;
+const WARM_READING_MAX_MESSAGES = 1000;
+const WARM_READING_MAX_CHARACTERS = 32 * 1024 * 1024;
+
+function _trimMessagesIfNeeded(): void {
+  const retained = new Set<string>();
+  let characters = 0;
+  const now = Date.now();
+  // Reverse before sorting so equal timestamps also prefer the latest leave.
+  const recent = [..._lastViewedAt.entries()].reverse().sort((a, b) => b[1] - a[1]);
+  for (const [id, lastViewed] of recent) {
+    if (retained.size >= WARM_READING_WINDOWS) break;
+    const state = sessions.get(id);
+    const scroll = readSessionScroll(id);
+    if (!state?.historyLoaded || _activeViewSessions.has(id) || _isSessionBusy(id, state) ||
+      now - lastViewed >= DEMOTE_IDLE_MS || scroll?.isNearBottom !== false ||
+      state.messages.length <= TRIM_THRESHOLD || state.messages.length > WARM_READING_MAX_MESSAGES) continue;
+    const anchor = scroll.messageClientId ?? scroll.restoreClientId;
+    if (!anchor || !state.messages.some((message) => message.clientId === anchor)) continue;
+    const size = state.messages.reduce((sum, message) => sum + message.content.length, 0);
+    if (characters + size > WARM_READING_MAX_CHARACTERS) continue;
+    characters += size;
+    retained.add(id);
+  }
+  // Admission or a background update can displace another window. Apply the
+  // original guarded/epoch-aware trim to it immediately, not on its next visit.
+  for (const id of sessions.keys()) {
+    if (!retained.has(id)) _trimSessionMessages(id);
+  }
+}
+
+function _trimSessionMessages(sessionId: string): void {
   const state = sessions.get(sessionId);
   if (!state || state.messages.length <= TRIM_THRESHOLD) return;
   if (_isSessionBusy(sessionId, state)) return;
@@ -3598,7 +4032,7 @@ function _trimMessagesIfNeeded(sessionId: string): void {
     // 的精确游标。清成 null 后空闲恢复会拿 messages[0](孤岛)当 beforeTs,向更老处
     // 翻页,填不了孤岛与尾段之间的缺口,未解析计划会一直缺席到整窗重载。
     const keepGapCursor =
-      s.historyWindowHasIsland === true &&
+      s.historyWindowIslands.length > 0 &&
       retainedWindowKeepsGapCursor(retained, s.oldestMessageId);
     return {
       ...s,
@@ -3606,13 +4040,13 @@ function _trimMessagesIfNeeded(sessionId: string): void {
       hasMoreMessages: true,
       oldestMessageId: keepGapCursor ? s.oldestMessageId : null,
       isLoadingMore: false,
-      // 孤岛标记**保持原值**:`slice(-TRIM_TARGET)` 只保证"取最新的 200 行",不保证这 200 行
+      // 孤岛集合按保留窗口收口:`slice(-TRIM_TARGET)` 只保证"取最新的 200 行",不保证这 200 行
       // 连续 —— 若先前几次深跳留下多个孤岛、而真正连续的尾段不足 200 行,裁剪结果里就还夹着
-      // 孤岛。清掉标记会让 canFocusWithoutJumpLoad 把命中孤岛当成已覆盖直接 focus,而从孤岛
-      // 边界往上翻又取不到那段更新的缺失区间 → 洞永久固化,直到整会话重载(#676 review)。
-      //
-      // 代价是出现过孤岛的会话在裁剪后仍会多做补齐尝试;方向上是安全的那一侧。
-      // 真正清零只发生在"整窗从最新重建"的路径(reloadMessages / clear / demote / purge)。
+      // 孤岛。整座被裁掉的孤岛随洞一起消失;被拦腰裁断的那座只保留存活部分(最老边界换成本
+      // 窗口最老行,见 pruneIslandsForTrimmedWindow)。漏收口会让 canFocusWithoutJumpLoad
+      // 把命中孤岛当成已覆盖直接 focus,而从孤岛边界往上翻又取不到那段更新的缺失区间 →
+      // 洞永久固化,直到整会话重载(#676 review)。
+      historyWindowIslands: pruneIslandsForTrimmedWindow(s.historyWindowIslands, retained),
     };
   });
 }
@@ -3644,6 +4078,18 @@ const _activeViewSessions = new Map<string, number>();
 // On leave, history is invalidated and live error banner is cleared so the
 // reloaded history shows only the persisted ErrorMessageCard.
 const _pendingErrorClearOnLeave = new Set<string>();
+/** Deferred persist IPC in flight: live 横幅点关闭/重试时还没有 persistId,等它回来再 dismiss。 */
+const _deferredTurnErrorPersist = new Map<string, Promise<string | undefined>>();
+/**
+ * 当前 live 终态错误的代次。error 从有到无、从无到有、或换成另一条文案时 +1。
+ * 迟到的 deferred IPC / 脏信号必须对上这一代,才能绑 persistId 或清 live 横幅。
+ */
+const _liveErrorEpoch = new Map<string, number>();
+/**
+ * 本窗口 deferred IPC 带回、但已对不上当前代次的 persistId。
+ * 脏信号不带 renderer epoch(跨窗口对不上),用这份名单拒绝把 A 绑到 B。
+ */
+const _staleDeferredErrorPersistIds = new Map<string, Set<string>>();
 
 /** Terminal error 后、配对 done 到达前，凭据刷新必须等 host 空闲。 */
 const GATEWAY_PROXY_TOKEN_TURN_SETTLE_MS = 5_000;
@@ -3694,11 +4140,109 @@ function resolveGatewayRecoveryProviderId(
 }
 
 function enterView(sessionId: string): () => void {
+  const view = getRemoteHistoryView(sessionId);
+  const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+  if (deviceId) view?.setNetworkAvailable(!isRemoteDeviceMarkedDisconnected(deviceId));
+  const resumingHistory = view && !view.isActive();
+  view?.setActive(true);
   _activeViewSessions.set(sessionId, (_activeViewSessions.get(sessionId) ?? 0) + 1);
   _lastViewedAt.delete(sessionId);
   _ensureDemoteTimer();
-  scheduleIdlePlanDiscoveryIfNeeded(sessionId);
+  if (resumingHistory) {
+    // A repair push may have arrived after leaveView, when refresh is inactive.
+    // Reuse the normal resume read to hand off unchanged streaming rows too.
+    void reconcileRemoteMessages(sessionId, { force: true, repair: true, freshHistory: false }).then(() => {
+      if (!view.getSnapshot().error) scheduleIdlePlanDiscoveryIfNeeded(sessionId);
+    }).catch(() => undefined);
+  } else scheduleIdlePlanDiscoveryIfNeeded(sessionId);
   return () => leaveView(sessionId);
+}
+
+function persistTurnErrorDeferredTracked(
+  sessionId: string,
+  errData: Record<string, unknown> | null,
+  agentMeta: AgentMeta | null = null,
+): void {
+  // 必须在 live error 已经 setState 之后调用,这样抓到的是这一代横幅的 epoch。
+  const epoch = _liveErrorEpoch.get(sessionId) ?? 0;
+  let pending: Promise<string | undefined>;
+  pending = makerApiFor(sessionId)
+    .input.persistTurnErrorDeferred(sessionId, errData, agentMeta)
+    .then((persistId) => {
+      const id = typeof persistId === 'string' && persistId ? persistId : undefined;
+      // IPC 回执只表示已入队并登记了 persistId,不是 createMessage 成功。
+      // 先绑定身份再摘掉 pending,点关闭/重试才能 dismiss 同一行;
+      // 历史失效与后台清 live 仍等 local-db:session:error-persisted。
+      // 代次已变(用户已进入下一轮横幅)则丢弃,避免把 A 的 id 绑到 B。
+      if (id) {
+        if ((_liveErrorEpoch.get(sessionId) ?? 0) !== epoch) {
+          const stale = _staleDeferredErrorPersistIds.get(sessionId) ?? new Set();
+          stale.add(id);
+          _staleDeferredErrorPersistIds.set(sessionId, stale);
+        }
+        bindLiveErrorPersistId(sessionId, id, epoch);
+      }
+      if (_deferredTurnErrorPersist.get(sessionId) === pending) {
+        _deferredTurnErrorPersist.delete(sessionId);
+      }
+      return id;
+    })
+    .catch((err: unknown) => {
+      if (_deferredTurnErrorPersist.get(sessionId) === pending) {
+        _deferredTurnErrorPersist.delete(sessionId);
+      }
+      log.warn('deferred turn error persist failed', err);
+      return undefined;
+    });
+  _deferredTurnErrorPersist.set(sessionId, pending);
+}
+
+function bindLiveErrorPersistId(sessionId: string, persistId: string, epoch?: number): void {
+  const state = sessions.get(sessionId);
+  if (!state?.error || state.errorPersistId) return;
+  if (epoch !== undefined && (_liveErrorEpoch.get(sessionId) ?? 0) !== epoch) return;
+  setState(sessionId, (s) => ({
+    ...s,
+    errorPersistId: s.error && !s.errorPersistId ? persistId : s.errorPersistId,
+  }));
+}
+
+function applyErrorPersistedDirtySignal(sessionId: string, persistId?: string): void {
+  const state = sessions.get(sessionId);
+  if (!state) return;
+  if (
+    persistId &&
+    !state.errorPersistId &&
+    state.error &&
+    !_deferredTurnErrorPersist.has(sessionId) &&
+    !_staleDeferredErrorPersistIds.get(sessionId)?.has(persistId)
+  ) {
+    // 本窗口没有 in-flight deferred(设备互联控制端只收到脏信号):绑到当前未绑定横幅。
+    // 本窗口刚拒绝过的迟到 persistId 不算控制端信号,不能绑到下一轮错误。
+    bindLiveErrorPersistId(sessionId, persistId);
+  }
+  const latest = sessions.get(sessionId) ?? state;
+  if (persistId && latest.errorPersistId !== persistId) {
+    // 上一轮错误的写成功:不能绑到或清掉当前横幅。历史仍可能因那一行落库而脏。
+    if (!_activeViewSessions.has(sessionId) && latest.historyLoaded) {
+      setState(sessionId, (s) => (s.historyLoaded ? { ...s, historyLoaded: false } : s));
+    }
+    return;
+  }
+  if (_activeViewSessions.has(sessionId)) {
+    // Keep live banner during active view; invalidate + clear on leave so the
+    // persisted card can appear the next time the user enters without having
+    // clicked. Click (retry/close) is what disposes — leave does not.
+    _pendingErrorClearOnLeave.add(sessionId);
+    return;
+  }
+  setState(sessionId, (s) => ({
+    ...s,
+    ...(s.historyLoaded ? { historyLoaded: false } : {}),
+    ...(s.error
+      ? { error: null, usageLimitRecovery: null, errorRetryText: null, errorPersistId: null }
+      : {}),
+  }));
 }
 
 function leaveView(sessionId: string): void {
@@ -3710,6 +4254,7 @@ function leaveView(sessionId: string): void {
     return;
   }
   _activeViewSessions.delete(sessionId);
+  getRemoteHistoryView(sessionId)?.setActive(false);
   cancelIdlePlanDiscovery(sessionId);
   _lastViewedAt.set(sessionId, Date.now());
   if (_pendingErrorClearOnLeave.has(sessionId)) {
@@ -3717,10 +4262,12 @@ function leaveView(sessionId: string): void {
     setState(sessionId, (s) => ({
       ...s,
       ...(s.historyLoaded ? { historyLoaded: false } : {}),
-      ...(s.error ? { error: null, usageLimitRecovery: null, errorRetryText: null } : {}),
+      ...(s.error
+        ? { error: null, usageLimitRecovery: null, errorRetryText: null, errorPersistId: null }
+        : {}),
     }));
   }
-  _trimMessagesIfNeeded(sessionId);
+  _trimMessagesIfNeeded();
 }
 
 function _demoteIdleSessions(): void {
@@ -3742,6 +4289,9 @@ function _demoteIdleSessions(): void {
     // 分页锁。漏 bump 的后果是 in-flight 那一页按 demote 前的游标提交,把一段脱离上下文
     // 的旧历史 merge 进空切片(或重开后的新切片),最近的消息反而缺席(#676 review)。
     cancelIdlePlanDiscovery(sessionId);
+    // Discard the view with its message slice. Resetting an active prefetch would
+    // start another read and immediately repopulate the cache being evicted.
+    releaseRemoteHistoryView(sessionId);
     invalidateMessageHistoryWindow(sessionId);
     setState(sessionId, (s) => ({
       ...s,
@@ -3751,7 +4301,7 @@ function _demoteIdleSessions(): void {
       oldestMessageId: null,
       hasMoreMessages: true,
       isLoadingMore: false,
-      historyWindowHasIsland: false,
+      historyWindowIslands: EMPTY_WINDOW_ISLANDS,
     }));
   }
 }
@@ -3772,6 +4322,7 @@ function getOrCreateState(sessionId: string): SessionChatState {
   let state = sessions.get(sessionId);
   if (!state) {
     state = createInitialState();
+    sessionIncarnations.set(sessionId, nextSessionIncarnation++);
     sessions.set(sessionId, state);
     _touchSession(sessionId);
     _evictLruIfNeeded();
@@ -3789,6 +4340,9 @@ function setState(
   const prev = getOrCreateState(sessionId);
   const next = updater(prev);
   if (next === prev) return;
+  if (prev.error !== next.error) {
+    _liveErrorEpoch.set(sessionId, (_liveErrorEpoch.get(sessionId) ?? 0) + 1);
+  }
   const previousIssueRequestId = prev.pendingIssueConfirm?.requestId;
   if (previousIssueRequestId && next.pendingIssueConfirm?.requestId !== previousIssueRequestId) {
     clearIssueConfirmDraft(sessionId, previousIssueRequestId);
@@ -3855,10 +4409,6 @@ function scheduleWakeBridgeReconciliation(sessionId: string): void {
     });
   }, WAKE_BRIDGE_RECONCILE_MS);
   wakeBridgeReconcileTimers.set(sessionId, timer);
-}
-
-function notify(sessionId: string): void {
-  emitStateNotifications(sessionId);
 }
 
 /**
@@ -4050,6 +4600,13 @@ function applyInputProjection(
     }
   }
   let settlingClientIds: string[] = [];
+  let locallyDispatchedQueueItems: QueuedMessage[] = [];
+  const deferredPersistFromProjection: {
+    payload: {
+      data: Record<string, unknown> | null;
+      agentMeta: Record<string, unknown> | null;
+    } | null;
+  } = { payload: null };
   setState(projection.sessionId, (s) => {
     // DB created 可能先于 projection 回来；正式消息已经占据 transcript 的同一
     // clientId 位置时，不要让稍晚的旧 pendingQueue 再造一行重复队列项。
@@ -4095,6 +4652,19 @@ function applyInputProjection(
       );
     });
     settlingClientIds = settlingQueueItems.map((item) => item.clientId);
+    // A local send can race with the main coordinator becoming idle between
+    // the renderer's busy check and `input.enqueue()`. In that case the
+    // coordinator starts the turn immediately and the returned projection has
+    // an empty pendingQueue. Keep the optimistic row visible as a pending
+    // transcript message until the durable messages:created echo arrives (or
+    // a later authoritative projection puts it back in the queue after a
+    // pre-accept failure).
+    locallyDispatchedQueueItems = s.pendingQueue.filter(
+      (item) =>
+        item.isPendingEnqueue === true &&
+        !currentQueueIds.has(item.clientId) &&
+        !persistedMessageIds.has(item.clientId),
+    );
     // Only trigger if the retried message is still stuck in the pending queue:
     // projection.error is queue-level (string | null, no clientId), so we correlate
     // via pendingQueue. If the retry message was already dispatched and the agent
@@ -4108,11 +4678,11 @@ function applyInputProjection(
         ? s._authRetryPersistOnProjectionError
         : null;
     if (authRetryProjectionError) {
-      void makerApiFor(projection.sessionId).input.persistTurnErrorDeferred(
-        projection.sessionId,
-        authRetryProjectionError.data,
-        authRetryProjectionError.agentMeta,
-      );
+      // 等这次 setState 把 live error 装上并 bump epoch 后再 persist,否则抓到的是上一代。
+      deferredPersistFromProjection.payload = {
+        data: authRetryProjectionError.data,
+        agentMeta: authRetryProjectionError.agentMeta,
+      };
     }
     // 视觉连续性兜底: sendMessage 在"agent 空闲假设"下会乐观把 user 气泡
     // (isPendingPersist) 提前 push 进 messages。如果某条乐观气泡的 clientId 仍停在
@@ -4125,9 +4695,13 @@ function applyInputProjection(
       queuedIds.size > 0 && s.messages.some((m) => m.isPendingPersist && queuedIds.has(m.clientId))
         ? s.messages.filter((m) => !(m.isPendingPersist && queuedIds.has(m.clientId)))
         : s.messages;
-    const withSettlingMessages = settlingQueueItems.reduce<ChatMessage[]>((messages, item) => {
+    const withSettlingMessages = [
+      ...settlingQueueItems,
+      ...locallyDispatchedQueueItems,
+    ].reduce<ChatMessage[]>((messages, item) => {
       if (messages.some((message) => message.clientId === item.clientId)) return messages;
-      return [...messages, { ...item.chatMessage, isPendingPersist: true }];
+      const row = { ...item.chatMessage, isPendingPersist: true };
+      return [...messages, remoteProjection ? reserveRemoteUser(row, messages) : row];
     }, dedupedMessages);
     // Codex 原生重连已经被 host 接管、进入凭证切换等待或明确回落时，原生进行态行
     // 必须让位给 Cindy 的接管行、凭证切换状态或终态错误。没有这些字段的普通
@@ -4185,6 +4759,11 @@ function applyInputProjection(
       : projection.error === s.error
         ? s.usageLimitRecovery
         : extractUsageLimitRecoveryHint({ message: projection.error });
+    const projectionErrorReason =
+      projection.error && typeof projection.errorReason === 'string' && projection.errorReason.length > 0
+        ? projection.errorReason
+        : null;
+    const projectionToolLoop = parseToolLoopErrorDetails(projection.toolLoop) ?? null;
     return {
       ...s,
       messages,
@@ -4198,14 +4777,17 @@ function applyInputProjection(
       error: projection.error,
       usageLimitRecovery,
       // projection 覆盖 error(dispatch 失败等,无 reason 语义)→ reason 一并清,
-      // 避免 silent-stop 的「继续」按钮挂在一条不相干的错误上。
-      errorReason: null,
+      // 避免 silent-stop 的「继续」按钮挂在一条不相干的错误上。结构化字段同样
+      // 只在 error 仍存在时保留，并经过 parser 进行远端边界校验。
+      errorReason: projectionErrorReason,
+      toolLoop: projectionToolLoop,
       // 进入凭证切换等待态时同步清 stale recoverableError:等待中的消息永不 dispatch,
       // 没有 stream/turn-done 事件替它清 —— 残留会让视图的 error(=recoverableError
       // 回落)遮住等待横幅,复现"静默排队"(review P2 2026-07-04)。
       recoverableError:
         projection.error || projection.credentialSwitchWait ? null : s.recoverableError,
       errorRetryText: projection.errorRetryText,
+      errorPersistId: projection.error ? s.errorPersistId : null,
       credentialSwitchWait: projection.credentialSwitchWait ?? null,
       continuationInFlightClientId: projection.continuationInFlightClientId ?? null,
       continuationTurnClientId: projectedContinuationTurnClientId,
@@ -4216,6 +4798,13 @@ function applyInputProjection(
       ...(authRetryProjectionError ? { _authRetryPersistOnProjectionError: undefined } : {}),
     };
   });
+  if (deferredPersistFromProjection.payload) {
+    persistTurnErrorDeferredTracked(
+      projection.sessionId,
+      deferredPersistFromProjection.payload.data,
+      (deferredPersistFromProjection.payload.agentMeta as AgentMeta | null) ?? null,
+    );
+  }
   for (const clientId of settlingClientIds) {
     scheduleRemoteOptimisticSettlingRetirement(projection.sessionId, clientId);
   }
@@ -4686,7 +5275,7 @@ function mergeAgentTaskUpdate(
     // CLI 节流帧不带 workflowProgress(undefined = 沿用旧树),必须保留上一帧。
     workflowProgress: next.workflowProgress ?? prev.workflowProgress,
     createdAt: prev.createdAt ?? next.createdAt,
-    model: next.model === null ? null : next.model ?? prev.model,
+    model: next.model === null ? null : (next.model ?? prev.model),
     updatedAt: next.updatedAt ?? prev.updatedAt,
   };
 }
@@ -4739,6 +5328,17 @@ function hasRunningWakeTask(state: SessionChatState): boolean {
 function hasBackgroundAgentWork(sessionId: string, state: SessionChatState): boolean {
   if (state.pendingTaskWake === 0 && !hasRunningWakeTask(state)) return false;
   return !isRemoteSessionSticky(sessionId) && !state.remoteHostId;
+}
+
+/**
+ * Any task that is still live while Main retains the session handle must
+ * survive a rejected owner transition. This is deliberately broader than
+ * hasBackgroundAgentWork: local_bash and other non-wake tasks do not keep the
+ * foreground turn running, but stopping their renderer projection during a
+ * rollback would still hide work that Main never stopped.
+ */
+function hasRunningBackgroundTask(state: SessionChatState): boolean {
+  return [...(state.taskUpdates?.values() ?? [])].some((task) => task.status === 'running');
 }
 
 /**
@@ -4886,7 +5486,7 @@ export function handleStreamEvent(
       : null;
   const isCodexReconnectProgress =
     event.type === 'error' &&
-    event.source === 'codex' &&
+    (event.source === 'codex' || event.source === 'pi') &&
     !isTerminalErrorData(event.data) &&
     reconnectAttempt !== null &&
     !isCodexUserActionableRetryError(event.data);
@@ -4913,6 +5513,7 @@ export function handleStreamEvent(
   // - turnCompleted 由 main 在 done 边界盖到该 SDK turn 的最后一条 assistant 上,
   //   让后台任务自动续跑时前一轮正式总结不会被后续补充回复顶掉。
   const assistantMetaFields: {
+    botPrivateReply?: boolean;
     model?: string;
     parentToolUseId?: string;
     turnCompleted?: boolean;
@@ -4924,6 +5525,7 @@ export function handleStreamEvent(
       ? { parentToolUseId: incomingMeta.parentUuid }
       : {}),
     ...(incomingMeta?.turnCompleted === true ? { turnCompleted: true } : {}),
+    ...(typeof incomingMeta?.botPrivateReply === 'boolean' ? { botPrivateReply: incomingMeta.botPrivateReply } : {}),
   };
   switch (event.type) {
     case 'text': {
@@ -4933,15 +5535,113 @@ export function handleStreamEvent(
         isFinal: boolean;
         isFullText?: boolean;
       };
+      const snapshot = readRemoteTextSnapshot(event);
+      if (snapshot?.truncated) return state;
+      // Persistence can finish the row before the turn clears streamingClientId.
+      // The row, rather than that assembly pointer, owns durable precedence.
+      if (snapshot && event.persistId && state.messages.some((message) =>
+        message.clientId === event.persistId && message.role === 'assistant' && !message.isStreaming)) return state;
+
+      // A full-text snapshot can be non-final while the item is still streaming.
+      // It is authoritative for the current block and must replace the delta
+      // prefix rather than being appended as another delta.
+      if (
+        !isFinal &&
+        isFullText === true &&
+        event.persistId &&
+        event.persistId === state.streamingClientId &&
+        typeof text === 'string'
+      ) {
+        const id = state.streamingClientId;
+        return {
+          ...state,
+          streamingText: text,
+          lastAgentMeta: incomingMeta ?? state.lastAgentMeta,
+          messages: replaceMessage(
+            state.messages,
+            (message) => message.clientId === id,
+            (message) => ({ ...message, content: text, ...assistantMetaFields,
+              ...(snapshot?.createdAt ? { createdAt: snapshot.createdAt } : {}) }),
+          ),
+        };
+      }
+
+      // A DB/history snapshot can beat the first batched delta, or an old item's
+      // final event can arrive after a newer item starts. Identity, not tail
+      // position/content equality, decides whether this is a new bubble.
+      if (event.persistId && event.persistId !== state.streamingClientId) {
+        const existing = state.messages.find(
+          (message) => message.clientId === event.persistId && message.role === 'assistant',
+        );
+        if (existing) {
+          // Persisted/finalized text already includes these late deltas. Only an
+          // explicitly authoritative full-text event may calibrate it again.
+          if (!isFinal) {
+            if (isFullText !== true || typeof text !== 'string') return state;
+            const updated = {
+              ...existing,
+              content: text,
+              ...assistantMetaFields,
+            };
+            const isCurrentStream = state.streamingClientId === event.persistId;
+            const lastAgentMeta = state.streamingClientId
+              ? state.lastAgentMeta
+              : incomingMeta ?? state.lastAgentMeta;
+            const unchanged = shallowEqualChatMessage(existing, updated);
+            if (unchanged && !isCurrentStream && lastAgentMeta === state.lastAgentMeta) return state;
+            return {
+              ...state,
+              ...(isCurrentStream ? { streamingText: text } : {}),
+              lastAgentMeta,
+              messages: unchanged
+                ? state.messages
+                : replaceMessage(state.messages, (message) => message === existing, () => updated),
+            };
+          }
+          const updated = {
+            ...existing,
+            ...(isFullText === true && text ? { content: text } : {}),
+            ...assistantMetaFields,
+          };
+          // A late item may update its own chip, not the newer stream's metadata.
+          const lastAgentMeta = state.streamingClientId
+            ? state.lastAgentMeta
+            : incomingMeta ?? state.lastAgentMeta;
+          const unchanged = shallowEqualChatMessage(existing, updated);
+          if (unchanged && lastAgentMeta === state.lastAgentMeta) return state;
+          return {
+            ...state,
+            lastAgentMeta,
+            messages: unchanged
+              ? state.messages
+              : replaceMessage(state.messages, (message) => message === existing, () => updated),
+          };
+        }
+      }
+
+      // Main assigns a fresh persistId when the provider starts a distinct assistant item.
+      // Seal the preceding bubble before applying the new item's deltas/full-text calibration.
+      const itemBoundary = Boolean(
+        event.persistId &&
+        state.streamingClientId &&
+        event.persistId !== state.streamingClientId,
+      );
+      const textState = itemBoundary ? finalizeStreamingInState(state) : state;
 
       if (isFinal) {
         // Confirmation of streamed text, or a non-streaming final burst.
-        if (!state.streamingClientId && text) {
+        if (!textState.streamingClientId && text) {
           // Guard: if the last message is an assistant with identical content,
           // this is a duplicate isFinal event from the SDK — skip it.
-          const last = state.messages[state.messages.length - 1];
-          if (last && last.role === 'assistant' && last.content === text && !last.isStreaming) {
-            return state;
+          const last = textState.messages[textState.messages.length - 1];
+          if (
+            last &&
+            last.role === 'assistant' &&
+            last.content === text &&
+            !last.isStreaming &&
+            (!event.persistId || last.clientId === event.persistId)
+          ) {
+            return textState;
           }
 
           // F1-a: clientId 用 main 下发的 persistId(落库由 main 单点做,见
@@ -4950,10 +5650,10 @@ export function handleStreamEvent(
           const clientId = event.persistId ?? crypto.randomUUID();
 
           return {
-            ...state,
-            lastAgentMeta: incomingMeta ?? state.lastAgentMeta,
+            ...textState,
+            lastAgentMeta: incomingMeta ?? textState.lastAgentMeta,
             messages: [
-              ...state.messages,
+              ...textState.messages,
               {
                 clientId,
                 role: 'assistant',
@@ -4974,20 +5674,24 @@ export function handleStreamEvent(
         const hasAssistantFields =
           assistantMetaFields.model !== undefined ||
           assistantMetaFields.parentToolUseId !== undefined ||
-          assistantMetaFields.turnCompleted === true;
+          assistantMetaFields.turnCompleted === true ||
+          assistantMetaFields.botPrivateReply !== undefined;
         const shouldCalibrateText = Boolean(
-          isFullText === true && text && state.streamingClientId && text !== state.streamingText,
+          isFullText === true &&
+          text &&
+          textState.streamingClientId &&
+          text !== textState.streamingText,
         );
-        if (!incomingMeta && !hasAssistantFields && !shouldCalibrateText) return state;
+        if (!incomingMeta && !hasAssistantFields && !shouldCalibrateText) return textState;
         return {
-          ...state,
+          ...textState,
           ...(shouldCalibrateText ? { streamingText: text } : {}),
           ...(incomingMeta ? { lastAgentMeta: incomingMeta } : {}),
-          ...((hasAssistantFields || shouldCalibrateText) && state.streamingClientId
+          ...((hasAssistantFields || shouldCalibrateText) && textState.streamingClientId
             ? {
                 messages: replaceMessage(
-                  state.messages,
-                  (m) => m.clientId === state.streamingClientId,
+                  textState.messages,
+                  (m) => m.clientId === textState.streamingClientId,
                   (m) => ({
                     ...m,
                     ...(shouldCalibrateText ? { content: text } : {}),
@@ -5000,37 +5704,41 @@ export function handleStreamEvent(
       }
 
       // Delta update
-      if (!state.streamingClientId) {
+      if (!textState.streamingClientId) {
         // F1-a: 在途流式气泡用 main 下发的 persistId 当 clientId(贯穿本 block 所有 delta),
         // 让该 block 最终由 main 落库后的 onCreated 同 id 命中 dedup。
         const clientId = event.persistId ?? crypto.randomUUID();
         return {
-          ...state,
+          ...textState,
           streamingClientId: clientId,
           streamingText: text,
           messages: [
-            ...state.messages,
+            ...textState.messages,
             {
               clientId,
               role: 'assistant',
               content: text,
               isStreaming: true,
-              createdAt: new Date().toISOString(),
+              createdAt: snapshot?.createdAt ?? new Date().toISOString(),
               ...assistantMetaFields,
             },
           ],
         };
       }
 
-      const nextText = state.streamingText + text;
-      const id = state.streamingClientId;
+      const nextText = reconcileRemoteText(textState.streamingText, text, {
+        snapshot: snapshot !== undefined, durable: false,
+        truncated: (event as unknown as Record<string, unknown>).__deviceLinkTruncated === true
+          || (event.data as Record<string, unknown>).__deviceLinkTruncated === true,
+      });
+      const id = textState.streamingClientId;
       return {
-        ...state,
+        ...textState,
         streamingText: nextText,
         messages: replaceMessage(
-          state.messages,
+          textState.messages,
           (m) => m.clientId === id,
-          (m) => ({ ...m, content: nextText }),
+          (m) => ({ ...m, content: nextText, ...(snapshot?.createdAt ? { createdAt: snapshot.createdAt } : {}) }),
         ),
       };
     }
@@ -5052,6 +5760,9 @@ export function handleStreamEvent(
         | { stage: 'redacted'; blockId: string };
 
       if (data.stage === 'start') {
+        // Replayed starts and DB-before-live delivery must not add a second row
+        // or reset content that this identity has already accumulated.
+        if (state.messages.some((message) => message.clientId === data.blockId)) return state;
         // Thinking starts at the head of an API call, possibly before any
         // assistant text. Don't finalize streamingText here — text deltas
         // may resume on the *same* assistant message after the thinking
@@ -5078,7 +5789,7 @@ export function handleStreamEvent(
           ...state,
           messages: replaceMessage(
             state.messages,
-            (m) => m.clientId === data.blockId && m.role === 'thinking',
+            (m) => m.clientId === data.blockId && m.role === 'thinking' && m.isStreaming === true,
             (m) => ({ ...m, content: m.content + data.text }),
           ),
         };
@@ -5252,8 +5963,8 @@ export function handleStreamEvent(
         // 直到唤醒桥接整体被清除。
         pendingTaskWakeDuringTurn:
           nextWake > 0
-          ? (state.pendingTaskWakeDuringTurn + (wakesAfterTerminal && mainTurnDoneNotCrossed ? 1 : 0))
-          : 0,
+          ? state.pendingTaskWakeDuringTurn + (wakesAfterTerminal && mainTurnDoneNotCrossed ? 1 : 0)
+            : 0,
         // 最小年龄闸的时钟起点:每次真实置位都刷新(见字段注释)。
         pendingTaskWakeArmedAt: wakesAfterTerminal ? Date.now() : state.pendingTaskWakeArmedAt,
         // 置位代次:对账收口的 ABA 防护(见字段注释)。
@@ -5263,11 +5974,9 @@ export function handleStreamEvent(
 
     case 'tool_use': {
       dismissVisionBridgeToast(event.sessionId);
-      const { toolUseId, toolName, input } = event.data as {
-        toolUseId: string;
-        toolName: string;
-        input: unknown;
-      };
+      const { toolUseId, toolName, input } = parseMessageToolUse({
+        role: 'tool_use', content: event.data,
+      });
 
       // F1-a: 在飞 assistant 文本 + tool_use 的落库都已收口 main(messagePersistBroadcaster
       // 在 tool_use 边界先 flushAssistantBlock 再落 tool_use),renderer 这里只做 UI:
@@ -5388,6 +6097,10 @@ export function handleStreamEvent(
       // F1-a: assistant 文本落库已收口 main(messagePersistBroadcaster 在 done 边界
       // flushAssistantBlock),renderer 这里只做 UI 收尾(finalize 在飞气泡)。
       const finalized = finalizeStreamingInState(state);
+      // A terminal tool-loop error may be followed by the SDK's done event.
+      // Keep its structured details for the live banner while the terminal
+      // error remains visible; a clean done must still clear stale details.
+      const preservedToolLoop = finalized.error !== null ? state.toolLoop : null;
 
       // Side-effect (titleUpdateCallbacks) is fired by the stream handler in
       // `initGlobalListeners`, not from inside this reducer — reducers stay pure.
@@ -5429,7 +6142,7 @@ export function handleStreamEvent(
       });
 
       const terminalData = event.data as
-        { cancelled?: unknown; reason?: unknown; plan?: unknown; raw?: { id?: unknown; status?: unknown } }
+        | { cancelled?: unknown; reason?: unknown; plan?: unknown; raw?: { id?: unknown; status?: unknown } }
         | null
         | undefined;
       const terminalTurnId = typeof terminalData?.raw?.id === 'string' ? terminalData.raw.id : null;
@@ -5462,6 +6175,7 @@ export function handleStreamEvent(
         streamingText: '',
         isStreaming: false,
         recoverableError: null,
+        toolLoop: preservedToolLoop,
         activeTurnRetryText: null,
         errorRetryText: finalized.error ? finalized.errorRetryText : null,
         pendingPermission: null,
@@ -5480,6 +6194,8 @@ export function handleStreamEvent(
         pendingGhostGrantConfirm: null,
         pendingRemoteDesktopConfirmation: null,
         pendingRemoteDesktopConfirmationQueue: [],
+        lastStopWasPrivateReply: (incomingMeta ?? state.lastAgentMeta)?.botPrivateReply === true,
+        lastStopWasGroupLane: (incomingMeta ?? state.lastAgentMeta)?.botGroupLane === true,
         // agent-meta: turn 结束清空，下一 turn 重新累积。
         lastAgentMeta: null,
         queueAbortPending: false,
@@ -5500,12 +6216,15 @@ export function handleStreamEvent(
         reason,
         errorStatus,
         imageCount,
+        toolLoop: toolLoopRaw,
       } = event.data as {
         message: string;
         reason?: string;
         errorStatus?: number | null;
         imageCount?: number;
+        toolLoop?: unknown;
       };
+      const toolLoop = parseToolLoopErrorDetails(toolLoopRaw);
       // 视觉桥用户提示（正在识别 / fallback / 不可用）：toast 展示，完全不改 turn 状态
       // （不设 recoverableError、不阻断开流），零阻断。用 isVisionBridgeReason 三重校验
       // （source==='vision-bridge' + isTerminal:false + reason 枚举）——普通 agent / 远程
@@ -5554,7 +6273,7 @@ export function handleStreamEvent(
               ? i18n.t('logic.errors.silentStopExhausted')
               : reason === 'codex-auto-review-unavailable'
                 ? i18n.t('logic.errors.codexAutoReviewUnavailable')
-                : decodeRemoteErrorMessage(safeErrMsg);
+                : remoteErrorMessageForBanner(safeErrMsg);
       const isTerminalError = isTerminalErrorData(event.data);
       // 终态错误 = turn 收口（含失败）：清掉该 session 的「正在识别图片中」toast，
       // 避免视觉桥未输出就终结时 loading toast 残留（done/abort/terminal error 兜底）。
@@ -5588,8 +6307,10 @@ export function handleStreamEvent(
             error: null,
             usageLimitRecovery: null,
             errorReason: null,
+            toolLoop: null,
             recoverableError: null,
             errorRetryText: null,
+            errorPersistId: null,
             isStreaming: hasAutoResumePendingCard ? state.isStreaming : true,
             agentStatus: {
               ...(hasAutoResumePendingCard
@@ -5611,8 +6332,10 @@ export function handleStreamEvent(
           // 重试进度, 而重投恰恰只在**非终止**态发生 —— 清掉就等于 UI 侧只能回退
           // 文案匹配。其它非终止 error 仍不带 reason, 行为不变。
           errorReason: reason ?? null,
+          toolLoop: null,
           recoverableError: errMsg,
           errorRetryText: null,
+          errorPersistId: null,
           isStreaming: true,
           agentStatus: {
             ...state.agentStatus,
@@ -5668,8 +6391,19 @@ export function handleStreamEvent(
             : extractUsageLimitRecoveryHint(event.data),
         errorReason:
           isPlannedUpgradeClose || suppressAutoResumeBroadcastError ? null : (reason ?? null),
+        toolLoop:
+          isPlannedUpgradeClose || suppressAutoResumeBroadcastError ? null : (toolLoop ?? null),
         recoverableError: null,
         errorRetryText: derivedRetryText ?? preservedRetryText,
+        // persistId 只绑定即将落库的 error 行,不是重试依据。新事件带来非空 id
+        // 时更新绑定;同一 turn 重复终态 error 常因 main dedup 不再带 persistId,
+        // 缺失时保留已有绑定,避免关掉/重试后无法 dismiss 已预留的那一行。
+        errorPersistId:
+          isPlannedUpgradeClose || suppressAutoResumeBroadcastError
+            ? null
+            : typeof event.persistId === 'string' && event.persistId
+                ? event.persistId
+                : state.errorPersistId,
         isStreaming: false,
         activeTurnRetryText: null,
         continuationTurnClientId: null,
@@ -5690,6 +6424,8 @@ export function handleStreamEvent(
         pendingGhostGrantConfirm: null,
         pendingRemoteDesktopConfirmation: null,
         pendingRemoteDesktopConfirmationQueue: [],
+        // 失败的群专线回合同样由群聊承接,终态 error 也要保留这份归属。
+        lastStopWasGroupLane: (incomingMeta ?? state.lastAgentMeta)?.botGroupLane === true,
         // agent-meta: turn 异常结束也清空。
         lastAgentMeta: null,
         // 出错也是 turn 终结：清掉 isRunning，否则 RunningStatusBar 会一直停在
@@ -5722,13 +6458,19 @@ export function handleStreamEvent(
         description: data.description,
         suggestions: data.suggestions,
         autoReviewUnavailable: data.autoReviewUnavailable === true,
-      };
-      if (
+      };      if (
         state.pendingPermission?.requestId === permission.requestId ||
         state.pendingPermissionQueue.some((item) => item.requestId === permission.requestId)
       ) {
         return state;
       }
+      // A newer request supersedes a card whose decision is in flight: that
+      // receipt race is already lost, so the newest authoritative request takes
+      // the head (upstream semantics — a failure snapshot must not resurrect it).
+      if (state.pendingPermission?.submitting) {
+        return { ...state, pendingPermission: permission };
+      }
+      // FIFO: an actionable card keeps the head; parallel requests queue behind.
       return {
         ...state,
         pendingPermission: state.pendingPermission ?? permission,
@@ -5775,6 +6517,7 @@ export function handleStreamEvent(
           pendingPluginSetupQueue: remainingSetups,
           pluginSetupViewerState: 'expanded',
           pluginSetupCommandInFlight: null,
+          pluginSetupCommandError: null,
         };
       }
       const queuedSetupIndex = state.pendingPluginSetupQueue.findIndex(
@@ -5896,6 +6639,25 @@ export function handleStreamEvent(
         requestId: string;
         questions: AskUserQuestionItem[];
       };
+      // Codex done reconciles pending interactions with fresh IPC objects. Keep
+      // the same question's identity: AskUserQuestionPrompt restores selections
+      // when questions changes, which would erase locally typed, unsubmitted text.
+      // Compare fields rather than JSON object key order; changed questions must
+      // still take the normal initialization path.
+      const previousAsk = state.pendingAskUser;
+      const keepAskProgress = previousAsk?.requestId === data.requestId &&
+        previousAsk.questions.length === data.questions.length &&
+        previousAsk.questions.every((question, index) => {
+          const next = data.questions[index];
+          return question.question === next.question &&
+            question.header === next.header &&
+            question.multiSelect === next.multiSelect &&
+            (question.options?.length ?? 0) === (next.options?.length ?? 0) &&
+            (question.options ?? []).every((option, optionIndex) =>
+              option.label === next.options?.[optionIndex]?.label &&
+              option.description === next.options?.[optionIndex]?.description,
+            );
+        });
       // F1-a: ask_user 消息的落库(+ 在飞 assistant flush)已收口 main
       // (messagePersistBroadcaster.onInteractionMessage,在 setInteractionListener 里),
       // renderer 只做 UI:finalize 在飞气泡 + 用 main 下发的 persistId 建 ask_user 气泡
@@ -5943,19 +6705,17 @@ export function handleStreamEvent(
 
       return {
         ...finalized,
-        pendingAskUser: {
+        pendingAskUser: keepAskProgress ? previousAsk : {
           requestId: data.requestId,
           questions: data.questions,
         },
         // F-AUQ-MIN-1: Every new pendingAskUser starts expanded — even if the
         // previous question in this same session was minimized. Folding never
         // carries across questions.
-        askUserViewerState: 'expanded',
-        // F-AUQ-DRAFT: Same logic — a new question batch must never inherit a
-        // stale draft, even if for some reason the previous draft happened to
-        // share the same requestId. The component additionally guards via
-        // `draft.requestId === pending.requestId` before hydrating.
-        askUserDraft: null,
+        askUserViewerState: keepAskProgress ? state.askUserViewerState : 'expanded',
+        // Only an unchanged pending request may retain its draft. A new batch
+        // or changed question content starts clean, even with the same requestId.
+        askUserDraft: keepAskProgress ? state.askUserDraft : null,
         messages: askMessages,
       };
     }
@@ -6121,6 +6881,7 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
     !state.messages.some((m) => m.isStreaming) &&
     !state.queueAbortPending &&
     state.steeringQueueClientIds.length === 0 &&
+    state.continuationInFlightClientId === null &&
     state.continuationTurnClientId === null &&
     state.pendingTaskWake === 0 &&
     !state.messages.some(
@@ -6128,6 +6889,8 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
         message.clientId === CODEX_RECONNECT_PENDING_CLIENT_ID ||
         message.clientId === AUTO_RESUME_PENDING_CLIENT_ID,
     ) &&
+    state.inputRecovery === null &&
+    !state.pendingQueue.some((item) => item.autoResume === true) &&
     stoppedTasks === state.taskUpdates
   ) {
     return state;
@@ -6157,8 +6920,15 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
     streamingText: '',
     isStreaming: false,
     recoverableError: null,
+    toolLoop: null,
     activeTurnRetryText: null,
     errorRetryText: null,
+    errorPersistId: null,
+    inputRecovery: null,
+    // A successful owner commit closes the outgoing session. Automatic
+    // continuation entries belong to that owner and must not survive the
+    // boundary; user queued input remains available for the next owner.
+    pendingQueue: finalized.pendingQueue.filter((item) => item.autoResume !== true),
     pendingPermission: null,
     pendingPermissionQueue: [],
     pendingAskUser: null,
@@ -6166,6 +6936,7 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
     pendingPluginSetupQueue: [],
     pluginSetupViewerState: 'expanded',
     pluginSetupCommandInFlight: null,
+    pluginSetupCommandError: null,
     askUserViewerState: 'expanded',
     askUserDraft: null,
     pendingPlanReview: null,
@@ -6176,7 +6947,9 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
     pendingRemoteDesktopConfirmationQueue: [],
     queueAbortPending: false,
     steeringQueueClientIds: [],
+    continuationInFlightClientId: null,
     continuationTurnClientId: null,
+    continuationInFlightProjectionCapability: 'unknown',
     // session 都关了,后台任务事件流已断:running 残留任务标 stopped、唤醒桥接
     // 清零,否则 running 快照(折算了后台任务)会让 spinner 永久转下去。
     taskUpdates: stoppedTasks,
@@ -6262,6 +7035,7 @@ function applyBackgroundStatus(
       : rawStatus;
   let contextTokens = state.agentStatus.contextTokens;
   let contextWindow = state.agentStatus.contextWindow;
+  let contextWindowFromRuntime = state.agentStatus.contextWindowFromRuntime;
   if (
     typeof data.contextWindow === 'number' &&
     data.contextWindow > 0 &&
@@ -6270,6 +7044,7 @@ function applyBackgroundStatus(
   ) {
     contextTokens = data.contextTokens;
     contextWindow = data.contextWindow;
+    contextWindowFromRuntime = true;
   }
   return {
     ...state,
@@ -6278,6 +7053,7 @@ function applyBackgroundStatus(
       status,
       contextTokens,
       contextWindow,
+      contextWindowFromRuntime,
     },
   };
 }
@@ -6358,6 +7134,8 @@ function handleStatusUpdate(
     ...state,
     // 真实 turn 的起/止都把 side-task 标记复位(它只描述「最近一次 stop」)。
     lastStopWasSideTask: false,
+    lastStopWasPrivateReply: update.isRunning ? false : state.lastStopWasPrivateReply,
+    lastStopWasGroupLane: update.isRunning ? false : state.lastStopWasGroupLane,
     // 唤醒桥接:仅在 wake turn 真正启动(isRunning:true)时消费一个计数,或 wake turn
     // 失败时消费——后者表现为 Done + !isRunning 且主 turn 已经结束
     // (state.agentStatus.isRunning 已为 false),此时 isTurnStart 永远不会
@@ -6369,16 +7147,16 @@ function handleStatusUpdate(
     // Done 前 SDK 先推了 isRunning=false 的中间 status」误判成 wake 失败。
     // pendingTaskWakeStarted:isTurnStart 已消费桥接时置 true,防止 Done 分支
     // 因 SDK 中间 isRunning=false 而重复消费下一个任务的桥接计数。
-    pendingTaskWake: isTurnStart ? Math.max(0, state.pendingTaskWake - 1) :
-      (isTurnComplete && state.pendingTaskWake > 0 && !state.agentStatus.isRunning && state.pendingTaskWakeDuringTurn === 0 && !state.pendingTaskWakeStarted) ? Math.max(0, state.pendingTaskWake - 1) :
+    pendingTaskWake: isTurnStart ? Math.max(0, state.pendingTaskWake - 1) : isTurnComplete && state.pendingTaskWake > 0 && !state.agentStatus.isRunning && state.pendingTaskWakeDuringTurn === 0 && !state.pendingTaskWakeStarted
+        ? Math.max(0, state.pendingTaskWake - 1) :
       state.pendingTaskWake,
     // 跨主 turn 标记:主 turn 自己的 Done 越过(标记仍为 true 时到达的首个 Done)后,
     // 标记使命已尽、立即退休。否则 wake turn 失败(从未 isRunning:true、无 isTurnStart)
     // 时,终态 Done 会因 !pendingTaskWakeDuringTurn 恒为 false 而永远无法清除
     // pendingTaskWake,会话永久卡在 running/Stop 态。退休只清标记、不清桥接:
     // 桥接(pendingTaskWake)仍存活,直到 wake turn 真正启动或失败。
-    pendingTaskWakeDuringTurn: isTurnStart ? 0 :
-      (isTurnComplete && state.pendingTaskWakeDuringTurn > 0) ? 0 :
+    pendingTaskWakeDuringTurn: isTurnStart ? 0 : isTurnComplete && state.pendingTaskWakeDuringTurn > 0
+        ? 0 :
       state.pendingTaskWakeDuringTurn,
     // isTurnStart 已消费标记:isTurnStart 且 pendingTaskWake > 0 时置 true(本轮
     // 桥接已消费),isTurnComplete 时复位。防止 SDK 中间推送 isRunning=false 后,
@@ -6393,6 +7171,7 @@ function handleStatusUpdate(
       costUsd: cu,
       contextTokens: ct,
       contextWindow: cw,
+      contextWindowFromRuntime: hasContextSnapshot || state.agentStatus.contextWindowFromRuntime,
       isRunning: update.isRunning,
       startedAt,
       ...mergeLiveGenerationStatus(isTurnStart, update, state.agentStatus),
@@ -6409,7 +7188,9 @@ function handleStatusUpdate(
     error: isTurnStart ? null : state.error,
     usageLimitRecovery: isTurnStart ? null : state.usageLimitRecovery,
     errorReason: isTurnStart ? null : state.errorReason,
+    toolLoop: isTurnStart ? null : state.toolLoop,
     errorRetryText: isTurnStart || (isTurnComplete && !state.error) ? null : state.errorRetryText,
+    errorPersistId: isTurnStart ? null : state.errorPersistId,
     recoverableError: isTurnComplete ? null : state.recoverableError,
     isStreaming: update.isRunning
       ? true
@@ -6454,6 +7235,7 @@ type LiveIngressContext = {
   ownerStamp?: unknown;
   remoteDeviceId?: string;
   ownerStampPresent?: boolean;
+  sourceEpoch?: number;
 };
 
 function isCurrentLiveIngress(context?: LiveIngressContext): boolean {
@@ -6465,7 +7247,7 @@ function isCurrentLiveIngress(context?: LiveIngressContext): boolean {
     return !hasStamp || isDataOwnerPushStampCurrent(context.ownerStamp);
   }
 
-  return isRemoteDataOwnerPushCurrent(context.remoteDeviceId, context.ownerStamp, hasStamp);
+  return isRemoteDataOwnerPushCurrent(context.remoteDeviceId, context.ownerStamp, hasStamp, context.sourceEpoch);
 }
 
 function isCurrentLocalLiveIngress(ownerStamp: unknown): boolean {
@@ -6477,6 +7259,7 @@ function isCurrentLocalLiveIngress(ownerStamp: unknown): boolean {
 
 function sameLiveIngressScope(a: LiveIngressContext, b: LiveIngressContext): boolean {
   if (a.remoteDeviceId !== b.remoteDeviceId) return false;
+  if (a.sourceEpoch !== b.sourceEpoch) return false;
   const aStamp = isDataOwnerPushStamp(a.ownerStamp) ? a.ownerStamp : null;
   const bStamp = isDataOwnerPushStamp(b.ownerStamp) ? b.ownerStamp : null;
   if (aStamp === null || bStamp === null) return aStamp === bStamp;
@@ -6513,6 +7296,24 @@ const BACKGROUND_TASK_RECONCILE_DELAY_MS = 3000;
 const WAKE_BRIDGE_RECONCILE_MIN_AGE_MS = 10_000;
 const backgroundTaskReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const backgroundTaskReconcileEpoch = new Map<string, number>();
+
+// A remote `messages:created` push can be lost while the controlled session
+// keeps streaming.  Keep a small, per-session repair debounce so any later
+// remote event can heal the missing durable row without turning the live
+// stream into a polling loop.
+const REMOTE_MESSAGE_REPAIR_DELAY_MS = 1_500;
+const remoteMessageRepairTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleRemoteMessageRepair(sessionId: string): void {
+  if (!sessionId || remoteMessageRepairTimers.has(sessionId)) return;
+  remoteMessageRepairTimers.set(
+    sessionId,
+    setTimeout(() => {
+      remoteMessageRepairTimers.delete(sessionId);
+      void reconcileRemoteMessages(sessionId, { repair: true }).catch(() => undefined);
+    }, REMOTE_MESSAGE_REPAIR_DELAY_MS),
+  );
+}
 
 function invalidateBackgroundTaskReconcile(sessionId: string): number {
   const next = (backgroundTaskReconcileEpoch.get(sessionId) ?? 0) + 1;
@@ -6637,9 +7438,7 @@ function bindIpc(
 }
 
 function isTextDeltaEvent(event: NonNullable<MakerEventPayload>['event']): boolean {
-  if (event?.type !== 'text') return false;
-  const data = event.data as { text?: unknown; isFinal?: unknown } | null;
-  return data?.isFinal === false && typeof data.text === 'string';
+  return isRemoteTextDelta(event);
 }
 
 function isHighFrequencyStreamEvent(event: NonNullable<MakerEventPayload>['event']): boolean {
@@ -6746,6 +7545,10 @@ function enqueueTextDeltaPayload(
       !sameLiveIngressScope(existing.ingress, ingress))
   ) {
     discardPendingTextDelta(sessionId);
+    existing = undefined;
+  }
+  if (existing?.persistId && persistId && existing.persistId !== persistId) {
+    flushPendingTextDelta(sessionId);
     existing = undefined;
   }
   if (existing) {
@@ -6861,6 +7664,9 @@ function parsePluginSetupInlineFormAction(
 
 /** Strict renderer boundary parser: unknown push data never reaches the card. */
 export function parsePendingPluginSetup(request: {
+  remoteOauth?: unknown;
+  remoteSecret?: unknown;
+  remoteConnection?: unknown;
   requestId?: unknown;
   revision?: unknown;
   terminal?: unknown;
@@ -6976,6 +7782,9 @@ export function parsePendingPluginSetup(request: {
   return {
     requestId: request.requestId,
     revision: request.revision,
+    ...(request.remoteOauth === true ? { remoteOauth: true as const } : {}),
+    ...(request.remoteSecret === true ? { remoteSecret: true as const } : {}),
+    ...(request.remoteConnection === true ? { remoteConnection: true as const } : {}),
     ...(request.terminal === true ? { terminal: true as const } : {}),
     ghost: {
       id: ghost.id,
@@ -7039,6 +7848,9 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       const current = getOrCreateState(sessionId);
       if (current.sdkSessionId === sdkSessionId) return;
       setState(sessionId, (s) => ({ ...s, sdkSessionId }));
+      // The sidebar observes the same event through a read-only preload. The
+      // primary window owns persistence; the observer only updates its mirror.
+      if (isSidebarWindow()) return;
       if (!isDataOwnerGenerationCurrent(dataOwnerAtIngress)) return;
       sessionService
         .update(sessionId, { sdkSessionId })
@@ -7078,6 +7890,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
     // CCAgentStreamEvent.agentMeta 让 handleStreamEvent 落库 messages.agent_meta 行,
     // fork / rewind 反向找 prior assistant 锚点要靠这个字段。
     // Legacy CC/XD remote auth-retry: 在 reducer 写 error 之前拦截,避免 error banner 闪烁。
+    let persistDeferredAfterDispatch = false;
     if (event.type === 'error') {
       const errData =
         (event.data as {
@@ -7246,16 +8059,6 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
               }
             } catch {
               if (!isDataOwnerGenerationCurrent(dataOwnerAtIngress)) return;
-              if (
-                isCindyGatewayProxyTokenInvalid ||
-                (preSnap.remoteHostId && preSnap.agentKind === 'claude-code')
-              ) {
-                void makerApiFor(sessionId).input.persistTurnErrorDeferred(
-                  sessionId,
-                  event.data as Record<string, unknown> | null,
-                  event.agentMeta ?? null,
-                );
-              }
               const terminalErrorEvent = {
                 sessionId,
                 type: 'error',
@@ -7263,6 +8066,16 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
               } as CCAgentStreamEvent;
               supersedeInputProjectionOnTerminalEvent(sessionId, terminalErrorEvent);
               setState(sessionId, (s) => handleStreamEvent(s, terminalErrorEvent));
+              if (
+                isCindyGatewayProxyTokenInvalid ||
+                (preSnap.remoteHostId && preSnap.agentKind === 'claude-code')
+              ) {
+                persistTurnErrorDeferredTracked(
+                  sessionId,
+                  event.data as Record<string, unknown> | null,
+                  event.agentMeta ?? null,
+                );
+              }
             } finally {
               if (isDataOwnerGenerationCurrent(dataOwnerAtIngress)) {
                 setState(sessionId, (s) => ({ ...s, _authRetryInFlight: false }));
@@ -7289,15 +8102,18 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           (isAuthError && preSnap.remoteHostId && preSnap.agentKind === 'claude-code')) &&
         !preSnap._authRetryInFlight
       ) {
-        void makerApiFor(sessionId).input.persistTurnErrorDeferred(
-          sessionId,
-          event.data as Record<string, unknown> | null,
-          event.agentMeta ?? null,
-        );
+        persistDeferredAfterDispatch = true;
       }
     }
 
     dispatchStreamEventPayload(sessionId, event, persistId, resolvedContent, deferNotification);
+    if (persistDeferredAfterDispatch) {
+      persistTurnErrorDeferredTracked(
+        sessionId,
+        event.data as Record<string, unknown> | null,
+        event.agentMeta ?? null,
+      );
+    }
 
     // done / error 副作用 (从老 stream listener 搬过来)
     if (isProductTurnDoneEvent(event)) {
@@ -7319,7 +8135,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           : s,
       );
       // MEM-OPT-1: trim non-active sessions after turn completes
-      queueMicrotask(() => _trimMessagesIfNeeded(sessionId));
+      queueMicrotask(_trimMessagesIfNeeded);
     }
     // 视觉桥用户提示事件（source==='vision-bridge' + reason 枚举 + isTerminal:false）：
     // 已在 dispatchStreamEventPayload 的 case 'error' 分流为 toast，不进 error-banner /
@@ -7385,6 +8201,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
   const handleMakerStatusRaw = (raw: unknown, ingress: LiveIngressContext = {}) => {
     if (!isCurrentLiveIngress(ingress)) return;
     const payload = raw as { sessionId?: string; status?: string } | null;
+    if (payload?.sessionId) getRemoteHistoryView(payload.sessionId)?.invalidate();
     if (!payload?.sessionId || payload.status !== 'closed') return;
     bumpInteractionReconcileEpoch(payload.sessionId);
     supersedeInputProjectionRequests(payload.sessionId, { supersedeOperations: true });
@@ -7546,6 +8363,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
             pendingPluginSetup: parsed,
             pluginSetupViewerState: 'expanded',
             pluginSetupCommandInFlight: null,
+            pluginSetupCommandError: null,
           };
         }
         if (current.requestId === parsed.requestId) {
@@ -7555,6 +8373,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
             ...s,
             pendingPluginSetup: parsed,
             pluginSetupCommandInFlight: advanced ? null : s.pluginSetupCommandInFlight,
+            pluginSetupCommandError: advanced ? null : s.pluginSetupCommandError,
           };
         }
 
@@ -7594,11 +8413,16 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       // ephemeral 卡片(同 permission 语义,无 persistId 不落库),直接写 state,
       // 不走 handleStreamEvent —— 它不属于 agent 事件流。
       const draft = request.draft as PendingIssueConfirm['draft'] | undefined;
-      // region 必须先 Omit 掉再重建成 unknown:交叉类型做不到这件事
+      // 公开 runtime metadata 必须先 Omit 掉再重建成 unknown:交叉类型做不到这件事
       // (`CindyRegion & unknown` 仍是 `CindyRegion`),那样写会让 TS 以为 IPC 传来的
       // region 已经是合法值,下面的白名单校验看着像在校验、实际没有类型层面的约束。
       const rawEnv = request.env as
-        (Omit<PendingIssueConfirm['env'], 'region'> & { region?: unknown }) | undefined;
+        | (Omit<PendingIssueConfirm['env'], 'region' | 'harness' | 'modelId'> & {
+            region?: unknown;
+            harness?: unknown;
+            modelId?: unknown;
+          })
+        | undefined;
       const submissionIdentity = parseIssueSubmissionIdentity(request.submissionIdentity);
       if (!draft || !rawEnv || !submissionIdentity) return;
       // 新版 Main:平台默认 + 可选 GitHub 身份。旧版 Main:只传已经固定的单一
@@ -7611,8 +8435,13 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
         submissionIdentity.kind === 'platform'
           ? parseIssueSuggestedPublicName(request.suggestedPublicName)
           : undefined;
-      // region 过一遍白名单:非法值宁可不展示区域,也不能把 CN 版说成默认版。
-      const env = { ...rawEnv, region: parseIssueEnvRegion(rawEnv.region) };
+      // IPC 值过白名单/单行化：非法值宁可不展示，也不能污染公开确认内容。
+      const env = {
+        ...rawEnv,
+        region: parseIssueEnvRegion(rawEnv.region),
+        harness: parseIssueEnvHarness(rawEnv.harness),
+        modelId: parseIssueEnvModelId(rawEnv.modelId),
+      };
       setState(sessionId, (s) => ({
         ...s,
         pendingIssueConfirm: {
@@ -7751,12 +8580,27 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
     const payload = raw as { sessionId?: string; message?: Message } | null;
     if (!payload?.sessionId || !payload.message) return;
     const { sessionId, message } = payload;
+    getRemoteHistoryView(sessionId)?.invalidate();
     if (isBeforeOrAtRendererClearBoundary(sessionId, message.createdAt)) return;
     const [mapped] = mapServerMessages([message]);
     if (!mapped) return;
     clearRemoteOptimisticSend(sessionId, mapped.clientId);
     const current = getOrCreateState(sessionId);
     const existing = current.messages.find((candidate) => candidate.clientId === mapped.clientId);
+    if (mapped.systemCardType?.startsWith('cindy-make')) {
+      // A late update to an older preparation card must not replace the current result.
+      const existingIndex = existing ? current.messages.indexOf(existing) : -1;
+      const newerMessage = current.messages.some(
+        (candidate, index) =>
+          candidate.clientId !== mapped.clientId &&
+          candidate.createdAt &&
+          mapped.createdAt &&
+          (candidate.createdAt > mapped.createdAt ||
+            (candidate.createdAt === mapped.createdAt && existingIndex >= 0 && index > existingIndex)),
+      );
+      if (!newerMessage)
+        applyCindyMakeCardAttention(sessionId, existing, mapped, _activeViewSessions.has(sessionId));
+    }
     const isLiveToolEcho =
       existing?.role === mapped.role &&
       (mapped.role === 'tool_use' || mapped.role === 'tool_result');
@@ -7845,6 +8689,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       turnUsageDetails?: unknown;
     } | null;
     if (!p?.sessionId || !p.clientId) return;
+    getRemoteHistoryView(p.sessionId)?.invalidate();
     const turnCostIsEstimate = p.turnCostIsEstimate === true;
     const turnUsageDetails = normalizeTurnUsageDetails(p.turnUsageDetails);
     const normalizedTurnMoney = normalizeRegionalMoney(p.turnMoney);
@@ -7961,12 +8806,14 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
         channel?: string;
         payload?: unknown;
         ownerStamp?: unknown;
+        sourceEpoch?: number;
       } | null;
       if (!push?.channel) return;
       const remoteIngress: LiveIngressContext = push.deviceId
         ? {
             remoteDeviceId: push.deviceId,
             ownerStamp: push.ownerStamp,
+            sourceEpoch: push.sourceEpoch,
             ownerStampPresent: Object.prototype.hasOwnProperty.call(push, 'ownerStamp'),
           }
         : {};
@@ -8006,8 +8853,66 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       }
       // stall 看门狗信号:只用重会话流刷新 lastInboundEventAt。列表级轻量 activity/patch
       // 可能仍在持续抵达,但 maker:event 重 topic 已经断流;若这里也刷新会掩盖卡死。
+      if (push.channel === SESSION_SYNC_CHANNEL
+        && (!inboundSid || remoteProjectsStore.getSessionDeviceId(inboundSid) !== push.deviceId)) return;
+      const inboundHasPersistId =
+        typeof (push.payload as { persistId?: unknown } | null)?.persistId === 'string';
+      const isDurableMessagePush =
+        push.channel === 'local-db:messages:created' ||
+        (push.channel === 'maker:event' && inboundHasPersistId);
+      const inboundEvent = (push.payload as { event?: unknown } | null)?.event as
+        { type?: unknown; data?: { isFinal?: unknown; isFullText?: unknown } }
+        | null
+        | undefined;
+      const isOrdinaryStreamingTextDelta =
+        push.channel === 'maker:event' &&
+        inboundEvent?.type === 'text' &&
+        inboundEvent.data?.isFinal === false &&
+        inboundEvent.data?.isFullText !== true;
+      if (push.deviceId && inboundSid && isDurableMessagePush && !isOrdinaryStreamingTextDelta) {
+        scheduleRemoteMessageRepair(inboundSid);
+      }
       if (inboundSid && isRemoteHeavyInboundChannel(push.channel)) _markInboundEvent(inboundSid);
+      if (inboundSid) {
+        const view = getRemoteHistoryView(inboundSid);
+        if (view && ['maker:history-view-changed', 'local-db:messages:created', 'maker:status-changed'].includes(push.channel)) view.invalidate();
+      }
       switch (push.channel) {
+        case SESSION_SYNC_CHANNEL: {
+          let preserveClientIds: ReadonlySet<string> | undefined;
+          consumeRemoteSessionSync(push.payload, {
+            applyEvent: (event) => {
+              handleMakerEventRaw(event, remoteIngress);
+              const row = sessions.get(event.sessionId as string)?.messages.find(
+                (message) => message.clientId === event.persistId && message.isStreaming,
+              );
+              if (row) preserveClientIds = new Set([row.clientId]);
+            },
+            invalidateHistory: (sessionId) => {
+              const state = sessions.get(sessionId);
+              if (!state) return;
+              if (getRemoteHistoryView(sessionId)) {
+                // resyncRequired also repairs unrelated durable rows; a full
+                // text snapshot only protects its own live block.
+                void reconcileRemoteMessages(sessionId, {
+                  force: true, repair: true, freshHistory: true, preserveClientIds,
+                });
+                return;
+              }
+              if (!state.historyLoaded) {
+                // A first page captured before the repair must not clear its
+                // meaning. Existing invalidated-load settlement starts one new read.
+                bumpMessagesEpoch(sessionId);
+                ensureInitialMessages(sessionId);
+                return;
+              }
+              void reconcileRemoteMessages(sessionId, {
+                force: true, repair: true, preserveClientIds,
+              });
+            },
+          });
+          break;
+        }
         case 'maker:event':
           handleMakerEventRaw(push.payload, remoteIngress);
           break;
@@ -8077,6 +8982,13 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           }
           break;
         }
+        case 'local-db:task-tags:changed': {
+          if (!push.deviceId) break;
+          const tags = normalizeTaskTags((push.payload as { tags?: unknown })?.tags, 256);
+          remoteProjectsStore.applyTagCatalog(push.deviceId, tags);
+          emitTaskTagCatalog(push.deviceId, tags);
+          break;
+        }
         case 'local-db:sessions:patched': {
           // 被控端会话元数据 / 设置变更 → 就地镜像到远程项目分片(取代乐观覆盖)。
           const p = push.payload as { sessionId?: string; patch?: Record<string, unknown> } | null;
@@ -8089,6 +9001,9 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
             const ownsSession = getStickySessionDeviceId(p.sessionId) === push.deviceId;
             if (Object.prototype.hasOwnProperty.call(p.patch, 'clearedAt')) {
               observeRemoteInputClearBoundary(p.sessionId, p.patch.clearedAt);
+              if (!terminal && ownsSession && typeof p.patch.clearedAt === 'string' && getRemoteHistoryView(p.sessionId)) {
+                reloadMessages(p.sessionId);
+              }
             }
             remoteProjectsStore.applyPatch(push.deviceId, p.sessionId, p.patch);
             if (terminal && ownsSession) {
@@ -8096,7 +9011,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
               // controller while this renderer still owns an offline outbox.
               // Retire it at the authoritative push boundary so reconnect
               // cannot dispatch into a task that no longer exists.
-              removeRemoteSessionActivityEntry(p.sessionId);
+              removeRemoteSessionActivityEntry(p.sessionId, push.deviceId);
               _purgeSession(p.sessionId);
               break;
             }
@@ -8104,7 +9019,7 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
             mirrorSessionFields(p.sessionId, p.patch);
             // 会话在被控端被删除 / 归档 → 同步清掉活动镜像,避免孤儿状态点。
             if (terminal) {
-              removeRemoteSessionActivityEntry(p.sessionId);
+              removeRemoteSessionActivityEntry(p.sessionId, push.deviceId);
             }
           }
           break;
@@ -8124,24 +9039,12 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
           // 被控端 terminal error 落库脏信号 → 让控制端已加载历史的远程会话同样失效,
           // 下次用户打开该会话时从被控端重拉,error 卡得以正常出现。
           // 当前正在被查看的会话:保留 live ErrorBanner 不干扰,但登记 pending,离开时再清。
-          const ep = push.payload as { sessionId?: string } | null;
+          const ep = push.payload as { sessionId?: string; persistId?: string } | null;
           if (ep?.sessionId) {
-            const epState = sessions.get(ep.sessionId);
-            if (epState) {
-              if (_activeViewSessions.has(ep.sessionId)) {
-                // Keep live banner; register pending so the error card appears on leave.
-                // Mirrors the local onErrorPersisted path including the streaming case.
-                _pendingErrorClearOnLeave.add(ep.sessionId);
-              } else {
-                setState(ep.sessionId, (s) => ({
-                  ...s,
-                  ...(s.historyLoaded ? { historyLoaded: false } : {}),
-                  ...(s.error
-                    ? { error: null, usageLimitRecovery: null, errorRetryText: null }
-                    : {}),
-                }));
-              }
-            }
+            applyErrorPersistedDirtySignal(
+              ep.sessionId,
+              typeof ep.persistId === 'string' ? ep.persistId : undefined,
+            );
           }
           break;
         }
@@ -8181,6 +9084,10 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
   // 纯来源漂移驱动,正常 patched 推送(current===loaded)不误重载。teardown 时随其它监听一并清。
   {
     const unsub = remoteProjectsStore.subscribe(() => {
+      for (const [sessionId, entry] of remoteHistoryViews) {
+        const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+        if (deviceId) entry.view?.setNetworkAvailable(!isRemoteDeviceMarkedDisconnected(deviceId));
+      }
       // Snapshot/reseed can be the first clear signal (the projection or patch
       // may have been dropped). Reconcile boundaries before any subscriber or
       // outbox pump can observe the new shard.
@@ -8311,26 +9218,12 @@ function initGlobalListeners(options: GlobalListenerOptions = {}): void {
       ) {
         return;
       }
-      const p = raw as { sessionId?: string } | null;
+      const p = raw as { sessionId?: string; persistId?: string } | null;
       if (!p?.sessionId) return;
-      const state = sessions.get(p.sessionId);
-      if (!state) return;
-      if (_activeViewSessions.has(p.sessionId)) {
-        // Keep live banner during active view (or when a follow-up turn is streaming
-        // in the active view); invalidate + clear on leave so the ErrorMessageCard
-        // appears the next time the user enters the session.
-        _pendingErrorClearOnLeave.add(p.sessionId);
-        return;
-      }
-      // Background session (not in active view), possibly streaming a follow-up turn.
-      // ensureInitialMessages guards against mid-stream reload, so marking
-      // historyLoaded=false here is safe; the error card will surface when the user
-      // opens the session after the current turn finishes.
-      setState(p.sessionId, (s) => ({
-        ...s,
-        ...(s.historyLoaded ? { historyLoaded: false } : {}),
-        ...(s.error ? { error: null, usageLimitRecovery: null, errorRetryText: null } : {}),
-      }));
+      applyErrorPersistedDirtySignal(
+        p.sessionId,
+        typeof p.persistId === 'string' ? p.persistId : undefined,
+      );
     },
     'local-db-session-error-persisted',
   );
@@ -8611,10 +9504,15 @@ function __teardownGlobalListeners(): void {
   pendingTextDeltaBatches.clear();
   for (const timer of backgroundTaskReconcileTimers.values()) clearTimeout(timer);
   backgroundTaskReconcileTimers.clear();
+  for (const timer of remoteMessageRepairTimers.values()) clearTimeout(timer);
+  remoteMessageRepairTimers.clear();
   clearDeferredStateNotificationTimer();
   pendingDeferredStateNotifications.clear();
   pendingMessageCreatedPatches.clear();
   _pendingErrorClearOnLeave.clear();
+  _deferredTurnErrorPersist.clear();
+  _liveErrorEpoch.clear();
+  _staleDeferredErrorPersistIds.clear();
   remotePresenceOnlineByDevice.clear();
   resetRemoteDataOwnerPushFence();
   const remoteOptimisticSessionIds = new Set([
@@ -8674,15 +9572,19 @@ function selectLightState(state: SessionChatState): SessionChatLightState {
     error: state.error,
     usageLimitRecovery: state.usageLimitRecovery,
     errorReason: state.errorReason,
+    toolLoop: state.toolLoop,
     recoverableError: state.recoverableError,
     errorRetryText: state.errorRetryText,
+    errorPersistId: state.errorPersistId,
+    disposedErrorPersistId: state.disposedErrorPersistId,
     credentialSwitchWait: state.credentialSwitchWait,
     continuationInFlightClientId: state.continuationInFlightClientId,
     continuationTurnClientId: state.continuationTurnClientId,
     continuationInFlightProjectionCapability: state.continuationInFlightProjectionCapability,
     isLoadingMore: state.isLoadingMore,
     hasMoreMessages: state.hasMoreMessages,
-    historyWindowHasIsland: state.historyWindowHasIsland,
+    // 派生布尔给 UI / 判定用,正本始终是 historyWindowIslands 区间模型。
+    historyWindowHasIsland: state.historyWindowIslands.length > 0,
     isFirstMessage: state.isFirstMessage,
     historyLoaded: state.historyLoaded,
     pendingPermission: state.pendingPermission,
@@ -8690,6 +9592,7 @@ function selectLightState(state: SessionChatState): SessionChatLightState {
     pendingPluginSetup: state.pendingPluginSetup,
     pluginSetupViewerState: state.pluginSetupViewerState,
     pluginSetupCommandInFlight: state.pluginSetupCommandInFlight,
+    pluginSetupCommandError: state.pluginSetupCommandError,
     askUserViewerState: state.askUserViewerState,
     askUserDraft: state.askUserDraft,
     pendingPlanReview: state.pendingPlanReview,
@@ -8719,8 +9622,11 @@ function lightStateEquals(a: SessionChatLightState, b: SessionChatLightState): b
     a.error === b.error &&
     a.usageLimitRecovery === b.usageLimitRecovery &&
     a.errorReason === b.errorReason &&
+    a.toolLoop === b.toolLoop &&
     a.recoverableError === b.recoverableError &&
     a.errorRetryText === b.errorRetryText &&
+    a.errorPersistId === b.errorPersistId &&
+    a.disposedErrorPersistId === b.disposedErrorPersistId &&
     a.credentialSwitchWait === b.credentialSwitchWait &&
     a.continuationInFlightClientId === b.continuationInFlightClientId &&
     a.continuationTurnClientId === b.continuationTurnClientId &&
@@ -8735,6 +9641,7 @@ function lightStateEquals(a: SessionChatLightState, b: SessionChatLightState): b
     a.pendingPluginSetup === b.pendingPluginSetup &&
     a.pluginSetupViewerState === b.pluginSetupViewerState &&
     a.pluginSetupCommandInFlight === b.pluginSetupCommandInFlight &&
+    a.pluginSetupCommandError === b.pluginSetupCommandError &&
     a.askUserViewerState === b.askUserViewerState &&
     a.askUserDraft === b.askUserDraft &&
     a.pendingPlanReview === b.pendingPlanReview &&
@@ -8923,7 +9830,10 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
     // (远程会话豁免,见 hasBackgroundAgentWork 注释。)
     const bgTaskRunning = hasBackgroundAgentWork(id, state);
 
-    if (state.agentStatus.isRunning || bgTaskRunning) {
+    // Recovery is still unfinished work. Keep the existing running edge alive
+    // so a dispatch failure can settle as error without another vendor turn.
+    const recoveryPending = !state.error && hasSessionRecoveryPending(id);
+    if (state.agentStatus.isRunning || bgTaskRunning || recoveryPending) {
       // Currently running — always include.
       next.set(id, {
         isRunning: true,
@@ -9043,6 +9953,29 @@ function hasSessionTerminalError(sessionId: string): boolean {
   return !!s?.error && !s.lastStopWasSideTask;
 }
 
+/** Non-creating read: recovery can outlive the one-generation stop snapshot. */
+function hasSessionRecoveryPending(sessionId: string): boolean {
+  const state = sessions.get(sessionId);
+  return !!state && hasSessionRecoveryPendingState(state);
+}
+
+/**
+ * Automatic continuation can be in its retry backoff after the foreground
+ * turn has gone idle. In that window Main keeps the session handle alive, but
+ * the renderer may only have the typed recovery marker (or a queued auto-resume
+ * item), rather than a running task snapshot.
+ */
+function hasSessionRecoveryPendingState(state: SessionChatState): boolean {
+  return (
+    state.messages.some((message) =>
+      message.clientId === AUTO_RESUME_PENDING_CLIENT_ID ||
+      message.clientId === CODEX_RECONNECT_PENDING_CLIENT_ID,
+    ) ||
+    (!state.queuePaused && state.pendingQueue.some((item) => item.autoResume === true)) ||
+    (state.inputRecovery?.kind === 'active-turn' && state.inputRecovery.item.autoResume === true)
+  );
+}
+
 // 远程回执 error 免疫的兜底探针:活动镜像缺条目(推送丢失 / 未达)时,
 // sessionAttentionStore 回落到消息层的终止错误判定(注入避免循环依赖)。
 setRemoteTerminalErrorProbe(hasSessionTerminalError);
@@ -9053,6 +9986,47 @@ interface ActiveSessionSnapshot {
   isTurnRunning: boolean;
 }
 
+interface ActiveTurnBoundaryMarker {
+  sessionIncarnation: number;
+  sdkSessionId: string | null;
+  startedAt: number | null;
+  streamingClientId: string | null;
+  continuationTurnClientId: string | null;
+  pendingTaskWakeGen: number;
+  isStreaming: boolean;
+}
+
+function captureActiveTurnBoundaryMarker(
+  sessionId: string,
+  state: SessionChatState,
+): ActiveTurnBoundaryMarker {
+  return {
+    sessionIncarnation: sessionIncarnations.get(sessionId) ?? 0,
+    sdkSessionId: state.sdkSessionId,
+    startedAt: state.agentStatus.startedAt,
+    streamingClientId: state.streamingClientId,
+    continuationTurnClientId: state.continuationTurnClientId,
+    pendingTaskWakeGen: state.pendingTaskWakeGen,
+    isStreaming: state.isStreaming,
+  };
+}
+
+function sameActiveTurnBoundaryMarker(
+  sessionId: string,
+  state: SessionChatState,
+  marker: ActiveTurnBoundaryMarker,
+): boolean {
+  return (
+    (sessionIncarnations.get(sessionId) ?? 0) === marker.sessionIncarnation &&
+    state.sdkSessionId === marker.sdkSessionId &&
+    state.agentStatus.startedAt === marker.startedAt &&
+    state.streamingClientId === marker.streamingClientId &&
+    state.continuationTurnClientId === marker.continuationTurnClientId &&
+    state.pendingTaskWakeGen === marker.pendingTaskWakeGen &&
+    state.isStreaming === marker.isStreaming
+  );
+}
+
 function isActiveSessionSnapshot(value: unknown): value is ActiveSessionSnapshot {
   if (!value || typeof value !== 'object') return false;
   const item = value as Record<string, unknown>;
@@ -9061,6 +10035,78 @@ function isActiveSessionSnapshot(value: unknown): value is ActiveSessionSnapshot
     (item.agentKind === 'claude-code' || item.agentKind === 'codex' || item.agentKind === 'pi') &&
     typeof item.isTurnRunning === 'boolean'
   );
+}
+
+/** A rejected account change can leave the old owner with already-closed SDK sessions. */
+export async function reconcileSessionsAfterDataOwnerRollback(): Promise<void> {
+  const listActive = typeof window === 'undefined' ? undefined : window.electronAPI?.maker?.listActive;
+  if (typeof listActive !== 'function') return;
+  const owner = getDataOwnerGeneration();
+  if (owner.dataOwnerId === null) return;
+  const candidates = [...sessions].flatMap(([id, state]) => {
+    if (isRemoteSessionSticky(id) || !hasActiveTurnStateForOwnerBoundary(state)) return [];
+    return [[id, captureActiveTurnBoundaryMarker(id, state)] as const];
+  });
+  if (candidates.length === 0) return;
+  try {
+    const active = await listActive();
+    // Compare the publication object too: A -> null -> A may reuse the same
+    // main generation on rollback, but must invalidate the older read.
+    if (getDataOwnerGeneration() !== owner) return;
+    if (!Array.isArray(active) || !active.every(isActiveSessionSnapshot)) return;
+    const liveTurns = new Map(active.map((item) => [item.sessionId, item.isTurnRunning]));
+    for (const [id, marker] of candidates) {
+      // Keep a turn that Main still reports running, and never apply a delayed
+      // absence to a new turn or changed session. Ignore unrelated renderer
+      // updates while retaining the marker for the turn we actually queried.
+      // A live-but-idle handle has already stopped its turn and must take the
+      // same finalizer path.
+      let current = sessions.get(id);
+      const initialMainTurnRunning = liveTurns.get(id);
+      if (
+        initialMainTurnRunning === true ||
+        !current ||
+        !sameActiveTurnBoundaryMarker(id, current, marker)
+      )
+        continue;
+      let mainTurnRunning: boolean | undefined = initialMainTurnRunning;
+      // The first query can legitimately race a replacement turn created by
+      // another renderer. Re-read every non-running snapshot immediately
+      // before finalization so a stale idle/absence result cannot close that
+      // new turn.
+      if (initialMainTurnRunning === false || initialMainTurnRunning === undefined) {
+        const latest = await listActive();
+        if (getDataOwnerGeneration() !== owner) return;
+        if (!Array.isArray(latest) || !latest.every(isActiveSessionSnapshot)) return;
+        const latestSession = latest.find((item) => item.sessionId === id);
+        if (latestSession) {
+          mainTurnRunning = latestSession.isTurnRunning;
+        }
+        if (latestSession?.isTurnRunning === true) {
+          continue;
+        }
+        const refreshed = sessions.get(id);
+        if (!refreshed || !sameActiveTurnBoundaryMarker(id, refreshed, marker)) {
+          continue;
+        }
+        current = refreshed;
+      }
+      // listActive keeps idle session handles that still own background work.
+      // isTurnRunning=false only says the foreground turn ended; do not close
+      // any task Main may still be running while rolling back a rejected owner
+      // transition (wake and non-wake tasks alike).
+      if (
+        mainTurnRunning === false &&
+        (hasRunningBackgroundTask(current) || hasSessionRecoveryPendingState(current))
+      ) continue;
+      bumpInteractionReconcileEpoch(id);
+      supersedeInputProjectionRequests(id, { supersedeOperations: true });
+      flushPendingTextDelta(id);
+      setState(id, forceFinalizeOnSessionClosed);
+    }
+  } catch (error) {
+    log.warn('Failed to reconcile maker sessions after auth rollback:', error);
+  }
 }
 
 /**
@@ -9090,6 +10136,7 @@ function syncActiveTurnsFromMain(): void {
             error: null,
             usageLimitRecovery: null,
             errorReason: null,
+            toolLoop: null,
             recoverableError: null,
             activeTurnRetryText: null,
             errorRetryText: null,
@@ -9175,14 +10222,21 @@ function reconcilePendingInteractions(
       // A successful list response is the Host-authoritative snapshot for Setup
       // interactions. Reconcile it subtractively before replaying the snapshot so
       // a Device Link reconnect cannot leave cards that the Host already closed.
-      // Other interaction kinds keep their existing replay semantics.
+      // Permissions also need subtraction after a lost decision receipt.
       const authoritativePluginSetupIds = new Set<string>();
+
       const authoritativePermissions = list
         .map((item) => parsePendingPermissionRequest(item?.request))
         .filter((permission): permission is PendingPermission => permission !== null);
+
+      const authoritativePermissionIds = new Set<string>();
+
       const authoritativeRemoteDesktopConfirmationIds = new Set<string>();
       for (const item of list) {
         const request = item?.request;
+        if (request?.kind === 'permission' && typeof request.requestId === 'string') {
+          authoritativePermissionIds.add(request.requestId);
+        }
         if (
           request?.kind === 'plugin_setup' &&
           typeof request.requestId === 'string' &&
@@ -9207,6 +10261,7 @@ function reconcilePendingInteractions(
       // in flight — the old guard blocks every action on the new request).
       const oldPendingPermission = getOrCreateState(sessionId).pendingPermission;
       setState(sessionId, (state) => {
+
         // Permission snapshots are authoritative too. In particular, do not
         // append the snapshot behind a stale displayed request: a renderer can
         // miss A's dismissal, reconnect while B is pending, and otherwise keep
@@ -9229,6 +10284,7 @@ function reconcilePendingInteractions(
           state.pendingPermissionQueue.some(
             (permission, index) => permission !== nextPermissionQueue[index],
           );
+
         const currentSurvives =
           state.pendingPluginSetup !== null &&
           authoritativePluginSetupIds.has(state.pendingPluginSetup.requestId);
@@ -9280,6 +10336,7 @@ function reconcilePendingInteractions(
           !permissionChanged &&
           !currentChanged &&
           !queueChanged &&
+          nextPermission === state.pendingPermission &&
           nextCommand === state.pluginSetupCommandInFlight &&
           promotedRemoteDesktopConfirmation === state.pendingRemoteDesktopConfirmation &&
           !remoteQueueChanged
@@ -9289,11 +10346,14 @@ function reconcilePendingInteractions(
         return {
           ...state,
           pendingPermission: nextPermission,
+
           pendingPermissionQueue: nextPermissionQueue,
+
           pendingPluginSetup: nextCurrent,
           pendingPluginSetupQueue: survivingQueue,
           pluginSetupViewerState: currentChanged ? 'expanded' : state.pluginSetupViewerState,
           pluginSetupCommandInFlight: nextCommand,
+          pluginSetupCommandError: currentChanged ? null : state.pluginSetupCommandError,
           pendingRemoteDesktopConfirmation: promotedRemoteDesktopConfirmation,
           pendingRemoteDesktopConfirmationQueue: remainingRemoteConfirmations,
         };
@@ -9952,6 +11012,7 @@ function settleRemoteOptimisticFailure(sessionId: string, clientId: string, erro
           error: decodeRemoteErrorMessage(error instanceof Error ? error.message : String(error)),
           usageLimitRecovery: null,
           errorReason: null,
+          toolLoop: null,
           recoverableError: null,
           errorRetryText: null,
         }
@@ -10066,6 +11127,7 @@ function bumpMessagesEpoch(sessionId: string): void {
  * bumpMessagesEpoch。
  */
 function invalidateMessageHistoryWindow(sessionId: string): void {
+  getRemoteHistoryView(sessionId)?.reset();
   bumpMessagesEpoch(sessionId);
   resetSessionAutomaticHistoryLoadCompletion(sessionId);
 }
@@ -10107,6 +11169,12 @@ function retryInvalidatedInitialHistoryFetchIfNeeded(
   epoch: number,
 ): void {
   const ownsFetch = _historyFetchToken.get(sessionId) === token;
+  // Release the shared pagination lock only when this fetch still owns the
+  // token.  A stale callback from a superseded fetch must not clear the lock
+  // that a newer replacement backfill is actively holding.
+  if (ownsFetch) {
+    setState(sessionId, (s) => (s.isLoadingMore ? { ...s, isLoadingMore: false } : s));
+  }
   const epochChanged = (_messagesEpoch.get(sessionId) ?? 0) !== epoch;
   const originUnchanged = remoteProjectsStore.getSessionDeviceId(sessionId) === origin;
   releaseHistoryFetchIfCurrent(sessionId, token);
@@ -10243,8 +11311,142 @@ function releaseCacheHydrationAfterFailure(sessionId: string): void {
   _cacheHydrateStarted.delete(sessionId);
 }
 
+export type HistoryChatMessage = ChatMessage & { id: string; createdAt: string };
+const remoteHistoryViews = new Map<string, {
+  view: HistoryViewController<HistoryChatMessage> | undefined;
+  intentQueue: { tail: Promise<void> };
+  isCurrent(): boolean;
+}>();
+function releaseRemoteHistoryView(sessionId: string, expected?: HistoryViewController<HistoryChatMessage>): void {
+  const entry = remoteHistoryViews.get(sessionId);
+  if (!entry?.view || (expected && entry.view !== expected)) return;
+  // Detach before publishing inactivity; the old subscriber cannot refill the slice.
+  const view = entry.view;
+  entry.view = undefined;
+  view.setActive(false);
+  // Keep the ordering through an immediate A -> B -> A replacement. Remove
+  // an unused slot only after its final release has reached the old Host.
+  const tail = entry.intentQueue.tail;
+  void tail.finally(() => {
+    if (remoteHistoryViews.get(sessionId) === entry && !entry.view && entry.intentQueue.tail === tail) {
+      remoteHistoryViews.delete(sessionId);
+    }
+  });
+}
+export function getRemoteHistoryView(sessionId: string) {
+  const entry = remoteHistoryViews.get(sessionId);
+  if (entry?.view && !entry.isCurrent()) {
+    releaseRemoteHistoryView(sessionId, entry.view);
+    return undefined;
+  }
+  return entry?.view;
+}
+function createRemoteHistoryView(sessionId: string) {
+  const existing = getRemoteHistoryView(sessionId);
+  const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+  if (!deviceId && (typeof window === 'undefined' || !window.electronAPI?.localDb?.messages?.historyView)) return undefined;
+  if (existing) return existing;
+  const entry = remoteHistoryViews.get(sessionId) ?? {
+    view: undefined, intentQueue: { tail: Promise.resolve() }, isCurrent: () => false,
+  };
+  const owner = getDataOwnerGeneration();
+  // Begin the protected disk read before taking write tokens for remote requests.
+  const cached = deviceId ? readRemoteHistoryCache<HistoryChatMessage>(deviceId, sessionId) : Promise.resolve(null);
+  let writeCache: ReturnType<typeof remoteHistoryCacheWriter> | undefined;
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  const isCurrent = (): boolean => isDataOwnerGenerationCurrent(owner)
+    && remoteProjectsStore.getSessionDeviceId(sessionId) === deviceId
+    && remoteHistoryViews.get(sessionId)?.view === view;
+  const mapRows = (rows: Message[]): HistoryChatMessage[] => mapServerMessages(rows).map((row) => ({
+    ...row, id: row.id ?? row.clientId, createdAt: row.createdAt ?? '',
+  }));
+  const call = async <T,>(channel: string, args: unknown[]): Promise<T> => {
+    if (!isCurrent()) throw new Error('History source changed');
+    const value = deviceId ? await window.electronAPI.deviceLink.invoke(deviceId, channel, args)
+      : channel === 'local-db:messages:view'
+        ? await window.electronAPI.localDb.messages.historyView(sessionId, args[1] as { before?: string; lazyDetails?: boolean })
+        : channel === 'local-db:messages:work-details'
+          ? await window.electronAPI.localDb.messages.workDetails(sessionId, args[1] as import('@cindy/maker-shared/message-window').HistoryWorkReference, args[2] as { after?: string })
+          : undefined;
+    if (!isCurrent()) throw new Error('History source changed');
+    return value as T;
+  };
+  const view = new HistoryViewController<HistoryChatMessage>({
+    page: async (before) => {
+      const writer = deviceId ? remoteHistoryCacheWriter(deviceId, sessionId) : undefined;
+      const page = await call<HistoryViewPage<Message>>('local-db:messages:view', [sessionId, { before, lazyDetails: true }]);
+      if (page == null) throw new Error('[CHANNEL_NOT_ALLOWED] History view is unavailable');
+      writeCache = writer;
+      return { ...page, items: mapHistoryViewMessages(page.items, mapRows) };
+    },
+    details: async (ref, after) => {
+      const writer = deviceId ? remoteHistoryCacheWriter(deviceId, sessionId) : undefined;
+      const page = await call<HistoryDetailPage<Message>>('local-db:messages:work-details', [sessionId, ref, { after }]);
+      writeCache = writer;
+      return { ...page, messages: mapRows(page.messages) };
+    },
+    expanded: async (refs) => {
+      // Releasing an old view must still clear its original Host's interest.
+      // The existing intent queue orders this after any in-flight expand.
+      if (!refs.length) {
+        if (deviceId && isDataOwnerGenerationCurrent(owner)) {
+          await window.electronAPI.deviceLink.invoke(deviceId, 'local-db:messages:view-intent', [sessionId, []]);
+        }
+      } else await call<void>('local-db:messages:view-intent', [sessionId, refs]);
+    },
+  }, entry.intentQueue);
+  entry.view = view;
+  entry.isCurrent = isCurrent;
+  remoteHistoryViews.set(sessionId, entry);
+  view.setNetworkAvailable(!deviceId || !isRemoteDeviceMarkedDisconnected(deviceId));
+  view.subscribe(() => {
+    if (persistTimer) clearTimeout(persistTimer);
+    if (!isCurrent() || !sessions.has(sessionId)) return;
+    const snapshot = view.getSnapshot();
+    if (isHistoryViewUnavailable(snapshot.error)) {
+      writeCache = undefined;
+      // Keep the last usable mirror until the raw fallback succeeds and replaces it.
+      setState(sessionId, (state) => ({ ...state, messages: confirmRemoteUsers(state.messages,
+        new Set(state.messages.filter((row) => !row.isPendingPersist).map((row) => row.clientId))) }));
+    } else if (snapshot.ready && !snapshot.loading && !snapshot.error && writeCache) {
+      const writer = writeCache;
+      persistTimer = setTimeout(() => { if (isCurrent()) writer(snapshot); }, 1200);
+    }
+    if (!snapshot.ready) {
+      if (view.isActive() && isHistoryViewUnavailable(snapshot.error)) {
+        void reconcileRemoteMessages(sessionId, { force: true }).catch(() => undefined);
+      }
+      return;
+    }
+    const available = historyViewLeaves(snapshot.items).flatMap((item) => item.type === 'messages' ? item.messages : []);
+    for (const detail of snapshot.details.values()) available.push(...detail.messages);
+    setState(sessionId, (state) => ({ ...state, historyLoaded: true,
+      messages: confirmRemoteUsers(
+        mergeMessages(available, state.messages.filter((message) => !message.cacheHydrated), { addOnly: true }),
+        new Set(available.filter((message) => message.role === 'user').map((message) => message.clientId)),
+      ),
+      hasMoreMessages: snapshot.hasMore, isLoadingMore: view.isLoadingOlder(),
+      oldestMessageId: snapshot.nextCursor,
+      historyWindowHasIsland: false,
+    }));
+  });
+  void view.restoreCachedView(async () => {
+    const snapshot = await cached;
+    return isCurrent() ? snapshot : null;
+  });
+  return view;
+}
+
 function ensureInitialMessages(sessionId: string): void {
   const state = getOrCreateState(sessionId);
+  const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+  if (deviceId && isRemoteDeviceMarkedDisconnected(deviceId)) {
+    _historyLoadOrigin.set(sessionId, deviceId);
+    noteInputProjectionOrigin(sessionId, deviceId);
+    createRemoteHistoryView(sessionId);
+    hydrateRemoteMessagesFromCache(sessionId);
+    return;
+  }
   requestInputProjection(sessionId);
   // Prefetch and other non-mounted callers still create a cache entry. Give
   // that entry the same bounded lifetime as a viewed session so a cancelled
@@ -10341,6 +11543,7 @@ function ensureInitialMessages(sessionId: string): void {
             costUsd: session.totalCostUsd ?? s.agentStatus.costUsd,
             contextTokens: session.contextTokens || s.agentStatus.contextTokens,
             contextWindow: session.contextWindow || s.agentStatus.contextWindow,
+            // Read projection can supply catalog metadata; only status events prove runtime origin.
           };
         }
         return Object.keys(updates).length > 0 ? { ...s, ...updates } : s;
@@ -10367,8 +11570,32 @@ function ensureInitialMessages(sessionId: string): void {
       }
     });
 
-  listMessagesFor(sessionId)
+  (async () => {
+    const view = createRemoteHistoryView(sessionId);
+    if (view) {
+      await view.refresh();
+      if (!isCurrentHistoryLoad() || getRemoteHistoryView(sessionId) !== view) {
+        retryInvalidatedInitialHistoryFetchIfNeeded(sessionId, historyFetchToken, historyOriginAtStart, historyEpochAtStart);
+        return null;
+      }
+      const snapshot = view.getSnapshot();
+      if (!snapshot.error && snapshot.ready) {
+        if (isCurrentHistoryLoad()) {
+          // The structured snapshot is persisted through the same mirror-cache barriers.
+          settleCacheHydration(sessionId);
+        }
+        releaseHistoryFetchIfCurrent(sessionId, historyFetchToken);
+        void reconcilePendingInteractions(sessionId);
+        scheduleIdlePlanDiscoveryIfNeeded(sessionId);
+        return null;
+      }
+      if (!isHistoryViewUnavailable(snapshot.error)) throw snapshot.error;
+      releaseRemoteHistoryView(sessionId, view);
+    }
+    return listMessagesFor(sessionId);
+  })()
     .then(async (existing) => {
+      if (existing === null) return;
       if (
         !isCurrentHistoryFetch(
           sessionId,
@@ -10498,7 +11725,7 @@ function ensureInitialMessages(sessionId: string): void {
           ),
           isFirstMessage: false,
           oldestMessageId:
-            s.historyWindowHasIsland === true
+            s.historyWindowIslands.length > 0
               ? initialOldestId
               : (oldestServerMessageIdForWindow(
                   existing,
@@ -10588,9 +11815,7 @@ function ensureInitialMessages(sessionId: string): void {
       const oldestId = oldestRow.id;
       settleCacheHydration(sessionId);
       if (!isCurrentHistoryLoad()) return;
-      setState(sessionId, (s) => ({
-        ...s,
-        historyLoaded: true,
+      setState(sessionId, (s) => {
         // Merge: keep any messages already appended by streaming events
         // (unlikely here since we gate history load on first mount, but
         // preserves slice invariants).
@@ -10598,36 +11823,46 @@ function ensureInitialMessages(sessionId: string): void {
         // 冷缓存 hydrate 的行先**整批剔除**再 merge:mergeMessages 只增不删,权威页里
         // 已经不存在的缓存行(被控端 /clear、rewind、删消息)否则会永久留在窗口里。
         // 仍在权威页里的那些会由 mapped 原样带回来,不会闪。
-        messages: mergeMessages(
+        const messages = mergeMessages(
           mapped,
           s.messages.some((m) => m.cacheHydrated === true)
             ? s.messages.filter((m) => m.cacheHydrated !== true)
             : s.messages,
           {},
           'newest-first',
-        ),
-        isFirstMessage: false,
-        // 窗口里掺着跳转孤岛时,**本页的下沿**接管游标,不再取"两者中更老的那个"。
-        //
-        // 序列(#676 review codex P1):会话刚打开就直接深跳,首拉还没回来 → 补齐无从下手、
-        // 退回 around 孤岛并用孤岛下沿播种游标(那时窗口里只有孤岛,只能这么播)。随后首拉
-        // 的最新页落地,若仍保留更老的孤岛游标,缺失区间恰好比它**更新**:普通向上翻页与
-        // 孤岛感知重试都只会请求比孤岛更老的行,那段洞永远拉不回来,除非整会话重载。
-        // 换成最新页下沿后,往上翻会一页页穿过那段洞,补齐也能真正命中目标并自愈。
-        //
-        // 孤岛标记**不清**:洞还在,直到翻页真的把它填上。
-        oldestMessageId:
-          s.historyWindowHasIsland === true
-            ? oldestId
-            : (oldestServerMessageIdForWindow(
-                merged,
-                s.messages,
-                s.oldestMessageId,
-                'newest-first',
-              ) ?? oldestId),
-        hasMoreMessages: hasMore,
-        isLoadingMore: false,
-      }));
+        );
+        return {
+          ...s,
+          historyLoaded: true,
+          messages,
+          isFirstMessage: false,
+          // 窗口里掺着跳转孤岛时,**本页的下沿**接管游标,不再取"两者中更老的那个"。
+          //
+          // 序列(#676 review codex P1):会话刚打开就直接深跳,首拉还没回来 → 补齐无从下手、
+          // 退回 around 孤岛并用孤岛下沿播种游标(那时窗口里只有孤岛,只能这么播)。随后首拉
+          // 的最新页落地,若仍保留更老的孤岛游标,缺失区间恰好比它**更新**:普通向上翻页与
+          // 孤岛感知重试都只会请求比孤岛更老的行,那段洞永远拉不回来,除非整会话重载。
+          // 换成最新页下沿后,往上翻会一页页穿过那段洞,补齐也能真正命中目标并自愈。
+          //
+          // 孤岛区间**不清**:洞还在,直到翻页真的把它填上(absorbIslandsCrossedByPaging)。
+          oldestMessageId:
+            s.historyWindowIslands.length > 0
+              ? oldestId
+              : (oldestServerMessageIdForWindow(
+                  merged,
+                  s.messages,
+                  s.oldestMessageId,
+                  'newest-first',
+                ) ?? oldestId),
+          hasMoreMessages: hasMore,
+          isLoadingMore: false,
+          historyWindowIslands: absorbIslandsCrossedByPaging(
+            s.historyWindowIslands,
+            messages,
+            oldestId,
+          ),
+        };
+      });
       if (import.meta.env.DEV) {
         const ingestDurMs = performance.now() - ingestStartMs;
         if (ingestDurMs >= 30) {
@@ -10666,7 +11901,7 @@ function ensureInitialMessages(sessionId: string): void {
       // rewind 之类的粘滞抑制(见 releaseCacheHydrationAfterFailure)。屏上已 hydrate 的
       // 缓存行**保持不动**:离线时它是用户唯一能看到的历史,清掉纯属倒退。
       releaseCacheHydrationAfterFailure(sessionId);
-      setState(sessionId, (s) => ({ ...s, historyLoaded: false }));
+      setState(sessionId, (s) => ({ ...s, historyLoaded: false, isLoadingMore: false }));
     });
 }
 
@@ -10685,14 +11920,14 @@ function scheduleIdlePlanDiscoveryIfNeeded(sessionId: string): void {
   const state = sessions.get(sessionId);
   if (!state?.historyLoaded || state.isLoadingMore || !state.hasMoreMessages) return;
   const planState = getLatestMessageTodoState(state.messages, {
-    taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowHasIsland,
+    taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowIslands.length > 0,
   });
   if (planState.hasPlanEvent && planState.isResolved) return;
   if (_idlePlanDiscoveryHandles.has(sessionId)) return;
 
   const run = () => {
     _idlePlanDiscoveryHandles.delete(sessionId);
-    void loadOneOlderPageForPlanDiscovery(sessionId);
+    void loadOneOlderPageForPlanDiscovery(sessionId).catch(() => undefined);
   };
 
   _idlePlanDiscoveryHandles.set(sessionId, setTimeout(run, IDLE_PLAN_DISCOVERY_DELAY_MS));
@@ -10705,7 +11940,7 @@ function loadOneOlderPageForPlanDiscovery(sessionId: string): Promise<boolean> {
     return Promise.resolve(false);
   }
   const planState = getLatestMessageTodoState(state.messages, {
-    taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowHasIsland,
+    taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowIslands.length > 0,
   });
   if (planState.hasPlanEvent && planState.isResolved) return Promise.resolve(false);
   if (planState.hasPlanEvent && !planState.isResolved) {
@@ -10728,7 +11963,7 @@ async function continuePlanResolutionAfterIdleDiscovery(sessionId: string): Prom
     const state = sessions.get(sessionId);
     if (!state?.historyLoaded || state.isLoadingMore || !state.hasMoreMessages) return;
     const planState = getLatestMessageTodoState(state.messages, {
-      taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowHasIsland,
+      taskHistoryMayBeIncomplete: state.hasMoreMessages || state.historyWindowIslands.length > 0,
     });
     if (!planState.hasPlanEvent || planState.isResolved) return;
     const advanced = await loadOlderMessages(sessionId, false, 1);
@@ -10745,6 +11980,7 @@ async function continuePlanResolutionAfterIdleDiscovery(sessionId: string): Prom
  */
 function reloadMessages(sessionId: string, opts?: { allowCacheHydrate?: boolean }): void {
   discardPendingTextDelta(sessionId);
+  if (!opts?.allowCacheHydrate) invalidateRemoteMessageCache(sessionId);
   // 代际递增:作废 in-flight 的 loadOlderMessages 追页窗口(见 _messagesEpoch 注释)。
   invalidateMessageHistoryWindow(sessionId);
   invalidateHistoryFetch(sessionId);
@@ -10769,7 +12005,6 @@ function reloadMessages(sessionId: string, opts?: { allowCacheHydrate?: boolean 
     // 标记没了而盘上那份还是 rewind 之前的窗口 —— 下次离线冷启动照样 hydrate 出已被软删
     // 的消息(review: codex P1)。所以同时把盘上那份清掉:缓存是纯优化,重载后的首拉
     // 成功时会重新写上。
-    invalidateRemoteMessageCache(sessionId);
   }
   setState(sessionId, (s) => {
     const optimisticRecords = remoteOptimisticSendRecords(sessionId);
@@ -10795,7 +12030,7 @@ function reloadMessages(sessionId: string, opts?: { allowCacheHydrate?: boolean 
       oldestMessageId: null,
       isStreaming: false,
       // 窗口从最新重新拉起 → 不再有孤岛。
-      historyWindowHasIsland: false,
+      historyWindowIslands: EMPTY_WINDOW_ISLANDS,
       // 分页锁归本次重置释放:窗口和游标都清了,in-flight 的翻页 / 跳转补齐也已被上面的
       // bumpMessagesEpoch 作废,锁再留着只会让行首守卫卡住下一次翻页。由这里清而不是
       // 让被作废的请求代清 —— 它们无法分辨锁是自己那一代的还是重置后新代际的(#676 review)。
@@ -10862,6 +12097,14 @@ function removeMessagesByClientIds(
       messages,
       taskUpdates,
       isFirstMessage: !messages.some((message) => message.role === 'user'),
+      // 删除落在孤岛区间内会把孤岛从中间截断,剩余部分的连通性不再可判 → 保守按
+      // 整窗不连续建模(主段为空)。删在主段里则与旧 boolean 同口径:不另记孤岛。
+      historyWindowIslands: conservativeIfIslandRowRemoved(
+        s.historyWindowIslands,
+        s.messages,
+        deletedClientIds,
+        messages,
+      ),
       ...lockReset,
     };
   });
@@ -10905,6 +12148,13 @@ function dropMessagesFromClientId(sessionId: string, clientId: string): void {
     return {
       ...s,
       messages: s.messages.slice(0, idx),
+      // 从最新一侧截断:整座落在截断区里的孤岛随洞一起消失;被拦腰截断的那座保守按
+      // 整窗不连续建模(存活部分的最老边界未知,见 pruneIslandsAfterNewestTruncation)。
+      historyWindowIslands: pruneIslandsAfterNewestTruncation(
+        s.historyWindowIslands,
+        s.messages,
+        idx,
+      ),
       taskUpdates: new Map(),
       isStreaming: false,
       // 同 reloadMessages / clearSessionAfterGuard:本地截断也是 epoch-reset 路径,
@@ -10934,6 +12184,7 @@ function reconcileOpenSessionOrigins(): void {
     // 最初按 A 发起的旧查询在来源恢复后重新通过检查,覆盖恢复后的权威投影。
     const originChange = noteInputProjectionOrigin(sessionId, current);
     if (originChange.changed) {
+      releaseRemoteHistoryView(sessionId);
       bumpInteractionReconcileEpoch(sessionId);
       // 来源变更后旧设备的 owner / capability 都失效。在新来源 projection 回来前
       // fail closed，不能让 B 的历史沿用 A 的精确 owner 或 legacy 兜底。
@@ -10946,7 +12197,12 @@ function reconcileOpenSessionOrigins(): void {
     }
     if (current === undefined) continue;
     const loaded = _historyLoadOrigin.get(sessionId);
-    if (current === loaded) continue;
+    if (current === loaded && !originChange.changed) {
+      if (_activeViewSessions.has(sessionId) && !sessions.get(sessionId)?.historyLoaded && !isRemoteDeviceMarkedDisconnected(current)) {
+        ensureInitialMessages(sessionId);
+      }
+      continue;
+    }
     // undefined → deviceId 是启动竞速的**首次解析**(上一次首拉命中的是本机空库),
     // 缓存并未因此过期 → 放开 hydrate,让被控端离线时也能看到上次的最近一页。
     // 设备之间真的换了 origin(string → 另一个 string)时不放开:那是另一台机器的历史。
@@ -10971,6 +12227,7 @@ function reconcileOpenSessionOrigins(): void {
  *  - isStreaming=true → 跳过(不打断在串的 turn;turn 结束会再触发一次)。
  *    例外:`opts.force`(仅 stall 看门狗在**被控端权威报 not-running 之后**才传)放行 ——
  *    此时 isStreaming 是「卡死残留」而非真在串,必须能补回丢失的终态/消息。
+ *    repair 为已授权的补流信号:允许在途对账,保留历史未覆盖或拉取期间更新的 live 行。
  *  - 无新 clientId → no-op(不产生新数组引用,避免无谓重渲染)。
  */
 /**
@@ -10991,37 +12248,216 @@ function reconcileOpenSessionOrigins(): void {
  */
 const _remoteReconcileInFlight = new Map<
   string,
-  { run: Promise<void>; rerun: boolean; rerunForce: boolean }
+  { run: Promise<boolean>; rerun: boolean; rerunForce: boolean; rerunRepair: boolean; preserveClientIds: Set<string> }
 >();
 
-function reconcileRemoteMessages(sessionId: string, opts?: { force?: boolean }): Promise<void> {
+type HistoryViewForceFlight = {
+  run: Promise<boolean>;
+  rerun: boolean;
+  rowsAtStart: Map<string, ChatMessage>;
+  latestOpts: {
+    force?: boolean;
+    repair?: boolean;
+    freshHistory?: boolean;
+    preserveClientIds?: ReadonlySet<string>;
+  };
+};
+
+const _historyViewForceInFlight = new Map<string, HistoryViewForceFlight>();
+
+function reconcileRemoteMessages(sessionId: string, opts?: {
+  force?: boolean;
+  repair?: boolean;
+  freshHistory?: boolean;
+  preserveClientIds?: ReadonlySet<string>;
+}): Promise<boolean> {
+  const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+  if (deviceId && isRemoteDeviceMarkedDisconnected(deviceId)) return Promise.resolve(false);
+  const view = getRemoteHistoryView(sessionId);
+  if (view && (view.getSnapshot().ready || opts?.freshHistory || opts?.repair)) {
+    const runHistoryView = (flight?: HistoryViewForceFlight) => {
+      const syncToken = noteRemoteSessionSyncStarted(sessionId);
+      const rowsAtStart = new Map((sessions.get(sessionId)?.messages ?? []).map((row) => [row.clientId, row]));
+      const epochAtStart = _messagesEpoch.get(sessionId) ?? 0;
+      const noteHydration = (before: readonly ChatMessage[], after: readonly ChatMessage[]) => {
+        if (!flight) return;
+        const previous = new Map(before.map((row) => [row.clientId, row]));
+        for (const row of after) {
+          // Advance only our own writes. A row changed by live ingress must
+          // keep its old baseline so the trailing read still protects it.
+          if (flight.rowsAtStart.get(row.clientId) === previous.get(row.clientId)) {
+            flight.rowsAtStart.set(row.clientId, row);
+          }
+        }
+      };
+      // Read receipts also need a post-signal page: joining a pre-existing read
+      // cannot certify this sync generation. Preserve the view and expansion.
+      return Promise.all([
+        view.refresh(false, true),
+        reconcilePendingInteractions(sessionId),
+      ]).then(async () => {
+        if (getRemoteHistoryView(sessionId) !== view || !view.isActive()) return false;
+        if (isHistoryViewUnavailable(view.getSnapshot().error)) {
+          releaseRemoteHistoryView(sessionId, view);
+          return runRemoteReconcile(sessionId, { ...opts, force: true }, noteHydration);
+        }
+        {
+          // readPage starts expanded details without awaiting them. Join those
+          // same reads before certifying receipts; their display may still be old.
+          // Historical folded bodies stay lazy. A force recovery must still seal
+          // live rows already on screen when their final push was lost; only
+          // ranges containing those rows may be read without user expansion.
+          const liveRows = opts?.force ? [...rowsAtStart.values()].filter((row) => row.isStreaming) : [];
+          const summaries = historyWorkSummaries(view.getSnapshot().items);
+          const recoveryKeys = new Set(summaries.filter((summary) => liveRows.some((row) => {
+            if (summary.parentToolUseId && !row.parentToolUseId) return false;
+            const createdAt = Date.parse(row.createdAt ?? '');
+            return row.clientId === summary.anchorClientId
+              || (createdAt >= summary.startedAtMs && createdAt <= summary.endedAtMs);
+          })).map((summary) => summary.key));
+          await Promise.all(summaries
+            .filter((summary) => recoveryKeys.has(summary.key) || view.getSnapshot().expanded.has(summary.key))
+            .map((summary) => recoveryKeys.has(summary.key)
+              ? view.loadDetails(summary, { allowCollapsed: true }) : view.loadDetails(summary)));
+          if (getRemoteHistoryView(sessionId) !== view || !view.isActive()
+            || (_messagesEpoch.get(sessionId) ?? 0) !== epochAtStart) return false;
+          const detailsSnapshot = view.getSnapshot();
+          const incompleteDetails = historyWorkSummaries(detailsSnapshot.items).some((summary) => {
+            if (!recoveryKeys.has(summary.key) && !detailsSnapshot.expanded.has(summary.key)) return false;
+            const detail = detailsSnapshot.details.get(summary.key);
+            return !detail?.complete || !!detail.error || detail.revision !== summary.revision;
+          });
+          if (incompleteDetails) {
+            if (!opts?.force) return false;
+            // Collapse can cancel a joined detail read without rejecting it.
+            // Missing, partial, failed or stale details cannot certify recovery.
+            // Use the same authoritative fallback as a transient read failure;
+            // if that read also fails, preserve rejection.
+            return runRemoteReconcile(sessionId, opts, noteHydration);
+          }
+        }
+        if (getRemoteHistoryView(sessionId) !== view || !view.isActive()) return false;
+        const snapshot = view.getSnapshot();
+        if (snapshot.error) throw snapshot.error;
+        if ((_messagesEpoch.get(sessionId) ?? 0) !== epochAtStart) return false;
+        if (opts?.force && snapshot.ready) {
+          // Host thinking snapshots use synthetic IDs and carry no terminal
+          // marker. Only durable rows may seal an existing live row; provisional
+          // rows already participate in the ordinary add-only subscription.
+          const details = historyWorkSummaries(snapshot.items).flatMap((summary) => {
+            const detail = snapshot.details.get(summary.key);
+            return detail?.complete
+              && !detail.error && detail.revision === summary.revision ? detail.messages : [];
+          });
+          const available = details.concat(historyViewLeaves(snapshot.items)
+            .flatMap((item) => item.type === 'messages' ? item.messages : []))
+            .filter((row) => !row.id.startsWith('history-live:')
+              && !opts?.preserveClientIds?.has(row.clientId));
+          setState(sessionId, (state) => {
+            // The ordinary view subscriber is add-only. Explicit recovery must
+            // hydrate stale live shells, or their handoff keeps masking sealed rows.
+            // Preserve rows changed by live events while this read was pending.
+            const untouched = new Set(state.messages.filter((row) => rowsAtStart.get(row.clientId) === row).map((row) => row.clientId));
+            const messages = mergeMessages(available, state.messages, { addOnly: true, addOnlyExcept: untouched });
+            noteHydration(state.messages, messages);
+            return messages === state.messages ? state : { ...state, messages };
+          });
+        }
+        // Failed, inactive or superseded views return above without certifying
+        // unread content. Raw-history fallbacks report their own sync generation.
+        if (snapshot.ready) noteRemoteSessionSyncCompleted(sessionId, syncToken);
+        return snapshot.ready;
+      });
+    };
+    if (!opts?.force) return runHistoryView();
+    const existing = _historyViewForceInFlight.get(sessionId);
+    if (existing) {
+      existing.rerun = true;
+      existing.latestOpts = opts;
+      return existing.run;
+    }
+    const entry: HistoryViewForceFlight = {
+      run: Promise.resolve(false),
+      rerun: false,
+      rowsAtStart: new Map((sessions.get(sessionId)?.messages ?? []).map((row) => [row.clientId, row])),
+      latestOpts: opts,
+    };
+    _historyViewForceInFlight.set(sessionId, entry);
+    entry.run = (async () => {
+      try {
+        let applied: boolean;
+        try {
+          applied = await runHistoryView(entry);
+        } catch (error) {
+          // Replacing the view while its page is in flight rejects the old
+          // controller read. A coalesced force signal still needs to retry on
+          // the replacement view; without a pending force, preserve the
+          // original error for callers that explicitly await this promise.
+          if (!entry.rerun || !sessions.has(sessionId)) throw error;
+          applied = false;
+        }
+        if (entry.rerun && sessions.has(sessionId)) {
+          _historyViewForceInFlight.delete(sessionId);
+          const preserveClientIds = new Set(entry.latestOpts.preserveClientIds);
+          for (const row of sessions.get(sessionId)?.messages ?? []) {
+            if (entry.rowsAtStart.has(row.clientId) && entry.rowsAtStart.get(row.clientId) !== row) {
+              preserveClientIds.add(row.clientId);
+            }
+          }
+          applied = await reconcileRemoteMessages(sessionId, {
+            ...entry.latestOpts,
+            preserveClientIds,
+          });
+        }
+        return applied;
+      } finally {
+        if (_historyViewForceInFlight.get(sessionId) === entry) _historyViewForceInFlight.delete(sessionId);
+      }
+    })();
+    void entry.run.catch(() => undefined);
+    return entry.run;
+  }
   // 返回完成 promise 供调用方需要时等待;既有调用方均按 fire-and-forget 使用。
-  if (!sessionId || !isRemoteSession(sessionId)) return Promise.resolve();
+  if (!sessionId || !isRemoteSession(sessionId)) return Promise.resolve(false);
   const inFlight = _remoteReconcileInFlight.get(sessionId);
   if (inFlight) {
     inFlight.rerun = true;
-    if (opts?.force) inFlight.rerunForce = true;
+    if (opts?.force) {
+      inFlight.rerunForce = true;
+      // The latest forced signal identifies the current live block. A later
+      // snapshot-less resync can authoritatively seal the previous block.
+      inFlight.preserveClientIds = new Set(opts.preserveClientIds);
+    }
+    if (opts?.repair) inFlight.rerunRepair = true;
     void reconcilePendingInteractions(sessionId).catch(() => undefined);
     return inFlight.run;
   }
-  const entry: { run: Promise<void>; rerun: boolean; rerunForce: boolean } = {
-    run: Promise.resolve(),
+  const entry: { run: Promise<boolean>; rerun: boolean; rerunForce: boolean; rerunRepair: boolean; preserveClientIds: Set<string> } = {
+    run: Promise.resolve(false),
     rerun: false,
     rerunForce: false,
+    rerunRepair: false,
+    preserveClientIds: new Set(),
   };
   _remoteReconcileInFlight.set(sessionId, entry);
   entry.run = (async () => {
+    let applied = false;
     try {
-      await runRemoteReconcile(sessionId, opts);
+      applied = await runRemoteReconcile(sessionId, opts);
     } finally {
       const rerun = entry.rerun;
       const rerunForce = entry.rerunForce;
+      const rerunRepair = entry.rerunRepair;
       // 先摘掉在飞标记,再补跑 —— 补跑会自己建新的 entry,期间来的触发继续被那一份合并。
       _remoteReconcileInFlight.delete(sessionId);
       if (rerun && sessions.has(sessionId)) {
-        await reconcileRemoteMessages(sessionId, rerunForce ? { force: true } : undefined);
+        applied = await reconcileRemoteMessages(
+          sessionId,
+          { force: rerunForce, repair: rerunRepair, preserveClientIds: entry.preserveClientIds },
+        );
       }
     }
+    return applied;
   })();
   // 显式挂一个吞掉的 rejection handler:返回的 promise 语义不变(仍然会 reject,需要的调用方照样
   // 能 await 到),但 Node / renderer 不再把它当成 unhandled rejection —— 绝大多数调用方是
@@ -11031,7 +12467,11 @@ function reconcileRemoteMessages(sessionId: string, opts?: { force?: boolean }):
   return entry.run;
 }
 
-function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Promise<void> {
+function runRemoteReconcile(sessionId: string, opts?: {
+  force?: boolean;
+  repair?: boolean;
+  preserveClientIds?: ReadonlySet<string>;
+}, noteHydration?: (before: readonly ChatMessage[], after: readonly ChatMessage[]) => void): Promise<boolean> {
   // 挂起交互面板重建**无条件先行**,不受下方 isStreaming 守卫约束:turn 内弹出的
   // permission / ask / plan 正是 isStreaming=true 的常见态(pendingPermission 与
   // isRunning 共存),断连重连 / 聚焦时若被守卫吞掉,交互面板不重建、用户无法回应,
@@ -11039,7 +12479,10 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
   // 未读的 passive 远程回执必须等提示真实重建后才放行。
   const interactionsSync = reconcilePendingInteractions(sessionId);
   const state = sessions.get(sessionId);
-  if (!state || !state.historyLoaded || (state.isStreaming && !opts?.force)) {
+  // A repair without force started while streaming is deliberately additive: it may insert
+  // durable rows whose push was lost, but it must never hydrate or replace the
+  // live row that the stream is still producing.
+  if (!state || !state.historyLoaded || (state.isStreaming && !opts?.force && !opts?.repair)) {
     // 消息对账被守卫挡下,但交互重建照跑。为它单独开一代:turn 进行中的
     // needs-interaction 未读,其「内容」就是权限 / ask / plan 提示本身——提示真实
     // 重建(count>0)才算一代完成,挂起的 passive 回执随之放行,不必等 turn 结束。
@@ -11056,8 +12499,8 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
     // 映射成 Promise<void> 并吞掉 rejection(engine 路径 fire-and-forget 无 catch;
     // 失败已由 reconcilePendingInteractions 内部日志记录)。
     return interactionsSync.then(
-      () => undefined,
-      () => undefined,
+      () => false,
+      () => false,
     );
   }
   const existingIds = new Set(state.messages.map((m) => m.clientId));
@@ -11111,7 +12554,6 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
         }
         before = oldest.id;
       }
-      if (collected.length === 0) return;
       // 本次对账整体作废的两种情形:
       //  1. 代际已变:窗口被 rewind / clear / trim / demote / 另一次对账重建过;
       //  2. 已经有一次**更晚启动**的对账成功落地过:它读到的是更新的真相,本次的 existingIds
@@ -11130,7 +12572,10 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
         windowApplied = false;
         return;
       }
-      const mapped = mapServerMessages(collected);
+      if (collected.length === 0) return;
+      const mapped = mapServerMessages(collected).filter(
+        (message) => !opts?.preserveClientIds?.has(message.clientId),
+      );
       // 翻满上限仍没接回已知区段 → 下面走权威重建分支:整片旧窗口被换掉、oldestMessageId
       // 也被改写。这是第八条"整体重建窗口"的路径,必须 bump epoch 作废 in-flight 的翻页 /
       // 跳转补齐 —— 否则那些请求会带着**重建前**的游标返回,把一段脱离上下文的旧历史接到
@@ -11141,7 +12586,7 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
       // 赢、把对账推到下一轮触发)会让被控端权威内容继续缺着,而走到这个分支本身就说明本地
       // 窗口已经严重过期。所以让权威重建赢。
       //
-      // historyWindowHasIsland 按"是否保留了晚到的本地行"决定清不清,见下方 lateArrivals。
+      // historyWindowIslands 按"是否保留了晚到的本地行"决定清不清,见下方 lateArrivals。
       const isContiguous = reachedKnownWindow;
       // 代际 bump 与分页锁释放都**只在重建确定提交时**做。不能放在 setState 外面提前 bump:
       // 更新器里的 isStreaming 守卫可能否掉重建。也不能等 setState 通知完成后才 bump:
@@ -11152,6 +12597,14 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
         // force 时(stall 看门狗已确认被控端 not-running)放行:此处 isStreaming 是卡死残留。
         // 丢弃合并 = 拉回的窗口没进 UI:置 windowApplied=false,本次不得上报同步完成
         // (否则挂起的远程已读回执会在缺帧内容尚未展示时被放行),等 turn 结束的下一轮。
+        // Snapshot repairs are additive; force recovery instead uses the
+        // reference-guarded authoritative merge below, including when a
+        // force signal was coalesced with an earlier repair.
+        if (s.isStreaming && opts?.repair && !opts.force) {
+          const repaired = mergeMessages(mapped, s.messages, { addOnly: true }, 'newest-first');
+          if (repaired === s.messages) return s;
+          return { ...s, messages: repaired };
+        }
         if (s.isStreaming && !opts?.force) {
           windowApplied = false;
           return s;
@@ -11160,11 +12613,15 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
         // 并发跳转刚 merge 进来的孤岛)。
         const lateArrivals = isContiguous
           ? []
-          : s.messages.filter((message) => !existingIds.has(message.clientId));
+          : s.messages.filter((message) => !existingIds.has(message.clientId)
+            || (opts?.repair && message.isStreaming === true));
         // 只给"启动到现在没被动过"的行开 hydrate 口子:其余只补不改。单飞之后,期间唯一可能动过
         // 这些行的就是 live push(messages:created),它比本次快照更新,不该被旧快照盖回去。
         const untouchedSinceStart = new Set<string>();
         for (const message of s.messages) {
+          // A missing terminal push can leave isStreaming stuck. The existing
+          // reference guard protects concurrent deltas; an unchanged row must
+          // still accept its durable counterpart, including the terminal state.
           if (rowsAtStart.get(message.clientId) === message) {
             untouchedSinceStart.add(message.clientId);
           }
@@ -11177,6 +12634,7 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
               'newest-first',
             )
           : mergeAuthoritativeRemoteWindow(mapped, lateArrivals, 'newest-first');
+        noteHydration?.(s.messages, messages);
         // 无缺失且无权威字段变化 → 不换引用(视同已应用)。
         if (messages === s.messages) return s;
         if (isContiguous) return { ...s, messages };
@@ -11235,7 +12693,12 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
           // 锁归本次重置释放(与 reloadMessages / clear / trim / demote 同规矩):被作废的
           // 请求不会代清,漏清会让行首守卫把该会话的翻页永久卡住。
           isLoadingMore: false,
-          historyWindowHasIsland: hasDetachedArrival,
+          // 晚到行全部脱离权威窗口 → 窗口整体不可信:保守按"主段为空"建模(任何目标都
+          // 继续走补齐尝试,与旧 boolean=true 同语义)。没有脱离行 → 权威窗口本身是
+          // 连续拉回的一段,整窗即主段,窗口内搜索直接 focus。
+          historyWindowIslands: hasDetachedArrival
+            ? conservativeIslandsFor(messages)
+            : EMPTY_WINDOW_ISLANDS,
         };
       });
     } finally {
@@ -11252,7 +12715,7 @@ function runRemoteReconcile(sessionId: string, opts?: { force?: boolean }): Prom
     },
     (err) => log.warn('reconcileRemoteMessages failed', { sessionId, err: String(err) }),
   );
-  return run;
+  return run.then(() => windowApplied);
 }
 
 /**
@@ -11300,6 +12763,24 @@ function loadOlderMessages(
   automatic = false,
   maxPages = MAX_LOAD_OLDER_PAGES,
 ): Promise<boolean> {
+  const deviceId = remoteProjectsStore.getSessionDeviceId(sessionId);
+  if (deviceId && isRemoteDeviceMarkedDisconnected(deviceId)) return Promise.resolve(false);
+  const view = getRemoteHistoryView(sessionId);
+  if (view?.getSnapshot().ready) {
+    const before = view.getSnapshot().nextCursor;
+    const epoch = _messagesEpoch.get(sessionId) ?? 0;
+    return view.refresh(true).then(() => {
+      if (getRemoteHistoryView(sessionId) !== view) return false;
+      if (isHistoryViewUnavailable(view.getSnapshot().error)) {
+        releaseRemoteHistoryView(sessionId, view);
+        return reconcileRemoteMessages(sessionId, { force: true }).then(() => loadOlderMessages(sessionId, automatic, maxPages));
+      }
+      if (view.getSnapshot().error) throw view.getSnapshot().error;
+      const snapshot = view.getSnapshot();
+      return getRemoteHistoryView(sessionId) === view && snapshot.ready && view.isActive()
+        && (_messagesEpoch.get(sessionId) ?? 0) === epoch && snapshot.nextCursor !== before;
+    });
+  }
   const state = getOrCreateState(sessionId);
   if (state.isLoadingMore || !state.hasMoreMessages) return Promise.resolve(false);
 
@@ -11308,10 +12789,13 @@ function loadOlderMessages(
     firstPageOpts = { limit: 50, before: state.oldestMessageId };
   } else if (state.messages.length > 0) {
     // 无 ID 时默认用 messages[0]。有孤岛时那是孤岛最老行,beforeTs 会翻到缺口
-    // 更早的一侧;改用最新连续段下沿,才能填孤岛与尾段之间的洞。
+    // 更早的一侧;改用主连续段(最后一个孤岛最新边界行之后)的下沿,才能填孤岛与
+    // 尾段之间的洞 —— 与 canFocusWithoutJumpLoad / 补齐快速通道同一把结构尺子,
+    // 不再用时间阈值近似(见 oldestMessageOfMainContiguousRun)。
     const oldest =
-      state.historyWindowHasIsland === true
-        ? (oldestMessageOfNewestContiguousRun(state.messages) ?? state.messages[0])
+      state.historyWindowIslands.length > 0
+        ? (oldestMessageOfMainContiguousRun(state.messages, state.historyWindowIslands) ??
+          state.messages[0])
         : state.messages[0];
     if (!oldest.createdAt) return Promise.resolve(false);
     const ts = new Date(oldest.createdAt).getTime();
@@ -11333,8 +12817,8 @@ function loadOlderMessages(
   return (async () => {
     try {
       const collected: Message[] = [];
-      // 跨页按 clientId 去重:mergeMessages 只对"新批 vs 已有"去重,不去重批内
-      // 重复;游标异常(如远端排序不稳)返回重叠页时,不去重会把同一行灌多份。
+      // 跨页提前按 clientId 去重,避免重叠页虚增回填预算和游标进度;
+      // mergeMessages 仍在发布窗口时兜底消息身份唯一性。
       const collectedClientIds = new Set<string>();
       let pageOpts = firstPageOpts;
       // 初值 true:首页就 fetch 失败时不能把 hasMoreMessages 误收成 false(要留给用户重试)。
@@ -11402,6 +12886,13 @@ function loadOlderMessages(
           oldestMessageId: nextOldestMessageId,
           hasMoreMessages: hasMore,
           isLoadingMore: false,
+          // 翻页从主段游标向更老一侧推进:被跨过的孤岛(行落进本批拉取范围)接回主段,
+          // 从显式模型里消失 —— 这是"孤岛 + 已翻到历史起点"的会话恢复零成本跳转的通道。
+          historyWindowIslands: absorbIslandsCrossedByPaging(
+            s.historyWindowIslands,
+            messages,
+            nextOldestMessageId,
+          ),
         };
       });
       if (didAdvanceWindow && automatic) {
@@ -11536,15 +13027,19 @@ async function backfillHistoryUntil(
   // 所以锁被占用时一律 busy —— 返回 busy 而不是 unavailable,是因为锁是别人的,
   // fallback 路径不得代为释放。
   if (getOrCreateState(sessionId).isLoadingMore) return { outcome: 'busy', ownsPagingLock: false };
-  // 快速通道只在窗口没有孤岛时可信:some(clientId) 是成员判定,不是连续覆盖判定。窗口里
-  // 掺过孤岛(补齐失败时 merge 的 around 窗口)时,目标可能正是那座孤岛上的行 —— 直接返回
-  // covered 就等于承认"中间缺失"永久修不好。有孤岛时一律走下面的翻页补齐,让它自愈。
+  // 快速通道只在目标落在**主连续段**里时可信:some(clientId) 是成员判定,不是连续覆盖
+  // 判定。窗口里掺过孤岛(补齐失败时 merge 的 around 窗口)时,目标可能正是那座孤岛上的行
+  // —— 直接返回 covered 就等于承认"中间缺失"永久修不好。目标在主段内(最新 → 目标的整段
+  // 历史已确认连续)才允许零成本短路;落在孤岛上的一律走下面的翻页补齐,让它自愈。
   const stateBeforeFetch = getOrCreateState(sessionId);
   if (
-    stateBeforeFetch.historyWindowHasIsland !== true &&
-    stateBeforeFetch.messages.some((message) => message.clientId === targetClientId)
+    isInsideMainContiguousRun(
+      stateBeforeFetch.messages,
+      stateBeforeFetch.historyWindowIslands,
+      targetClientId,
+    )
   ) {
-    // 窗口本身连续(无孤岛)时,成员判定就等于覆盖判定,可以零成本短路。
+    // 目标在主连续段内:成员判定就等于覆盖判定,可以零成本短路。
     // 注意 ownsPagingLock=false:这条路一个请求都没发、也没置锁,所以提交时不得清锁、
     // 不得写游标 —— 否则两个 around 响应同时落地时,这一次会把另一次刚拿到的锁清掉、
     // 并覆写它的游标(#676 review codex P1)。
@@ -11579,17 +13074,26 @@ async function backfillHistoryUntil(
   const publishCollected = (): void => {
     if (collected.length === 0) return;
     const mapped = mapServerMessages(collected);
-    setState(sessionId, (s) => ({
-      ...s,
+    setState(sessionId, (s) => {
       // addOnly:这些页可能是几秒前取到的,期间 live push 可能已经更新过其中某行;
       // 用旧快照 hydrate 会把 live 更新盖回去(见 mergeMessages 的 addOnly 说明)。
-      messages: mergeMessages(mapped, s.messages, { addOnly: true }, 'newest-first'),
-      historyLoaded: true,
-      isFirstMessage: false,
-      oldestMessageId: cursorId ?? s.oldestMessageId,
-      hasMoreMessages: hasMoreAtEnd,
-      isLoadingMore: true,
-    }));
+      const messages = mergeMessages(mapped, s.messages, { addOnly: true }, 'newest-first');
+      return {
+        ...s,
+        messages,
+        historyLoaded: true,
+        isFirstMessage: false,
+        oldestMessageId: cursorId ?? s.oldestMessageId,
+        hasMoreMessages: hasMoreAtEnd,
+        isLoadingMore: true,
+        // 同 loadOlderMessages:被翻页跨过的孤岛接回主段、移出模型。
+        historyWindowIslands: absorbIslandsCrossedByPaging(
+          s.historyWindowIslands,
+          messages,
+          cursorId,
+        ),
+      };
+    });
   };
 
   try {
@@ -11750,19 +13254,25 @@ function commitAroundWindow(
       'oldest-first',
     );
     if (!ownsPagingLock) {
-      // mergeMessages 只增不减 → "长度没变"等价于"没引入可能不连续的行"。
-      const addedRows = messages.length !== s.messages.length;
       // busy 意味着补齐**根本没跑**(让位给正在飞行的分页),这次 merge 进来的 around 行与
-      // 尾部窗口之间可能隔着没加载的历史 → 记上孤岛,否则下次跳同一目标会命中成员快速通道、
-      // 永远修不回连续。
+      // 尾部窗口之间可能隔着没加载的历史 → 交给 updateIslandsAfterAroundMerge 按"around 块
+      // 与窗口里既有行是否重叠"决定记孤岛、并入既有孤岛还是并入主段:一行没加进(addedRows
+      // 等价于 messages 没变)时窗口形状没动,孤岛集合原样返回 —— 绝不凭空记一座
+      // (#676 review codex P1 的 busy 零新增用例)。
       //
-      // covered 且不持锁 = 成员快速通道:它成立的前提就是"窗口无孤岛且目标在窗口里",
-      // 所以 radius 内的邻居与目标同处连续区间,不产生孤岛,标记不动。
-      const marksIsland = outcome === 'busy' && addedRows;
-      if (marksIsland) return { ...s, messages, historyWindowHasIsland: true };
-      // 真正的 no-op(merge 没换引用、也不用记孤岛)直接返回原 state:setState 只要
-      // next !== prev 就通知订阅者,白发一次会让整棵消息树重渲染(#676 review copilot)。
-      return messages === s.messages ? s : { ...s, messages };
+      // covered 且不持锁 = 成员快速通道:它成立的前提就是"目标在主连续段里",
+      // 所以 radius 内的邻居与目标同处连续区间,不产生孤岛,孤岛集合不动。
+      if (outcome === 'covered') {
+        return messages === s.messages ? s : { ...s, messages };
+      }
+      const nextIslands = updateIslandsAfterAroundMerge(
+        s.historyWindowIslands,
+        s.messages,
+        messages,
+        rows,
+      );
+      if (messages === s.messages && nextIslands === s.historyWindowIslands) return s;
+      return { ...s, messages, historyWindowIslands: nextIslands };
     }
     // 已补齐:hasMore 归 backfill 维护,不能被 around 窗口的边界回退。
     // 但游标要取两侧更早的那个:radius 决定的 around 窗口可能含比"命中那一页的
@@ -11780,10 +13290,11 @@ function commitAroundWindow(
         // (#676 review copilot)。
         historyLoaded: true,
         isFirstMessage: false,
-        // 注意这里**不清**孤岛标记。补齐到达目标只证明"尾部 → 本次目标"连续,不证明更早的
-        // 孤岛都被跨过:先前一次失败的深跳留下孤岛 A,之后跳一个更近的目标 B 并补齐成功,
-        // B↔A 之间的洞和 A 自己的行都还在。清掉唯一的 boolean 会让之后跳回 A 走成员快速
-        // 通道、永不修复(#676 review 给的两孤岛序列)。
+        // 注意这里**不动**孤岛集合:absorbIslandsCrossedByPaging 已按"本次翻页真的跨过"
+        // 逐座收口(目标所在的孤岛被接回主段时自然消失)。补齐到达目标只证明
+        // "尾部 → 本次目标"连续,不证明更早的孤岛都被跨过:先前一次失败的深跳留下孤岛 A,
+        // 之后跳一个更近的目标 B 并补齐成功,B↔A 之间的洞和 A 自己的行都还在。清掉
+        // 模型会让之后跳回 A 走成员快速通道、永不修复(#676 review 给的两孤岛序列)。
         oldestMessageId: oldestServerMessageIdForWindow(
           rows,
           s.messages,
@@ -11799,6 +13310,15 @@ function commitAroundWindow(
       messages,
       historyLoaded: true,
       isFirstMessage: false,
+      // 退回 around 窗口 = 窗口里多了一座孤岛(或并入既有孤岛;around 块与主段重叠时
+      // 则是主段向更老延伸,不产生新孤岛 —— 见 updateIslandsAfterAroundMerge)。
+      // 一行都没加进来时窗口形状没变,孤岛集合保持原值。
+      historyWindowIslands: updateIslandsAfterAroundMerge(
+        s.historyWindowIslands,
+        s.messages,
+        messages,
+        rows,
+      ),
       // 游标:已有连续窗口时**留在它的边缘**,不跟着孤岛前移(#676 review)。
       //
       // 退回 around 窗口时,缺失的区间比那座孤岛更新。若把 oldestMessageId 推到孤岛上,
@@ -11825,9 +13345,6 @@ function commitAroundWindow(
       hasMoreMessages: addedRows ? true : s.hasMoreMessages,
       // 锁由本次提交释放。
       isLoadingMore: false,
-      // 退回 around 窗口 = 窗口里多了一座孤岛(它与尾部窗口之间隔着没加载的历史)。
-      // 同理:没加进任何行就没有新孤岛,保持原值。
-      historyWindowHasIsland: addedRows ? true : s.historyWindowHasIsland,
     };
   });
 }
@@ -11842,7 +13359,19 @@ async function loadAroundMessage(
   // around 行会被当成新代际 merge 回窗口。
   const epochAtStart = _messagesEpoch.get(sessionId) ?? 0;
   // 按来源路由:远程会话经隧道 local-db:messages:around(直连本机会查控制端空库,跳转必失败)。
-  const rows = await aroundMessagesFor(sessionId, messageId, opts);
+  const view = getRemoteHistoryView(sessionId);
+  const rows = await aroundMessagesFor(sessionId, messageId, view?.getSnapshot().ready ? { radius: 0 } : opts);
+  if (view?.getSnapshot().ready) {
+    const target = rows.find((row) => row.id === messageId);
+    try {
+      return target ? await view.locate(target.clientId, target.createdAt) : null;
+    } catch (error) {
+      if (!isHistoryViewUnavailable(error)) throw error;
+      if (getRemoteHistoryView(sessionId) !== view || (_messagesEpoch.get(sessionId) ?? 0) !== epochAtStart) return null;
+      releaseRemoteHistoryView(sessionId, view);
+      return loadAroundMessage(sessionId, messageId, opts);
+    }
+  }
   if (rows.length === 0) return null;
 
   const mapped = mapServerMessages(rows);
@@ -11907,7 +13436,19 @@ async function loadAroundMessageClientId(
 ): Promise<ChatMessage | null> {
   // 同 loadAroundMessage:epoch 在 around 请求之前快照,覆盖该请求自身的竞态窗口。
   const epochAtStart = _messagesEpoch.get(sessionId) ?? 0;
-  const rows = await aroundMessagesByClientIdFor(sessionId, clientId, opts);
+  const view = getRemoteHistoryView(sessionId);
+  const rows = await aroundMessagesByClientIdFor(sessionId, clientId, view?.getSnapshot().ready ? { radius: 0 } : opts);
+  if (view?.getSnapshot().ready) {
+    const target = rows.find((row) => row.clientId === clientId);
+    try {
+      return target ? await view.locate(clientId, target.createdAt) : null;
+    } catch (error) {
+      if (!isHistoryViewUnavailable(error)) throw error;
+      if (getRemoteHistoryView(sessionId) !== view || (_messagesEpoch.get(sessionId) ?? 0) !== epochAtStart) return null;
+      releaseRemoteHistoryView(sessionId, view);
+      return loadAroundMessageClientId(sessionId, clientId, opts);
+    }
+  }
   if (rows.length === 0) return null;
 
   const mapped = mapServerMessages(rows);
@@ -12034,18 +13575,19 @@ function buildQueuedMessage(
   };
 }
 
+/** 返回物化结果是否已交给 outbox(记录已被清除 / 撤销时为 false)。 */
 function completeRemoteOptimisticMaterialization(
   sessionId: string,
   clientId: string,
   buildMaterializedQueued: () => QueuedMessage,
-): void {
+): boolean {
   const record = remoteOptimisticSendRecords(sessionId)?.get(clientId);
   if (
     !record ||
     !record.materializationPending ||
     !isRemoteOptimisticSendRegistered(sessionId, record)
   ) {
-    return;
+    return false;
   }
 
   const previousQueued = record.queued;
@@ -12074,7 +13616,8 @@ function completeRemoteOptimisticMaterialization(
     const messages = state.messages.map((message) => {
       if (message.clientId !== clientId || message.isPendingPersist !== true) return message;
       changed = true;
-      return { ...queued.chatMessage, isPendingPersist: true };
+      return { ...queued.chatMessage, isPendingPersist: true,
+        ...(message.localSendPrecedingClientIds ? { localSendPrecedingClientIds: message.localSendPrecedingClientIds } : {}) };
     });
     return changed ? { ...state, pendingQueue, messages } : state;
   });
@@ -12082,6 +13625,7 @@ function completeRemoteOptimisticMaterialization(
   delete record.onMaterializationReady;
   onMaterializationReady?.(queued);
   pumpRemoteOptimisticSendsAfterCurrent(sessionId);
+  return true;
 }
 
 function extractSessionRefs(
@@ -12288,6 +13832,377 @@ function updateQueueItem(sessionId: string, clientId: string, newText: string): 
   ).catch((err) => log.warn('updateQueueItem failed:', err));
 }
 
+export interface QueueItemContentUpdate {
+  content: {
+    text: string;
+    mentions: MentionedResource[];
+    hasQuotes: boolean;
+    agentReferences: AgentInputReference[];
+    pastedTextRanges: PastedTextRange[];
+    slashCommandRanges: SlashCommandRange[];
+  };
+  files: AttachedFile[];
+}
+
+function queuedContentProjectionMatches(
+  accepted: QueuedMessage | undefined,
+  replacement: QueuedMessage,
+): boolean {
+  if (!accepted || accepted.text !== replacement.text) return false;
+  const stableFiles = (files: QueuedMessage['files']) =>
+    (files ?? []).map((file) => ({
+      id: file.id,
+      name: file.name,
+      ext: file.ext,
+      category: file.category,
+      mimeType: file.mimeType,
+      originalName: file.originalName ?? file.name,
+      textContent: file.textContent,
+      truncated: file.truncated,
+      annotated: file.annotated,
+    }));
+  return (
+    JSON.stringify(stableFiles(accepted.files)) ===
+      JSON.stringify(stableFiles(replacement.files)) &&
+    JSON.stringify(accepted.mentions ?? []) === JSON.stringify(replacement.mentions ?? []) &&
+    accepted.chatMessage.quotesEncoded === replacement.chatMessage.quotesEncoded &&
+    JSON.stringify(accepted.chatMessage.agentReferences ?? []) ===
+      JSON.stringify(replacement.chatMessage.agentReferences ?? []) &&
+    JSON.stringify(accepted.chatMessage.pastedTextRanges ?? []) ===
+      JSON.stringify(replacement.chatMessage.pastedTextRanges ?? []) &&
+    JSON.stringify(accepted.chatMessage.slashCommandRanges ?? []) ===
+      JSON.stringify(replacement.chatMessage.slashCommandRanges ?? [])
+  );
+}
+
+function cleanupUnacceptedQueueEditMaterialization(
+  originalFiles: readonly AttachedFile[],
+  preparedFiles: readonly AttachedFile[],
+  queuedFiles: readonly AttachedFile[] = [],
+): void {
+  // 仍被原队列消息引用的文件(含免重烧复用的烧录图)绝不是本次编辑新生成的。
+  const originalUrls = new Set(
+    [...originalFiles, ...queuedFiles].map((file) => file.url).filter(Boolean),
+  );
+  const generatedUrls = preparedFiles
+    .map((file) => file.url)
+    .filter((url): url is string => Boolean(url) && !originalUrls.has(url));
+  if (generatedUrls.length === 0) return;
+  void window.electronAPI.cleanupCachedImages(generatedUrls).catch((error: unknown) => {
+    log.warn('cleanup rejected queue edit images failed:', error);
+  });
+}
+
+function cleanupAcceptedQueueEditReplacements(
+  originalFiles: readonly AttachedFile[],
+  originalRetryFiles: readonly AttachedFile[],
+  preparedFiles: readonly AttachedFile[],
+  acceptedFiles: readonly AttachedFile[],
+): void {
+  const acceptedUrls = new Set(acceptedFiles.map((file) => file.url).filter(Boolean));
+  const retainedUrls = new Set(
+    [...preparedFiles, ...acceptedFiles].flatMap((file) =>
+      [file.url, file.annotationSourceUrl].filter((url): url is string => Boolean(url)),
+    ),
+  );
+  const originalFilesById = new Map(originalFiles.map((file) => [file.id, file]));
+  const removedUrls = [
+    ...originalFiles
+      .map((file) => file.url)
+      .filter(
+        (url): url is string => Boolean(url?.startsWith('xdt-image://')) && !acceptedUrls.has(url),
+      ),
+    ...originalRetryFiles
+      .filter((file) => {
+        const original = originalFilesById.get(file.id);
+        return (
+          original?.path === file.path &&
+          original.url === file.url &&
+          file.cacheUrlShared !== true &&
+          Boolean(file.annotationSourceUrl?.startsWith('xdt-image://')) &&
+          !retainedUrls.has(file.annotationSourceUrl!)
+        );
+      })
+      .map((file) => file.annotationSourceUrl!),
+  ];
+  if (removedUrls.length > 0) {
+    void window.electronAPI
+      .cleanupCachedImages([...new Set(removedUrls)])
+      .catch((error: unknown) => {
+        log.warn('cleanup replaced queue edit images failed:', error);
+      });
+  }
+
+  const acceptedPaths = new Set(acceptedFiles.map((file) => file.path));
+  cleanupStagedChatAttachmentFiles(
+    originalFiles.filter((file) => !acceptedPaths.has(file.path)),
+  );
+}
+
+function cleanupAcceptedQueueEditMaterializationSources(
+  queuedFiles: readonly AttachedFile[],
+  editedFiles: readonly AttachedFile[],
+  preparedFiles: readonly AttachedFile[],
+  acceptedFiles: readonly AttachedFile[],
+  remoteMediaSession: boolean,
+): void {
+  const queuedUrls = new Set(queuedFiles.map((file) => file.url).filter(Boolean));
+  const retainedUrls = new Set(
+    (remoteMediaSession ? acceptedFiles : [...preparedFiles, ...acceptedFiles]).flatMap((file) =>
+      [file.url, file.annotationSourceUrl].filter((url): url is string => Boolean(url)),
+    ),
+  );
+  const removedSourceUrls = [
+    ...new Set(
+      editedFiles.flatMap((file) => {
+        if (
+          file.cacheUrlShared === true ||
+          !file.url?.startsWith('xdt-image://') ||
+          queuedUrls.has(file.url) ||
+          retainedUrls.has(file.url)
+        ) {
+          return [];
+        }
+        return [file.url];
+      }),
+    ),
+  ];
+  if (removedSourceUrls.length === 0) return;
+  void window.electronAPI.cleanupCachedImages(removedSourceUrls).catch((error: unknown) => {
+    log.warn('cleanup accepted queue edit annotation sources failed:', error);
+  });
+}
+
+/**
+ * 队列中可"免重烧复用"的烧录附件(按附件 id):队列消息的 retryFile 描述的正是
+ * 这张烧录图(annotationRestore 配对规则),且烧录图是 `cindy-media://` 内容寻址
+ * 文件——渲染进程的缓存清理 IPC 从不物理删除 cindy-media(见 image-cache:cleanup-files),
+ * 复用后无论编辑被接受还是拒绝,都不会有清理路径删掉仍被队列 / 新消息引用的字节。
+ * 旧版 xdt-image:// 烧录图按文件删除,保守起见不复用、照旧重烧。
+ * 返回的是 retryFile 本身:保留原图与笔迹(下次编辑仍可还原)和标注区域。
+ */
+function reusableQueuedAnnotatedFiles(queued: QueuedMessage): Map<string, AttachedFile> {
+  const retryFilesById = new Map(
+    (queued.chatMessage.retryFiles ?? []).map((file) => [file.id, file]),
+  );
+  const reusable = new Map<string, AttachedFile>();
+  for (const file of queued.files ?? []) {
+    const retryFile = retryFilesById.get(file.id);
+    if (!retryFile || !queuedAnnotationEditMeta(file, retryFile)) continue;
+    if (!file.url?.startsWith('cindy-media://')) continue;
+    reusable.set(file.id, retryFile);
+  }
+  return reusable;
+}
+
+function queueEditFilesMatch(
+  left: readonly AttachedFile[] | undefined,
+  right: readonly AttachedFile[] | undefined,
+): boolean {
+  const stable = (files: readonly AttachedFile[] | undefined) =>
+    (files ?? []).map((file) => ({
+      id: file.id,
+      name: file.name,
+      path: file.path,
+      ext: file.ext,
+      size: file.size,
+      category: file.category,
+      mimeType: file.mimeType,
+      url: file.url,
+      originalName: file.originalName ?? file.name,
+      base64: file.base64,
+      textContent: file.textContent,
+      truncated: file.truncated,
+      annotated: file.annotated,
+      baseAnnotated: file.baseAnnotated,
+      annotationSourceUrl: file.annotationSourceUrl,
+      annotationStrokes: file.annotationStrokes,
+    }));
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
+
+function queueEditFilesRemainUnchanged(
+  queued: QueuedMessage,
+  editedFiles: readonly AttachedFile[],
+): boolean {
+  if (queueEditFilesMatch(queued.files, editedFiles)) return true;
+  const retryFilesById = new Map(
+    (queued.chatMessage.retryFiles ?? []).map((file) => [file.id, file]),
+  );
+  // 与输入框编辑草稿同一套还原规则(annotationRestore),比较口径才一致。
+  const editableQueuedFiles = (queued.files ?? []).map((file) => {
+    const meta = queuedAnnotationEditMeta(file, retryFilesById.get(file.id));
+    return meta ? toEditableAnnotatedAttachment(file, meta) : file;
+  });
+  return queueEditFilesMatch(editableQueuedFiles, editedFiles);
+}
+
+function canFallbackQueueEditToText(
+  queued: QueuedMessage,
+  replacement: QueuedMessage,
+  content: QueueItemContentUpdate['content'],
+  files: readonly AttachedFile[],
+): boolean {
+  if (!content.text.trim() || !queueEditFilesRemainUnchanged(queued, files)) return false;
+  if (JSON.stringify(queued.mentions ?? []) !== JSON.stringify(content.mentions ?? [])) return false;
+  if ((queued.chatMessage.quotesEncoded === true) !== content.hasQuotes) return false;
+  if ((queued.chatMessage.agentReferences?.length ?? 0) > 0) return false;
+  if ((queued.agentReferences?.length ?? 0) > 0) return false;
+  if ((queued.chatMessage.pastedTextRanges?.length ?? 0) > 0) return false;
+  if ((queued.chatMessage.slashCommandRanges?.length ?? 0) > 0) return false;
+  if (replacement.chatMessage.agentReferences?.length) return false;
+  if (replacement.chatMessage.pastedTextRanges?.length) return false;
+  if (replacement.chatMessage.slashCommandRanges?.length) return false;
+  return true;
+}
+
+async function updateQueueItemContent(
+  sessionId: string,
+  clientId: string,
+  update: QueueItemContentUpdate,
+): Promise<boolean> {
+  if (!sessionId || !clientId) return false;
+  const queued = getOrCreateState(sessionId).pendingQueue.find((item) => item.clientId === clientId);
+  if (!queued) return false;
+  const { content, files } = update;
+  if (!content.text.trim() && files.length === 0) return false;
+  const queuedFilesById = new Map((queued.files ?? []).map((file) => [file.id, file]));
+  const reusableBurnedFiles = reusableQueuedAnnotatedFiles(queued);
+  const filesForMaterialization = files.map((file) => {
+    // 只改了文字、标注原样的图:直接沿用队列里已烧录的附件(retryFile 原样,含其
+    // 所有权标记与原图 / 笔迹元数据),不重新解码 / 编码。
+    const reused = reusableBurnedFiles.get(file.id);
+    if (
+      reused &&
+      file.url === reused.annotationSourceUrl &&
+      file.path === reused.annotationSourceUrl &&
+      annotationStrokesEqual(file.annotationStrokes, reused.annotationStrokes)
+    ) {
+      return reused;
+    }
+    const queuedFile = queuedFilesById.get(file.id);
+    if (!queuedFile || queuedFile.url !== file.url || queuedFile.path !== file.path) return file;
+    return { ...file, cacheUrlShared: undefined, stagedPathShared: undefined };
+  });
+  const remoteMediaSession = isRemoteMediaSession(sessionId);
+  // 队列编辑是交互式保存:烧录失败即中止(抛出,输入框里的编辑与笔迹原样保留,
+  // 由 ChatInput 提示),不再悄悄把原图存进队列。此时尚未改动任何队列状态。
+  const preparedFiles =
+    (await materializeAnnotatedAttachmentsForSend(filesForMaterialization, sessionId, {
+      stripAnnotationMeta: remoteMediaSession,
+      burnFailure: 'abort',
+    })) ?? [];
+
+  const textUnchanged = content.text === queued.text;
+  const queuedAgentReferences =
+    queued.chatMessage.agentReferences?.length
+      ? queued.chatMessage.agentReferences
+      : (queued.agentReferences ?? []);
+  const replacement = buildQueuedMessage(
+    sessionId,
+    content.text,
+    queued.model,
+    queued.effort,
+    queued.permissionMode,
+    queued.workingDir,
+    preparedFiles,
+    content.mentions,
+    {
+      ...(queued.vendorOptions ? { vendorOptions: queued.vendorOptions } : {}),
+      ...((textUnchanged ? queued.chatMessage.quotesEncoded === true : content.hasQuotes)
+        ? { quotesEncoded: true }
+        : {}),
+      ...((textUnchanged ? queuedAgentReferences : content.agentReferences).length > 0
+        ? { agentReferences: textUnchanged ? queuedAgentReferences : content.agentReferences }
+        : {}),
+      ...((textUnchanged
+        ? (queued.chatMessage.pastedTextRanges ?? [])
+        : content.pastedTextRanges
+      ).length > 0
+        ? {
+            pastedTextRanges: textUnchanged
+              ? queued.chatMessage.pastedTextRanges
+              : content.pastedTextRanges,
+          }
+        : {}),
+      slashCommandRanges: textUnchanged
+        ? queued.chatMessage.slashCommandRanges
+        : content.slashCommandRanges,
+    },
+    {
+      clientId: queued.clientId,
+      createdAt: queued.chatMessage.createdAt ?? new Date().toISOString(),
+    },
+  );
+  const replacementSessionRefs = extractSessionRefs(content.text, queued.sessionRefs);
+  if (replacementSessionRefs.length > 0) replacement.sessionRefs = replacementSessionRefs;
+  else delete replacement.sessionRefs;
+  const boundaryOpts = getRemoteInputClearBoundaryOpts(sessionId);
+  let projection: AgentInputProjection;
+  let usedTextFallback = false;
+  try {
+    ({ projection } = await runInputProjectionOperation(sessionId, (input) =>
+      boundaryOpts
+        ? input.updateContent(sessionId, clientId, replacement, boundaryOpts)
+        : input.updateContent(sessionId, clientId, replacement),
+    ));
+  } catch (error) {
+    if (
+      extractIpcError(error)?.code === 'DEVICE_LINK_CHANNEL_NOT_ALLOWED' &&
+      canFallbackQueueEditToText(queued, replacement, content, files)
+    ) {
+      try {
+        ({ projection } = await runInputProjectionOperation(sessionId, (input) =>
+          boundaryOpts
+            ? input.updateText(
+                sessionId,
+                clientId,
+                content.text,
+                replacement.sessionRefs,
+                undefined,
+                boundaryOpts,
+              )
+            : input.updateText(sessionId, clientId, content.text, replacement.sessionRefs),
+        ));
+        usedTextFallback = true;
+      } catch (fallbackError) {
+        cleanupUnacceptedQueueEditMaterialization(files, preparedFiles, queued.files ?? []);
+        throw fallbackError;
+      }
+    } else {
+      cleanupUnacceptedQueueEditMaterialization(files, preparedFiles, queued.files ?? []);
+      throw error;
+    }
+  }
+  const accepted = projection.pendingQueue.find((item) => item.clientId === clientId);
+  const acceptedReplacement = usedTextFallback
+    ? { ...replacement, files: queued.files }
+    : replacement;
+  const updated = queuedContentProjectionMatches(accepted, acceptedReplacement);
+  if (updated && accepted) {
+    if (usedTextFallback) {
+      cleanupUnacceptedQueueEditMaterialization(files, preparedFiles, queued.files ?? []);
+    } else {
+      cleanupAcceptedQueueEditReplacements(
+        queued.files ?? [],
+        queued.chatMessage.retryFiles ?? [],
+        preparedFiles,
+        accepted.files ?? [],
+      );
+      cleanupAcceptedQueueEditMaterializationSources(
+        queued.files ?? [],
+        files,
+        preparedFiles,
+        accepted.files ?? [],
+        remoteMediaSession,
+      );
+    }
+  } else {
+    cleanupUnacceptedQueueEditMaterialization(files, preparedFiles, queued.files ?? []);
+  }
+  return updated;
+}
+
 /**
  * 已确认「不再需要自动起名」的会话(main 返回 done=true:已起过名,或用户手动
  * 改过名)。纯粹是省 IPC 的缓存 —— 权威判定始终在 main。
@@ -12451,6 +14366,7 @@ function maybeAutoNameUnnamedSession(
   agentKind: 'claude-code' | 'codex' | 'pi',
 ): void {
   if (!seed?.isUserText) return;
+  if (sessions.get(sessionId)?.autoTitleDisabled === true) return;
   scheduleAutoName(sessionId, seed.text, agentKind, true);
 }
 
@@ -12478,11 +14394,60 @@ type SendMessageOpts = {
   beforeEnqueue?: () => Promise<boolean>;
   /** 远程乐观发送在稍后确认永久失败时恢复 composer。 */
   onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
+  /**
+   * 标注烧录失败时中止本次发送(返回 false、提示用户、不产生任何消息),而不是
+   * 降级发原图。只有「返回 false 必定原样保留草稿」的调用方才能传(输入框对
+   * 已有任务的发送);缺省保持降级 + 提示。device-link 乐观发送气泡已上屏,
+   * 一律降级。
+   */
+  annotationBurnFailure?: 'abort';
 };
 
 /** remote(SSH / device-link)会话:标注编辑数据指向控制端本地缓存,发送时剥离。 */
 function isRemoteMediaSession(sessionId: string): boolean {
   return Boolean(getOrCreateState(sessionId).remoteHostId ?? getStickySessionDeviceId(sessionId));
+}
+
+/**
+ * 烧录降级提示:无法安全中止的发送路径发出了不含标注的原图,必须让用户知道。
+ * 只在消息确实交出后调用(本机:dispatch 受理;device-link:物化结果进入 outbox),
+ * 未发出的消息不能提示"已发送原图"。
+ */
+function notifyAnnotationBurnFallback(): void {
+  toast.warning(i18n.t('chat.media.annotateBurnFailedSentOriginal'));
+}
+
+/**
+ * 本机 / SSH 发送的标注物化:`annotationBurnFailure: 'abort'` 时烧录失败即中止
+ * (提示 + 返回 false,调用方原样恢复草稿与笔迹供重试);否则降级发原图并提示。
+ * 物化发生在 dispatch 之前,中止时尚未产生气泡、队列项或落库。
+ */
+function runLocalAnnotatedSend(
+  sessionId: string,
+  files: AttachedFile[] | undefined,
+  burnFailure: 'abort' | undefined,
+  dispatch: (prepared: AttachedFile[] | undefined) => Promise<boolean>,
+): Promise<boolean> {
+  let fellBack = false;
+  return runRemoteOptimisticMaterialization(
+    null,
+    materializeAnnotatedAttachmentsForSend(files, sessionId, {
+      stripAnnotationMeta: isRemoteMediaSession(sessionId),
+      burnFailure: burnFailure === 'abort' ? 'abort' : 'fallback',
+      onFallback: () => {
+        fellBack = true;
+      },
+    }),
+    async (prepared) => {
+      const accepted = await dispatch(prepared);
+      if (accepted && fellBack) notifyAnnotationBurnFallback();
+      return accepted;
+    },
+  ).catch((error: unknown) => {
+    if (!isAnnotationBurnInError(error)) throw error;
+    toast.error(i18n.t('chat.media.annotateBurnFailedNotSent'));
+    return false;
+  });
 }
 
 /**
@@ -12589,24 +14554,34 @@ function sendMessage(
         void accepted.then(
           (optimisticallyAccepted) => {
             if (!optimisticallyAccepted) return;
+            // 气泡已上屏、输入框已清空:烧录失败不中止,降级发原图;物化结果进入
+            // outbox 后再提示(被 /clear 等撤销的消息不提示)。
+            let fellBack = false;
             void materializeAnnotatedAttachmentsForSend(files, sessionId, {
               stripAnnotationMeta,
+              onFallback: () => {
+                fellBack = true;
+              },
             })
               .then((prepared) => {
-                completeRemoteOptimisticMaterialization(sessionId, identity.clientId, () =>
-                  buildQueuedMessage(
-                    sessionId,
-                    text,
-                    model,
-                    effort,
-                    permissionMode,
-                    workingDir,
-                    prepared,
-                    mentions,
-                    opts,
-                    identity,
-                  ),
+                const handedOff = completeRemoteOptimisticMaterialization(
+                  sessionId,
+                  identity.clientId,
+                  () =>
+                    buildQueuedMessage(
+                      sessionId,
+                      text,
+                      model,
+                      effort,
+                      permissionMode,
+                      workingDir,
+                      prepared,
+                      mentions,
+                      opts,
+                      identity,
+                    ),
                 );
+                if (handedOff && fellBack) notifyAnnotationBurnFallback();
               })
               .catch((error) => {
                 const record = remoteOptimisticSendRecords(sessionId)?.get(identity.clientId);
@@ -12619,11 +14594,10 @@ function sendMessage(
         );
         return accepted;
       }
-      return runRemoteOptimisticMaterialization(
-        null,
-        materializeAnnotatedAttachmentsForSend(files, sessionId, {
-          stripAnnotationMeta: isRemoteMediaSession(sessionId),
-        }),
+      return runLocalAnnotatedSend(
+        sessionId,
+        files,
+        opts?.annotationBurnFailure,
         (prepared) =>
           sendMessageCore(
             sessionId,
@@ -12715,8 +14689,13 @@ async function sendMessageCore(
     : undefined;
   if (deviceLinkRemote && !remoteRecord) return false;
 
-  // device-link 乐观第一拍：空闲沿用消息流气泡，忙时也立即显示 sending 队列行。
-  if (deviceLinkRemote && isSendBusyForQueue(current)) {
+  // Busy sends must be visible before the main projection round-trip.  This is
+  // especially important for local sessions: the coordinator can be waiting
+  // for a delayed/stale turn boundary, so waiting for `input.enqueue()` to
+  // resolve would make the user's message appear to disappear.  The
+  // authoritative projection will replace the temporary marker (or remove it
+  // on a pre-accept failure) once the IPC call settles.
+  if (isSendBusyForQueue(current)) {
     setState(sessionId, (s) =>
       s.pendingQueue.some((item) => item.clientId === queued.clientId)
         ? s
@@ -12726,7 +14705,9 @@ async function sendMessageCore(
     setState(sessionId, (s) =>
       s.messages.some((m) => m.clientId === queued.clientId)
         ? s
-        : { ...s, messages: [...s.messages, { ...queued.chatMessage, isPendingPersist: true }] },
+        : { ...s, messages: [...s.messages, deviceLinkRemote
+          ? reserveRemoteUser({ ...queued.chatMessage, isPendingPersist: true }, s.messages)
+          : { ...queued.chatMessage, isPendingPersist: true }] },
     );
   }
 
@@ -12846,6 +14827,12 @@ async function sendMessageCore(
       setState(sessionId, (s) => ({
         ...s,
         error: message,
+        pendingQueue: s.pendingQueue.filter(
+          (item) => !(item.clientId === queued.clientId && item.isPendingEnqueue === true),
+        ),
+        messages: s.messages.filter(
+          (item) => !(item.clientId === queued.clientId && item.isPendingPersist === true),
+        ),
         usageLimitRecovery: null,
         errorReason: null,
         recoverableError: null,
@@ -12918,6 +14905,8 @@ function steerMessage(
     slashCommandRanges?: SlashCommandRange[];
     beforeEnqueue?: () => Promise<boolean>;
     onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
+    /** 见 SendMessageOpts.annotationBurnFailure。 */
+    annotationBurnFailure?: 'abort';
   },
 ): Promise<boolean> {
   if (!sessionId || (!text.trim() && (!files || files.length === 0)) || !workingDir) {
@@ -12991,24 +14980,34 @@ function steerMessage(
         void accepted.then(
           (optimisticallyAccepted) => {
             if (!optimisticallyAccepted) return;
+            // 气泡已上屏、输入框已清空:烧录失败不中止,降级发原图;物化结果进入
+            // outbox 后再提示(被 /clear 等撤销的消息不提示)。
+            let fellBack = false;
             void materializeAnnotatedAttachmentsForSend(files, sessionId, {
               stripAnnotationMeta,
+              onFallback: () => {
+                fellBack = true;
+              },
             })
               .then((prepared) => {
-                completeRemoteOptimisticMaterialization(sessionId, identity.clientId, () =>
-                  buildQueuedMessage(
-                    sessionId,
-                    text,
-                    model,
-                    effort,
-                    permissionMode,
-                    workingDir,
-                    prepared,
-                    mentions,
-                    opts,
-                    identity,
-                  ),
+                const handedOff = completeRemoteOptimisticMaterialization(
+                  sessionId,
+                  identity.clientId,
+                  () =>
+                    buildQueuedMessage(
+                      sessionId,
+                      text,
+                      model,
+                      effort,
+                      permissionMode,
+                      workingDir,
+                      prepared,
+                      mentions,
+                      opts,
+                      identity,
+                    ),
                 );
+                if (handedOff && fellBack) notifyAnnotationBurnFallback();
               })
               .catch((error) => {
                 const record = remoteOptimisticSendRecords(sessionId)?.get(identity.clientId);
@@ -13021,11 +15020,10 @@ function steerMessage(
         );
         return accepted;
       }
-      return runRemoteOptimisticMaterialization(
-        null,
-        materializeAnnotatedAttachmentsForSend(files, sessionId, {
-          stripAnnotationMeta: isRemoteMediaSession(sessionId),
-        }),
+      return runLocalAnnotatedSend(
+        sessionId,
+        files,
+        opts?.annotationBurnFailure,
         (prepared) =>
           steerMessageCore(
             sessionId,
@@ -13114,7 +15112,7 @@ async function steerMessageCore(
     setState(sessionId, (s) =>
       s.messages.some((message) => message.clientId === queued.clientId)
         ? s
-        : { ...s, messages: [...s.messages, { ...queued.chatMessage, isPendingPersist: true }] },
+        : { ...s, messages: [...s.messages, reserveRemoteUser({ ...queued.chatMessage, isPendingPersist: true }, s.messages)] },
     );
   }
   const rollbackOptimisticSteer = () => {
@@ -13515,10 +15513,36 @@ function popQueueTail(sessionId: string): boolean {
 }
 
 /**
- * Dismiss the error banner without retrying. Pure UI state — no persistence.
+ * 用户点了 live 横幅的重试或关闭:这次错误算已处置。尾部横幅跳过同一 persistId,
+ * 并尽快把即将/已经落库的 error 行标 dismissed。离开视图不会走这里。
+ */
+function disposeLiveErrorPersist(sessionId: string): void {
+  const persistId = sessions.get(sessionId)?.errorPersistId;
+  if (persistId) {
+    setState(sessionId, (s) =>
+      s.disposedErrorPersistId === persistId ? s : { ...s, disposedErrorPersistId: persistId },
+    );
+    void dismissErrorTailMessage(sessionId, persistId);
+    return;
+  }
+  const pending = _deferredTurnErrorPersist.get(sessionId);
+  if (!pending) return;
+  void pending.then((id) => {
+    if (!id) return;
+    setState(sessionId, (s) =>
+      s.disposedErrorPersistId === id ? s : { ...s, disposedErrorPersistId: id },
+    );
+    void dismissErrorTailMessage(sessionId, id);
+  });
+}
+
+/**
+ * Dismiss the error banner without retrying. Also disposes the bound persist row
+ * so the same error does not reappear as a tail banner in this view.
  */
 function clearError(sessionId: string): void {
   if (!sessionId) return;
+  disposeLiveErrorPersist(sessionId);
   const boundaryOpts = getRemoteInputClearBoundaryOpts(sessionId);
   runInputProjectionOperation(sessionId, (input) =>
     boundaryOpts ? input.clearError(sessionId, boundaryOpts) : input.clearError(sessionId),
@@ -13528,7 +15552,8 @@ function clearError(sessionId: string): void {
       s.error == null &&
       s.usageLimitRecovery == null &&
       s.recoverableError == null &&
-      s.errorRetryText == null
+      s.errorRetryText == null &&
+      s.errorPersistId == null
     ) {
       return s;
     }
@@ -13537,14 +15562,17 @@ function clearError(sessionId: string): void {
       error: null,
       usageLimitRecovery: null,
       errorReason: null,
+      toolLoop: null,
       recoverableError: null,
       errorRetryText: null,
+      errorPersistId: null,
     };
   });
 }
 
 function retryLastError(sessionId: string): Promise<void> {
   if (!sessionId) return Promise.resolve();
+  disposeLiveErrorPersist(sessionId);
   // 续跑语义在 main:coordinator 判定失败 turn 已有 assistant 产出时,用共享英文
   // 常量 CONTINUE_AFTER_ERROR_PROMPT 替代重发原文(shared/interruptedTurn.ts),
   // renderer 不传文案、不做判定。
@@ -13662,6 +15690,7 @@ function retryLastError(sessionId: string): Promise<void> {
  */
 function continueAfterSilentStop(sessionId: string): void {
   if (!sessionId) return;
+  disposeLiveErrorPersist(sessionId);
   void sendUiTrigger(sessionId, CONTINUE_AFTER_ERROR_PROMPT).then(
     () => {
       setState(sessionId, (s) => ({
@@ -13669,7 +15698,9 @@ function continueAfterSilentStop(sessionId: string): void {
         error: null,
         usageLimitRecovery: null,
         errorReason: null,
+        toolLoop: null,
         errorRetryText: null,
+        errorPersistId: null,
       }));
     },
     (err) => {
@@ -13865,12 +15896,12 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
       streamingClientId: null,
       streamingText: '',
       isStreaming: false,
-      // 窗口清空 → 按构造没有孤岛,标记必须一起清零(与 reloadMessages / trim / demote
-      // 同规矩)。漏清的后果不是数据错而是永久降级:covered 刻意保留孤岛标记(到达本次
+      // 窗口清空 → 按构造没有孤岛,模型必须一起清零(与 reloadMessages / trim / demote
+      // 同规矩)。漏清的后果不是数据错而是永久降级:covered 刻意保留孤岛区间(到达本次
       // 目标不证明更早的洞都补上了),于是 /clear 之后这个会话永远被判为"不连续",
       // canFocusWithoutJumpLoad 拒绝每一次窗口内命中,每次搜索跳转都白跑一轮补齐
       // (#676 review)。
-      historyWindowHasIsland: false,
+      historyWindowIslands: EMPTY_WINDOW_ISLANDS,
       // 分页锁归本次重置释放(与 reloadMessages / dropMessagesFromClientId 同规矩):
       // 上面刚 bump epoch 作废了 in-flight 的翻页 / 跳转补齐,而被作废的请求不会(也不该)
       // 代清这把锁 —— 它们分辨不出锁属于哪一代。漏清会让行首守卫把该会话的翻页永久
@@ -13879,6 +15910,7 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
       error: null,
       usageLimitRecovery: null,
       errorReason: null,
+      toolLoop: null,
       recoverableError: null,
       activeTurnRetryText: null,
       errorRetryText: null,
@@ -13889,6 +15921,7 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
       pendingPluginSetupQueue: [],
       pluginSetupViewerState: 'expanded',
       pluginSetupCommandInFlight: null,
+      pluginSetupCommandError: null,
       // F-AUQ-MIN-5: Clear session — wipe viewer state too.
       askUserViewerState: 'expanded',
       // F-AUQ-DRAFT: Clear session also wipes any in-progress draft.
@@ -13942,12 +15975,14 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
 }
 
 /**
- * F-CMD: Insert a local-only system card into the message stream.
- * Not persisted to the database — purely ephemeral UI.
+ * F-CMD: Insert a local system card into the message stream.
+ * Cindy Make cards are persisted below so the structured card survives reloads;
+ * the other command cards remain local-only UI state.
  */
 function insertSystemCard(
   sessionId: string,
-  cardType: 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'compact' | 'cmd' | 'learn',
+  cardType:
+    | 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'compact' | 'cmd' | 'learn' | 'cindy-make-doctor' | 'cindy-make',
   data?: Record<string, unknown>,
 ): string | null {
   if (!sessionId) return null;
@@ -13978,7 +16013,49 @@ function insertSystemCard(
       ],
     };
   });
+  if (
+    (cardType === 'cindy-make' || cardType === 'cindy-make-doctor') &&
+    data?.modalOnly !== true
+  ) {
+    enqueueCindyMakeCardPersistence(sessionId, clientId, cardType, data ?? {}, true);
+  }
   return clientId;
+}
+
+const CINDY_MAKE_CARD_MARKER = '__cindyMakeCard';
+const cindyMakeCardQueues = new Map<string, Promise<void>>();
+const cindyMakeNewCards = new Set<string>();
+
+/** Persist Cindy Make's structured card in the same message row that renders it. */
+function enqueueCindyMakeCardPersistence(
+  sessionId: string,
+  clientId: string,
+  cardType: 'cindy-make' | 'cindy-make-doctor',
+  data: Record<string, unknown>,
+  creating = false,
+): void {
+  const key = `${sessionId}:${clientId}`;
+  if (creating) cindyMakeNewCards.add(key);
+  const previous = cindyMakeCardQueues.get(key) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const content = { [CINDY_MAKE_CARD_MARKER]: { type: cardType, data } };
+      if (cindyMakeNewCards.has(key)) {
+        await messageService.create(sessionId, {
+          clientId,
+          role: 'assistant',
+          content,
+        });
+        cindyMakeNewCards.delete(key);
+      } else {
+        await messageService.updateContent(sessionId, clientId, content);
+      }
+    })
+    .catch((error) => {
+      log.warn('Failed to persist Cindy Make card:', error);
+    });
+  cindyMakeCardQueues.set(key, next);
 }
 
 /**
@@ -14042,52 +16119,96 @@ function updateSystemCardData(
     };
     return { ...s, messages };
   });
+  const current = getSnapshot(sessionId).messages.find((message) => message.clientId === clientId);
+  if (
+    current?.systemCardType === 'cindy-make' ||
+    current?.systemCardType === 'cindy-make-doctor'
+  ) {
+    if (current.systemCardData?.modalOnly !== true) {
+      enqueueCindyMakeCardPersistence(
+        sessionId,
+        clientId,
+        current.systemCardType,
+        current.systemCardData ?? {},
+      );
+    }
+  }
 }
 
-/**
- * F7.4/F7.5: Send all user answers for ask-user-question to the main process.
- * Updates the corresponding ask_user message to 'answered' state.
- */
+// Only an accepted Host receipt may commit a question/plan decision. A rejected
+// or lost receipt leaves the existing card and its draft available for retry.
+const questionDecisionsInFlight = new Set<string>();
+
+function submitQuestionDecision(
+  sessionId: string,
+  requestId: string,
+  decision: Record<string, unknown>,
+  onAccepted: () => void,
+): void {
+  const key = JSON.stringify([sessionId, requestId]);
+  if (questionDecisionsInFlight.has(key)) return;
+  questionDecisionsInFlight.add(key);
+  const owner = getDataOwnerGeneration();
+  const epoch = _messagesEpoch.get(sessionId) ?? 0;
+  const authority = _inputProjectionAuthorityEpoch.get(sessionId) ?? 0;
+  const origin = remoteProjectsStore.getSessionDeviceId(sessionId);
+  const isCurrent = () => isDataOwnerGenerationCurrent(owner) &&
+    (_messagesEpoch.get(sessionId) ?? 0) === epoch &&
+    (_inputProjectionAuthorityEpoch.get(sessionId) ?? 0) === authority &&
+    remoteProjectsStore.getSessionDeviceId(sessionId) === origin;
+  bumpInteractionReconcileEpoch(sessionId);
+  void (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const receipt = await Promise.race([
+        makerApiFor(sessionId).resolveInteraction(requestId, decision),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Interaction receipt timeout')), 15_000);
+        }),
+      ]);
+      if (!isCurrent()) return;
+      if (receipt?.accepted !== true) throw new Error('Interaction decision was not accepted');
+      bumpInteractionReconcileEpoch(sessionId);
+      onAccepted();
+    } catch (error) {
+      if (!isCurrent()) return;
+      const state = sessions.get(sessionId);
+      // A winning dismissal from another window/Stop remains authoritative.
+      if (state?.pendingAskUser?.requestId !== requestId &&
+        state?.pendingPlanReview?.requestId !== requestId) return;
+      log.warn('Question decision receipt unavailable', error);
+      toast.warning(i18n.t('newChat.permissionPrompt.submissionFailed'));
+    } finally {
+      if (timer) clearTimeout(timer);
+      questionDecisionsInFlight.delete(key);
+    }
+  })();
+}
+
 function answerUserQuestion(
   sessionId: string,
   requestId: string,
   answers: Record<string, string>,
 ): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingAskUser) return;
-  if (state.pendingAskUser.requestId !== requestId) return;
-  bumpInteractionReconcileEpoch(sessionId);
-
-  // Build a human-readable reply summary
-  const replySummary = formatAskUserReply(answers);
-
-  // Update message to answered + clear pendingAskUser
-  setState(sessionId, (s) => ({
+  if (getOrCreateState(sessionId).pendingAskUser?.requestId !== requestId) return;
+  const submittedAnswers = { ...answers };
+  const replySummary = formatAskUserReply(submittedAnswers);
+  submitQuestionDecision(sessionId, requestId, {
+    kind: 'ask_user_question', answers: submittedAnswers,
+  }, () => setState(sessionId, (s) => ({
     ...s,
-    pendingAskUser: null,
-    // F-AUQ-MIN-5: question resolved — reset viewer for the next one.
-    askUserViewerState: 'expanded',
-    // F-AUQ-DRAFT: question resolved — drop the draft so a future question
-    // (potentially with the same questions[] payload) starts at step 1.
-    askUserDraft: null,
+    pendingAskUser: s.pendingAskUser?.requestId === requestId ? null : s.pendingAskUser,
+    askUserViewerState: s.pendingAskUser?.requestId === requestId ? 'expanded' : s.askUserViewerState,
+    askUserDraft: s.pendingAskUser?.requestId === requestId ? null : s.askUserDraft,
     messages: s.messages.map((m) =>
       m.askUserRequestId === requestId && m.askUserStatus === 'pending'
-        ? {
-            ...m,
-            askUserStatus: 'answered' as const,
-            askUserReply: replySummary,
-            askUserAnswers: answers,
-          }
+        ? { ...m, askUserStatus: 'answered' as const, askUserReply: replySummary, askUserAnswers: submittedAnswers }
         : m,
     ),
-  }));
-
-  // 落库只走 main 的 onInteractionResolved。renderer 先写会让多窗口输家/
-  // Stop-vs-answer 的迟到 updateContent 覆盖赢家或 cancelled。
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, { kind: 'ask_user_question', answers })
-    .catch((err) => log.error('Failed to answer user question:', err));
+  })));
+  // Persistence belongs exclusively to Main's onInteractionResolved, including
+  // local sessions. A late renderer write must not overwrite a winning decision.
 }
 
 function respondToPluginSetup(
@@ -14100,16 +16221,52 @@ function respondToPluginSetup(
   if (!sessionId) return;
   const state = getOrCreateState(sessionId);
   const pending = state.pendingPluginSetup;
-  if (!pending || pending.requestId !== requestId || state.pluginSetupCommandInFlight) return;
+  if (!pending || pending.requestId !== requestId) return;
+  if (state.pluginSetupCommandInFlight && !(action === 'cancel' && isRemoteSession(sessionId) &&
+    ((pending.remoteOauth && state.pluginSetupCommandInFlight.action === 'run_action') ||
+      ((pending.remoteSecret || pending.remoteConnection) && state.pluginSetupCommandInFlight.action === 'submit_form')))) return;
+
+  const owner = getDataOwnerGeneration();
+  const recordRemoteFailure = (command: PluginSetupCommandInFlight, error: unknown) => {
+    if (!isDataOwnerGenerationCurrent(owner)) return;
+    setState(sessionId, (current) => {
+      if (current.pluginSetupCommandInFlight !== command ||
+          current.pendingPluginSetup?.requestId !== requestId ||
+          current.pendingPluginSetup.revision !== pending.revision) return current;
+      return {
+        ...current,
+        pluginSetupCommandInFlight: null,
+        pluginSetupCommandError: { requestId, revision: pending.revision, code: remotePluginSetupErrorCode(error) },
+      };
+    });
+  };
 
   const selectedAction = actionId
     ? pending.steps.find((step) => step.action?.id === actionId)?.action
     : undefined;
   if (action === 'run_action') {
     if (!selectedAction || selectedAction.kind === 'inline_form') return;
+    if (isRemoteSession(sessionId) && (!pending.remoteOauth || selectedAction.kind !== 'oauth_connect')) return;
   } else if (action === 'submit_form') {
+    if (selectedAction?.kind === 'manage_connection' && isRemoteSession(sessionId) && pending.remoteConnection) {
+      let value: import('@cindy/device-link').PluginConnectionInput;
+      try { value = parsePluginConnectionInput({ host: values?.host, token: values?.value }); }
+      catch { return; }
+      const step = pending.steps.find(s => s.action?.id === selectedAction.id)!;
+      if (pending.terminal || !['pending', 'failed'].includes(step.phase)) return;
+      bumpInteractionReconcileEpoch(sessionId);
+      const command: PluginSetupCommandInFlight = { requestId, action, actionId: selectedAction.id };
+      setState(sessionId, s => ({ ...s, pluginSetupCommandInFlight: command, pluginSetupCommandError: null }));
+      void submitRemotePluginConnection(sessionId, { requestId, actionId: selectedAction.id,
+        expectedRevision: pending.revision, ghostId: pending.ghost.id, value,
+        presentation: createPluginConnectionPresentation(pending, step) }).catch((error) => {
+          // Never log the request, provider reply or IPC details from credential input.
+          recordRemoteFailure(command, error);
+        });
+      return;
+    }
     if (
-      isRemoteSession(sessionId) ||
+      (isRemoteSession(sessionId) && !pending.remoteSecret) ||
       !selectedAction ||
       selectedAction.kind !== 'inline_form' ||
       typeof values?.value !== 'string'
@@ -14126,17 +16283,28 @@ function respondToPluginSetup(
       action,
       actionId: selectedAction.id,
     };
-    setState(sessionId, (s) => ({ ...s, pluginSetupCommandInFlight: command }));
-    window.electronAPI.maker
-      .submitPluginSetupInline({
-        requestId,
-        actionId: selectedAction.id,
-        expectedRevision: pending.revision,
-        value,
-      })
-      .catch(() => {
+    setState(sessionId, (s) => ({ ...s, pluginSetupCommandInFlight: command, pluginSetupCommandError: null }));
+    const step = pending.steps.find((s) => s.action?.id === selectedAction.id)!;
+    const submission = {
+      requestId,
+      actionId: selectedAction.id,
+      expectedRevision: pending.revision,
+      value,
+    };
+    const operation = isRemoteSession(sessionId)
+      ? submitRemotePluginSecret(sessionId, {
+          ...submission,
+          ghostId: pending.ghost.id,
+          presentation: createPluginSecretPresentation(pending, step, field),
+        })
+      : window.electronAPI.maker.submitPluginSetupInline(submission);
+    operation
+      .catch((error) => {
+        if (isRemoteSession(sessionId)) { recordRemoteFailure(command, error); return; }
         // Do not attach IPC error details here: this path carries a secret.
         log.error('Failed to submit plugin setup form');
+        if (sessions.get(sessionId)?.pluginSetupCommandInFlight !== command) return;
+        toast.warning(i18n.t('newChat.pluginSetup.error.ACTION_FAILED'));
         setState(sessionId, (s) =>
           s.pluginSetupCommandInFlight === command ? { ...s, pluginSetupCommandInFlight: null } : s,
         );
@@ -14150,16 +16318,20 @@ function respondToPluginSetup(
     action,
     ...(actionId ? { actionId } : {}),
   };
-  setState(sessionId, (s) => ({ ...s, pluginSetupCommandInFlight: command }));
+  setState(sessionId, (s) => ({ ...s, pluginSetupCommandInFlight: command, pluginSetupCommandError: null }));
 
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, {
+  const remoteOauth = isRemoteSession(sessionId) && action === 'run_action' && actionId;
+  const operation = remoteOauth
+    ? assistRemotePluginOauth(sessionId, { ghostId: pending.ghost.id, requestId, actionId, expectedRevision: pending.revision })
+    : makerApiFor(sessionId).resolveInteraction(requestId, {
       kind: 'plugin_setup',
       action,
       ...(actionId ? { actionId } : {}),
       expectedRevision: pending.revision,
-    })
+    });
+  operation
     .catch((err) => {
+      if (remoteOauth) { recordRemoteFailure(command, err); return; }
       log.error('Failed to respond to plugin setup:', err);
       setState(sessionId, (s) =>
         s.pluginSetupCommandInFlight === command ? { ...s, pluginSetupCommandInFlight: null } : s,
@@ -14168,7 +16340,7 @@ function respondToPluginSetup(
 }
 
 /**
- * F-PERM-2: Send a permission decision to the main process and clear pendingPermission.
+ * Keep the card until the host acknowledges the decision (or dismisses it).
  */
 function respondToPermission(
   sessionId: string,
@@ -14177,75 +16349,115 @@ function respondToPermission(
 ): void {
   if (!sessionId) return;
   const state = getOrCreateState(sessionId);
-  if (!state.pendingPermission) return;
+  if (!state.pendingPermission || state.pendingPermission.submitting) return;
 
-  // P1 security: use the explicit requestId from the UI component if provided.
-  // This is the identity the user acted on when they clicked/pressed Enter.
-  // Falling back to state.pendingPermission.requestId only when the caller
-  // did not provide one (e.g. hardware approval path that doesn't go through
-  // PermissionPrompt).
   const requestId = capturedRequestId ?? state.pendingPermission.requestId;
 
-  // Session-scoped guard: block all responses during the gesture-dedupe window.
-  if (permissionResponseInFlight.has(sessionId)) return;
-
-  permissionResponseInFlight.set(sessionId, requestId);
+  const owner = getDataOwnerGeneration();
+  const messagesEpoch = _messagesEpoch.get(sessionId) ?? 0;
+  const authorityEpoch = _inputProjectionAuthorityEpoch.get(sessionId) ?? 0;
+  const origin = remoteProjectsStore.getSessionDeviceId(sessionId);
+  const stickyDevice = getStickySessionDeviceId(sessionId);
+  const isCurrent = () =>
+    isDataOwnerGenerationCurrent(owner) &&
+    (_messagesEpoch.get(sessionId) ?? 0) === messagesEpoch &&
+    (_inputProjectionAuthorityEpoch.get(sessionId) ?? 0) === authorityEpoch &&
+    remoteProjectsStore.getSessionDeviceId(sessionId) === origin &&
+    (!stickyDevice || !isRemoteTerminalSessionTombstoned(sessionId, stickyDevice));
+  const hasCurrentCard = () => isCurrent() && sessions.get(sessionId)?.pendingPermission?.requestId === requestId;
+  // The guard doubles as the duplicate-gesture gate: if the same requestId is
+  // already armed (double-click / key repeat), this response is a duplicate.
+  if (permissionResponseInFlight.get(sessionId) === requestId) return;
+  // Any other session guard entry also blocks (cross-request duplicate input).
+  if (permissionResponseInFlight.has(sessionId) &&
+      permissionResponseInFlight.get(sessionId) !== requestId) return;
   bumpInteractionReconcileEpoch(sessionId);
 
-  // P1 security: verify the captured requestId is STILL the head of the queue.
-  // Between the user click and this function body, a dismissal or reconnect
-  // may have replaced A with B.  We compare by requestId value (not object
-  // reference) so that even if the permission object was recreated during
-  // reconciliation, the identity check is correct.
-  const preState = getOrCreateState(sessionId);
-  if (preState.pendingPermission?.requestId !== requestId) {
-    // Permission was replaced between click and guard arm.  A different card
-    // is now the head — our click is stale.  Release guard and bail.
-    releasePermissionResponseGuard(sessionId);
-    return;
-  }
+  // Receipt protocol: keep the card on screen with submitting=true until the
+  // host acknowledges the decision (or dismisses it).
+  setState(sessionId, (s) => ({
+    ...s,
+    pendingPermission: { ...s.pendingPermission!, submitting: true, submissionFailed: false },
+  }));
 
-  // Promote the next parallel request from the queue.
-  setState(sessionId, (s) => {
-    const [nextPermission = null, ...remainingPermissions] = s.pendingPermissionQueue;
-    return {
-      ...s,
-      pendingPermission: nextPermission,
-      pendingPermissionQueue: remainingPermissions,
-    };
-  });
-
-  // Send to maker (InteractionDecision kind: 'permission').
-  let response: Promise<unknown>;
-  try {
-    response = makerApiFor(sessionId).resolveInteraction(requestId, {
-      kind: 'permission',
-      behavior: result.behavior,
-      updatedInput: (result as { updatedInput?: Record<string, unknown> }).updatedInput,
-      reason: (result as { message?: string }).message,
-      permissionUpdates: Array.isArray(result.updatedPermissions)
-        ? result.updatedPermissions
-        : undefined,
-    });
-  } catch (err) {
-    releasePermissionResponseGuard(sessionId);
-    log.error('Failed to respond to permission:', err);
-    return;
-  }
-  void response
-    .catch((err) => {
-      log.error('Failed to respond to permission:', err);
-      // The resolve never reached the host (device-link disconnect / timeout
-      // before settling).  We already promoted A out of the queue and showed
-      // B, but the host is still waiting on A.  Reconcile against the
-      // authoritative host snapshot: if A is still pending there it is
-      // restored as the head; if the host actually resolved it, A is not
-      // resurrected.  Never let the renderer guess — the host owns the truth.
-      void reconcilePendingInteractions(sessionId).catch(() => undefined);
-    })
-    .finally(() => {
-      armPermissionResponseGuard(sessionId, requestId);
-    });
+  // Bound both local IPC and remote delivery; a lost reply must not disable the
+  // card forever. Never resend an allow automatically after an uncertain reply.
+  const withReceiptTimeout = async <T>(operation: () => Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Permission receipt timeout')), 15_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  // Reserve the guard immediately so a synchronous duplicate (double-click)
+  // is blocked before IPC settles — then the ownership-checked arm in the
+  // receipt path hands the window over for the gesture-dedupe span.
+  permissionResponseInFlight.set(sessionId, requestId);
+  void (async () => {
+    try {
+      const receipt = await withReceiptTimeout(() => makerApiFor(sessionId).resolveInteraction(requestId, {
+        kind: 'permission',
+        behavior: result.behavior,
+        updatedInput: (result as { updatedInput?: Record<string, unknown> }).updatedInput,
+        reason: (result as { message?: string }).message,
+        permissionUpdates: Array.isArray(result.updatedPermissions)
+          ? result.updatedPermissions
+          : undefined,
+      }));
+      if (!hasCurrentCard()) {
+        // The card was dismissed/replaced mid-flight; still arm the dedupe
+        // window so a late input for the old card cannot authorize a new one.
+        armPermissionResponseGuard(sessionId, requestId);
+        return;
+      }
+      if (receipt?.accepted === true) {
+        bumpInteractionReconcileEpoch(sessionId);
+        // FIFO promote: the decision was accepted — show the next queued card.
+        setState(sessionId, (s) => {
+          const [nextPermission = null, ...remainingPermissions] = s.pendingPermissionQueue;
+          return {
+            ...s,
+            pendingPermission: nextPermission,
+            pendingPermissionQueue: remainingPermissions,
+          };
+        });
+        armPermissionResponseGuard(sessionId, requestId);
+        return;
+      }
+      if (receipt?.accepted === false) {
+        bumpInteractionReconcileEpoch(sessionId);
+        setState(sessionId, (s) => ({ ...s, pendingPermission: null }));
+        toast.warning(i18n.t('newChat.permissionPrompt.requestEnded'));
+        armPermissionResponseGuard(sessionId, requestId);
+        return;
+      }
+      throw new Error('Missing permission receipt');
+    } catch (err) {
+      // Failure path: the card must be retryable immediately — release the
+      // guard instead of arming the dedupe window (an uncertain reply must
+      // not lock the user out of retrying).
+      releasePermissionResponseGuard(sessionId);
+      if (!hasCurrentCard()) return;
+      log.warn('Permission decision receipt unavailable', err);
+      toast.warning(i18n.t('newChat.permissionPrompt.submissionFailed'));
+      try {
+        await withReceiptTimeout(() => reconcilePendingInteractions(sessionId, isCurrent));
+      } catch {
+        // Leave the card retryable when the host cannot be reached at all.
+      }
+      if (!hasCurrentCard()) return;
+      setState(sessionId, (s) => ({
+        ...s,
+        pendingPermission: { ...s.pendingPermission!, submitting: false, submissionFailed: true },
+      }));
+    }
+  })();
 }
 
 /**
@@ -14336,8 +16548,11 @@ function parseGhostGrantConfirmRequest(request: {
     lane !== 'attachments' &&
     lane !== 'dir' &&
     lane !== 'save_dir' &&
+    lane !== 'reveal_path' &&
     lane !== 'fs_write' &&
-    lane !== 'workspace'
+    lane !== 'workspace' &&
+    lane !== 'forge_source' &&
+    lane !== 'outside_workdir'
   )
     return null;
   if (typeof request.ghostId !== 'string' || typeof request.ghostName !== 'string') return null;
@@ -14369,6 +16584,10 @@ function parseGhostGrantConfirmRequest(request: {
     ghostId: request.ghostId,
     ghostName: request.ghostName,
     lane,
+    ...(typeof request.sourceTool === 'string' ? { sourceTool: request.sourceTool } : {}),
+    ...(request.operation === 'read' || request.operation === 'write'
+      ? { operation: request.operation }
+      : {}),
     items,
   };
 }
@@ -14408,122 +16627,43 @@ function respondToPlanReview(
   feedback?: string,
 ): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingPlanReview) return;
-  if (state.pendingPlanReview.requestId !== requestId) return;
-
-  const nextStatus = approved ? 'approved' : 'revised';
-  const trimmedFeedback = feedback?.trim() ?? '';
-  bumpInteractionReconcileEpoch(sessionId);
-
-  // Find the clientId for persistence update
-  const planMsg = state.messages.find(
-    (m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending',
-  );
-
-  setState(sessionId, (s) => ({
-    ...s,
-    pendingPlanReview: null,
-    // Reset viewer state so the next review starts fresh
-    planViewerState: 'expanded',
-    lastExpandedPlanViewerState: 'expanded',
-    messages: s.messages.map((m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending'
-        ? {
-            ...m,
-            planReviewStatus: nextStatus as 'approved' | 'revised',
-            planReviewFeedback: approved ? undefined : trimmedFeedback || undefined,
-          }
-        : m,
-    ),
-  }));
-
-  // Persist answered state via PATCH API。远程会话由被控端权威落库(见 answerUserQuestion 注释),
-  // 控制端跳过避免 dead write;本机会话保持原样。
-  if (planMsg && !isRemoteSession(sessionId)) {
-    messageService
-      .updateContent(sessionId, planMsg.clientId, {
-        requestId,
-        plan: planMsg.planReviewPlan ?? '',
-        planFilePath: planMsg.planReviewFilePath ?? '',
-        status: nextStatus,
-        feedback: approved ? null : trimmedFeedback || null,
-      })
-      .catch((err) => log.error('Failed to persist plan_review state:', err));
-  }
-
-  // Send to maker (InteractionDecision kind: 'plan_review')
-  // approved → behavior='allow' + editedPlan = current pending.plan (用户改过的版本)
-  // 拒绝 → behavior='deny' + reason=feedback (模型读到 feedback 知道为什么被拒)
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, {
-      kind: 'plan_review',
-      behavior: approved ? 'allow' : 'deny',
-      editedPlan: approved ? state.pendingPlanReview.plan : undefined,
-      reason: approved ? undefined : trimmedFeedback || undefined,
-    })
-    .catch((err) => log.error('Failed to respond to plan review:', err));
+  const pending = getOrCreateState(sessionId).pendingPlanReview;
+  if (pending?.requestId !== requestId) return;
+  const trimmedFeedback = feedback?.trim() || undefined;
+  submitPlanReviewDecision(sessionId, requestId, {
+    kind: 'plan_review',
+    behavior: approved ? 'allow' : 'deny',
+    editedPlan: approved ? pending.plan : undefined,
+    reason: approved ? undefined : trimmedFeedback,
+  }, approved ? 'approved' : 'revised', approved ? undefined : trimmedFeedback);
 }
 
-/**
- * 取消本次计划审阅(issue #475):与批准/反馈并列的第三条出路。
- * 关闭卡片、气泡标 cancelled;决策发 deny + dismissed 标记 ——
- *   - Codex: 结束本轮计划循环,不发修订 turn(dismissed 语义,见 maker-core;下一条消息回常规模式);
- *   - Claude: ExitPlanMode 以默认理由被拒,模型收到后收尾等待,计划模式不变。
- * 持久化与 respondToPlanReview 同款(远程会话由被控端权威落库,本机 PATCH)。
- */
 function cancelPlanReview(sessionId: string, requestId: string): void {
   if (!sessionId) return;
-  const state = getOrCreateState(sessionId);
-  if (!state.pendingPlanReview) return;
-  if (state.pendingPlanReview.requestId !== requestId) return;
-  bumpInteractionReconcileEpoch(sessionId);
+  if (getOrCreateState(sessionId).pendingPlanReview?.requestId !== requestId) return;
+  submitPlanReviewDecision(sessionId, requestId, {
+    kind: 'plan_review', behavior: 'deny', dismissed: true,
+  }, 'cancelled');
+}
 
-  const planMsg = state.messages.find(
-    (m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending',
-  );
-
-  setState(sessionId, (s) => ({
+function submitPlanReviewDecision(
+  sessionId: string,
+  requestId: string,
+  decision: Record<string, unknown>,
+  status: 'approved' | 'revised' | 'cancelled',
+  feedback?: string,
+): void {
+  submitQuestionDecision(sessionId, requestId, decision, () => setState(sessionId, (s) => ({
     ...s,
-    pendingPlanReview: null,
-    planViewerState: 'expanded',
-    lastExpandedPlanViewerState: 'expanded',
+    pendingPlanReview: s.pendingPlanReview?.requestId === requestId ? null : s.pendingPlanReview,
+    planViewerState: s.pendingPlanReview?.requestId === requestId ? 'expanded' : s.planViewerState,
+    lastExpandedPlanViewerState: s.pendingPlanReview?.requestId === requestId ? 'expanded' : s.lastExpandedPlanViewerState,
     messages: s.messages.map((m) =>
-      m.role === 'plan_review' &&
-      m.planReviewRequestId === requestId &&
-      m.planReviewStatus === 'pending'
-        ? { ...m, planReviewStatus: 'cancelled' as const, planReviewFeedback: undefined }
+      m.role === 'plan_review' && m.planReviewRequestId === requestId && m.planReviewStatus === 'pending'
+        ? { ...m, planReviewStatus: status, planReviewFeedback: feedback }
         : m,
     ),
-  }));
-
-  if (planMsg && !isRemoteSession(sessionId)) {
-    messageService
-      .updateContent(sessionId, planMsg.clientId, {
-        requestId,
-        plan: planMsg.planReviewPlan ?? '',
-        planFilePath: planMsg.planReviewFilePath ?? '',
-        status: 'cancelled',
-        feedback: null,
-      })
-      .catch((err) => log.error('Failed to persist cancelled plan_review state:', err));
-  }
-
-  makerApiFor(sessionId)
-    .resolveInteraction(requestId, {
-      kind: 'plan_review',
-      behavior: 'deny',
-      dismissed: true,
-    })
-    .catch((err) => log.error('Failed to cancel plan review:', err));
+  })));
 }
 
 /**
@@ -15104,6 +17244,10 @@ function setSessionRuntime(
     agentKind?: 'claude-code' | 'codex' | 'pi';
     fastMode?: boolean;
     planModeEnabled?: boolean;
+    /** Seed before SessionView hydrates the DB row; sendMessage reads this for SSH routing. */
+    remoteHostId?: string | null;
+    /** Disable automatic first-message renaming for product-owned titled sessions. */
+    autoTitleDisabled?: boolean;
   },
 ): void {
   if (!sessionId) return;
@@ -15111,10 +17255,16 @@ function setSessionRuntime(
     const nextAgentKind = opts.agentKind ?? s.agentKind;
     const nextFastMode = opts.fastMode ?? s.fastMode;
     const nextPlanMode = opts.planModeEnabled ?? s.planModeEnabled;
+    const nextRemoteHostId = Object.hasOwn(opts, 'remoteHostId')
+      ? (opts.remoteHostId ?? null)
+      : s.remoteHostId;
+    const nextAutoTitleDisabled = opts.autoTitleDisabled ?? s.autoTitleDisabled;
     if (
       s.agentKind === nextAgentKind &&
       s.fastMode === nextFastMode &&
-      s.planModeEnabled === nextPlanMode
+      s.planModeEnabled === nextPlanMode &&
+      s.remoteHostId === nextRemoteHostId &&
+      s.autoTitleDisabled === nextAutoTitleDisabled
     )
       return s;
     return {
@@ -15122,6 +17272,8 @@ function setSessionRuntime(
       agentKind: nextAgentKind,
       fastMode: nextFastMode,
       planModeEnabled: nextPlanMode,
+      remoteHostId: nextRemoteHostId,
+      autoTitleDisabled: nextAutoTitleDisabled,
       ...(s.planModeEnabled !== nextPlanMode ? { planModeRev: s.planModeRev + 1 } : {}),
     };
   });
@@ -15137,6 +17289,10 @@ function setContextWindow(sessionId: string, contextWindow: number | undefined):
     return;
   const nextContextWindow = Math.floor(contextWindow);
   setState(sessionId, (s) => {
+    // Model-selection metadata cannot relabel usage from an applied runtime budget.
+    // Keep Codex unknown until its native total is read, even before its first turn.
+    if (s.agentKind === 'codex' || s.agentStatus.contextWindowFromRuntime ||
+        s.agentStatus.contextTokens > 0) return s;
     if (s.agentStatus.contextWindow === nextContextWindow) return s;
     return {
       ...s,
@@ -15164,6 +17320,7 @@ function mirrorSessionFields(
         fastMode?: unknown;
         planModeEnabled?: unknown;
         agentKind?: unknown;
+        runtimeEffective?: unknown;
         providerId?: unknown;
         agentSwitchIntent?: unknown;
         agentSwitchIntentCanceled?: unknown;
@@ -15185,7 +17342,11 @@ function mirrorSessionFields(
   if (patch.agentKind === 'cc' || patch.agentKind === 'codex' || patch.agentKind === 'pi') {
     const nextKind = dbToMakerAgentKind(patch.agentKind);
     setState(sessionId, (s) => {
-      const intentApplied = s.agentSwitchIntent?.target === nextKind;
+      // New hosts publish the full runtime snapshot before explicitly clearing
+      // the consumed intent with CAS. An agent-kind match alone may belong to
+      // an older switch to the same engine, not the user's latest model choice.
+      const intentApplied = !('runtimeEffective' in patch) &&
+        !('agentSwitchIntent' in patch) && s.agentSwitchIntent?.target === nextKind;
       if (s.agentKind === nextKind && !intentApplied) return s;
       return {
         ...s,
@@ -15263,7 +17424,12 @@ export const makerChatStore = {
   getRunningSnapshot,
   /** F-SB-7: Authoritative terminal-error read, immune to snapshot-generation races. */
   hasSessionTerminalError,
+  hasSessionRecoveryPending,
   wasLastStopSideTask,
+  wasLastStopPrivateReply: (sessionId: string): boolean =>
+    sessions.get(sessionId)?.lastStopWasPrivateReply === true,
+  wasLastStopGroupLane: (sessionId: string): boolean =>
+    sessions.get(sessionId)?.lastStopWasGroupLane === true,
   /** 输入框推荐后台完成配对用的 non-creating turn 起点。 */
   getPromptRecommendationRunStartedAt,
   /** 输入框推荐后台完成资格的 non-creating 终态快照。 */
@@ -15314,9 +17480,12 @@ export const makerChatStore = {
   removeFromQueue,
   /** F-QUEUE-DEFER: edit a single queued message's text (✏️ button). */
   updateQueueItem,
+  updateQueueItemContent,
   clearSession,
   /** Dismiss the error banner without retrying. */
   clearError,
+  /** Bind live error to persist row as already handled (retry/close). */
+  disposeLiveErrorPersist,
   /** Retry the typed recovery target owned by main coordinator. */
   retryLastError,
   /** silent-stop 耗尽横幅「继续」:清横幅 + 隐藏续跑指令(见函数注释)。 */
@@ -15545,6 +17714,10 @@ export const makerChatStore = {
     setState(sessionId, (s) => handleStatusUpdate(s, update));
     scheduleWakeBridgeReconciliation(sessionId);
   },
+  /** Exposed for tests only: apply a main input projection without IPC wiring. */
+  __applyInputProjectionForTest: (projection: AgentInputProjection): void => {
+    applyInputProjection(projection);
+  },
   /** Exposed for tests only. */
   __hydratePersistedMessageForTest: hydratePersistedMessage,
   /** Exposed for tests only. */
@@ -15570,7 +17743,8 @@ export const makerChatStore = {
   /**
    * device-link:对账打开的远程会话消息(重拉最近一页 + 合并去重,补回 push 丢失的消息)。
    * 由 useRemoteSessionSync 在重连 / 被控端回在线 / turn 结束 / 聚焦 / 手动同步时调用。
-   * `opts.force` 仅供 stall 看门狗在确认被控端 not-running 后放行 isStreaming 守卫。
+   * `opts.force` 仅供 stall 看门狗在确认被控端 not-running 后放行 isStreaming 守卫；
+   * `opts.repair` 仅供 durable message push 丢失后的限频补读，streaming 时只追加缺失行。
    */
   reconcileRemoteMessages,
   /** stall 看门狗:读某 session 最近入站事件时刻(ms),判「卡死 Generating 但久未收 push」。 */
@@ -15656,7 +17830,9 @@ function collapseConsecutiveAutoResumeRows(messages: ChatMessage[]): ChatMessage
       }
       continue;
     }
-    if (isSubstantiveChatRow(message)) sawCardSinceContent = false;
+    // Without a later resume card there is no boundary to resolve. In particular,
+    // refreshing input projection for cached history must not rescan old tool text.
+    if (sawCardSinceContent && isSubstantiveChatRow(message)) sawCardSinceContent = false;
   }
   return changed && out ? out : messages;
 }
@@ -15681,16 +17857,25 @@ function mergeMessages(
   rowsOrder: RemoteRowsOrder = 'oldest-first',
 ): ChatMessage[] {
   const serverOrder = new Map(serverMsgs.map((message, index) => [message.clientId, index]));
+  const serverByClientId = new Map(serverMsgs.map((message) => [message.clientId, message]));
   if (existing.length === 0) {
     return collapseConsecutiveAutoResumeRows(
-      sortMessagesChronologically(serverMsgs, serverOrder, rowsOrder),
+      sortMessagesChronologically([...serverByClientId.values()], serverOrder, rowsOrder),
     );
   }
-  const serverByClientId = new Map(serverMsgs.map((message) => [message.clientId, message]));
-  const seen = new Set<string>();
-  let changed = false;
-  const hydratedExisting = existing.map((message) => {
-    seen.add(message.clientId);
+  // Repair already-duplicated in-memory rows as well as duplicates within a
+  // fetched batch. Keep the first slot and merge later metadata/content before
+  // applying the authoritative snapshot (or the addOnly live-state guard).
+  const existingByClientId = new Map<string, ChatMessage>();
+  for (const message of existing) {
+    const previous = existingByClientId.get(message.clientId);
+    existingByClientId.set(
+      message.clientId,
+      previous ? hydratePersistedMessage(previous, message, options) : message,
+    );
+  }
+  let changed = existingByClientId.size !== existing.length;
+  const hydratedExisting = Array.from(existingByClientId.values(), (message) => {
     const persisted = serverByClientId.get(message.clientId);
     if (!persisted) return message;
     if (options.addOnly === true && options.addOnlyExcept?.has(message.clientId) !== true) {
@@ -15700,7 +17885,7 @@ function mergeMessages(
     if (hydrated !== message) changed = true;
     return hydrated;
   });
-  const filtered = serverMsgs.filter((m) => !seen.has(m.clientId));
+  const filtered = [...serverByClientId.values()].filter((m) => !existingByClientId.has(m.clientId));
   if (filtered.length > 0) changed = true;
   const sorted = sortMessagesChronologically(
     [...hydratedExisting, ...filtered],
@@ -16034,15 +18219,32 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
   const ordered = filtered.sort(compareMessageTimeline);
   const legacyUserTurnCosts = projectLegacyUserTurnCosts(ordered);
   const mapped = ordered.map((m) => {
+    const persistedCindyCard =
+      m.role === 'assistant' && m.content && typeof m.content === 'object'
+        ? (m.content as Record<string, unknown>)[CINDY_MAKE_CARD_MARKER]
+        : undefined;
+    if (persistedCindyCard && typeof persistedCindyCard === 'object') {
+      const card = persistedCindyCard as Record<string, unknown>;
+      const type: 'cindy-make' | 'cindy-make-doctor' =
+        card.type === 'cindy-make' ? 'cindy-make' : 'cindy-make-doctor';
+      const data =
+        card.data && typeof card.data === 'object'
+          ? (card.data as Record<string, unknown>)
+          : {};
+      return {
+        clientId: m.clientId,
+        role: 'assistant' as const,
+        content: '',
+        isStreaming: false,
+        systemCardType: type,
+        systemCardData: data,
+      };
+    }
     if (m.role === 'tool_use' && m.content && typeof m.content === 'object') {
       const c = m.content as Record<string, unknown>;
-      const toolName = typeof c.toolName === 'string' ? c.toolName : '';
-      const toolInput = c.input ?? null;
+      const { toolName, input: toolInput, toolUseId } = parseMessageToolUse(m);
       const agentTaskStatus = normalizeAgentTaskTerminalStatus(m.agentMeta?.agentTaskStatus);
       // toolUseId 来源:DB 列(新数据) → fallback 旧数据存在 content.toolUseId 里
-      const toolUseId =
-        (typeof m.toolUseId === 'string' && m.toolUseId.length > 0 ? m.toolUseId : undefined) ??
-        (typeof c.toolUseId === 'string' && c.toolUseId.length > 0 ? c.toolUseId : undefined);
       return {
         clientId: m.clientId,
         role: m.role,
@@ -16208,6 +18410,7 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
       >;
       const message = typeof c.message === 'string' ? c.message : '';
       const reason = typeof c.reason === 'string' ? c.reason : undefined;
+      const toolLoop = parseToolLoopErrorDetails(c.toolLoop);
       const errorProviderId =
         typeof c.providerId === 'string' && c.providerId ? c.providerId : undefined;
       return {
@@ -16216,6 +18419,7 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
         content: message,
         isStreaming: false,
         ...(reason ? { errorReason: reason } : {}),
+        ...(toolLoop ? { toolLoop } : {}),
         // 错误发生时的 provider 快照:恢复后的分类按它走,不用当前 session.providerId。
         ...(errorProviderId ? { errorProviderId } : {}),
         // interrupted-turn-resume:「忽略」的持久化标记(updateContent 写入)。
@@ -16264,6 +18468,50 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
           handoff: typeof c.handoff === 'string' ? c.handoff : '',
           resumed: c.resumed === true,
         },
+      };
+    }
+    // 后台任务锚点与补充消息留痕共享历史 metadata。只投影当前仍会生成的父任务
+    // 锚点和补充消息；旧的目标侧镜像不再生成，也不再重复画第二张任务卡。
+    const collaboration = readBotCollaborationMeta(m.agentMeta?.botCollaboration);
+    if (
+      m.role === 'assistant'
+      && (
+        collaboration?.role === 'delegation-request'
+        || collaboration?.role === 'delegation-result'
+        || collaboration?.role === 'interjection')
+    ) {
+      return {
+        clientId: m.clientId,
+        role: m.role,
+        content: '',
+        isStreaming: false,
+        systemCardType:
+          collaboration.role === 'delegation-result'
+            ? ('bot-session-task-result' as const)
+            : collaboration.role === 'interjection'
+            ? ('bot-session-task-message' as const)
+            : ('bot-session-task' as const),
+        systemCardData: {
+          ...collaboration,
+          // 旧记录可能含完整执行指令；实时与历史都只投影任务状态，不修改原记录。
+          text: '',
+        },
+      };
+    }
+    const authorization = readBotAuthorizationCard(m.agentMeta?.botAuthorization);
+    if (m.role === 'assistant' && authorization) return {
+      clientId: m.clientId, role: m.role, content: '', isStreaming: false,
+      systemCardType: 'bot-authorization' as const, systemCardData: { ...authorization },
+    };
+    const directMessage = readBotDirectMessageMeta(m.agentMeta?.botDirectMessage);
+    if (m.role === 'assistant' && directMessage) {
+      return {
+        clientId: m.clientId,
+        role: m.role,
+        content: '',
+        isStreaming: false,
+        systemCardType: 'bot-direct-message' as const,
+        systemCardData: { ...directMessage },
       };
     }
     // image-local-cache: user role messages may have JSON-shaped content
@@ -16317,13 +18565,16 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
         };
       }
       const parsed = parseUserContent(m.content);
-      // scheduler 注入的消息带 agentMeta.origin(历史加载与 messages:created
-      // 直推两条路径都经过这里),透传给 UserMessage 渲染来源标签。
-      const origin = m.agentMeta?.origin;
+      // scheduler / 工具 / Orca 注入的消息带 agentMeta.origin(历史加载与
+      // messages:created 直推两条路径都经过这里),投影后透传给 UserMessage 渲染来源标签。
+      const automationOrigin = toMessageAutomationOrigin(m.agentMeta?.origin);
       const delivery = m.agentMeta?.delivery;
       const goalObjective = m.agentMeta?.goalObjective;
-      const hookSource = m.agentMeta?.hookSource;
+      // Both ingress paths share the Desktop card, but local IM must not opt
+      // older Mobile clients into legacy Hook/system-card semantics.
+      const hookSource = m.agentMeta?.imSource ?? m.agentMeta?.hookSource;
       return {
+        sharedAuthorName: sharedTaskAuthorName(m.agentMeta),
         clientId: m.clientId,
         role: m.role,
         content: parsed.text,
@@ -16343,7 +18594,7 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
         ...(parsed.sessionReferences && parsed.sessionReferences.length > 0
           ? { sessionReferences: parsed.sessionReferences }
           : {}),
-        ...(origin?.kind === 'scheduler' && { automationOrigin: origin }),
+        ...(automationOrigin && { automationOrigin }),
         ...(delivery === 'turn' || delivery === 'steer' ? { delivery } : {}),
         ...(goalObjective ? { goalBadge: goalObjective } : {}),
         ...(hookSource ? { hookSource } : {}),
@@ -16371,6 +18622,17 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
         isStreaming: false,
         systemCardType: 'goal-complete' as const,
         systemCardData: { ...m.agentMeta.goalCompletion },
+      };
+    }
+    // 个人版制作任务完成记录:同 goal-complete,从持久 agentMeta 派生成完成卡片。
+    if (m.role === 'assistant' && m.agentMeta?.cindyMakeCompletion) {
+      return {
+        clientId: m.clientId,
+        role: m.role,
+        content: '',
+        isStreaming: false,
+        systemCardType: 'cindy-make-complete' as const,
+        systemCardData: { ...m.agentMeta.cindyMakeCompletion },
       };
     }
     // /goal 提示记录(usageLimited 到点自动续跑)→ 'goal-resumed' system card,同上派生。
@@ -16453,6 +18715,7 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
       clientId: m.clientId,
       role: m.role,
       content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      ...(m.agentMeta?.botPrivateReply === true ? { botPrivateReply: true } : {}),
       // tool_result 消息也带 toolUseId(DB 列),让 MessageStream 能按 id 配对
       ...(m.role === 'tool_result' && typeof m.toolUseId === 'string' && m.toolUseId.length > 0
         ? { toolUseId: m.toolUseId }
@@ -16602,9 +18865,6 @@ function formatToolUseSummary(toolName: string, input: unknown): string {
 
   return `${toolName}()`;
 }
-
-// `notify` kept here for potential future external dispatchers.
-void notify;
 
 // ---------------------------------------------------------------------------
 // HMR teardown — ensure old listeners are disposed before the module reloads

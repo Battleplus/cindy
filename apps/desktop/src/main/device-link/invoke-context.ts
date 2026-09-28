@@ -10,10 +10,15 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { isMobilePlatform } from './controllerPlatform';
 import * as subscriptions from './subscriptions.js';
+import type { SharedTaskPeerCapture } from './sharedTaskDispatch.js';
 
 export interface DeviceLinkInvokeContext {
   controllerDeviceId: string;
   channel: string;
+  /** Host-verified sharedTask identity and revocation fence; never populated from wire args. */
+  sharedTask?: SharedTaskPeerCapture;
+  /** Shared only within this invoke; an admitted native mutation must finish or roll back. */
+  sharedTaskSetting?: { admitted: boolean };
   /**
    * 控制端平台(presence 登记的 `PresenceSnapshot.platform`);未登记时 undefined。
    *
@@ -31,6 +36,8 @@ export interface DeviceLinkInvokeContext {
    * 跳过校验或做任何安全判定。
    */
   controllerPlatform?: string;
+  /** Captured before asynchronous dispatch checks; cannot mutate a replacement subscription. */
+  historyView?: ReturnType<typeof subscriptions.prepareHistoryView>;
 }
 
 const storage = new AsyncLocalStorage<DeviceLinkInvokeContext>();

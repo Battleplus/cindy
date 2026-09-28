@@ -52,6 +52,26 @@ function permission(suggestions?: unknown[]): PendingPermission {
 }
 
 describe('PermissionPrompt 的会话级授权按钮', () => {
+  it('提交中禁用按钮和快捷键，失败后允许重试', () => {
+    const onRespond = vi.fn();
+    const request = permission([bashRule]);
+    const { rerender } = render(<PermissionPrompt permission={{ ...request, submitting: true }} onRespond={onRespond} />);
+    for (const button of screen.getAllByRole('button')) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(button);
+    }
+    fireEvent.keyDown(window, { key: 'Enter' });
+    fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true });
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(screen.getByRole('status').textContent).toBe('newChat.permissionPrompt.submitting');
+    rerender(<PermissionPrompt permission={{ ...request, submitting: false, submissionFailed: true }} onRespond={onRespond} />);
+    expect(screen.getByRole('status').textContent).toBe('newChat.permissionPrompt.submissionFailed');
+    fireEvent.click(screen.getByRole('button', { name: /allowOnce/ }));
+    // P1: the component freezes and reports the requestId it was mounted for.
+    expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow', requestId: 'req-1' });
+  });
+
   it('把规则范围写进按钮文案', () => {
     render(<PermissionPrompt permission={permission([bashRule])} onRespond={vi.fn()} />);
 
@@ -231,5 +251,28 @@ describe('PermissionPrompt 的会话级授权按钮', () => {
     fireEvent.click(screen.getByText('agentIsland.native.allowOnce'), { detail: 2 });
     fireEvent.click(screen.getByText('agentIsland.native.allowOnce'), { detail: 3 });
     expect(onRespond).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PermissionPrompt 的插件安装确认', () => {
+  it('首行作说明，权限清单放进可滚动区域，不显示内部参数', () => {
+    render(
+      <PermissionPrompt
+        permission={{
+          requestId: 'req-install',
+          toolName: 'cindy.plugin.install',
+          input: { ghost_id: 'weather-chip', version: '1.0.0' },
+          title: '安装插件「Weather」？',
+          description: '版本 1.0.0 · 由 Agent 发起 · 来自 Cindy 插件市场\n确认后才会安装。\n安装后它将拥有：\n• 访问 api.weather.test',
+        }}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('版本 1.0.0 · 由 Agent 发起 · 来自 Cindy 插件市场')).toBeTruthy();
+    const list = screen.getByText(/安装后它将拥有/);
+    expect(list.textContent).toContain('• 访问 api.weather.test');
+    expect(list.textContent).not.toContain('版本 1.0.0');
+    expect(screen.queryByText(/weather-chip/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /alwaysAllow/ })).toBeNull();
   });
 });

@@ -1,11 +1,19 @@
+import { chatCompatibilityCapabilities, normalizeProviderRequest } from '@cindy/model-compat';
 import type { ServerResponse } from 'node:http';
 
 import { ChatSseTranslator } from './chat-sse-translator.js';
-import { translateResponsesRequestWithContext } from './translate-request.js';
+import {
+  overrideHeadersCaseInsensitive,
+  resolveConversationSessionHeaders,
+  withChatBridgeUserAgent,
+} from './session-header.js';
+import { classifySystemOrderError, shouldRetrySystemNormalization } from './system-order.js';
+import { coalesceLeadingSystemMessages, translateResponsesRequestWithContext } from './translate-request.js';
 import {
   UnsupportedResponsesFeatureError,
   type ChatBridgeLogger,
   type ChatBridgeProviderConfig,
+  type ChatMessage,
   type ResponsesChatBridgeHandler,
   type ResponsesRequest,
 } from './types.js';
@@ -162,18 +170,19 @@ export function createResponsesChatHandler(
   const fetchImpl = opts.fetchImpl ?? fetch;
 
   return {
-    async handle({ parsedBody, res }): Promise<void> {
+    async handle({ parsedBody, res, requestHeaders }): Promise<void> {
       if (!isPlainObject(parsedBody) || typeof parsedBody.model !== 'string') {
         writeJson(res, 400, responsesError(400, 'invalid_request', 'invalid Responses request body'));
         return;
       }
       const request = parsedBody as ResponsesRequest;
       const realModel = provider.rewriteModel?.(request.model) ?? request.model;
+      const compatibilityRoute = { harness: 'codex' as const, protocol: 'openai-chat' as const, upstreamBase: provider.upstreamBase, model: realModel };
       let translated;
       try {
         translated = translateResponsesRequestWithContext(request, {
           model: realModel,
-          capabilities: provider.capabilities,
+          capabilities: chatCompatibilityCapabilities(compatibilityRoute, provider.capabilities),
           onDroppedTool: (type, index) => {
             if (type === 'web_search') {
               log.warn?.('responses-chat bridge dropped unsupported built-in tool', {
@@ -235,17 +244,51 @@ export function createResponsesChatHandler(
       const abortUpstream = (): void => abort.abort();
       res.once('close', abortUpstream);
       let upstream: Response;
+      let upstreamErrorText: string | undefined;
       try {
-        upstream = await fetchImpl(upstreamUrl, {
+        // 出站头 = 供应商凭证/自定义头(缺 UA 时补 bridge 标识)+ 稳定会话头 + 协议头。
+        // 会话头按每个对话从入站 thread-id 映射,优先于供应商静态配置里同名的固定值
+        // (整机共用一个 ID 达不到上游「每个对话稳定」的要求,见 #4073);其余入站头不出网。
+        // 覆盖按头名大小写不敏感进行,否则 `X-OpenCode-Session` 与 `x-opencode-session`
+        // 会被 fetch 合并成一个非法复合值。
+        const sessionHeaders = resolveConversationSessionHeaders(requestHeaders);
+        const send = (): Promise<Response> => fetchImpl(upstreamUrl, {
           method: 'POST',
           headers: {
-            ...providerHeaders,
+            ...overrideHeadersCaseInsensitive(withChatBridgeUserAgent(providerHeaders), sessionHeaders),
             'content-type': 'application/json',
             accept: 'text/event-stream',
           },
-          body: JSON.stringify(chatRequest),
+          body: JSON.stringify(normalizeProviderRequest(chatRequest, compatibilityRoute, { reasoningEffortAlreadyMapped: provider.capabilities?.reasoningEffortMap !== undefined })),
           signal: abort.signal,
         });
+        upstream = await send();
+        if (!upstream.ok) {
+          upstreamErrorText = await readErrorText(upstream);
+          // 上游只允许 system 出现在开头:Qwen 拒 instructions + developer (#3583),
+          // Google 兼容层拒中段 system(Claude Code 的 mid-conversation-system 会带进来)。
+          // 只重试一次、只限本次请求内;显式策略与原生 developer 语义仍然优先。
+          const systemOrderRejection = classifySystemOrderError(upstream.status, upstreamErrorText);
+          if (
+            provider.capabilities?.systemMessagePolicy === undefined
+            && provider.capabilities?.developerRole !== 'developer'
+            && systemOrderRejection !== null
+            && !abort.signal.aborted
+            && shouldRetrySystemNormalization(systemOrderRejection, chatRequest.messages)
+          ) {
+            const coalesced = coalesceLeadingSystemMessages(chatRequest.messages);
+            if (coalesced !== chatRequest.messages) {
+              chatRequest.messages = coalesced;
+              upstream = await send();
+              upstreamErrorText = upstream.ok ? undefined : await readErrorText(upstream);
+            }
+          }
+        }
+        if (abort.signal.aborted) {
+          res.off('close', abortUpstream);
+          void upstream.body?.cancel().catch(() => {});
+          return;
+        }
       } catch (error) {
         res.off('close', abortUpstream);
         if (abort.signal.aborted) return;
@@ -271,7 +314,7 @@ export function createResponsesChatHandler(
       };
 
       if (!upstream.ok || !upstream.body) {
-        const text = await readErrorText(upstream);
+        const text = upstreamErrorText ?? await readErrorText(upstream);
         log.warn?.('responses-chat bridge upstream error', {
           model: request.model,
           status: upstream.status,

@@ -9,6 +9,9 @@ import {
 } from '@cindy/maker-shared/agent-input-projection';
 import type { InputProjection, QueuedRemoteMessage, RemoteImageRef, RemoteSession } from '@/session/types';
 import type { RemoteSerializedAttachment } from '@/session/types';
+import { parseMobileToolLoopErrorDetails } from '@/session/agentErrorI18n';
+import { i18n } from '@/i18n';
+import { resolveSystemLocale } from '@/i18n/locale';
 import { permissionModeOrAsk } from '@cindy/maker-shared/permission-mode';
 import {
   composerDocumentsEqual,
@@ -67,6 +70,8 @@ export const EMPTY_INPUT_PROJECTION: InputProjection = Object.freeze({
   queueEditLocks: [],
   queueAbortPending: false,
   error: null,
+  errorReason: null,
+  toolLoop: null,
   recovery: null,
   errorRetryText: null,
   credentialSwitchWait: null,
@@ -92,6 +97,8 @@ export function normalizeInputProjection(value: unknown, fallbackSessionId = '')
     queueEditLocks: readStringArray(record?.queueEditLocks),
     queueAbortPending: record?.queueAbortPending === true,
     error: readString(record?.error),
+    errorReason: readString(record?.errorReason),
+    toolLoop: parseMobileToolLoopErrorDetails(record?.toolLoop),
     recovery: record?.recovery,
     errorRetryText: readString(record?.errorRetryText),
     autoResumePending: readRecord(record?.autoResumePending),
@@ -122,6 +129,7 @@ export function buildQueuedTextMessage(
   clientId = createUuid(),
   options: {
     attachments?: readonly RemoteSerializedAttachment[];
+    planMode?: boolean;
     quotesEncoded?: boolean;
     agentReferences?: AgentInputReference[];
     pastedTextRanges?: Array<{ start: number; end: number; display: string }>;
@@ -148,10 +156,12 @@ export function buildQueuedTextMessage(
     options.agentReferences,
   );
   const createdAt = now.toISOString();
+  const uiLanguage = resolveSystemLocale(i18n.resolvedLanguage || i18n.language);
 
   return {
     clientId,
     text: trimmed,
+    uiLanguage,
     persistedContent,
     ...(attachments.length > 0 ? { files: [...attachments] } : {}),
     ...(options.agentReferences?.length ? { agentReferences: options.agentReferences } : {}),
@@ -173,6 +183,7 @@ export function buildQueuedTextMessage(
     },
     createOpts: {
       agentKind,
+      ...(options.planMode !== undefined ? { planMode: options.planMode } : {}),
       workingDir,
       model: session.model,
       effort,

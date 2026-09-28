@@ -25,6 +25,10 @@ import {
   type RelayErrorPayload,
 } from '@cindy/device-link-protocol';
 
+export { SHARED_TASK_RELAY_CAPABILITY, sharedTaskDeviceId, parseSharedTaskScope, type SharedTaskScope } from '@cindy/device-link-protocol';
+export { sharedTaskHostPeer, sharedTaskGuestPeer, isSharedTaskPeer, parseSharedTaskPeer } from './sharedTaskPeer.js';
+export type { SharedTaskPeer } from './sharedTaskPeer.js';
+
 export {
   MAX_FRAME_BYTES,
   NOTIFY_BODY_MAX_LENGTH,
@@ -58,6 +62,7 @@ export type DeviceLinkErrorCode = RelayErrorCode
   | 'CHANNEL_NOT_ALLOWED' // channel 不在远程调用白名单
   | 'ACCESS_REVOKED' // 被控端已撤销该控制端的访问权限(逐设备黑名单,被控端本地强制)
   | 'INVOKE_TIMEOUT' // 控制端等待 invoke-result 超时
+  | 'PEER_RESET' // peer 传输复位；仅用于可安全重试的幂等读请求
   | 'LINK_NOT_OPEN' // 控制链路未建立
   | 'NOT_CONNECTED' // 本端尚未连上 relay
   | 'BACKPRESSURE' // 本端可靠传输缓冲已满，拒绝继续制造积压
@@ -118,12 +123,27 @@ export const CONTROLLER_CAPABILITY_PROVIDER_LOGO_KINDS_V2 = 'provider-logo-kinds
 export const CONTROLLER_CAPABILITY_SET_MODEL_EXPLICIT_PROVIDER_NULL_V1 =
   'set-model-explicit-provider-null-v1';
 
+/** 控制端会为有损模型换窗携带用户明确确认过的精确窗口。 */
+export const CONTROLLER_CAPABILITY_MODEL_WINDOW_CONFIRMATION_V1 =
+  'model-window-confirmation-v1';
+
 /**
  * 控制端能消费 `maker:event:batch` 微批帧(拆包后逐条按原路消费)。
  * 被控端只对声明了本能力的控制端发批,未声明者照旧逐帧转发——旧控制端
  * 因此永远收不到该 channel,无需为未知 channel 做任何兼容。
  */
 export const CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1 = 'maker-event-batch-v1';
+
+/** Accepts ordered current-text snapshots and history repair hints, including after backpressure. */
+export const CONTROLLER_CAPABILITY_SESSION_TEXT_SNAPSHOT_V1 = 'session-text-snapshot-v1';
+
+/**
+ * 后台链路(link-open / link-accept 双向声明)。控制端在本机没有订阅对端任何 topic 时建链
+ * 即声明:被控端不装 legacy `'*'` 兼容订阅 —— 不亮被控横幅、不转发推送、不挡无人值守更新
+ * 重启 —— 直到控制端显式 subscribe。被控端在 link-accept 声明支持;旧被控端忽略该能力,
+ * 照旧装 legacy `'*'`,只读类后台请求须先确认对端支持(见 desktop remoteBackgroundInvoke)。
+ */
+export const DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1 = 'background-link-v1';
 
 export interface LinkAcceptPayload {
   appVersion: string;

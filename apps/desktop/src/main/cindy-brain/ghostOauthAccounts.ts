@@ -871,6 +871,12 @@ export class GhostOauthAccountManager {
        * GhostOauthClientConfig.corsDeliveryHosts。
        */
       deliveryHosts?: readonly string[];
+      /** Main-only handoff for reopening the current authorization page. */
+      onAuthorizationUrl?: (url: string) => void;
+      remote?: import('../plugin-oauth/context.js').RemoteOauthContext;
+      /** Main-only caller boundary, checked inside the credential mutation lock. */
+      assertCurrent?: () => void;
+      beforeCommit?: () => Promise<void>;
     },
   ): Promise<GhostOauthConnectResult> {
     if (decl.tokenBroker !== undefined && !this.isTokenBrokerAuthorized(ghostId)) {
@@ -918,7 +924,8 @@ export class GhostOauthAccountManager {
 
     const flow = await startGhostOauthFlow({
       config,
-      openExternal: this.deps.openExternal,
+      remote: opts?.remote,
+      openExternal: (url) => { opts?.onAuthorizationUrl?.(url); return this.deps.openExternal(url); },
       fetchImpl: this.deps.fetchImpl,
       broker: this.deps.broker,
       brandName: this.deps.brandName,
@@ -930,6 +937,7 @@ export class GhostOauthAccountManager {
       reclaimPort: isFirstPartyHostPrivilegeGhostId(ghostId) ? this.deps.reclaimPort : undefined,
     });
     if (!flow.ok) return { ok: false, error: flow.error, detail: flow.detail };
+    opts?.remote?.assertCurrent();
     if (this.deps.isConnectTargetCurrent?.(ghostId, secretKey, decl) === false) {
       return {
         ok: false,
@@ -970,6 +978,9 @@ export class GhostOauthAccountManager {
     }
 
     return this.withMutationLock(ghostId, async () => {
+      await opts?.beforeCommit?.();
+      opts?.assertCurrent?.();
+      opts?.remote?.assertCurrent();
       // Identity/avatar fetches are asynchronous as well. Recheck inside the
       // same strict mutation lock as the first vault read/write so a package
       // update cannot replace the declaration between validation and commit.
@@ -1060,6 +1071,7 @@ export class GhostOauthAccountManager {
           secretKey,
           accountId: existing.id,
         });
+        opts?.remote?.finish(true);
         this.notifyConnected(ghostId, secretKey, existing.displayLabel ?? existing.label);
         return {
           ok: true,
@@ -1124,6 +1136,7 @@ export class GhostOauthAccountManager {
         secretKey,
         accountId: account.id,
       });
+      opts?.remote?.finish(true);
       this.notifyConnected(ghostId, secretKey, account.displayLabel ?? account.label);
       return {
         ok: true,

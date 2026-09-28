@@ -1,5 +1,13 @@
 export { AuthApiError, CindyAuthClient } from "./client.js";
+export {
+  accountVaultKey,
+  isStoredAccountMetadata,
+  passportVaultKey,
+  reconcileSavedAccountMetadata,
+  storedAccountMetadataFromMembership,
+} from "./accountMetadata.js";
 export { discoverSsoOrgRealm } from "./orgRealmDiscovery.js";
+export { discoverEmailLogin, discoverPersonalLoginOrganization } from "./emailLoginDiscovery.js";
 export {
   MAX_SSO_ORG_HISTORY_ENTRIES,
   MAX_SSO_ORG_IDENTIFIER_LENGTH,
@@ -17,6 +25,10 @@ export {
   serializeAuthSessionRecord,
 } from "./sessionRealm.js";
 export { isValidEmail } from "./email.js";
+export type {
+  AccountMetadataVault,
+  StoredAccountMetadata,
+} from "./accountMetadata.js";
 export type {
   AuthClientOptions,
   AuthFetch,
@@ -36,6 +48,7 @@ export {
   accountDeletionChallengeSchema,
   accountDeletionStatusSchema,
   accountMembershipSchema,
+  accountTokenPairSchema,
   authRegionSchema,
   CAPTCHA_CHALLENGE_PAGE_PATH,
   captchaConfigSchema,
@@ -44,6 +57,7 @@ export {
   desktopAuthorizationPollSchema,
   loginMethodSchema,
   loginOutcomeSchema,
+  recognizeLoginMethods,
   meResponseSchema,
   membershipSchema,
   providerConfigSchema,
@@ -61,6 +75,7 @@ export type {
   AccountDeletionChallenge,
   AccountDeletionStatus,
   AccountMembership,
+  AccountTokenPair,
   AuthClientType,
   AuthFlowAction,
   AuthFlowState,

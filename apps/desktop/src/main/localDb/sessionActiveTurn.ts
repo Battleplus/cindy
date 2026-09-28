@@ -52,6 +52,11 @@
 import { and, desc, eq, gt, inArray, isNull, lt, sql } from 'drizzle-orm';
 
 import { getDbClient } from './client/current';
+import { listCindyMakePendingFailureSessionIds } from './cindyMakeAttention';
+import {
+  getSessionInterruptionBootAt,
+  setSessionInterruptionBootAtForTests,
+} from './sessionInterruptionBoot';
 import { messages, sessions } from './schema';
 import { createLogger } from '../logger';
 import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../shared/sessionSource.js';
@@ -147,6 +152,28 @@ function notifyTurnEndedPersisted(sessionId: string, endedAt: number, context: u
 
 /** started / ended 的 per-session 写链:只做 UPDATE 排队保序,无读改写。 */
 const _writeChains = new Map<string, Promise<void>>();
+// Captured synchronously at the running edge, before either durable queue can
+// stall. Notification delivery uses this turn boundary when its DB preview is
+// unavailable; a later turn must never inherit the previous turn's dedupe key.
+const _notificationTurns = new Map<string, { startedAt: number; sequence: number; endedAt?: number }>();
+let _notificationTurnSequence = 0;
+
+export function getSessionNotificationTurnSignal(sessionId: string): { id: string; fallbackEventId: string; ended: boolean } | undefined {
+  const turn = _notificationTurns.get(sessionId);
+  if (!turn) return undefined;
+  return {
+    id: `signal:${turn.sequence}`,
+    ended: turn.endedAt !== undefined,
+    // The mobile deduper can reconcile an anonymous scheduler completion by
+    // terminal time even while SQLite is unavailable.
+    fallbackEventId: `turn:${turn.startedAt}:${turn.endedAt ?? turn.startedAt}:signal-${turn.sequence}`,
+  };
+}
+
+/** Wait for the turn-marker writes already queued for this session. */
+export function drainSessionActiveTurnWrites(sessionId: string): Promise<void> {
+  return _writeChains.get(sessionId) ?? Promise.resolve();
+}
 
 /** 返回链上本次写完成(含失败吞错)的 promise,供需要落库确认的调用方 await。 */
 function chainWrite(sessionId: string, op: () => Promise<void>): Promise<void> {
@@ -160,6 +187,7 @@ function chainWrite(sessionId: string, op: () => Promise<void>): Promise<void> {
 export function markSessionTurnStarted(sessionId: string): void {
   if (_quitFrozen) return;
   const startedAt = Date.now();
+  _notificationTurns.set(sessionId, { startedAt, sequence: ++_notificationTurnSequence });
   chainWrite(sessionId, async () => {
     try {
       await getDbClient()
@@ -191,9 +219,12 @@ export function markSessionTurnStarted(sessionId: string): void {
 export function markSessionTurnEnded(sessionId: string, endedAtOverride?: number): void {
   if (isEndedWriteSuppressed()) return;
   const notifyContext = captureTurnEndedPersistedContext();
+  const endedAt = Math.min(endedAtOverride ?? Date.now(), Date.now());
+  const notificationTurn = _notificationTurns.get(sessionId);
+  if (notificationTurn && notificationTurn.endedAt === undefined) notificationTurn.endedAt = endedAt;
   enqueueEndedWrite(
     sessionId,
-    Math.min(endedAtOverride ?? Date.now(), Date.now()),
+    endedAt,
     notifyContext,
   );
 }
@@ -211,6 +242,8 @@ export function markSessionTurnEndedAfterBarrier(sessionId: string, barrier: Pro
   if (isEndedWriteSuppressed()) return;
   const endedAt = Date.now();
   const notifyContext = captureTurnEndedPersistedContext();
+  const notificationTurn = _notificationTurns.get(sessionId);
+  if (notificationTurn && notificationTurn.endedAt === undefined) notificationTurn.endedAt = endedAt;
   void barrier.then(
     () => enqueueEndedWrite(sessionId, endedAt, notifyContext),
     () => enqueueEndedWrite(sessionId, endedAt, notifyContext),
@@ -329,11 +362,9 @@ function enqueueEndedWrite(sessionId: string, endedAt: number, notifyContext: un
  * 检测不到(PR #879 review P1,两个 reviewer 独立指出)。现在把边界下沉进查询本身,
  * 调用时机不再影响正确性。
  */
-let _bootAtMs = Date.now();
-
 /** 测试专用:定格「本进程启动时刻」,让中断判定不依赖真实时钟。 */
 export function _setBootAtMsForTests(ms: number): void {
-  _bootAtMs = ms;
+  setSessionInterruptionBootAtForTests(ms);
 }
 
 /**
@@ -360,11 +391,13 @@ export async function listInterruptedPendingRows(): Promise<
         gt(sessions.activeTurnStartedAt, sql`COALESCE(${sessions.lastTurnEndedAt}, 0)`),
         gt(sessions.activeTurnStartedAt, sql`COALESCE(${sessions.clearedAt}, 0)`),
         // 只认「开始于本进程启动之前」的 turn —— 排除正在跑的(见 _bootAtMs 注释)。
-        lt(sessions.activeTurnStartedAt, _bootAtMs),
+        lt(sessions.activeTurnStartedAt, getSessionInterruptionBootAt()),
       ),
     );
   // startedAt 必非 null(上面的 gt/lt 比较已排除),类型收窄用于批量处置的 CAS。
-  return rows.flatMap((r) => (r.startedAt == null ? [] : [{ sessionId: r.id, startedAt: r.startedAt }]));
+  return rows.flatMap((r) =>
+    r.startedAt == null ? [] : [{ sessionId: r.id, startedAt: r.startedAt }],
+  );
 }
 
 /** 同上,只要会话 id —— 红点首拉用。 */
@@ -436,10 +469,13 @@ export async function listErrorTailPendingRows(): Promise<
   return rows;
 }
 
-/** 同上,只要会话 id —— 红点派生用。 */
+/** Native Make failures use the same unresolved-alert projection, not synthetic error rows. */
 export async function listErrorTailPendingSessionIds(): Promise<string[]> {
-  const rows = await listErrorTailPendingRows();
-  return [...new Set(rows.map((r) => r.sessionId))];
+  const [rows, makeFailures] = await Promise.all([
+    listErrorTailPendingRows(),
+    listCindyMakePendingFailureSessionIds(),
+  ]);
+  return [...new Set([...rows.map((r) => r.sessionId), ...makeFailures])];
 }
 
 /**
@@ -612,5 +648,5 @@ export function _resetSessionActiveTurnStateForTests(): void {
   // bootAt 一并重置:它在模块 import 时定格,而用例常以「相对 now 的 startedAt」
   // 造数据 —— 文件内前置用例的累计耗时一旦超过该相对差,后续用例的中断判定就会
   // 因 startedAt >= bootAt 静默翻转(时钟脆弱)。每个用例重新定基消除顺序耦合。
-  _bootAtMs = Date.now();
+  setSessionInterruptionBootAtForTests(Date.now());
 }

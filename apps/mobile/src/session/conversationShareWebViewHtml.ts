@@ -7,6 +7,7 @@ import {
   type SelectableMarkdownHtmlOptions,
 } from "@/session/selectableMarkdownHtml";
 import { buildMessageContentLayout } from "@/session/messageContentLayout";
+import { collectMobileMarkdownImages } from "@/session/messageMarkdown";
 import { lineHeight, typeScale } from "@/theme/tokens";
 
 export interface ConversationShareMessage {
@@ -17,11 +18,20 @@ export interface ConversationShareMessage {
   body: string;
   bodyParts?: readonly ConversationShareBodyPart[];
   secondaryBody?: string;
+  /** Export-only decoded images, keyed by attachment/Markdown source. */
+  images?: ReadonlyMap<string, ConversationShareImage>;
+}
+
+export interface ConversationShareImage {
+  uri: string;
+  width: number;
+  height: number;
 }
 
 export interface ConversationShareAttachment {
   kind: "image" | "file";
   name: string;
+  uri?: string;
 }
 
 export type ConversationShareBodyPart =
@@ -124,6 +134,25 @@ function buildMessageHtml(
   message: ConversationShareMessage,
   markdownOptions: SelectableMarkdownHtmlOptions,
 ): string {
+  markdownOptions = {
+    ...markdownOptions,
+    imageSources: message.images ?? new Map(),
+  };
+  const texts = message.bodyParts
+    ? message.bodyParts.flatMap((part) =>
+        part.kind === "text" ? [part.text] : [],
+      )
+    : [message.body];
+  if (message.secondaryBody) texts.push(message.secondaryBody);
+  // Redaction can consume image delimiters as well as URLs. Let the existing
+  // SVG path own all image-bearing text that needs redaction, even when image
+  // preparation failed; never parse damaged Markdown or expose its source URL.
+  if (
+    texts.some((text) => redactSensitiveText(text) !== text) &&
+    texts.some((text) => collectMobileMarkdownImages(text).length > 0)
+  ) {
+    throw new Error("conversation-share-image-requires-svg");
+  }
   const body = redactSensitiveText(message.body).trim();
   const secondaryBody = message.secondaryBody
     ? redactSensitiveText(message.secondaryBody).trim()
@@ -136,15 +165,21 @@ function buildMessageHtml(
   const secondaryHtml = secondaryBody
     ? buildSelectableMarkdownFragmentHtml(secondaryBody, markdownOptions)
     : "";
-  const attachmentsHtml = buildAttachmentsHtml(message.attachments ?? []);
-  const bubbleHtml = bodyHtml || secondaryHtml
-    ? [
-        `<div class="share-bubble share-bubble-${message.kind}">`,
-        bodyHtml,
-        secondaryHtml ? `<div class="share-secondary">${secondaryHtml}</div>` : "",
-        "</div>",
-      ].join("")
-    : "";
+  const attachmentsHtml = buildAttachmentsHtml(
+    message.attachments ?? [],
+    message.images,
+  );
+  const bubbleHtml =
+    bodyHtml || secondaryHtml
+      ? [
+          `<div class="share-bubble share-bubble-${message.kind}">`,
+          bodyHtml,
+          secondaryHtml
+            ? `<div class="share-secondary">${secondaryHtml}</div>`
+            : "",
+          "</div>",
+        ].join("")
+      : "";
   const automationOriginHtml = message.automationOriginLabel
     ? `<div class="share-automation-origin">${escapeHtml(redactSensitiveText(message.automationOriginLabel).trim())}</div>`
     : "";
@@ -165,27 +200,42 @@ function buildBodyPartsHtml(
     if (part.kind === "text") {
       const text = redactSensitiveText(part.text).trim();
       return text
-        ? [`<div class="share-content-text">${buildSelectableMarkdownFragmentHtml(text, markdownOptions)}</div>`]
+        ? [
+            `<div class="share-content-text">${buildSelectableMarkdownFragmentHtml(text, markdownOptions)}</div>`,
+          ]
         : [];
     }
     const label = redactSensitiveText(part.label).trim();
-    const icon = part.kind === "quote" ? "❝" : part.kind === "pasted" ? "▤" : "";
+    const icon =
+      part.kind === "quote" ? "❝" : part.kind === "pasted" ? "▤" : "";
     const iconHtml = icon
       ? `<span class="share-inline-chip-icon" aria-hidden="true">${icon}</span>`
       : "";
     return label
-      ? [`<span class="share-inline-chip share-inline-chip-${part.kind}">${iconHtml}<span class="share-inline-chip-label">${escapeHtml(label)}</span></span>`]
+      ? [
+          `<span class="share-inline-chip share-inline-chip-${part.kind}">${iconHtml}<span class="share-inline-chip-label">${escapeHtml(label)}</span></span>`,
+        ]
       : [];
   });
-  return items.length > 0 ? `<div class="share-inline-body">${items.join("")}</div>` : "";
+  return items.length > 0
+    ? `<div class="share-inline-body">${items.join("")}</div>`
+    : "";
 }
 
 function buildAttachmentsHtml(
   attachments: readonly ConversationShareAttachment[],
+  images?: ConversationShareMessage["images"],
 ): string {
   if (attachments.length === 0) return "";
   const items = attachments.map((attachment) => {
     const name = redactSensitiveText(attachment.name).trim();
+    const image =
+      attachment.kind === "image" && attachment.uri
+        ? images?.get(attachment.uri)
+        : undefined;
+    if (image?.uri.startsWith("data:image/")) {
+      return `<img class="share-attachment-image" src="${escapeAttribute(image.uri)}" alt="${escapeAttribute(name)}">`;
+    }
     return `<div class="share-attachment-chip share-attachment-chip-${attachment.kind}"><span class="share-attachment-icon" aria-hidden="true"></span><span class="share-attachment-label">${escapeHtml(name)}</span></div>`;
   });
   return `<div class="share-attachments">${items.join("")}</div>`;
@@ -205,7 +255,6 @@ function buildConversationShareMarkdownOptions(
     lineHeight: lineHeight.bodyLarge,
     mutedColor: colors.textSecondary,
     syntaxColors: colors.syntax,
-    tableCellMinWidth: layout.markdownTableCellMinWidth,
     textColor: colors.textPrimary,
   };
 }
@@ -229,6 +278,9 @@ function buildConversationShareCss({
   textTertiary: string;
   width: number;
 }): string {
+  const bodyGap = buildMessageContentLayout({
+    screenWidth: width,
+  }).markdownBodyGap;
   return `
     html, body {
       margin: 0;
@@ -275,6 +327,13 @@ function buildConversationShareCss({
     }
     .share-message-user .share-attachments { align-items: flex-end; }
     .share-message-assistant .share-attachments { align-items: flex-start; }
+    .share-attachment-image {
+      display: block;
+      max-width: 100%;
+      max-height: 320px;
+      object-fit: contain;
+      border-radius: 12px;
+    }
     .share-attachment-chip {
       box-sizing: border-box;
       display: flex;
@@ -319,6 +378,9 @@ function buildConversationShareCss({
     .share-bubble {
       box-sizing: border-box;
       min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: ${bodyGap}px;
     }
     .share-bubble-user {
       max-width: 86%;
@@ -334,6 +396,11 @@ function buildConversationShareCss({
     .share-secondary {
       margin-top: 8px;
       color: ${cssValue(textSecondary)};
+    }
+    .share-secondary, .share-content-text {
+      display: flex;
+      flex-direction: column;
+      gap: ${bodyGap}px;
     }
     .share-inline-body {
       display: flex;
@@ -375,16 +442,22 @@ function buildConversationShareCss({
     }
     #xdt-content table {
       display: table;
-      width: max-content;
-      max-width: none;
+      table-layout: fixed;
+      width: 100%;
+      max-width: 100%;
       overflow: visible;
     }
+    #xdt-content th, #xdt-content td {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
     #xdt-content pre {
-      width: max-content;
-      min-width: 100%;
-      max-width: none;
+      width: 100%;
+      min-width: 0;
+      max-width: 100%;
       overflow: visible;
-      white-space: pre;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
     }
     .share-gap {
       width: 100%;
@@ -471,7 +544,7 @@ function buildConversationShareRichContentScript({
   const katexLoader = includeKatex
     ? buildKatexLoaderJs(
         renderKatexJs,
-        'clearTimeout(mathFallback); mathDone = true; maybeReady();',
+        "clearTimeout(mathFallback); mathDone = true; maybeReady();",
       )
     : "";
   const mermaidRenderer = includeMermaid
@@ -540,8 +613,8 @@ function buildConversationShareRichContentScript({
     ? `
   if (!mermaidDone) {
     ${buildMermaidLoaderJs(
-      'renderMermaidNodes();',
-      'mermaidDone = true; maybeReady();',
+      "renderMermaidNodes();",
+      "mermaidDone = true; maybeReady();",
     )}
   }
 `
@@ -559,7 +632,18 @@ function buildConversationShareRichContentScript({
   function maybeReady() {
     if (!ready && mathDone && mermaidDone) {
       ready = true;
-      window.__cindyConversationShareRichContentReady = true;
+      // A PNG cannot scroll. Fit unbreakable formulae after fonts settle, before
+      // the native snapshot measures the stage (which requires a fixed width).
+      Promise.resolve(document.fonts && document.fonts.ready).then(function () {
+        document.querySelectorAll('.katex').forEach(function (formula) {
+          var parent = formula.closest('[data-latex]');
+          if (!parent) return;
+          var available = parent.clientWidth || parent.parentElement.clientWidth;
+          var width = Math.max(formula.scrollWidth, formula.getBoundingClientRect().width);
+          if (available > 0 && width > available) formula.style.zoom = String(available / width);
+        });
+        window.__cindyConversationShareRichContentReady = true;
+      });
     }
   }
 

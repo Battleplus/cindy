@@ -1,6 +1,11 @@
+import {
+  isInstalledByokProvider,
+  readByokCredential,
+} from '../model-access/byokCredentials.js';
 import { app, safeStorage } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readChunkedSecret, writeChunkedSecret } from './chunkedSecretFile.js';
 
 import { storedCustomProviderId } from '@cindy/model-providers';
 
@@ -25,6 +30,7 @@ import {
 } from '../../shared/providerSecrets.js';
 import {
   getActiveAppSession,
+  isAppSessionBoundaryPending,
   dataOwnerStorageKey,
   LOCAL_DATA_OWNER_ID,
 } from '../appSessionState.js';
@@ -78,6 +84,8 @@ function secretDir(): string {
 }
 
 const DYNAMIC_SECRET_PREFIXES = [
+  'bot_environment_',
+  'byok_cache_',
   CUSTOM_MCP_SECRET_PREFIX,
   CUSTOM_PROVIDER_HEADER_SECRET_PREFIX,
   'provider_key_',
@@ -392,6 +400,9 @@ export function getProviderSecretStore(): ProviderSecretStore {
  * 与 renderer 经通用 safe-storage IPC 写入的 .enc 文件字节级互通。
  */
 export function readCustomProviderKey(providerId: string, agent: string): string | null {
+  const byok = readByokCredential(providerId, agent);
+  if (byok) return byok;
+  if (isInstalledByokProvider(providerId)) return null;
   const storageProviderId = storedCustomProviderId(providerId);
   try {
     return electronSecretIo.read(customProviderSecretStorageKey(storageProviderId, agent));
@@ -435,14 +446,23 @@ export function readCustomProviderHeaders(
 }
 
 /**
+ * 严格快照的第三态：密文文件存在，但用当前 safeStorage 主密钥解不开（钥匙串条目变更、
+ * 由另一签名 / 构建写入等，见 #871）。重试无意义，只有显式替换值才允许覆盖它；回滚时
+ * 不尝试恢复这份旧 blob，而是删掉本次写入的新值（#3821）。
+ */
+export const UNRECOVERABLE_PROVIDER_CREDENTIAL = Symbol('unrecoverable-provider-credential');
+export type UnrecoverableProviderCredential = typeof UNRECOVERABLE_PROVIDER_CREDENTIAL;
+
+/**
  * 配置 CRUD 回滚前的严格 API key 快照读取。
- * 仅 ENOENT 表示“没有旧 key”；owner / 加密不可用、文件读取或解密失败都必须抛错，
- * 防止调用方把暂时不可读的现有凭证误判为空并永久删除。
+ * 仅 ENOENT 表示“没有旧 key”；密文存在但解不开返回 UNRECOVERABLE_PROVIDER_CREDENTIAL；
+ * owner / 加密不可用、文件读取失败都必须抛错，防止调用方把暂时不可读的现有凭证误判为空
+ * 并永久删除。
  */
 export function readCustomProviderKeyForMutation(
   providerId: string,
   agent: string,
-): string | null {
+): string | null | UnrecoverableProviderCredential {
   const logicalKey = customProviderSecretStorageKey(providerId, agent);
   const scopedKey = resolveOwnerScopedSecretStorageKey(logicalKey);
   if (!scopedKey) throw new Error('provider secret owner is unavailable');
@@ -469,15 +489,19 @@ export function readCustomProviderKeyForMutation(
       { providerId, agent, err: err instanceof Error ? err.message : String(err) },
       'decrypt custom provider key snapshot failed',
     );
-    throw new Error('existing provider credential is unreadable');
+    return UNRECOVERABLE_PROVIDER_CREDENTIAL;
   }
 }
 
-/** Strict mutation snapshot for an encrypted runtime header blob. */
+/**
+ * Strict mutation snapshot for an encrypted runtime header blob. Same three states as
+ * readCustomProviderKeyForMutation: a blob that exists but cannot be decrypted (or parsed)
+ * is reported as UNRECOVERABLE_PROVIDER_CREDENTIAL instead of thrown.
+ */
 export function readCustomProviderHeadersForMutation(
   providerId: string,
   agent: string,
-): Record<string, string> | null {
+): Record<string, string> | null | UnrecoverableProviderCredential {
   const logicalKey = customProviderHeaderStorageKey(providerId, agent);
   const scopedKey = resolveOwnerScopedSecretStorageKey(logicalKey);
   if (!scopedKey) throw new Error('provider secret owner is unavailable');
@@ -500,7 +524,7 @@ export function readCustomProviderHeadersForMutation(
       { providerId, agent, err: err instanceof Error ? err.message : String(err) },
       'decrypt custom provider headers snapshot failed',
     );
-    throw new Error('existing provider header credentials are unreadable');
+    return UNRECOVERABLE_PROVIDER_CREDENTIAL;
   }
 }
 
@@ -890,3 +914,62 @@ export const genericOAuthSecretIo = {
     }
   },
 };
+
+/** Main-only BYOK snapshot storage; key names are fixed SHA-256 identities. */
+export const byokSnapshotSecretIo = {
+  read(key: string): string | null {
+    if (!/^byok_cache_[a-f0-9]{64}$/.test(key)) return null;
+    return electronSecretIo.read(key);
+  },
+  write(key: string, value: string): boolean {
+    if (!/^byok_cache_[a-f0-9]{64}$/.test(key)) return false;
+    return electronSecretIo.write(key, value);
+  },
+};
+
+/** Host-only companion environment. The key is never admitted by renderer safe-storage IPC. */
+export const botEnvironmentSecretIo = {
+  has(key: string): boolean {
+    if (!/^bot_environment_[a-f0-9]{64}$/.test(key)) throw new Error('Invalid companion secret key');
+    const scoped = resolveOwnerScopedSecretStorageKey(key);
+    if (!scoped) throw new Error('Companion credential storage unavailable');
+    try { return fs.readdirSync(secretDir()).some(name => name === `${scoped}.enc` || companionTemporaryFile(name, scoped)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+  },
+  async read(key: string, assertCurrent?: () => void): Promise<string | null> {
+    const { scoped, assertOwner } = companionSecretScope(key, assertCurrent);
+    return readChunkedSecret(path.join(secretDir(), `${scoped}.enc`), scoped, companionCipher, assertOwner);
+  },
+  async write(key: string, value: string, assertCurrent?: () => void): Promise<boolean> {
+    const { scoped, assertOwner } = companionSecretScope(key, assertCurrent);
+    await writeChunkedSecret(path.join(secretDir(), `${scoped}.enc`), scoped, value, companionCipher, assertOwner);
+    return true;
+  },
+  remove(key: string): boolean {
+    if (!/^bot_environment_[a-f0-9]{64}$/.test(key)) return false;
+    const scoped = resolveOwnerScopedSecretStorageKey(key);
+    if (!scoped) return false;
+    try {
+      // Remove encrypted leftovers from a hard crash as well as the committed file.
+      for (const name of fs.readdirSync(secretDir())) if (companionTemporaryFile(name, scoped)) fs.unlinkSync(path.join(secretDir(), name));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false; }
+    return electronSecretIo.remove(key).success;
+  },
+};
+
+const companionCipher = { encrypt: (value: string) => safeStorage.encryptString(value), decrypt: (value: Buffer) => safeStorage.decryptString(value) };
+function companionTemporaryFile(name: string, scoped: string): boolean {
+  return name.startsWith(`${scoped}.enc.`) && /^[a-f0-9-]{36}\.tmp$/.test(name.slice(scoped.length + 5));
+}
+function companionSecretScope(key: string, assertCurrent: () => void = () => {}) {
+  if (!/^bot_environment_[a-f0-9]{64}$/.test(key)) throw new Error('Invalid companion secret key');
+  const scoped = resolveOwnerScopedSecretStorageKey(key);
+  const generation = getActiveAppSession().generation;
+  const assertOwner = () => {
+    assertCurrent();
+    if (!scoped || isAppSessionBoundaryPending() || resolveOwnerScopedSecretStorageKey(key) !== scoped || getActiveAppSession().generation !== generation)
+      throw new Error('Companion credential owner changed');
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('Companion credential storage unavailable');
+  };
+  assertOwner(); return { scoped: scoped!, assertOwner };
+}

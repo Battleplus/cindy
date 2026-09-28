@@ -36,6 +36,7 @@
  *   直到 finally — 那个体验更差, 没有借鉴。
  */
 
+import { CHAT_BODY_CLASS } from './chatChrome';
 import { memo, useCallback, useMemo, useState, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, TriangleAlert } from 'lucide-react';
@@ -190,6 +191,8 @@ interface AssistantMessageProps {
    *  的收尾 assistant 正文传 true —— 任务执行过程中的中间句不挂 bar(bar 即使
    *  opacity-0 也占 24px 布局高度,每句都挂会拉散消息流)。默认 false。 */
   showActionBar?: boolean;
+  /** 伙伴对话使用常显、无费用、无 Fork 的轻量消息操作栏。 */
+  simplifiedBotConversation?: boolean;
   /** Per-turn 费用 (USD) — 仅该轮最后一条 assistant 有值, action bar 时间旁显示。 */
   turnMoney?: RegionalMoney;
   turnCostUsd?: number;
@@ -225,6 +228,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   forkBlocked,
   sessionRunning,
   showActionBar = false,
+  simplifiedBotConversation = false,
   turnMoney,
   turnCostUsd,
   turnCostIsEstimate,
@@ -259,6 +263,7 @@ export const AssistantMessage = memo(function AssistantMessage({
     currentSessionId ? originDeviceId(sessionFileOrigin) : undefined,
   );
   const isRemote = Boolean(remoteHostId);
+  const sharedGuest = isSharedTaskPeer(originDeviceId(sessionFileOrigin) ?? '');
   const forkSupported = !isRemote && (!agentKind || (capabilities?.fork?.supported ?? true));
   const handleFork = useForkAtMessage({
     sessionId: currentSessionId,
@@ -317,7 +322,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           // 导致代码块溢出消息流右边界。加上 min-w-0 让 w-full 真正生效，
           // <pre> 的 overflow-x-auto 才能正常接管横向滚动。
           'w-full min-w-0',
-          'text-15 font-normal leading-[1.6]',
+          CHAT_BODY_CLASS,
           'text-[var(--msg-assistant-text)]',
         )}
       >
@@ -404,10 +409,11 @@ export const AssistantMessage = memo(function AssistantMessage({
           copyLinkText={messageDeepLink}
           align="left"
           hovered={hovered}
-          onFork={canFork ? handleFork : undefined}
+          simplifiedBotConversation={simplifiedBotConversation}
+          onFork={!sharedGuest && canFork ? handleFork : undefined}
           onAddToChat={messageDeepLink ? handleAddToChat : undefined}
           onShareAsImage={handleShareAsImage}
-          onDelete={currentSessionId && messageClientId ? handleDelete : undefined}
+          onDelete={!sharedGuest && currentSessionId && messageClientId ? handleDelete : undefined}
           turnMoney={turnMoney}
           turnCostUsd={turnCostUsd}
           turnCostIsEstimate={turnCostIsEstimate}
@@ -420,3 +426,4 @@ export const AssistantMessage = memo(function AssistantMessage({
     </div>
   );
 });
+import { isSharedTaskPeer } from '@cindy/device-link';

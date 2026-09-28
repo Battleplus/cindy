@@ -1,3 +1,4 @@
+import { Button } from '@/components/ui/button';
 /**
  * MyDevicesPanel —— 「远程控制」页统一的「我的设备」面板。
  * ---------------------------------------------------------------------------
@@ -15,9 +16,9 @@
 
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { RefreshCw, Pencil, Trash2, Check, X } from 'lucide-react';
+import { RefreshCw, Pencil, Trash2, Check, X, Monitor } from 'lucide-react';
+import { toast } from '@/lib/toast';
 
-import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import type { DeviceLinkSettings } from '@/hooks/useDeviceLinkSettings';
 import { revokedDevicesStore } from '@/features/device-link/revokedDevicesStore';
@@ -132,9 +133,11 @@ function ControlRow({
 export function MyDevicesPanel({
   s,
   variant = 'all',
+  selfSettings,
 }: {
   s: DeviceLinkSettings;
   variant?: 'all' | 'self' | 'others';
+  selfSettings?: ReactNode;
 }) {
   const { t } = useTranslation();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -193,16 +196,19 @@ export function MyDevicesPanel({
     <div className="flex flex-col gap-4">
       {variant !== 'self' && (
         <div className="flex items-center justify-end">
-          <button
+          <Button
+            variant="secondary"
+            size="sm"
+            compact
+            loading={s.refreshing}
             type="button"
             onClick={() => void s.refresh(true)}
             disabled={s.refreshing}
-            className="flex h-7 items-center gap-1.5 rounded-full border border-[var(--border-default)] px-3 text-12 text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)] disabled:opacity-50"
             aria-label={t('settings.devices.refresh')}
           >
-            <Spinner icon={RefreshCw} size={12} spinning={s.refreshing} />
+            <RefreshCw size={12} />
             {t('settings.devices.refresh')}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -303,6 +309,7 @@ export function MyDevicesPanel({
               />
             </ControlRow>
           </div>
+          {s.enabled && selfSettings && <div className="mt-3">{selfSettings}</div>}
         </li>
         )}
 
@@ -382,6 +389,14 @@ export function MyDevicesPanel({
                   </div>
                   {editingId !== d.deviceId && (
                     <div className="flex shrink-0 items-center gap-1">
+                      {canBeControlledPlatform(d.platform) && !peerRevoked && (
+                        <button type="button" className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full text-[var(--text-primary)] hover:bg-[var(--surface-chip)] disabled:opacity-40"
+                          disabled={!d.online || !d.remoteControlEnabled || !d.controlEnabled}
+                          title={t('remoteDesktop.title')} aria-label={t('remoteDesktop.title')}
+                          onClick={() => void window.electronAPI.openRemoteDesktop({deviceId:d.deviceId,name:d.name}).catch(() => toast.error(t('remoteDesktop.connectionError')))}>
+                          <Monitor size={16}/>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {

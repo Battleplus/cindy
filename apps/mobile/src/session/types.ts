@@ -1,6 +1,9 @@
 import type { MobileSessionAgentSwitchIntent } from '@cindy/maker-shared/device-link-contract';
 import type { AgentInputReference } from '@cindy/maker-shared/agent-input-projection';
 import type { RemoteMoney } from '@/session/remoteMoney';
+import type { MobileToolLoopErrorDetails } from '@/session/agentErrorI18n';
+import type { MobileToolInputProjection } from '@/session/messageToolPayloadProjection';
+import type { AnnotationRegion } from '@cindy/maker-shared/image-annotation';
 
 export type RemoteSessionStatus = 'active' | 'archived' | 'deleted';
 export type RemoteMessageRole =
@@ -21,6 +24,7 @@ export type RemoteMessageRole =
   | 'agent_switch';
 
 export interface RemoteSession {
+  tags?: import('@cindy/maker-shared').TaskTag[];
   id: string;
   userId: string;
   title: string;
@@ -33,6 +37,11 @@ export interface RemoteSession {
   effort: string;
   permissionMode: string;
   fastMode: boolean;
+  /** Temporary host runtime route; optional for older controlled Desktop versions. */
+  runtimeGeneration?: number;
+  runtimeBaseline?: RemoteSessionRuntimeProfile;
+  runtimeEffective?: RemoteSessionRuntimeProfile;
+  runtimePending?: RemoteSessionRuntimePending | null;
   /** 计划模式一级开关(#494,与 permissionMode 正交)。被控端 sessionToCamel 带出,
    *  一次性消耗(plan_mode_changed)后经 sessions:patched 回流置 false;老被控端缺省。 */
   planModeEnabled?: boolean;
@@ -52,6 +61,8 @@ export interface RemoteSession {
    *  原样透出,startedAt > endedAt 且未被 /clear 越过 = 上次 turn 因应用退出被中断,
    *  见桌面 sessionActiveTurn.ts)。老被控端缺省 → 判定恒不命中,banner 不出现。 */
   activeTurnStartedAt?: number | null;
+  /** Host-confirmed pre-boot interruption generation; absent on older hosts. */
+  interruptedTurnStartedAt?: number | null;
   lastTurnEndedAt?: number | null;
   status: RemoteSessionStatus;
   agentKind: 'cc' | 'codex' | 'pi';
@@ -83,6 +94,20 @@ export interface RemoteSession {
   pendingLocalCreation?: boolean;
 }
 
+export interface RemoteSessionRuntimeProfile {
+  agentKind: 'claude-code' | 'codex' | 'pi';
+  model: string;
+  providerId: string | null;
+  effort: string | null;
+  fastMode: boolean;
+}
+
+export interface RemoteSessionRuntimePending {
+  generation: number;
+  source: 'agent' | 'fallback';
+  profile: RemoteSessionRuntimeProfile;
+}
+
 export interface RemoteMessage {
   id: string;
   clientId: string;
@@ -94,8 +119,11 @@ export interface RemoteMessage {
   toolUseId: string | null;
   agentMeta: Record<string, unknown> | null;
   createdAt: string;
+  /** Large settled tool input released from the transcript mirror and recoverable by message id. */
+  mobileToolInputProjection?: MobileToolInputProjection;
   systemCardData?: Record<string, unknown>;
-  systemCardType?: 'help' | 'context' | 'cost' | 'pwd' | 'status' | 'compact' | 'cmd' | 'goal-complete' | 'goal-resumed' | 'auto-resume' | 'learn' | 'agent-switch';
+  systemCardType?:
+    | 'help' | 'context' | 'cost' | 'pwd' | 'status' | 'compact' | 'cmd' | 'goal-complete' | 'goal-resumed' | 'context-rebuild' | 'auto-resume' | 'learn' | 'agent-switch';
 }
 
 export type RemoteAttachmentCategory = 'image' | 'pdf' | 'text' | 'office';
@@ -153,9 +181,17 @@ export interface RemoteSerializedAttachment {
    * 与桌面 AgentInputSerializedFile.annotated 同一契约。
    */
   annotated?: boolean;
+  /**
+   * 可选(向后兼容):标注区域,由笔迹归纳的归一化外接框(0..1,原点左上),与桌面
+   * AgentInputSerializedFile.annotationRegions 同一契约、同一归纳算法
+   * (summarizeAnnotationRegions)。新被控端校验后在标注说明里补一句每张图圈在哪;
+   * 旧被控端忽略。
+   */
+  annotationRegions?: AnnotationRegion[];
 }
 
 export interface QueuedRemoteMessage {
+  durableDelivery?: true;
   clientId: string;
   text: string;
   persistedContent: string;
@@ -173,6 +209,8 @@ export interface QueuedRemoteMessage {
   /** 与桌面队列契约镜像；目标桌面据此禁止缺失快照时按自己的设备坐标重解引用。 */
   sessionReferencesRequireTrustedSnapshot?: boolean;
   userName?: string;
+  /** Interface language of this phone. The desktop stamps it only for a remote turn. */
+  uiLanguage?: string;
   createOpts: {
     agentKind: 'claude-code' | 'codex' | 'pi';
     workingDir: string;
@@ -220,6 +258,10 @@ export interface InputProjection {
   queueEditLocks: string[];
   queueAbortPending: boolean;
   error: string | null;
+  /** Stable error reason for live projections; older controlled hosts may omit it. */
+  errorReason?: string | null;
+  /** Bounded details for tool-loop errors; older projections may omit them. */
+  toolLoop?: MobileToolLoopErrorDetails | null;
   recovery?: unknown;
   errorRetryText: string | null;
   autoResumePending?: Record<string, unknown> | null;

@@ -1,3 +1,5 @@
+import { isSubagentParentToolUseId } from '@cindy/maker-shared/message-render';
+import { isCompactingWorkingStatus, publicToolPhase, publicToolResultPhase, type WorkingPhase } from '@cindy/maker-shared';
 import {
   parseReconnectAttemptMessage,
   type AgentEvent,
@@ -10,6 +12,13 @@ import { LIVE_TASK_PRIORITY, liveTaskPriorityRank } from '../../shared/liveTaskP
 import { stripTrailingPathSeparators } from '../../shared/pathText';
 
 import { formatIslandToolDetail } from './toolDetail.js';
+import {
+  appendActivityTextStream,
+  cloneActivityTextStreamState,
+  createActivityTextStreamState,
+  normalizeActivityText,
+  type ActivityTextStreamState,
+} from './activityTextStream.js';
 
 import {
   createDefaultAgentIslandDisplayConfig,
@@ -45,12 +54,14 @@ export const AGENT_ISLAND_REVEAL_DWELL_MS = 5_000;
 export const AGENT_ISLAND_COMPLETION_REVEAL_DWELL_MS = 8_000;
 export const AGENT_ISLAND_ERROR_REVEAL_DWELL_MS = 12_000;
 export const AGENT_ISLAND_EXPANDED_MIN_DWELL_MS = 1_000;
+const AGENT_ISLAND_OUTSIDE_CLICK_PROTECTION_MS = 300;
 export const AGENT_ISLAND_HOVER_EXPAND_DELAY_MS = 500;
 export const AGENT_ISLAND_MOUSE_LEAVE_COLLAPSE_DELAY_MS = 150;
 export const AGENT_ISLAND_HOVER_SHORT_COOLDOWN_MS = 300;
 export const AGENT_ISLAND_TOOL_DETAIL_LINGER_MS = 2_000;
 export const AGENT_ISLAND_MESSAGE_PREVIEW_MIN_DWELL_MS = 1_600;
 export const AGENT_ISLAND_FOCUS_VERIFY_TIMEOUT_MS = 1_500;
+const AGENT_ISLAND_FOCUS_NAVIGATION_TIMEOUT_MS = 60_000;
 // 未读的 completed / error 在**灵动岛浮窗**里驻留的上限;超过后即便用户没 ack,
 // 也不再占用展开列表。岛 state 会按 TTL prune;远程绿/红点改订独立的
 // remoteUnreadTerminals 账本,不跟完整会话(含活动文本)一起留下。
@@ -58,7 +69,6 @@ export const AGENT_ISLAND_UNREAD_TRANSIENT_TTL_MS = 4 * 60 * 60 * 1_000;
 const AGENT_ISLAND_COMPACT_CURRENT_MIN_DWELL_MS = 1_200;
 const AGENT_ISLAND_MEASURED_HEIGHT_MAX = 2_000;
 const AGENT_ISLAND_ACTIVITY_MAX_LINES = 3;
-const AGENT_ISLAND_ACTIVITY_TEXT_MAX_LENGTH = 280;
 const AGENT_ISLAND_COMPACT_TITLE_MAX_LENGTH = 28;
 const AGENT_ISLAND_COMPACT_DETAIL_MAX_LENGTH = 120;
 
@@ -111,6 +121,8 @@ interface AgentIslandSessionState {
   detailSource: 'tool' | 'status' | 'interaction' | null;
   /** Localized transient reconnect progress; kept separate from tool/interaction detail. */
   reconnectStatus: string | null;
+  workingPhase?: WorkingPhase;
+  workingTools: Map<string, WorkingPhase>;
   currentToolUseId: string | null;
   toolDetailUntil: number | null;
   phase: AgentIslandSessionPhase;
@@ -137,7 +149,7 @@ interface AgentIslandSessionState {
   activityLines: AgentIslandActivityLine[];
   activitySeq: number;
   assistantStreamLineId: string | null;
-  assistantStreamRawText: string;
+  assistantStream: ActivityTextStreamState;
   messagePreview: {
     line: AgentIslandActivityLine;
     until: number;
@@ -181,6 +193,10 @@ export interface AgentIslandState {
   activeTransientSessionId: string | null;
   transientRevealQueue: string[];
   pendingFocusSessionId: string | null;
+  pendingFocusDismissOnAck: boolean;
+  // Short grace for a renderer ack before OS focus settles. Navigation itself
+  // may take longer (for example a renderer reload); its bounded deadline is
+  // derived from this timestamp by pendingFocusNavigationExpiresAt.
   pendingFocusUntil: number | null;
   lastDisplayMode: AgentIslandDisplayState['mode'] | null;
   lastDisplayPolicy: AgentIslandDisplayPolicy | null;
@@ -226,6 +242,7 @@ export function createAgentIslandState(): AgentIslandState {
     activeTransientSessionId: null,
     transientRevealQueue: [],
     pendingFocusSessionId: null,
+    pendingFocusDismissOnAck: false,
     pendingFocusUntil: null,
     lastDisplayMode: null,
     lastDisplayPolicy: null,
@@ -260,6 +277,7 @@ export function resetAgentIslandState(state: AgentIslandState): void {
   state.activeTransientSessionId = fresh.activeTransientSessionId;
   state.transientRevealQueue = fresh.transientRevealQueue;
   state.pendingFocusSessionId = fresh.pendingFocusSessionId;
+  state.pendingFocusDismissOnAck = fresh.pendingFocusDismissOnAck;
   state.pendingFocusUntil = fresh.pendingFocusUntil;
   state.lastDisplayMode = fresh.lastDisplayMode;
   state.lastDisplayPolicy = fresh.lastDisplayPolicy;
@@ -468,6 +486,8 @@ export function applyAgentIslandUserPrompt(
   applyMeta(session, meta);
   markSessionRunning(state, session, now);
   session.phase = 'running';
+  session.workingPhase = 'thinking';
+  session.workingTools.clear();
   session.interactionKind = undefined;
   session.detail = '';
   session.detailSource = null;
@@ -556,17 +576,35 @@ export function applyAgentIslandEvent(
   // still running, so do not create/update an island entry or trigger any
   // completion transition here; the unclaimed terminal tail will do that.
   if (isTurnContinuationBoundaryEvent(event)) return false;
+  const parentToolUseId = asRecord(event.data)?.parentToolUseId;
+  const foreground = event.turnScope !== 'background' && !(typeof parentToolUseId === 'string' && isSubagentParentToolUseId(parentToolUseId));
+  if (event.type === 'thinking' && !foreground) return false;
   const assistantText = event.type === 'text' ? assistantTextFromEvent(event) : null;
   if (event.type === 'text' && !assistantText) return false;
 
   const session = getOrCreateSession(state, meta, now);
   applyMeta(session, meta);
+  if (event.type === 'compact_boundary') {
+    if (!foreground || !session.running || session.workingPhase !== 'compacting') return false;
+    session.workingPhase = 'thinking';
+    session.lastActivityAt = now;
+    return true;
+  }
+  if (event.type === 'thinking') {
+    // Observe only the event kind. Repeated reasoning deltas neither change
+    // public status nor wake the roster/resource subscribers.
+    if (!session.running || session.workingPhase === 'thinking' || session.workingPhase?.startsWith('reviewing-')) return false;
+    session.workingPhase = 'thinking';
+    session.lastActivityAt = now;
+    return true;
+  }
   if (event.type !== 'error') {
     session.reconnectStatus = null;
   }
   session.lastActivityAt = now;
 
   if (event.type === 'text') {
+    if (foreground) session.workingPhase = 'replying';
     clearToolDetail(session);
     const isFinal = asRecord(event.data)?.isFinal === true;
     const line = applyAssistantTextLine(session, assistantText ?? '', isFinal);
@@ -589,6 +627,9 @@ export function applyAgentIslandEvent(
       return true;
     }
     if (isRunning === true) {
+      if (!session.running) { session.workingPhase = 'thinking'; session.workingTools.clear(); }
+      if (isCompactingWorkingStatus(status)) session.workingPhase = 'compacting';
+      else if (status && session.workingPhase === 'compacting') session.workingPhase = 'thinking';
       markSessionRunning(state, session, now);
       if (session.pendingInteractionIds.size === 0) {
         session.phase = 'running';
@@ -624,6 +665,10 @@ export function applyAgentIslandEvent(
     const toolName = firstNonEmptyString(data?.toolName, data?.name);
     const toolUseId = toolUseIdsFromEvent(event)[0] ?? null;
     const toolInput = data?.input;
+    if (foreground) {
+      session.workingPhase = publicToolPhase(toolName, toolInput);
+      if (toolUseId) session.workingTools.set(toolUseId, session.workingPhase);
+    }
     const toolDescription = toolName
       ? formatIslandToolDetail(toolName, toolInput, { wording: state.toolWording }, data ?? undefined)
       : firstNonEmptyString(data?.description, data?.toolDescription);
@@ -649,6 +694,12 @@ export function applyAgentIslandEvent(
 
   if (event.type === 'tool_result') {
     const toolUseIds = toolUseIdsFromEvent(event);
+    const phase = toolUseIds.map(id => session.workingTools.get(id)).find(Boolean);
+    if (foreground) for (const id of toolUseIds) session.workingTools.delete(id);
+    if (foreground && session.workingPhase !== 'compacting') {
+      session.workingPhase = [...session.workingTools.values()].at(-1)
+        ?? publicToolResultPhase(phase ?? session.workingPhase ?? 'processing');
+    }
     if (
       session.currentToolUseId
       && (toolUseIds.length === 0 || toolUseIds.includes(session.currentToolUseId))
@@ -730,9 +781,16 @@ export function applyAgentIslandEvent(
     session.interactionRevealDismissed = false;
     session.currentToolUseId = null;
     session.toolDetailUntil = null;
-    session.detail = typeof data?.message === 'string' && data.message.trim()
-      ? data.message.trim()
-      : '';
+    // Known terminal reasons use Agent Island's localized string bundle; the
+    // producer message remains diagnostic context. Unknown errors keep their detail.
+    const isToolLoopError = data?.reason === 'tool_use_loop_detected';
+    session.detail = data?.reason === 'output-limit'
+      ? state.strings.outputLimit
+      : isToolLoopError
+        ? state.strings.error
+        : typeof data?.message === 'string' && data.message.trim()
+          ? data.message.trim()
+          : '';
     session.detailSource = session.detail ? 'status' : null;
     if (session.detail) appendActivityLine(session, 'status', session.detail);
     session.errorUntil = now + AGENT_ISLAND_ERROR_DWELL_MS;
@@ -988,6 +1046,7 @@ function forgetAgentIslandSession(state: AgentIslandState, sessionId: string): v
   removeQueuedTransientReveal(state, sessionId);
   if (state.pendingFocusSessionId === sessionId) {
     state.pendingFocusSessionId = null;
+    state.pendingFocusDismissOnAck = false;
     state.pendingFocusUntil = null;
   }
 }
@@ -1059,30 +1118,45 @@ export function requestAgentIslandSessionFocus(
 ): boolean {
   const nextSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
   if (!nextSessionId) return false;
+  // Closing a completion notification is immediate feedback, not a read ack.
+  // Keep navigation tracking below so a loading window can still open the task.
+  let completionDismissed = false;
+  const isCompletion = state.sessions.get(nextSessionId)?.phase === 'completed';
+  if (isCompletion) {
+    completionDismissed = dismissTransientReveals(state);
+    completionDismissed = collapseAgentIslandToCompact(state, now) || completionDismissed;
+  }
   if (state.visibleSessionIds.has(nextSessionId)) {
     const dismissed = dismissFocusedSessionReveal(state, nextSessionId, now);
     const collapsed = collapseAgentIslandToCompact(state, now);
     state.pendingFocusSessionId = null;
+    state.pendingFocusDismissOnAck = false;
     state.pendingFocusUntil = null;
-    return dismissed || collapsed;
+    return completionDismissed || dismissed || collapsed;
   }
   const previousSessionId = state.pendingFocusSessionId;
   const previousUntil = state.pendingFocusUntil;
   state.pendingFocusSessionId = nextSessionId;
+  state.pendingFocusDismissOnAck = !isCompletion;
   state.pendingFocusUntil = now + AGENT_ISLAND_FOCUS_VERIFY_TIMEOUT_MS;
-  return previousSessionId !== state.pendingFocusSessionId || previousUntil !== state.pendingFocusUntil;
+  return completionDismissed || previousSessionId !== state.pendingFocusSessionId || previousUntil !== state.pendingFocusUntil;
 }
 
 export function isAgentIslandPendingFocusAck(
   state: AgentIslandState,
   sessionId: string | readonly string[] | null,
+  now = Date.now(),
 ): boolean {
-  if (!state.pendingFocusSessionId) return false;
+  if (!state.pendingFocusSessionId || !state.pendingFocusUntil || state.pendingFocusUntil <= now) return false;
   return normalizeVisibleSessionIds(sessionId).includes(state.pendingFocusSessionId);
 }
 
 export function dismissAgentIslandActiveReveal(state: AgentIslandState, now: number): boolean {
-  if (isExpandedProtected(state, now) && (hasActiveTransientReveal(state, now) || hasActiveBlockingReveal(state, now))) {
+  // Explicit outside clicks have a shorter guard than automatic mouse-leave collapse.
+  const clickProtectedUntil = state.expandedProtectUntil === null ? null
+    : state.expandedProtectUntil - AGENT_ISLAND_EXPANDED_MIN_DWELL_MS + AGENT_ISLAND_OUTSIDE_CLICK_PROTECTION_MS;
+  if (clickProtectedUntil !== null && clickProtectedUntil > now
+    && (hasActiveTransientReveal(state, now) || hasActiveBlockingReveal(state, now))) {
     return false;
   }
   const dismissedTransientReveal = dismissPublishedTransientReveal(state);
@@ -1240,7 +1314,7 @@ export function getNextAgentIslandTimerAt(state: AgentIslandState, now: number):
     state.hoverIntentAt,
     state.collapseAt,
     state.hoverCooldownUntil && isPointerInsideIsland(state) ? state.hoverCooldownUntil : null,
-    state.pendingFocusUntil,
+    pendingFocusNavigationExpiresAt(state),
     state.expandedProtectUntil && state.protectedDismissPending ? state.expandedProtectUntil : null,
   ]) {
     if (value && value > now && (next === null || value < next)) {
@@ -1367,9 +1441,19 @@ function completionRevealDwellMs(session: AgentIslandSessionState, now: number):
   return Math.max(AGENT_ISLAND_COMPLETION_REVEAL_DWELL_MS, remainingPreviewMs + AGENT_ISLAND_REVEAL_DWELL_MS);
 }
 
+function pendingFocusNavigationExpiresAt(state: AgentIslandState): number | null {
+  return state.pendingFocusUntil === null
+    ? null
+    : state.pendingFocusUntil - AGENT_ISLAND_FOCUS_VERIFY_TIMEOUT_MS + AGENT_ISLAND_FOCUS_NAVIGATION_TIMEOUT_MS;
+}
+
 function updateFocusVerificationLifecycle(state: AgentIslandState, now: number): void {
-  if (!state.pendingFocusUntil || state.pendingFocusUntil > now) return;
+  const expiresAt = pendingFocusNavigationExpiresAt(state);
+  if (expiresAt === null || expiresAt > now) return;
+  // Allow slow renderer loading, but do not let an abandoned navigation turn a
+  // much later ordinary visit into an acknowledgement of the old island click.
   state.pendingFocusSessionId = null;
+  state.pendingFocusDismissOnAck = false;
   state.pendingFocusUntil = null;
 }
 
@@ -1557,6 +1641,10 @@ function deferActiveTransientReveal(
 
 function dismissPublishedTransientReveal(state: AgentIslandState): boolean {
   if (state.lastDisplayMode !== 'expanded' || state.lastDisplayPolicy !== 'transient') return false;
+  return dismissTransientReveals(state);
+}
+
+function dismissTransientReveals(state: AgentIslandState): boolean {
   const transientSessionIds = [
     state.activeTransientSessionId,
     ...state.transientRevealQueue,
@@ -1936,10 +2024,17 @@ function applyVerifiedFocusIfMatched(
   state: AgentIslandState,
   now: number,
 ): boolean {
+  // A route report can arrive before the expiry timer gets a chance to run.
+  updateFocusVerificationLifecycle(state, now);
   const focusedSessionId = state.pendingFocusSessionId;
   if (!focusedSessionId || !state.visibleSessionIds.has(focusedSessionId)) return false;
+  const dismissOnAck = state.pendingFocusDismissOnAck;
   state.pendingFocusSessionId = null;
+  state.pendingFocusDismissOnAck = false;
   state.pendingFocusUntil = null;
+  // Completion clicks already closed their notification. A delayed navigation
+  // must not close a newer reveal or a list the user has since reopened.
+  if (!dismissOnAck) return false;
   const dismissed = dismissFocusedSessionReveal(state, focusedSessionId, now);
   const collapsed = collapseAgentIslandToCompact(state, now);
   return dismissed || collapsed;
@@ -2143,6 +2238,8 @@ function getOrCreateSession(
     currentToolUseId: null,
     toolDetailUntil: null,
     phase: 'running',
+    workingPhase: 'thinking',
+    workingTools: new Map(),
     agentKind: meta.agentKind ?? 'agent',
     pendingInteractionIds: new Set(),
     pendingInteractionKinds: new Map(),
@@ -2164,7 +2261,7 @@ function getOrCreateSession(
     activityLines: [],
     activitySeq: 0,
     assistantStreamLineId: null,
-    assistantStreamRawText: '',
+    assistantStream: createActivityTextStreamState(),
     messagePreview: null,
     messagePreviewQueue: [],
     startedAt: now,
@@ -2178,11 +2275,13 @@ function getOrCreateSession(
 function cloneSession(session: AgentIslandSessionState): AgentIslandSessionState {
   return {
     ...session,
+    workingTools: new Map(session.workingTools),
     pendingInteractionIds: new Set(session.pendingInteractionIds),
     pendingInteractionKinds: new Map(session.pendingInteractionKinds),
     pendingInteractionDetails: new Map(session.pendingInteractionDetails),
     pendingPermissionCanAllowForSession: new Map(session.pendingPermissionCanAllowForSession),
     activityLines: session.activityLines.map((line) => ({ ...line })),
+    assistantStream: cloneActivityTextStreamState(session.assistantStream),
     messagePreview: session.messagePreview
       ? {
           line: { ...session.messagePreview.line },
@@ -2248,6 +2347,7 @@ function toSnapshot(session: AgentIslandSessionState): AgentIslandSessionSnapsho
     compactDetail: compactDetailForSession(session),
     messagePreview: session.messagePreview?.line ?? null,
     phase: session.phase,
+    workingPhase: session.running && session.phase === 'running' ? session.workingPhase : undefined,
     agentKind: session.agentKind,
     interactionKind: session.interactionKind,
     permissionAction: session.permissionRequestId
@@ -2269,7 +2369,9 @@ function isAttentionSession(session: AgentIslandSessionState): boolean {
 }
 
 function isIslandRelevantEvent(event: AgentEvent): boolean {
-  return event.type === 'status'
+  return event.type === 'compact_boundary'
+    || event.type === 'thinking'
+    || event.type === 'status'
     || event.type === 'text'
     || event.type === 'tool_use'
     || event.type === 'tool_result'
@@ -2509,15 +2611,12 @@ function applyAssistantTextLine(
   rawText: string,
   isFinal: boolean,
 ): AgentIslandActivityLine | null {
-  const nextRawText = isFinal
-    ? rawText
-    : `${session.assistantStreamRawText}${rawText}`;
-  const text = normalizeActivityText(nextRawText);
+  const text = isFinal
+    ? normalizeActivityText(rawText)
+    : appendActivityTextStream(session.assistantStream, rawText);
   if (!text) {
     if (isFinal) {
       clearAssistantStream(session);
-    } else {
-      session.assistantStreamRawText = nextRawText;
     }
     return null;
   }
@@ -2535,8 +2634,6 @@ function applyAssistantTextLine(
       replaceMessagePreviewLine(session, line);
       if (isFinal) {
         clearAssistantStream(session);
-      } else {
-        session.assistantStreamRawText = nextRawText;
       }
       return line;
     }
@@ -2548,7 +2645,6 @@ function applyAssistantTextLine(
     clearAssistantStream(session);
   } else {
     session.assistantStreamLineId = line.id;
-    session.assistantStreamRawText = nextRawText;
   }
   return line;
 }
@@ -2564,7 +2660,7 @@ function replaceMessagePreviewLine(session: AgentIslandSessionState, line: Agent
 
 function clearAssistantStream(session: AgentIslandSessionState): void {
   session.assistantStreamLineId = null;
-  session.assistantStreamRawText = '';
+  session.assistantStream = createActivityTextStreamState();
 }
 
 function enqueueMessagePreview(
@@ -2592,17 +2688,6 @@ function assistantTextFromEvent(event: AgentEvent): string | null {
   return typeof data?.text === 'string' ? data.text : null;
 }
 
-function normalizeActivityText(text: string): string {
-  return extractActivityDisplayText(text)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .slice(0, AGENT_ISLAND_ACTIVITY_TEXT_MAX_LENGTH)
-    .trim();
-}
-
 function normalizeInlineText(text: string): string {
   return text
     .trim()
@@ -2620,41 +2705,6 @@ function truncateInlineText(text: string, maxLength: number): string {
   const chars = Array.from(normalized);
   if (chars.length <= maxLength) return normalized;
   return `${chars.slice(0, Math.max(0, maxLength - 3)).join('')}...`;
-}
-
-function extractActivityDisplayText(rawText: string): string {
-  const trimmed = rawText.trim();
-  if (!trimmed || !/^[{[]/.test(trimmed)) return rawText;
-
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    return extractTextFromStructuredContent(parsed) ?? rawText;
-  } catch {
-    return rawText;
-  }
-}
-
-function extractTextFromStructuredContent(value: unknown): string | null {
-  if (typeof value === 'string') return value.trim() || null;
-
-  if (Array.isArray(value)) {
-    const parts = value
-      .map(extractTextFromStructuredContent)
-      .filter((part): part is string => Boolean(part));
-    return parts.length > 0 ? parts.join(' ') : null;
-  }
-
-  const record = asRecord(value);
-  if (!record) return null;
-
-  for (const key of ['text', 'message', 'prompt']) {
-    const text = record[key];
-    if (typeof text === 'string' && text.trim()) return text.trim();
-  }
-
-  const content = record.content;
-  if (typeof content === 'string' && content.trim()) return content.trim();
-  return extractTextFromStructuredContent(content);
 }
 
 function projectNameFromWorkingDir(workingDir: string | null | undefined, workspaceKind?: string | null): string | null {

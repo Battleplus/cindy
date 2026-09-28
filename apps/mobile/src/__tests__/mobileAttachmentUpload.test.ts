@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { apiFetchRaw } from '@/api/client';
+import { installPeerUpload } from '@/device-link/peerFileRegistry';
+import { buildPeerAttachmentRef, parsePeerAttachmentRef } from '@cindy/device-link';
 import { DEVICE_LINK_API_BASE_URL } from '@/config/env';
 import { i18n } from '@/i18n';
 import { buildAttachmentOssRef, parseAttachmentOssRef } from '@/session/attachmentOssRef';
@@ -22,6 +24,50 @@ const readFileChunk = vi.fn(async (_uri: string, _position: number, length: numb
 );
 
 describe('mobileAttachmentUpload', () => {
+  it('uploads prepared bytes to the captured peer without presigning OSS', async () => {
+    const apiFetch = vi.fn();
+    const peer = vi.fn(async (_device, _uri, metadata) => buildPeerAttachmentRef({ ...metadata, ticket: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }));
+    const off = installPeerUpload(peer);
+    try {
+      const attachment = await uploadMobileAttachmentFromFile({ name: 'a.txt', size: 4, mimeType: 'text/plain' }, 'file:///source', {
+        deviceId: 'host-a', token: 'token', deps: { apiFetch, readFileChunk },
+      });
+      expect(peer.mock.calls[0][0]).toBe('host-a');
+      expect(parsePeerAttachmentRef(attachment.path)?.size).toBe(4);
+      expect(apiFetch).not.toHaveBeenCalled();
+    } finally { off(); }
+  });
+  it('never starts OSS after a cancelled peer upload', async () => {
+    const apiFetch = vi.fn();
+    const off = installPeerUpload(async () => { throw new Error('FILE_PEER_CANCELLED'); });
+    try {
+      await expect(uploadMobileAttachmentFromFile({ name: 'a.txt', size: 4 }, 'file:///source', {
+        deviceId: 'host-a', token: 'token', deps: { apiFetch, readFileChunk },
+      })).rejects.toThrow('CANCELLED');
+      expect(apiFetch).not.toHaveBeenCalled();
+    } finally { off(); }
+  });
+  it('falls back to OSS when the peer adapter declines an upload', async () => {
+    const apiFetch = vi.fn(async () => ({ putUrl: 'https://oss.example/upload', key: 'cindy/device-link/u/a.txt' }));
+    const uploadFile = vi.fn(async () => ({ status: 200 }));
+    const off = installPeerUpload(async () => null);
+    try {
+      const attachment = await uploadMobileAttachmentFromFile({ name: 'a.txt', size: 4 }, 'file:///source', {
+        deviceId: 'host-a', token: 'token', deps: { apiFetch: apiFetch as unknown as typeof apiFetchRaw, uploadFile, readFileChunk },
+      });
+      expect(parseAttachmentOssRef(attachment.path)?.ossKey).toBe('cindy/device-link/u/a.txt');
+      expect(uploadFile).toHaveBeenCalledOnce();
+    } finally { off(); }
+  });
+  it('presigns against the captured shared task rather than the private account namespace', async () => {
+    const apiFetch = vi.fn(async () => ({ putUrl: 'https://oss.example/upload', key: 'cindy/device-link/shared-task/task/u/file.png', expiresAt: '2026-09-16T12:00:00Z' }));
+    await presignMobileAttachmentUpload({ name: 'file.png', size: 10, mimeType: 'image/png' }, {
+      token: 'token', sharedTaskId: 'task', deps: { apiFetch: apiFetch as unknown as typeof apiFetchRaw },
+    });
+    expect(apiFetch).toHaveBeenCalledWith('/api/device-link/media/presign-put', expect.objectContaining({
+      body: { size: 10, ext: 'png', contentType: 'image/png', sharedTaskId: 'task' },
+    }));
+  });
   it('requests a device-link media presign-put with desktop-compatible file metadata', async () => {
     const apiFetch = vi.fn(async () => ({
       putUrl: 'https://oss.example/upload',
@@ -189,7 +235,7 @@ describe('mobileAttachmentUpload', () => {
     expect(uploadFile).toHaveBeenCalledWith('https://oss.example/upload', 'file:///tmp/photo.png', {
       'Content-Type': 'image/png',
       'x-oss-object-acl': 'private',
-    }, { signal: expect.any(AbortSignal) });
+    }, { signal: expect.any(AbortSignal), onProgress: expect.any(Function) });
   });
 
   it('returns an OSS-ref attachment after successful native file upload', async () => {
@@ -221,7 +267,7 @@ describe('mobileAttachmentUpload', () => {
     expect(uploadFile).toHaveBeenCalledWith('https://oss.example/upload', 'file:///tmp/photo.png', {
       'Content-Type': 'image/png',
       'x-oss-object-acl': 'private',
-    }, { signal: expect.any(AbortSignal) });
+    }, { signal: expect.any(AbortSignal), onProgress: expect.any(Function) });
     expect(attachment).toMatchObject({
       id: 'mobile-upload-2',
       name: 'photo.png',
@@ -276,7 +322,7 @@ describe('mobileAttachmentUpload', () => {
       'https://oss.example/upload',
       'file:///cache/upload-snapshot.png',
       expect.any(Object),
-      { signal: expect.any(AbortSignal) },
+      { signal: expect.any(AbortSignal), onProgress: expect.any(Function) },
     );
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
@@ -324,7 +370,7 @@ describe('mobileAttachmentUpload', () => {
         'Content-Type': 'application/octet-stream',
         'x-oss-object-acl': 'private',
       },
-      { signal: expect.any(AbortSignal) },
+      { signal: expect.any(AbortSignal), onProgress: expect.any(Function) },
     );
   });
 
@@ -399,26 +445,121 @@ describe('mobileAttachmentUpload', () => {
     expect(uploadFile).toHaveBeenCalledTimes(2);
   });
 
-  it('times out a hung native file PUT (no second 120s round) instead of hanging forever', async () => {
-    // 回归:iOS 前台 NSURLSession 只在「60s 无字节流动」时自行超时,慢速涓涓细流
-    // 可以合法挂很多分钟——JS 层必须有自己的超时出口,且超时不进第二轮重试。
+  it('settles after bounded automatic recovery even when native upload ignores abort', async () => {
     vi.useFakeTimers();
     try {
-      const uploadFile = vi.fn((_url: string, _fileUri: string, _headers: Record<string, string>, opts?: { signal?: AbortSignal }) =>
-        new Promise<{ status: number }>((_resolve, reject) => {
-          opts?.signal?.addEventListener('abort', () => reject(new Error('附件上传已取消。')));
-        }));
+      const uploadFile = vi.fn(() => new Promise<{ status: number }>(() => {}));
 
       const pending = putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', {
         uploadFile,
       });
       const expectation = expect(pending).rejects.toThrow('附件上传超时，请检查网络后重试。');
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(120_800);
       await expectation;
-      expect(uploadFile).toHaveBeenCalledTimes(1);
+      expect(uploadFile).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('automatically recovers a stuck PUT using the same bytes and ignores its late success', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveFirst!: (value: { status: number }) => void;
+      const uploadFile = vi.fn()
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+        .mockResolvedValueOnce({ status: 200 });
+      const onLateSuccess = vi.fn();
+      const pending = putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', { uploadFile }, { onLateSuccess });
+      await vi.advanceTimersByTimeAsync(60_800);
+      await pending;
+      expect(uploadFile).toHaveBeenCalledTimes(2);
+      expect(uploadFile.mock.calls[0].slice(0, 3)).toEqual(uploadFile.mock.calls[1].slice(0, 3));
+      expect(uploadFile.mock.calls[0][3].signal.aborted).toBe(true);
+      resolveFirst({ status: 200 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onLateSuccess).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('reclaims a late native success after all attempts failed', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveFirst!: (value: { status: number }) => void;
+      const uploadFile = vi.fn()
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+        .mockResolvedValueOnce({ status: 403 });
+      const onLateSuccess = vi.fn();
+      const pending = putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', { uploadFile }, { onLateSuccess });
+      const failed = expect(pending).rejects.toThrow('HTTP 403');
+      await vi.advanceTimersByTimeAsync(60_800);
+      await failed;
+      resolveFirst({ status: 200 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onLateSuccess).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([408, 429, 503])('automatically recovers a temporary HTTP %s failure', async (status) => {
+    const uploadFile = vi.fn().mockResolvedValueOnce({ status }).mockResolvedValueOnce({ status: 200 });
+    await putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', { uploadFile });
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds Blob uploads even when fetch ignores abort', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchPut = vi.fn(() => new Promise<Response>(() => {}));
+      const pending = putMobileAttachmentUpload('https://oss.example/upload', new Blob(['x']), 'text/plain', { fetch: fetchPut });
+      const failed = expect(pending).rejects.toThrow('附件上传超时');
+      await vi.advanceTimersByTimeAsync(240_800);
+      await failed;
+      expect(fetchPut).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('lets a slow native upload continue while bytes advance and retires its progress callback', async () => {
+    vi.useFakeTimers();
+    try {
+      let finish!: (value: { status: number }) => void;
+      let progress!: (bytes: number) => void;
+      let signal!: AbortSignal;
+      const uploadFile = vi.fn((_url, _uri, _headers, opts) => {
+        progress = opts.onProgress;
+        signal = opts.signal;
+        return new Promise<{ status: number }>((resolve) => { finish = resolve; });
+      });
+      const pending = putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', { uploadFile });
+      await vi.advanceTimersByTimeAsync(50_000);
+      progress(100);
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(signal.aborted).toBe(false);
+      expect(uploadFile).toHaveBeenCalledTimes(1);
+      finish({ status: 200 });
+      await pending;
+      progress(200);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('duplicate progress events cannot keep a stalled native upload alive', async () => {
+    vi.useFakeTimers();
+    try {
+      let progress!: (bytes: number) => void;
+      const uploadFile = vi.fn()
+        .mockImplementationOnce((_url, _uri, _headers, opts) => {
+          progress = opts.onProgress;
+          return new Promise(() => {});
+        })
+        .mockResolvedValueOnce({ status: 200 });
+      const pending = putMobileAttachmentUploadFromFile('https://oss.example/upload', 'file:///tmp/x.png', 'image/png', { uploadFile });
+      progress(100);
+      await vi.advanceTimersByTimeAsync(50_000);
+      progress(100);
+      await vi.advanceTimersByTimeAsync(10_800);
+      await pending;
+      expect(uploadFile).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
   });
 
   it('propagates external cancellation without retrying', async () => {

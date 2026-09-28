@@ -3,6 +3,7 @@
  * 这是远程控制的安全闸门,回归必须显式。
  */
 import { describe, it, expect } from 'vitest';
+import { TASK_MIGRATION_CHANNEL } from '../taskMigration.js';
 import {
   REMOTE_INVOKE_ALLOWLIST,
   REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS,
@@ -19,14 +20,40 @@ import {
   DL_TELEGRAM_STATUS_CHANNEL,
   DL_TELEGRAM_SET_ONLINE_CHANNEL,
 } from '../allowlist.js';
-import { SESSION_ACTIVITY_CHANNEL } from '../topics.js';
+import { SESSION_ACTIVITY_CHANNEL, topicForPush } from '../topics.js';
+import {
+  REMOTE_RESOURCE_CHANGED_CHANNEL,
+  REMOTE_RESOURCE_CHANNELS,
+} from '../remoteResources.js';
 
 describe('REMOTE_INVOKE_ALLOWLIST', () => {
+  it('allows the reduced teammate directory while keeping native configuration local', () => {
+    for (const channel of ['local-db:bots:list', 'local-db:bots:get']) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    for (const channel of [
+      'local-db:bots:choose-avatar', 'local-db:bots:create', 'local-db:bots:update',
+      'local-db:bots:model-chain-settings-set', 'maker:bot-lifecycle:action',
+    ]) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(false);
+    }
+  });
+
   it('keeps every Review external-input classification inside the remote allowlist', () => {
     for (const channel of REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS) {
       expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
     }
     expect(REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS.has('maker:input:get-projection')).toBe(false);
+  });
+
+  it('放行模块中立的远程资源 API，而不是逐功能扩张 channel', () => {
+    for (const channel of REMOTE_RESOURCE_CHANNELS) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    expect(PUSH_FORWARD_ALLOWLIST.has(REMOTE_RESOURCE_CHANGED_CHANNEL)).toBe(true);
+    expect(topicForPush(REMOTE_RESOURCE_CHANGED_CHANNEL, {
+      collectionId: 'teammates',
+    })).toBe('sessions');
   });
 
   it('放行核心会话链路', () => {
@@ -99,6 +126,10 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:get-workflow-progress')).toBe(true);
   });
 
+  it('放行后台命令输出尾部只读(.output 文件真相在被控端,控制端本机读必落空)', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:background-task:output-tail')).toBe(true);
+  });
+
   it('放行会话后台任务快照只读(任务真身在被控端,后台任务面板挂载水合用)', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:session-background-tasks:list')).toBe(true);
   });
@@ -142,9 +173,27 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:model-pricing')).toBe(true);
   });
 
+  it('放行用量历史跨设备合并的原始用量行只读读取', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:device-rows')).toBe(true);
+    // 本机聚合入口仍只对受信 renderer 开放, 不经隧道暴露。
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:history')).toBe(false);
+  });
+
   it('放行 Codex 官方额度读取与 desktop 绑定的人工 reset offer', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:codex-rate-limits')).toBe(true);
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:codex-rate-limit-reset')).toBe(true);
+  });
+
+  it('放行 Claude 订阅余量快照只读(远程订阅会话 chip 镜像被控端窗口剩余)', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:claude-subscription')).toBe(true);
+  });
+
+  it('放行 xAI 订阅周用量只读(被控端 dispatch 拦截执行,不进挂 assert 的 ipcMain)', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:xai-subscription')).toBe(true);
+  });
+
+  it('放行 cc 默认路由观察值只读(路由真值在被控端 proxy registry,远程形态判定用)', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:claude-session-route:get')).toBe(true);
   });
 
   it('放行被控端项目顺序读写(显示偏好,真相在被控端)', () => {
@@ -327,7 +376,9 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
     //  - `maker:api-key:present` 是 presence-only 探测:只回 { present: boolean },
     //    不回、也永不扩展为读取密钥材料(handler 见 desktop authHandlers.ts)。密钥类
     //    通用读写(api-key:save/get、safe-storage)仍被本模式看住,禁止再加同前缀通道。
-    const FORBIDDEN_EXEMPT = new Set(['maker:goal:set', 'maker:api-key:present']);
+    // 单任务迁移仅允许同账号控制端，通过校验后的快照附件与持久交接状态机执行；
+    // 不提供通用导入、调用方指定任意目标路径或裸写库接口。
+    const FORBIDDEN_EXEMPT = new Set(['maker:goal:set', 'maker:api-key:present', TASK_MIGRATION_CHANNEL]);
     for (const ch of REMOTE_INVOKE_ALLOWLIST) {
       if (FORBIDDEN_EXEMPT.has(ch)) continue;
       for (const { re, why } of FORBIDDEN) {
@@ -346,11 +397,21 @@ describe('PUSH_FORWARD_ALLOWLIST', () => {
       'maker:interaction-dismissed',
       'maker:auto-permission:fallback',
       'maker:provider:changed',
+      'maker:agents:changed',
       'maker:schedule:event',
       'maker:orca:worker-changed',
       'usage:message-turn-cost',
       'usage:session-spend-changed',
       'usage:session-tokens-changed',
+      'usage:claude-subscription-changed',
+      'usage:codex-account-changed',
+      'usage:codex-provider-account-changed',
+      'usage:subscription-provider-account-changed',
+      'usage:claude-account-changed',
+      'usage:xai-subscription-changed',
+      'usage:xai-rate-limit-changed',
+      'usage:xai-provider-rate-limit-changed',
+      'maker:claude-session-route-changed',
       'local-db:messages:created',
       'local-db:messages:deleted',
       'local-db:session:error-persisted',

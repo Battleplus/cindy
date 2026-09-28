@@ -1,3 +1,7 @@
+import { FileTypeIcon } from '@/components/ui/file-type-icon';
+import type { ImMessageSource } from '../../../shared/imMessageSource';
+import { isSharedTaskPeer } from '@cindy/device-link';
+import { hasEmbeddedImPrompt } from './userMessageDisplayText';
 /**
  * UserMessage
  * ---------------------------------------------------------------------------
@@ -12,6 +16,7 @@
  * F-MSG-DOC: document paths rendered inline as @path chips in text content
  */
 
+import { CHAT_BODY_CLASS } from './chatChrome';
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
@@ -19,7 +24,6 @@ import {
   ChevronRight,
   ChevronUp,
   Download,
-  File as FileIcon,
   FileText,
   Folder as FolderIcon,
   Sparkles,
@@ -52,12 +56,15 @@ import type {
 import type { PastedTextRange, SlashCommandRange } from '@/lib/imageRef';
 import type { AgentInputReference } from '../../../shared/agentInputQueue';
 import type { PersistedSessionReferenceMetadata } from '../../../shared/sessionReferenceMetadata';
-import { buildRewindDraftAttachments } from '@/lib/rewindDraftAttachments';
+import {
+  buildRewindDraftAttachments,
+  startRewindSourceProbe,
+  type RewindSourceProbe,
+} from '@/lib/rewindDraftAttachments';
 import {
   useAgentCapabilities,
   type AgentKind as MakerAgentKind,
 } from '@/hooks/useAgentCapabilities';
-import { useGitSafetyAutoSnapshotEnabledForDevice } from '@/hooks/useGitSafetySettings';
 import { useChatSessionFile } from './ChatSessionFileContext';
 import { isRemoteFileOrigin, originDeviceId, toRemoteMediaOrigin } from '@/lib/sessionFileOrigin';
 import { rewriteToRemoteMediaOrigin } from '../../../shared/remoteMediaUrl';
@@ -117,7 +124,11 @@ import { UserMessageUrlLink } from './UserMessageUrlLink';
 import { InlineReferenceChip } from './InlineReferenceChip';
 import { QuoteChip } from './QuoteChip';
 import { SentAgentReferenceChip, sentAgentReferenceDisplayLabel } from './SentAgentReferenceChip';
-import { parseOrcaCommunicationContent, resolveUserDisplayText } from './userMessageDisplayText';
+import {
+  parseOrcaCommunicationContent,
+  resolveHookGroupContext,
+  resolveUserDisplayText,
+} from './userMessageDisplayText';
 
 /**
  * image-local-cache: a user-message image can be in two shapes:
@@ -136,6 +147,7 @@ type UserImageItem =
   | { base64: string; mimeType: string; originalName?: string };
 
 interface UserMessageProps {
+  sharedAuthorName?: string;
   /** F2: session cwd used to resolve relative paths in inline @-chip refs.
    *  Stable per-session — only changes on session switch. */
   workingDir: string;
@@ -166,8 +178,8 @@ interface UserMessageProps {
    *  the Fork button is not rendered. */
   sessionId?: string;
   /** Owning agent kind (renderer 短名 'cc' | 'codex') — gates Fork/Rewind icon
-   *  visibility via capabilities. Codex rewind additionally requires the Git
-   *  safety snapshot setting because file rewind depends on savepoint commits. */
+   *  visibility via capabilities. File rewind may degrade to conversation-only
+   *  rewind when no Git savepoint is available; the preview explains why. */
   agentKind?: RendererAgentKind;
   /** Owning session's remote SSH host id (null for local). Remote cc daemon
    *  sessions don't support the query-rebuild that Fork/Rewind need yet (MVP),
@@ -190,15 +202,12 @@ interface UserMessageProps {
    *  edit-last-message: 只有最后一条 user 消息显示编辑入口(编辑 = rewind 到
    *  这条 + 重发,更早的消息编辑会静默丢弃后续轮次,v1 不开放)。 */
   isLastUserMessage?: boolean;
+  /** 伙伴对话使用常显、无 Fork 的轻量消息操作栏。 */
+  simplifiedBotConversation?: boolean;
   /** scheduler 注入的消息来源标记;存在时在气泡上方渲染"由自动化任务发送"标签。 */
   automationOrigin?: MessageAutomationOrigin;
   /** Hook 来源元数据;存在时渲染左对齐 Cindy 署名任务卡片(替代右对齐气泡)。 */
-  hookSource?: {
-    im: string;
-    channelName?: string | null;
-    userText?: string;
-    threadContext?: Array<{ author: string; text: string; isBot?: boolean }>;
-  };
+  hookSource?: ImMessageSource;
   /** /goal 目标设定/更新标记:在气泡上方渲一个「目标 / 目标已更新」徽标。 */
   goalBadge?: { updated: boolean };
   /** 订阅槽①:本条消息被意识钩子拦下(未发出)。存在时气泡下方渲一条 error
@@ -249,7 +258,7 @@ function UserFileChip({
     <>
       <InlineReferenceChip
         label={fileName}
-        icon={<FileIcon aria-hidden />}
+        icon={<FileTypeIcon name={fileName} />}
         tooltip={refText}
         tooltipMono
         ariaLabel={fileName}
@@ -365,7 +374,7 @@ function UserAttachmentChip({
         {downloadOnly ? (
           <Download size={14} className="shrink-0 text-[var(--msg-user-text)]" />
         ) : (
-          <FileText size={14} className="shrink-0 text-[var(--msg-user-text)]" />
+          <FileTypeIcon name={file.name} size={14} className="shrink-0 text-[var(--msg-user-text)]" />
         )}
         <span className="truncate">{file.name}</span>
       </button>
@@ -666,7 +675,7 @@ function renderContentWithoutPastedText(
               <InlineReferenceChip
                 key={key}
                 label={fileName}
-                icon={<FileIcon aria-hidden />}
+                icon={<FileTypeIcon name={fileName} />}
                 tooltip={ref}
                 tooltipMono
                 ariaLabel={fileName}
@@ -937,6 +946,7 @@ export function renderContent(
 // 老 UserImageItemView 已迁出,见 ChatImageView.tsx。
 
 export function UserMessage({
+  sharedAuthorName,
   workingDir,
   allowPrivilegedLinks = true,
   content,
@@ -956,6 +966,7 @@ export function UserMessage({
   delivery,
   isFirstUserMessage,
   isLastUserMessage,
+  simplifiedBotConversation = false,
   automationOrigin,
   hookSource,
   goalBadge,
@@ -973,7 +984,7 @@ export function UserMessage({
   // context 更新会穿透 memo 触发重渲,替代旧的 render 期一次性读取)。
   const sessionFileCtx = useChatSessionFile();
   const remoteDeviceId = originDeviceId(sessionFileCtx.origin);
-  const gitSafetyAutoSnapshotEnabled = useGitSafetyAutoSnapshotEnabledForDevice(remoteDeviceId);
+  const sharedGuest = isSharedTaskPeer(remoteDeviceId ?? '');
   const remoteMediaOrigin = useMemo(
     () => toRemoteMediaOrigin(sessionFileCtx.origin, sessionFileCtx.workingDir),
     [sessionFileCtx],
@@ -982,10 +993,8 @@ export function UserMessage({
   // 远端 cc daemon 会话暂不支持 Fork/Rewind 依赖的 query rebuild (MVP),
   // remoteHostId 非空时直接关掉这两个能力, 避免点了落到后端错误。
   const isRemote = Boolean(remoteHostId);
-  const codexRewindEntryAllowed = agentKind !== 'codex' || gitSafetyAutoSnapshotEnabled;
   const forkSupported = !isRemote && (!agentKind || (capabilities?.fork?.supported ?? true));
   const rewindSupported =
-    codexRewindEntryAllowed &&
     !isRemote &&
     (!agentKind || (capabilities?.rewind?.supported ?? true));
 
@@ -1021,6 +1030,10 @@ export function UserMessage({
   // 与提问导航条预览共用同一实现,规则见 userMessageDisplayText.ts;上面已
   // 解析过的 Orca 结果传入复用,渲染热路径不重复 JSON.parse(Copilot review)。
   const displayContent = resolveUserDisplayText({ content, hookSource }, orcaCommunication);
+  const groupContext = useMemo(
+    () => resolveHookGroupContext({ content, hookSource }),
+    [content, hookSource],
+  );
   const validAgentReferences = useMemo(
     () => readAgentInputReferences(agentReferences, content),
     [agentReferences, content],
@@ -1098,8 +1111,8 @@ export function UserMessage({
   // - 胶囊(pill):软提示未兑现 → 保持原低调形态,留在气泡下方。
   const ghostCardDisplay: GhostSummonDisplay | null = ghostDirective ?? ghostSemanticDisplay;
   const ghostPillForm = ghostDirective?.kind === 'mention' && !ghostMentionFulfilled;
-  const ghostChipDisplay = ghostPillForm ? null : ghostCardDisplay;
-  const ghostPillDisplay = ghostPillForm ? ghostDirective : null;
+  const ghostChipDisplay = simplifiedBotConversation || ghostPillForm ? null : ghostCardDisplay;
+  const ghostPillDisplay = !simplifiedBotConversation && ghostPillForm ? ghostDirective : null;
   // 气泡实际显示的正文与其在原始 content 中的起点(粘贴块/斜杠命令高亮的
   // 偏移投影用):硬指令剥 $token,其余原样。
   const displayBubbleBody = ghostCmdToken ? ghostPromptBody : bubbleBody;
@@ -1113,7 +1126,9 @@ export function UserMessage({
   // 视觉行数,窗口缩放 / 侧栏开合导致气泡宽度变化时由 ResizeObserver 重算。
   // 自动化任务注入的消息(模板化调度 prompt,每轮重复出现)用更低的收起
   // 阈值,收起后也只留 3 行(手打消息 14 行阈值 / 收起留 10 行不变)。
-  const collapseThreshold = automationOrigin
+  // 其他任务经工具发来的消息不是每轮重复的模板，保持手打消息的收起口径。
+  const isScheduledAutomation = automationOrigin?.kind === 'scheduler';
+  const collapseThreshold = isScheduledAutomation
     ? AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD
     : LONG_USER_MESSAGE_VISUAL_LINE_THRESHOLD;
   // 粘贴段在气泡展示正文(displayBubbleBody)局部坐标下的 range(与下方
@@ -1213,23 +1228,28 @@ export function UserMessage({
   // 同时按 capabilities.fork.supported gate (Codex 现支持; 未来若 agent 不支持自动隐藏)。
   const navigationMode = useSessionNavigationMode();
   const canFork =
+    !sharedGuest &&
     isInteractiveSessionNavigationMode(navigationMode) &&
     Boolean(sessionId && messageClientId) &&
     !isFirstUserMessage &&
     forkSupported &&
     !orcaCommunication &&
-    !hookSource;
+    !hasEmbeddedImPrompt(hookSource);
 
   // ── rewind ──────────────────────────────────────────────────────────────
   // Dialog open state lives here (UserMessage owns the in-flight period —
   // dialog opens → preview dryRun → user confirm → commit → close, the whole
   // span counts as "rewinding" for the action-bar Loader2). Reset on close.
   const [rewindOpen, setRewindOpen] = useState(false);
+  // 带可再编辑标注的历史图:确认框打开时就预探测未烧录原图是否还在,提交时
+  // 同步取结果(丢失的退回烧录图),草稿仍在提交当下一次写完。
+  const rewindSourceProbeRef = useRef<RewindSourceProbe<UserImageItem> | null>(null);
 
   const handleRewind = useCallback(() => {
     if (!sessionId || !messageClientId) return;
+    rewindSourceProbeRef.current = images ? startRewindSourceProbe(images) : null;
     setRewindOpen(true);
-  }, [sessionId, messageClientId]);
+  }, [sessionId, messageClientId, images]);
 
   const handleRewindCommitted = useCallback(
     (session: Session) => {
@@ -1239,7 +1259,10 @@ export function UserMessage({
       // reload it disappears from the list; the composer keeps the draft so
       // the user can edit and re-send.
       const draftText = quoteDraftDocument ?? textToTiptapDoc(bubbleBody);
-      const draftAttachments = buildRewindDraftAttachments({ images, files });
+      const probe = rewindSourceProbeRef.current;
+      rewindSourceProbeRef.current = null;
+      const draftImages = probe && probe.images === images ? probe.imagesForDraft() : images;
+      const draftAttachments = buildRewindDraftAttachments({ images: draftImages, files });
       if (draftText || draftAttachments.length > 0) {
         saveComposerDraft(sessionId, {
           text: draftText,
@@ -1263,13 +1286,14 @@ export function UserMessage({
 
   // 第一条 user 消息没有可作为锚点的 prior assistant uuid → 后端必抛
   // NO_PRIOR_ASSISTANT。直接藏掉按钮，避免无效点击。
-  // 同时按 capabilities.rewind.supported gate；Codex 入口还要用户显式开启 Git safety。
+  // 同时按 capabilities.rewind.supported gate；文件恢复能力由实际 Git 保存点决定。
   const canRewind =
+    !sharedGuest &&
     Boolean(sessionId && messageClientId) &&
     !isFirstUserMessage &&
     rewindSupported &&
     !orcaCommunication &&
-    !hookSource;
+    !hasEmbeddedImPrompt(hookSource);
 
   // ── edit-last-message ──────────────────────────────────────────────────
   // 编辑 = rewind 到本条 + 用编辑后的文本立即重发(见 UserMessageEditBox)。
@@ -1281,9 +1305,9 @@ export function UserMessage({
   // 普通重发(onCommitOverride),故可编辑条件与 rewind 无关——只要有
   // session/clientId 就能改了重发。
   const isBlocked = Boolean(blockedByGhost);
-  const canEdit = isBlocked
+  const canEdit = !sharedGuest && (isBlocked
     ? Boolean(sessionId && messageClientId)
-    : canRewind && Boolean(isLastUserMessage);
+    : canRewind && Boolean(isLastUserMessage));
 
   // 中断运行中的 turn——Stop 语义与输入框的 Stop 按钮完全一致
   // (useCCAgentChat.stopSession):有排队消息时 keepQueue+pauseQueue(停当前 +
@@ -1347,6 +1371,24 @@ export function UserMessage({
       : t('chat.userMessage.orcaFromWorker');
 
   // Attachments belong to the user message independently of its visual shell.
+  const messageActions = (
+    <MessageActionBar
+      createdAt={createdAt}
+      copyText={copyText}
+      copyLinkText={messageDeepLink}
+      align={hookSource ? 'left' : 'right'}
+      hovered={hovered}
+      simplifiedBotConversation={simplifiedBotConversation}
+      onFork={!isBlocked && canFork ? handleFork : undefined}
+      onAddToChat={!isBlocked && messageDeepLink ? handleAddToChat : undefined}
+      onShareAsImage={handleShareAsImage}
+      onDelete={!sharedGuest && !isBlocked && sessionId && messageClientId ? handleDelete : undefined}
+      onEdit={canEdit ? handleEdit : undefined}
+      onRewind={!isBlocked && canRewind ? handleRewind : undefined}
+      rewindInFlight={rewindOpen}
+    />
+  );
+
   // Define each renderer once, then place it inside the hook / ordinary branch
   // so the ordinary message keeps its established badge-before-attachment order.
   const imageAttachmentNodes =
@@ -1420,41 +1462,48 @@ export function UserMessage({
               : 'max-w-[488px] items-end',
         )}
       >
+        {sharedAuthorName && <span className="text-12 text-[var(--text-secondary)]">{sharedAuthorName}</span>}
         {orcaCommunication ? (
-          <div
-            className={cn(
-              'w-full rounded-[8px] border border-[var(--msg-tool-card-border)]',
-              'bg-[var(--msg-tool-card-bg)] text-[var(--msg-tool-card-text)]',
-              'overflow-hidden',
+          <>
+            {/* Orca 卡片标题只说明 Lead / Worker 角色；来源标签补上可跳转的发送方任务。 */}
+            {automationOrigin && (
+              <AutomationOriginBadge automationOrigin={automationOrigin} hostSessionId={sessionId} />
             )}
-          >
-            <button
-              type="button"
+            <div
               className={cn(
-                'flex w-full items-center gap-2 px-3 py-2 text-left',
-                'text-13 font-medium leading-none',
-                'hover:bg-[var(--cmd-palette-item-hover)] transition-colors',
+                'w-full rounded-[8px] border border-[var(--msg-tool-card-border)]',
+                'bg-[var(--msg-tool-card-bg)] text-[var(--msg-tool-card-text)]',
+                'overflow-hidden',
               )}
-              aria-expanded={orcaExpanded}
-              onClick={() => setOrcaExpanded((value) => !value)}
             >
-              <Bot size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
-              <span className="min-w-0 flex-1 truncate">{orcaCardTitle}</span>
-              {orcaExpanded ? (
-                <ChevronDown size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
-              ) : (
-                <ChevronRight size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+              <button
+                type="button"
+                className={cn(
+                  'flex w-full items-center gap-2 px-3 py-2 text-left',
+                  'text-13 font-medium leading-none',
+                  'hover:bg-[var(--cmd-palette-item-hover)] transition-colors',
+                )}
+                aria-expanded={orcaExpanded}
+                onClick={() => setOrcaExpanded((value) => !value)}
+              >
+                <Bot size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                <span className="min-w-0 flex-1 truncate">{orcaCardTitle}</span>
+                {orcaExpanded ? (
+                  <ChevronDown size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                ) : (
+                  <ChevronRight size={14} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                )}
+              </button>
+              {orcaExpanded && (
+                <div className="border-t border-[var(--msg-tool-card-border)] px-3 py-2">
+                  <pre className="m-0 whitespace-pre-wrap break-words font-mono text-[length:calc(var(--app-code-font-size)_-_2px)] leading-[calc(var(--app-code-font-size)_+_4px)] text-[var(--foreground)]">
+                    {displayContent}
+                  </pre>
+                </div>
               )}
-            </button>
-            {orcaExpanded && (
-              <div className="border-t border-[var(--msg-tool-card-border)] px-3 py-2">
-                <pre className="m-0 whitespace-pre-wrap break-words font-mono text-[length:calc(var(--app-code-font-size)_-_2px)] leading-[calc(var(--app-code-font-size)_+_4px)] text-[var(--foreground)]">
-                  {displayContent}
-                </pre>
-              </div>
-            )}
-          </div>
-        ) : hookSource ? (
+            </div>
+          </>
+        ) : hookSource && !editing ? (
           <>
             {/* hook 消息: Cindy 署名任务卡片(左对齐), 替代右对齐用户气泡 +
                 automation 标签。图片 / 文件附件仍属于同一条入站消息。 */}
@@ -1463,15 +1512,24 @@ export function UserMessage({
             <HookTaskCard
               im={hookSource.im}
               userText={displayContent}
+              collapseUserText={hookSource.contentFormat === 'user-text'}
               threadContext={hookSource.threadContext}
+              groupContext={groupContext}
+              replyContext={hookSource.contextSnapshot?.replyContext}
+              groupMessageCount={hookSource.contextSnapshot?.groupMessageCount}
+              replyMessageCount={hookSource.contextSnapshot?.replyMessageCount}
             />
+            {!hasEmbeddedImPrompt(hookSource) && messageActions}
           </>
         ) : (
           <>
-            {/* 自动化任务注入的消息:气泡上方右对齐渲染来源标签(不进气泡、不入 copyText)。
-            点击跳转自动化页并 focus 对应条目(与侧边栏自动化分组"编辑"同款 query
-            机制);任务已删除时 SchedulerPage 的 focus 兜底会自动回退到列表首条。 */}
-            {automationOrigin && <AutomationOriginBadge automationOrigin={automationOrigin} />}
+            {/* 自动化 / 其他任务注入的消息:气泡上方右对齐渲染来源标签(不进气泡、不入
+            copyText)。自动化来源跳转自动化页并 focus 对应条目(与侧边栏自动化分组"编辑"
+            同款 query 机制;已删除时 SchedulerPage 的 focus 兜底回退到列表首条);
+            任务来源跳转发送方任务。 */}
+            {automationOrigin && (
+              <AutomationOriginBadge automationOrigin={automationOrigin} hostSessionId={sessionId} />
+            )}
             {/* /goal 目标设定/更新:气泡上方右对齐渲一个徽标(不进气泡、不入 copyText)。 */}
             {goalBadge && (
               <span
@@ -1540,11 +1598,11 @@ export function UserMessage({
                       // 在任意字符处断行，并把内容的 min-content 缩小到一个字符宽。
                       // min-w-0 解除 flex item 默认的 min-width:auto，否则父容器的
                       // max-w-[488px] 会被超长 token 顶穿。两者缺一不可。
-                      'relative min-w-0 max-w-full rounded-[12px]',
+                      'relative min-w-0 max-w-full rounded-xl',
                       'border border-[var(--msg-user-border)]',
                       'bg-[var(--msg-user-bg)]',
                       'px-4 py-3',
-                      'text-15 font-normal leading-[1.6]',
+                      CHAT_BODY_CLASS,
                       'text-[var(--msg-user-text)]',
                       'select-text',
                     )}
@@ -1585,7 +1643,7 @@ export function UserMessage({
                         className={cn(
                           'min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere]',
                           longMessageCollapsed &&
-                            (automationOrigin ? 'line-clamp-3' : 'line-clamp-10'),
+                            (isScheduledAutomation ? 'line-clamp-3' : 'line-clamp-10'),
                         )}
                       >
                         {quoteSegments.map((segment, index) =>
@@ -1663,7 +1721,7 @@ export function UserMessage({
                         className={cn(
                           'whitespace-pre-wrap [overflow-wrap:anywhere]',
                           longMessageCollapsed &&
-                            (automationOrigin ? 'line-clamp-3' : 'line-clamp-10'),
+                            (isScheduledAutomation ? 'line-clamp-3' : 'line-clamp-10'),
                         )}
                       >
                         {longMessageCollapsed
@@ -1761,6 +1819,7 @@ export function UserMessage({
                 {blockedByGhost && (
                   <div className="mt-1.5">
                     <ErrorMessageCard
+                      kind="blocked-input"
                       message={blockedByGhost.reason || t('chat.ghostHook.blockedFallback')}
                     />
                   </div>
@@ -1768,20 +1827,7 @@ export function UserMessage({
                 {/* message-actions V1.2: hover-revealed bar below the bubble,
                 right-aligned, order [time][copy][fork][edit][undo][more]。被拦消息只保留
             编辑和链接复制,fork/rewind/delete 对未发消息无意义。 */}
-                <MessageActionBar
-                  createdAt={createdAt}
-                  copyText={copyText}
-                  copyLinkText={messageDeepLink}
-                  align="right"
-                  hovered={hovered}
-                  onFork={!isBlocked && canFork ? handleFork : undefined}
-                  onAddToChat={!isBlocked && messageDeepLink ? handleAddToChat : undefined}
-                  onShareAsImage={handleShareAsImage}
-                  onDelete={!isBlocked && sessionId && messageClientId ? handleDelete : undefined}
-                  onEdit={canEdit ? handleEdit : undefined}
-                  onRewind={!isBlocked && canRewind ? handleRewind : undefined}
-                  rewindInFlight={rewindOpen}
-                />
+                {messageActions}
               </>
             )}
           </>

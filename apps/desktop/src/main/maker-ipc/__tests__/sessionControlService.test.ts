@@ -90,6 +90,39 @@ function setup(opts?: {
     sessionExists: vi.fn(async () => opts?.exists ?? true),
     getLiveSession,
     getSessionActivitySnapshot: vi.fn(async () => activity),
+    getSessionRuntimeDetails: vi.fn(async () => ({
+      ...activity,
+      runtimeGeneration: 0,
+      baselineProfile: {
+        agentKind: 'codex' as const,
+        model: 'model',
+        providerId: 'openai',
+        effort: 'medium' as const,
+        fastMode: false,
+      },
+      effectiveProfile: {
+        agentKind: 'codex' as const,
+        model: 'model',
+        providerId: 'openai',
+        effort: 'medium' as const,
+        fastMode: false,
+      },
+      pendingMutation: null,
+      fallbackEnabled: false,
+    })),
+    setSessionRuntime: vi.fn(async () => ({
+      ok: true as const,
+      status: 'applied' as const,
+      generation: 1,
+      effectiveProfile: {
+        agentKind: 'codex' as const,
+        model: 'next',
+        providerId: 'openai',
+        effort: 'high' as const,
+        fastMode: false,
+      },
+      pendingMutation: null,
+    })),
     assertExternalInputAllowed: vi.fn(async () => undefined),
     createQueuedMessage: vi.fn(
       async ({
@@ -135,6 +168,36 @@ describe('session control domain service', () => {
         explicitOrigin: explicit,
       }),
     ).toBe(explicit);
+  });
+
+  it('snapshots the dispatcher title for the receiver source label', () => {
+    expect(
+      sessionQueueOriginForDispatcher({
+        dispatcherSessionId: 'caller',
+        dispatcherSessionTitle: '  Release checklist  ',
+        message: 'follow-up',
+      }),
+    ).toEqual({
+      kind: 'session',
+      senderSessionId: 'caller',
+      displayText: 'follow-up',
+      senderSessionTitle: 'Release checklist',
+    });
+    expect(
+      sessionQueueOriginForDispatcher({
+        dispatcherSessionId: 'caller',
+        dispatcherSessionTitle: '   ',
+        message: 'follow-up',
+      }),
+    ).not.toHaveProperty('senderSessionTitle');
+    expect(
+      sessionQueueOriginForDispatcher({
+        dispatcherSessionId: 'bot-task',
+        dispatcherSessionTitle: 'Weekly feedback',
+        dispatcherBot: { id: 'bot-1', name: 'Cindy' },
+        message: 'follow-up',
+      }),
+    ).toMatchObject({ senderBotId: 'bot-1', senderBotName: 'Cindy' });
   });
 
   it('shares queue lifecycle while enforcing sender ownership and preserving identity', async () => {
@@ -209,6 +272,24 @@ describe('session control domain service', () => {
     },
   );
 
+  it('keeps the host attachment envelope when the sender edits its own attachment item', () => {
+    const queued = item({ kind: 'session', senderSessionId: 'caller', displayText: 'before' });
+    queued.files = [{ name: 'notes.txt', path: '/repo/notes.txt', category: 'file' } as never];
+    queued.persistedContent = JSON.stringify({
+      text: 'before',
+      images: [],
+      files: [{ name: 'notes.txt', path: '/repo/notes.txt' }],
+    });
+
+    const updated = rebuildSessionQueueItem(queued, 'replacement');
+
+    expect(JSON.parse(updated.persistedContent)).toMatchObject({
+      text: 'replacement',
+      files: [{ name: 'notes.txt', path: '/repo/notes.txt' }],
+    });
+    expect(updated.origin).toMatchObject({ kind: 'session', displayText: 'replacement' });
+  });
+
   it('keeps renderer composer envelopes intact when rebuilding a non-session queue item', () => {
     const queued = item();
     queued.persistedContent = JSON.stringify({
@@ -273,6 +354,18 @@ describe('session control domain service', () => {
         message: 'urgent',
       }),
     ).resolves.toMatchObject({ ok: false, errorCode: 'NO_ACTIVE_TURN' });
+  });
+
+  it('passes a stable host steer ID to the coordinator without allocating a replacement', async () => {
+    const { deps, service } = setup();
+    const params = { callerSessionId: 'caller', targetSessionId: 'target', message: 'urgent', queuedMessageId: 'stable-steer' };
+    expect(await service.steerSession(params)).toEqual({ ok: true, queuedMessageId: 'stable-steer' });
+    expect(await service.steerSession(params)).toEqual({ ok: true, queuedMessageId: 'stable-steer' });
+    expect(deps.createId).not.toHaveBeenCalled();
+    expect(deps.createQueuedMessage).toHaveBeenNthCalledWith(1, params);
+    expect(deps.createQueuedMessage).toHaveBeenNthCalledWith(2, params);
+    expect(deps.steerQueuedMessage).toHaveBeenLastCalledWith('target',
+      expect.objectContaining({ clientId: 'stable-steer' }), expect.any(Object));
   });
 
   it('rejects when the original turn changes while the control message is being built', async () => {
@@ -363,6 +456,32 @@ describe('session control domain service', () => {
         }),
       },
     );
+  });
+
+  it('forwards an atomic runtime patch only after the target is known to exist', async () => {
+    const { deps, service } = setup();
+    await expect(
+      service.setSessionRuntime({
+        targetSessionId: 'target',
+        expectedGeneration: 4,
+        patch: { model: 'next', effort: 'high', fastMode: true },
+      }),
+    ).resolves.toMatchObject({ ok: true, status: 'applied', generation: 1 });
+    expect(deps.setSessionRuntime).toHaveBeenCalledWith({
+      targetSessionId: 'target',
+      expectedGeneration: 4,
+      patch: { model: 'next', effort: 'high', fastMode: true },
+    });
+
+    const missing = setup({ exists: false, live: false });
+    await expect(
+      missing.service.setSessionRuntime({
+        targetSessionId: 'gone',
+        expectedGeneration: 0,
+        patch: { effort: 'high' },
+      }),
+    ).resolves.toMatchObject({ ok: false, errorCode: 'NOT_FOUND' });
+    expect(missing.deps.setSessionRuntime).not.toHaveBeenCalled();
   });
 
   it('prefers an in-memory live session when persisted metadata is unavailable', async () => {

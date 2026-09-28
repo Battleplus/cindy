@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import {
   Sun,
   Moon,
@@ -23,21 +25,14 @@ import {
   DEFAULT_UI_FONT_SIZE,
   useFontSettings,
 } from '@/hooks/useFontSettings';
-import {
-  useSidebarCardMode,
-  useSidebarMainViewMode,
-  type SidebarMainViewMode,
-  type SidebarViewMode,
-} from '@/hooks/useSidebarCardMode';
-import {
-  useGhostPanelRestoreMode,
-  type GhostPanelRestoreMode,
-} from '@/hooks/useGhostPanelRestoreMode';
+import { useSidebarCardMode, useSidebarMainViewMode } from '@/hooks/useSidebarCardMode';
+import { useGhostPanelRestoreMode } from '@/hooks/useGhostPanelRestoreMode';
 import { getThemeFamilies, resolveFamilyVariant, type ThemeFamily } from '@/themes/families';
 import { buildCopyFromTheme, onLocalThemesChange, refreshLocalThemes } from '@/themes/local-themes';
 import { toast } from '@/lib/toast';
 import { isLocalThemeId } from '../../../shared/local-themes';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Button } from '@/components/ui/button';
 import { Tip } from '@/components/ui/tooltip';
 import { Slider } from '@/components/ui/slider';
 import { extractIpcError } from '@/utils/ipcError';
@@ -190,19 +185,16 @@ function LocalThemeIconButton({
 }) {
   return (
     <Tip text={label}>
-      <button
+      <Button
+        variant="secondary"
+        size="lg"
+        className="w-9 px-0"
         type="button"
         aria-label={label}
         onClick={onClick}
-        className={cn(
-          'flex h-9 w-9 items-center justify-center rounded-xl',
-          'border border-[var(--settings-input-border)]',
-          'bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-          'transition-colors hover:bg-[var(--settings-menu-bg-hover)]',
-        )}
       >
         <Icon size={16} />
-      </button>
+      </Button>
     </Tip>
   );
 }
@@ -509,7 +501,7 @@ export function AppearanceSection() {
       </h2>
 
       {/* Theme card — rounded 12, Card bg, 1px Board, padding 20 */}
-      <div
+      <div id="settings-search-settings-appearance-themeLabel"
         className={cn(
           'flex flex-col gap-[14px] rounded-xl p-5',
           'bg-[var(--settings-theme-card-bg)]',
@@ -517,7 +509,7 @@ export function AppearanceSection() {
         )}
       >
         {/* Appearance mode */}
-        <p
+        <p id="settings-search-settings-appearance-modeLabel"
           className="text-13 font-medium text-[var(--settings-section-sublabel)]"
           style={{ letterSpacing: '0.12px' }}
         >
@@ -585,7 +577,7 @@ export function AppearanceSection() {
         />
 
         <div className="flex flex-col gap-2 pt-1">
-          <p
+          <p id="settings-search-settings-appearance-localThemes-title"
             className="text-13 font-medium text-[var(--settings-section-sublabel)]"
             style={{ letterSpacing: '0.12px' }}
           >
@@ -630,7 +622,7 @@ export function AppearanceSection() {
         ) : null}
       </div>
 
-      <div
+      <div id="settings-search-settings-appearance-font-uiFamily-label"
         className={cn(
           'flex flex-col gap-[14px] rounded-xl p-5',
           'bg-[var(--settings-theme-card-bg)]',
@@ -654,7 +646,7 @@ export function AppearanceSection() {
         <div className="flex flex-col gap-3">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p
+              <p id="settings-search-settings-appearance-font-uiSize-label"
                 className="text-13 font-medium text-[var(--settings-section-sublabel)]"
                 style={{ letterSpacing: '0.12px' }}
               >
@@ -665,21 +657,16 @@ export function AppearanceSection() {
               </p>
             </div>
             <Tip text={t('settings.appearance.font.reset')}>
-              <button
+              <Button
+                variant="secondary"
+                className="w-8 px-0"
                 type="button"
                 aria-label={t('settings.appearance.font.reset')}
                 onClick={resetUiSize}
                 disabled={uiSize === DEFAULT_UI_FONT_SIZE}
-                className={cn(
-                  'flex h-8 w-8 shrink-0 items-center justify-center rounded-xl',
-                  'border border-[var(--settings-input-border)]',
-                  'bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-                  'transition-colors hover:bg-[var(--settings-menu-bg-hover)]',
-                  'disabled:cursor-default disabled:opacity-40 disabled:hover:bg-[var(--settings-input-bg)]',
-                )}
               >
                 <RefreshCw size={14} />
-              </button>
+              </Button>
             </Tip>
           </div>
 
@@ -721,7 +708,8 @@ export function AppearanceSection() {
 
         <div className="h-px bg-[var(--settings-input-border)]" />
 
-        <FontFamilyPicker
+        <div id="settings-search-settings-appearance-font-codeFamily-label">
+          <FontFamilyPicker
           label={t('settings.appearance.font.codeFamily.label')}
           description={t('settings.appearance.font.codeFamily.description')}
           ariaLabel={t('settings.appearance.font.codeFamily.aria')}
@@ -732,14 +720,15 @@ export function AppearanceSection() {
           previewFallbackFamily="var(--app-font-code-default)"
           onChange={setCodeFamily}
           onReset={resetCodeFamily}
-        />
+          />
+        </div>
 
         <div className="h-px bg-[var(--settings-input-border)]" />
 
         <div className="flex flex-col gap-3">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p
+              <p id="settings-search-settings-appearance-font-codeSize-label"
                 className="text-13 font-medium text-[var(--settings-section-sublabel)]"
                 style={{ letterSpacing: '0.12px' }}
               >
@@ -750,21 +739,16 @@ export function AppearanceSection() {
               </p>
             </div>
             <Tip text={t('settings.appearance.font.reset')}>
-              <button
+              <Button
+                variant="secondary"
+                className="w-8 px-0"
                 type="button"
                 aria-label={t('settings.appearance.font.reset')}
                 onClick={resetCodeSize}
                 disabled={codeSize === DEFAULT_CODE_FONT_SIZE}
-                className={cn(
-                  'flex h-8 w-8 shrink-0 items-center justify-center rounded-xl',
-                  'border border-[var(--settings-input-border)]',
-                  'bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-                  'transition-colors hover:bg-[var(--settings-menu-bg-hover)]',
-                  'disabled:cursor-default disabled:opacity-40 disabled:hover:bg-[var(--settings-input-bg)]',
-                )}
               >
                 <RefreshCw size={14} />
-              </button>
+              </Button>
             </Tip>
           </div>
 
@@ -814,9 +798,9 @@ export function AppearanceSection() {
           'border border-[var(--settings-theme-card-border)]',
         )}
       >
-        <div className="flex items-center justify-between gap-3">
+        <div className="cindy-segmented-row">
           <div className="flex min-w-0 flex-col gap-1">
-            <p
+            <p id="settings-search-settings-appearance-sidebarCardMode-label"
               className="text-13 font-medium text-[var(--settings-section-sublabel)]"
               style={{ letterSpacing: '0.12px' }}
             >
@@ -827,40 +811,21 @@ export function AppearanceSection() {
             </p>
           </div>
 
-          <div
-            role="radiogroup"
+          <SegmentedControl
             aria-label={t('settings.appearance.sidebarCardMode.aria')}
-            className="flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--settings-theme-card-border)] p-0.5"
-          >
-            {(
-              [
-                { value: 'text', labelKey: 'ccAgent.sidebar.viewStyleList' },
-                { value: 'card', labelKey: 'ccAgent.sidebar.viewStyleCard' },
-                { value: 'list', labelKey: 'ccAgent.sidebar.viewStyleListWide' },
-              ] as Array<{ value: SidebarViewMode; labelKey: string }>
-            ).map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                role="radio"
-                aria-checked={sidebarViewMode === opt.value}
-                onClick={() => setSidebarViewMode(opt.value)}
-                className={cn(
-                  'rounded-full px-2.5 py-1 text-xs transition-colors',
-                  sidebarViewMode === opt.value
-                    ? 'bg-[var(--chat-input-chip-bg)] font-medium text-[var(--msg-assistant-text)]'
-                    : 'text-[var(--settings-section-sublabel)] hover:bg-sidebar-item-hover',
-                )}
-              >
-                {t(opt.labelKey)}
-              </button>
-            ))}
-          </div>
+            value={sidebarViewMode}
+            onValueChange={setSidebarViewMode}
+            options={[
+              { value: 'text', label: t('ccAgent.sidebar.viewStyleList') },
+              { value: 'card', label: t('ccAgent.sidebar.viewStyleCard') },
+              { value: 'list', label: t('ccAgent.sidebar.viewStyleListWide') },
+            ]}
+          />
         </div>
 
-        <div className="flex items-center justify-between gap-3">
+        <div className="cindy-segmented-row">
           <div className="flex min-w-0 flex-col gap-1">
-            <p
+            <p id="settings-search-settings-appearance-sidebarMainListMode-label"
               className="text-13 font-medium text-[var(--settings-section-sublabel)]"
               style={{ letterSpacing: '0.12px' }}
             >
@@ -871,39 +836,20 @@ export function AppearanceSection() {
             </p>
           </div>
 
-          <div
-            role="radiogroup"
+          <SegmentedControl
             aria-label={t('settings.appearance.sidebarMainListMode.aria')}
-            className="flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--settings-theme-card-border)] p-0.5"
-          >
-            {(
-              [
-                { value: 'text', labelKey: 'ccAgent.sidebar.viewStyleList' },
-                { value: 'list', labelKey: 'ccAgent.sidebar.viewStyleListWide' },
-              ] as Array<{ value: SidebarMainViewMode; labelKey: string }>
-            ).map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                role="radio"
-                aria-checked={sidebarMainViewMode === opt.value}
-                onClick={() => setSidebarMainViewMode(opt.value)}
-                className={cn(
-                  'rounded-full px-2.5 py-1 text-xs transition-colors',
-                  sidebarMainViewMode === opt.value
-                    ? 'bg-[var(--chat-input-chip-bg)] font-medium text-[var(--msg-assistant-text)]'
-                    : 'text-[var(--settings-section-sublabel)] hover:bg-sidebar-item-hover',
-                )}
-              >
-                {t(opt.labelKey)}
-              </button>
-            ))}
-          </div>
+            value={sidebarMainViewMode}
+            onValueChange={setSidebarMainViewMode}
+            options={[
+              { value: 'text', label: t('ccAgent.sidebar.viewStyleList') },
+              { value: 'list', label: t('ccAgent.sidebar.viewStyleListWide') },
+            ]}
+          />
         </div>
 
-        <div className="flex items-center justify-between gap-3">
+        <div className="cindy-segmented-row">
           <div className="flex min-w-0 flex-col gap-1">
-            <p
+            <p id="settings-search-settings-appearance-ghostPanelRestore-label"
               className="text-13 font-medium text-[var(--settings-section-sublabel)]"
               style={{ letterSpacing: '0.12px' }}
             >
@@ -914,34 +860,15 @@ export function AppearanceSection() {
             </p>
           </div>
 
-          <div
-            role="radiogroup"
+          <SegmentedControl
             aria-label={t('settings.appearance.ghostPanelRestore.aria')}
-            className="flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--settings-theme-card-border)] p-0.5"
-          >
-            {(
-              [
-                { value: 'bubble', labelKey: 'settings.appearance.ghostPanelRestore.bubble' },
-                { value: 'sidebar', labelKey: 'settings.appearance.ghostPanelRestore.sidebar' },
-              ] as Array<{ value: GhostPanelRestoreMode; labelKey: string }>
-            ).map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                role="radio"
-                aria-checked={ghostPanelRestoreMode === option.value}
-                onClick={() => setGhostPanelRestoreMode(option.value)}
-                className={cn(
-                  'rounded-full px-2.5 py-1 text-xs transition-colors',
-                  ghostPanelRestoreMode === option.value
-                    ? 'bg-[var(--chat-input-chip-bg)] font-medium text-[var(--msg-assistant-text)]'
-                    : 'text-[var(--settings-section-sublabel)] hover:bg-sidebar-item-hover',
-                )}
-              >
-                {t(option.labelKey)}
-              </button>
-            ))}
-          </div>
+            value={ghostPanelRestoreMode}
+            onValueChange={setGhostPanelRestoreMode}
+            options={[
+              { value: 'bubble', label: t('settings.appearance.ghostPanelRestore.bubble') },
+              { value: 'sidebar', label: t('settings.appearance.ghostPanelRestore.sidebar') },
+            ]}
+          />
         </div>
       </div>
 

@@ -1,3 +1,13 @@
+import { createPluginMarketAgentTools } from '../plugin-market/agentTools.js';
+import type { GhostInstallConsentPrompt } from '../cindy-brain/ghostInstallConsent.js';
+import {
+  createTaskInstallConsentPrompt,
+  type HostPermissionRequester,
+} from '../cindy-brain/ghostInstallConsentInteraction.js';
+import type { PluginMarketService } from '../plugin-market/service.js';
+import { throwIpcError } from '../utils/ipcValidate.js';
+import { getBotAuthorizationService } from '../maker-ipc/botAuthorizationService.js';
+import { isBotAuthorizationSession } from '../maker-ipc/botAuthorizationHost.js';
 /**
  * ghost.ts — cindy-tools ghost 总机的 host 侧接线(docs/dev-rules/plugin-security-and-authoring.md)。
  * ---------------------------------------------------------------------------
@@ -10,9 +20,9 @@
  *     装/卸/唤醒/沉睡对新老会话"下一次查询即生效";
  *   - callGhostTool:透传给管子派发器(pipeDispatcher),资格审/按需拉起/
  *     配对超时/崩溃收卷全在那边,错误码两侧同构直接原样交回;
- *   - forgeGuide / forgeScaffold / forgePack:意识锻造(agent 帮用户做意识)——
- *     手册、骨架与打包真身在 cindy-brain/forge.ts。缺省打包经双击转交
- *     通道弹装入确认框；publish intent 改签一次性发布票据。
+ *   - forgeGuide / forgeScaffold / forgePack / forgeInstall:意识锻造(agent 帮用户做意识)——
+ *     手册、骨架与打包真身在 cindy-brain/forge.ts；pack 始终只产出文件，只有显式
+ *     forgeInstall 才复用本地包事务安装/更新，publish intent 改签一次性发布票据。
  *
  * cindy-tools 是意识系统工具集,包内零 Electron
  * 依赖,全部能力经本文件注入(设计规范规则 2)。
@@ -24,6 +34,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { buildGhostRosterPrompt } from 'cindy-tools';
 import type {
+  CindyForgeInstallResult,
   CindyForgePackResult,
   CindyForgePublishResult,
   CindyForgePublishStatusResult,
@@ -31,10 +42,16 @@ import type {
   CindyGhostInfo,
   CindyGhostsMcpDeps,
 } from 'cindy-tools';
-import type { PermissionMode } from '@cindy/maker-core';
-import { getLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
+import { toolAutoReviewAction, type PermissionMode, type ReviewableAction, type AutoReviewDecision } from '@cindy/maker-core';
+import {
+  getLiziMcpSessionContext,
+  type LiziMcpSessionContext,
+  type SessionPathAuthorization,
+  type SessionPathAuthorizationRequest,
+} from '@cindy/mcps';
 
 import {
+  GRANT_AUTHORIZATION_CHANGED_MESSAGE,
   GrantPolicyError,
   grantAttachmentsToGhost,
   MAX_GRANT_ATTACHMENTS,
@@ -54,8 +71,12 @@ import {
 } from '../cindy-brain/ghostGrantConfirmBridge.js';
 import { classifyLocalAttachmentPath } from '../cindy-brain/ghostLocalPathGrant.js';
 import { toolNotFoundMessage } from '../cindy-brain/pipeDispatcher.js';
-import { getSessionFsSnapshot, getSessionTitle } from '../localDb/ipc/sessions.js';
-import { getActiveAppSession, isAppSessionBoundaryPending } from '../appSessionState.js';
+import { getSessionFsSnapshot } from '../localDb/ipc/sessions.js';
+import {
+  getActiveAppSession,
+  isAppSessionBoundaryPending,
+  type ActiveAppSession,
+} from '../appSessionState.js';
 import {
   deriveGhostSessionContext,
   type GhostSessionContextInjected,
@@ -72,6 +93,7 @@ import {
   ghostForgeForbiddenRootDirs,
   captureGhostMutationOwnerForMcp,
   acquireGhostMutationLeaseForMcp,
+  installOrUpdateLocalGhostPackageFromForge,
   isGhostAvailableForActiveSession,
 } from '../cindy-brain/index.js';
 import { writeForgeScaffoldWithStableParent } from '../cindy-brain/forgeScaffoldCapability.js';
@@ -83,7 +105,6 @@ import { FORGE_GUIDE, packGhostDir, scaffoldGhostDir } from '../cindy-brain/forg
 import {
   completeForgePackStaging,
   getForgePackStagingController,
-  invalidateForgePackTicket,
   releaseForgePackStaging,
 } from '../cindy-brain/forgePackStaging.js';
 import { consumeForgePackForPublish } from '../cindy-brain/forgePackPublishConsume.js';
@@ -93,41 +114,334 @@ import {
   startPluginPublish,
 } from '../plugin-publisher/host.js';
 import { workdirWriteVerdict } from '../cindy-brain/fsSlot.js';
-import { handleIncomingCindyFile } from '../cindy-brain/openFileInstall.js';
-import type { GhostInstallOrigin } from '../../shared/ghostInstallOrigin.js';
 import * as blobStore from '../cindy-media/blobStore.js';
 import { commitMessageMediaRefs } from '../cindy-media/chatAttachments.js';
 import { callCindyMedia } from '../cindy-media/invocationService.js';
+import type { MediaDownloadContext } from '../cindy-media/mediaDownload.js';
 import * as ledger from '../cindy-media/ledger.js';
 import { chatAttachmentOrigin } from '../cindy-media/attachmentGrantGate.js';
 import { resolveGhostAttachmentUrl } from './ghostAttachmentResolve.js';
 import { ghostSetupInteractionSessionId } from './ghostSetupInteractionSurface.js';
 import { createForgeIconConverter } from './forgeIconConversion.js';
 import { forkForgeIconConversionHost } from './forgeIconConversionHost.js';
+import {
+  readAllowedBuiltinPluginIds,
+} from './codexBuiltinToolPolicy.js';
 import { t } from '../i18n.js';
 import { createLogger } from '../logger.js';
+import { isIpcError } from '../../shared/ipc-errors.js';
 
 const log = createLogger('mcp/cindy');
 const MAX_FORGE_ICON_SOURCE_BYTES = 25 * 1024 * 1024;
-const GHOST_NO_TOOLS_MESSAGE =
-  '该插件未声明任何可供调用的工具;不要重试,改用其它方式完成。';
+const GHOST_NO_AGENT_SURFACE_MESSAGE =
+  '该插件未声明可供调用的工具或可供读取的手册;不要重试,改用其它方式完成。';
 
 const convertForgeIconToPng = createForgeIconConverter({
   fork: forkForgeIconConversionHost,
 });
 
+const CINDY_FORGE_GRANT_ID = 'cindy-forge';
+const CINDY_SESSION_FS_GRANT_ID = 'cindy-session-fs';
+
+/** realpath 对尚未创建的 scaffold 目标会失败,改走已存在的最深祖先。 */
+function classifyForgeSourceRelativeToWorkdir(
+  source: string,
+  workdir: string,
+): 'inside' | 'outside' | 'unknown' {
+  try {
+    const realWorkdir = fs.realpathSync.native(path.resolve(workdir));
+    let cursor = path.resolve(source);
+    const { root } = path.parse(cursor);
+    while (true) {
+      try {
+        const realSource = fs.realpathSync.native(cursor);
+        return isPathInsideDir(realWorkdir, realSource) ? 'inside' : 'outside';
+      } catch {
+        if (cursor === root) return 'unknown';
+        const parent = path.dirname(cursor);
+        if (parent === cursor) return 'unknown';
+        cursor = parent;
+      }
+    }
+  } catch {
+    return 'unknown';
+  }
+}
+
+function resolveCanonicalForgeDir(source: string): string {
+  let cursor = path.resolve(source);
+  const tail: string[] = [];
+  const { root } = path.parse(cursor);
+  while (true) {
+    try {
+      const real = fs.realpathSync.native(cursor);
+      return path.join(real, ...tail);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return path.resolve(source);
+      if (cursor === root) return path.resolve(source);
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return path.resolve(source);
+      tail.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+type ForgeOutsideAccess =
+  | { ok: true; allowOutsideWorkdir: false }
+  | {
+      ok: true;
+      allowOutsideWorkdir: true;
+      authorizedDir: string;
+      isCurrent?: () => boolean;
+    }
+  | { ok: false; errorCode: 'PERMISSION_DENIED'; message: string };
+
+function forgeOutsidePackFlags(access: Extract<ForgeOutsideAccess, { ok: true }>): {
+  allowOutsideWorkdir?: boolean;
+  authorizedDir?: string;
+  isCurrent?: () => boolean;
+} {
+  return access.allowOutsideWorkdir
+    ? {
+        allowOutsideWorkdir: true,
+        authorizedDir: access.authorizedDir,
+        ...(access.isCurrent ? { isCurrent: access.isCurrent } : {}),
+      }
+    : {};
+}
+
+function requireLiveSessionInstance(
+  sessionId: string | undefined,
+  sessionInstanceId: string | undefined,
+  getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'],
+): { ok: true; sessionId: string; sessionInstanceId: string } | { ok: false; message: string } {
+  if (!sessionId || !sessionInstanceId || !getLiveSessionGrantState) {
+    return {
+      ok: false,
+      message: '当前调用无法确认任务实例，不能读写工作目录外的路径。请在本机已打开的任务里重试。',
+    };
+  }
+  try {
+    if (!getLiveSessionGrantState(sessionId, sessionInstanceId)) {
+      return {
+        ok: false,
+        message: '当前任务实例已失效，不能读写工作目录外的路径。请用当前任务重试。',
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      message: '当前任务权限状态读不到，不能读写工作目录外的路径。请用当前任务重试。',
+    };
+  }
+  return { ok: true, sessionId, sessionInstanceId };
+}
+
+async function authorizeForgeOutsideWorkdir(params: {
+  dir: string;
+  sessionWorkdir: string;
+  sessionContext: LiziMcpSessionContext | undefined;
+  toolName: 'ghost_forge_scaffold' | 'ghost_forge_pack' | 'ghost_forge_install';
+  operation: 'read' | 'write';
+  getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
+}): Promise<ForgeOutsideAccess> {
+  const location = classifyForgeSourceRelativeToWorkdir(params.dir, params.sessionWorkdir);
+  if (location !== 'outside') return { ok: true, allowOutsideWorkdir: false };
+  const live = requireLiveSessionInstance(
+    params.sessionContext?.sessionId,
+    params.sessionContext?.sessionInstanceId,
+    params.getLiveSessionGrantState,
+  );
+  if (!live.ok) {
+    return { ok: false, errorCode: 'PERMISSION_DENIED', message: live.message };
+  }
+  const authorizedDir = resolveCanonicalForgeDir(params.dir);
+  let size = 0;
+  let isDirectory = true;
+  try {
+    const stat = fs.statSync(authorizedDir);
+    isDirectory = stat.isDirectory() || stat.isSymbolicLink();
+    size = stat.size;
+  } catch {
+    /* pack/scaffold still report DIR_NOT_FOUND */
+  }
+  const granted = await requestGrantConfirm({
+    ghostId: CINDY_FORGE_GRANT_ID,
+    sessionId: live.sessionId,
+    sessionInstanceId: live.sessionInstanceId,
+    lane: 'forge_source',
+    items: [{
+      name: path.basename(authorizedDir) || authorizedDir,
+      absPath: authorizedDir,
+      size,
+      isDirectory,
+    }],
+    toolName: params.toolName,
+    operation: params.operation,
+    getLiveSessionGrantState: params.getLiveSessionGrantState,
+  });
+  if (!granted.ok) {
+    return { ok: false, errorCode: 'PERMISSION_DENIED', message: granted.message };
+  }
+  if (!granted.isCurrent) {
+    return {
+      ok: false,
+      errorCode: 'PERMISSION_DENIED',
+      message: '当前任务实例已失效，不能读写工作目录外的路径。请用当前任务重试。',
+    };
+  }
+  if (granted.isCurrent() === false) {
+    return { ok: false, errorCode: 'PERMISSION_DENIED', message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
+  }
+  return {
+    ok: true,
+    allowOutsideWorkdir: true,
+    authorizedDir,
+    isCurrent: granted.isCurrent,
+  };
+}
+
+function assertForgeGrantCurrent(access: Extract<ForgeOutsideAccess, { ok: true }>): ForgeOutsideAccess {
+  if (access.allowOutsideWorkdir && access.isCurrent?.() !== true) {
+    return { ok: false, errorCode: 'PERMISSION_DENIED', message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
+  }
+  return access;
+}
+
+function denyOutsideSessionPath(reason: string): SessionPathAuthorization {
+  return { allowed: false, reason };
+}
+
+export async function authorizeDesktopSessionPath(
+  request: SessionPathAuthorizationRequest,
+  getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'],
+): Promise<SessionPathAuthorization> {
+  if (request.remoteHostId) {
+    return {
+      allowed: false,
+      reason: '远程会话不能授权控制端本机路径。请改用当前任务工作目录内的路径，或在本机会话中重试。',
+    };
+  }
+  const live = requireLiveSessionInstance(request.sessionId, request.sessionInstanceId, getLiveSessionGrantState);
+  if (!live.ok) return denyOutsideSessionPath(live.message);
+  let size = 0;
+  let isDirectory = false;
+  try {
+    const stat = fs.statSync(request.path);
+    isDirectory = stat.isDirectory();
+    size = stat.size;
+  } catch {
+    /* write targets may not exist yet */
+  }
+  const granted = await requestGrantConfirm({
+    ghostId: CINDY_SESSION_FS_GRANT_ID,
+    sessionId: live.sessionId,
+    sessionInstanceId: live.sessionInstanceId,
+    lane: 'outside_workdir',
+    items: [{
+      name: path.basename(request.path) || request.path,
+      absPath: request.path,
+      size,
+      isDirectory,
+    }],
+    toolName: request.toolName,
+    operation: request.operation,
+    getLiveSessionGrantState,
+  });
+  if (!granted.ok) return denyOutsideSessionPath(granted.message);
+  if (!granted.isCurrent) {
+    return denyOutsideSessionPath('当前任务实例已失效，不能读写工作目录外的路径。请用当前任务重试。');
+  }
+  if (granted.isCurrent() === false) {
+    return { allowed: false, reason: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
+  }
+  return { allowed: true, isCurrent: granted.isCurrent };
+}
+
+/** pack 与显式 install 共用同一套可选 AI 图标叠加，避免二次打包丢失图标。 */
+async function packForgeSource(
+  dir: string,
+  sessionWorkdir: string,
+  iconSource?: string,
+  packFlags: {
+    allowOutsideWorkdir?: boolean;
+    authorizedDir?: string;
+    isCurrent?: () => boolean;
+  } = {},
+) {
+  let iconPng: Buffer | undefined;
+  let iconNote = '';
+  if (iconSource !== undefined) {
+    try {
+      const resolved = blobStore.resolveSafe(iconSource);
+      if (!resolved.mimeType.startsWith('image/')) {
+        throw new Error('icon_source 不是图片');
+      }
+      const stat = await fs.promises.stat(resolved.absPath);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_FORGE_ICON_SOURCE_BYTES) {
+        throw new Error(`icon_source 体积必须在 1–${MAX_FORGE_ICON_SOURCE_BYTES} 字节之间`);
+      }
+      iconPng = await convertForgeIconToPng(resolved.absPath);
+      iconNote = 'AI 图标已嵌入安装包。';
+    } catch (err) {
+      iconNote = 'AI 图标处理失败，已保留默认图标。';
+      log.warn('ghost forge icon fallback', {
+        dir,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (packFlags.allowOutsideWorkdir && packFlags.authorizedDir && packFlags.isCurrent?.() !== true) {
+    return {
+      ok: false as const,
+      result: { ok: false as const, errorCode: 'PERMISSION_DENIED' as const, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE },
+    };
+  }
+  const packOptions = {
+    sessionWorkdir,
+    forbiddenRootDirs: ghostForgeForbiddenRootDirs(),
+    ...(packFlags.allowOutsideWorkdir
+      ? {
+          allowOutsideWorkdir: true,
+          authorizedDir: packFlags.authorizedDir,
+          ...(packFlags.isCurrent ? { isCurrent: packFlags.isCurrent } : {}),
+        }
+      : {}),
+  };
+  let packed = await packGhostDir(dir, iconPng ? { ...packOptions, iconPng } : packOptions);
+  // icon overlay 的任何失败都不是打包门槛：用原源码再打一次。若原源码
+  // 本身也不合法，则返回原本就会出现的结构化错误。
+  if (!packed.ok && iconPng) {
+    const fallbackPacked = await packGhostDir(dir, packOptions);
+    if (fallbackPacked.ok) {
+      packed = fallbackPacked;
+      iconNote = 'AI 图标处理失败，已保留默认图标。';
+    } else {
+      return { ok: false as const, result: fallbackPacked };
+    }
+  }
+  if (!packed.ok) return { ok: false as const, result: packed };
+  return { ok: true as const, packed, iconNote };
+}
+
 /* ────────────────────────────────────────────────────────────────────────
- * workdir 外过户确认:
- *   - 过户对象在会话 workdir 内 → 自动放行(与目录过户同信任等级);
+ * workdir 外过户 / Forge 源码确认:
+ *   - 对象在会话 workdir 内 → 自动放行;
  *   - 本地活跃会话当前为 Full Access(bypassPermissions) → Host 自动放行;
- *   - 其余 workdir 外场景(含无会话/远程会话)→ 弹确认卡,用户点允许才继续。
- * Full Access 只替代本处文件/目录交接确认,不扩大插件 manifest slot、网络、
- * 凭证、Setup、安装/更新等其它授权边界。
+ *   - Auto → 当前会话统一审阅器(allow 继续 / block 返回原因 / ask 才弹卡);
+ *   - 其余(Ask、无会话、远程、查询失败)→ 弹确认卡,用户点允许才继续。
+ * 禁止在 Host 已按当前档位放行后再因目录边界悄悄硬断。
+ * Full Access 只替代本处确认,不扩大插件 manifest slot、网络、
+ * 凭证、Setup、安装/更新等其它授权边界。Forge 受管根仍硬拒。
  * ──────────────────────────────────────────────────────────────────────── */
 
 export interface GhostGrantLiveSessionState {
   permissionMode: PermissionMode | null;
   remoteHostId: string | null;
+  /** Includes the captured permission/Plan generations and forbids active or unknown Plan. */
+  isCurrent?: () => boolean;
+  reviewAction?: (action: ReviewableAction) => Promise<AutoReviewDecision>;
 }
 
 /**
@@ -140,6 +454,10 @@ export interface ToolResultImageDescription {
 }
 
 export interface CindyGhostsHostDeps {
+  pluginMarket?: Pick<PluginMarketService, 'snapshot' | 'detail' | 'install'>;
+  createMediaDownloadContext?: (sessionId: string, sessionInstanceId: string) => MediaDownloadContext | undefined;
+  /** 当前 Desktop 版本；Forge scaffold 用它生成具体插件包的默认最低版本。 */
+  getAppVersion?: () => string;
   /**
    * 现读活跃 Maker Session 的运行时状态。不得回退 DB:权限热切换先作用于
    * runtime、后持久化,DB 在合法窗口内会滞后;缺失/异常必须 fail closed。
@@ -148,6 +466,12 @@ export interface CindyGhostsHostDeps {
     sessionId: string,
     sessionInstanceId: string,
   ) => GhostGrantLiveSessionState | null;
+  /**
+   * 向当前任务投一张宿主权限确认卡(桌面对话、手机远控与 IM 渠道卡通用)，等用户
+   * 允许或拒绝。由 Host 主动发起，不经 Agent 自身审批回调，Full Access 也会弹。
+   * 会话不存在或实例不匹配返回 null。
+   */
+  requestHostPermission?: HostPermissionRequester;
   /**
    * 把工具结果里的图片（cindy-media:// 地址）转成文字描述（视觉桥，最佳努力）。
    * host 侧注入；内部判定视觉桥是否启用、当前 session 模型是否命中、blob 是否可读。
@@ -173,7 +497,7 @@ export interface CindyGhostsHostDeps {
   onToolResultImagesFailed?: (sessionId: string, attemptedCount: number) => void;
 }
 
-type GhostGrantApprovalSource = 'user' | 'full-access';
+type GhostGrantApprovalSource = 'user' | 'full-access' | 'auto-review';
 
 /** 确认卡内嵌图片预览的文件体积上限(只是预览阈值,不是过户限制——超阈值
  *  照样可过户,卡片上退化为文件名 + 路径 + 大小)。 */
@@ -247,8 +571,8 @@ async function buildGhostSessionContext(
 /* ────────────────────────────────────────────────────────────────────────
  * Forge C-4 门:Forge 做的是**本机文件写**,裸 MCP workingDir 只是标签,不能
  * 直接交给 fs。权威 session 行决定它是否本机、是否当前可写(远程/只读/plan 一律
- * fail closed)。owner lease 在首个 await 前捕获、持到 scaffold/pack + 装入确认
- * 转交结束,账号 teardown 会等它释放。
+ * fail closed)。owner lease 在 scaffold/pack 的首个 await 前捕获并持到打包结束；
+ * 装入确认在租约外求得，落位再取租约，账号 teardown 不会被确认卡拖住。
  * ──────────────────────────────────────────────────────────────────────── */
 
 type ForgeSessionFsGate =
@@ -259,11 +583,13 @@ type ForgeSessionFsGate =
       message: string;
     };
 
-async function withForgeOwnerLease<T>(operation: () => Promise<T>): Promise<T> {
+async function withForgeOwnerLease<T>(
+  operation: (owner: ActiveAppSession) => Promise<T>,
+): Promise<T> {
   const owner = captureGhostMutationOwnerForMcp();
   const release = acquireGhostMutationLeaseForMcp(owner);
   try {
-    return await operation();
+    return await operation(owner);
   } finally {
     release();
   }
@@ -300,6 +626,8 @@ async function getForgeSessionFsGate(
 
 /** 意识显示名(确认卡标题用;查不到回落 id)。 */
 function ghostDisplayName(ghostId: string): string {
+  if (ghostId === CINDY_FORGE_GRANT_ID) return 'Forge';
+  if (ghostId === CINDY_SESSION_FS_GRANT_ID) return 'Cindy';
   const g = getGhostManager()
     .list()
     .find((x) => x.manifest.id === ghostId);
@@ -326,14 +654,21 @@ async function requestGrantConfirm(params: {
   sessionInstanceId: string | null;
   lane: GhostGrantLane;
   items: GhostGrantFileItem[];
+  toolName?: string;
+  operation?: 'read' | 'write';
   getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
 }): Promise<
-  | { ok: true; approvalSource: GhostGrantApprovalSource; allowDirs?: boolean }
+  | { ok: true; approvalSource: GhostGrantApprovalSource; allowDirs?: boolean; isCurrent?: () => boolean }
   | { ok: false; message: string }
 > {
+  let isCurrent: (() => boolean) | undefined;
+  const expired = () => isCurrent?.() === false;
+  const denied = { ok: false as const, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
   if (params.sessionId && params.sessionInstanceId && params.getLiveSessionGrantState) {
     try {
       const live = params.getLiveSessionGrantState(params.sessionId, params.sessionInstanceId);
+      isCurrent = live?.isCurrent;
+      if (expired()) return denied;
       // 远程会话的 workingDir 是另一台机器上的路径。即使档位为 Full Access,
       // 也不能据此静默读取本机同名/任意路径;保留原确认边界。
       if (live?.permissionMode === 'bypassPermissions' && !live.remoteHostId) {
@@ -343,7 +678,22 @@ async function requestGrantConfirm(params: {
           count: params.items.length,
           grantSource: 'full-access',
         });
-        return { ok: true, approvalSource: 'full-access' };
+        return { ok: true, approvalSource: 'full-access', isCurrent };
+      }
+      if (live?.permissionMode === 'auto' && live.reviewAction) {
+        const decision = await live.reviewAction(toolAutoReviewAction('plugin_file_handoff', {
+          ghostId: params.ghostId,
+          lane: params.lane,
+          ...(params.toolName ? { sourceTool: params.toolName } : {}),
+          ...(params.operation ? { operation: params.operation } : {}),
+          files: params.items.map(({ absPath, size, mimeType, isDirectory }) => ({ absPath, size, mimeType, isDirectory })),
+        }, live.remoteHostId ? 'These are files on the controller, NOT the remote task filesystem.' : undefined));
+        if (expired()) return denied;
+        if (decision.verdict === 'allow') {
+          log.info('ghost grant: AI approved outside-workdir handoff', { ghostId: params.ghostId, lane: params.lane, grantSource: 'auto-review' });
+          return { ok: true, approvalSource: 'auto-review', isCurrent };
+        }
+        if (decision.verdict === 'block') return { ok: false, message: decision.reason ?? 'Automatic review denied this file handoff.' };
       }
     } catch (error) {
       // 自动扩权查询必须 fail closed:运行时状态读不到就继续走原确认路径,
@@ -355,6 +705,7 @@ async function requestGrantConfirm(params: {
       });
     }
   }
+  if (expired()) return denied;
   const bridge = getGhostGrantConfirmBridge();
   if (!bridge) {
     return {
@@ -375,16 +726,113 @@ async function requestGrantConfirm(params: {
     ghostName: ghostDisplayName(params.ghostId),
     lane: params.lane,
     items: params.items,
+    ...(params.toolName ? { sourceTool: params.toolName } : {}),
+    ...(params.operation ? { operation: params.operation } : {}),
   });
+  if (expired()) return denied;
   if (decision.confirmed) {
-    return { ok: true, approvalSource: 'user', allowDirs: decision.allowDirs };
+    return { ok: true, approvalSource: 'user', allowDirs: decision.allowDirs, isCurrent };
   }
   return {
     ok: false,
     message:
       decision.reason === 'timeout'
         ? '过户确认超时:用户未在时限内响应,本次调用已取消;如仍需要,请提醒用户后重试'
-        : '用户拒绝了本次过户请求,不要重试;如确有需要请先与用户沟通',
+        : decision.reason === 'session_closed' || decision.reason === 'session_aborted'
+          ? `Cindy 已取消本次过户请求（${decision.reason}），并非用户手动拒绝。`
+          : '用户拒绝了本次过户请求,不要重试;如确有需要请先与用户沟通',
+  };
+}
+
+/**
+ * 媒体仓路径揭示沿用当前会话权限；远端权限不能授权控制端的本机路径。
+ */
+async function requestMediaPathRevealConfirm(params: {
+  sessionId: string | null;
+  sessionInstanceId: string | null;
+  getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
+  absPath: string;
+  mimeType: string;
+}): Promise<{ ok: true; isCurrent?: () => boolean } | { ok: false; errorCode: string; message: string }> {
+  let isCurrent: (() => boolean) | undefined;
+  const expired = () => isCurrent?.() === false;
+  const denied = { ok: false as const, errorCode: 'LOCAL_PATH_REVEAL_DENIED',
+    message: 'Task or Plan permissions changed; retry with the current scope.' };
+  if (!params.sessionId) {
+    return {
+      ok: false,
+      errorCode: 'LOCAL_PATH_REVEAL_CONFIRM_UNAVAILABLE',
+      message: '当前调用没有会话语境，无法让用户确认是否把本机路径返回给 Agent',
+    };
+  }
+  if (params.sessionInstanceId && params.getLiveSessionGrantState) {
+    try {
+      const live = params.getLiveSessionGrantState(params.sessionId, params.sessionInstanceId);
+      isCurrent = live?.isCurrent;
+      if (expired()) return denied;
+      if (live?.permissionMode === 'bypassPermissions' && !live.remoteHostId) {
+        return { ok: true, isCurrent };
+      }
+      if (live?.permissionMode === 'auto' && live.reviewAction) {
+        const decision = await live.reviewAction(toolAutoReviewAction('cindy_media.resolve_local_path', {
+          path: params.absPath, mimeType: params.mimeType,
+        }, 'Return the controller local path of this managed media to the agent.'));
+        if (expired()) return denied;
+        if (decision.verdict === 'allow') return { ok: true, isCurrent };
+        if (decision.verdict === 'block') return {
+          ok: false, errorCode: 'LOCAL_PATH_REVEAL_DENIED', message: decision.reason ?? 'Automatic review denied revealing this path.',
+        };
+      }
+    } catch {
+      // Same failure boundary as file handoffs: a live-state/reviewer exception
+      // must reach the existing confirmation path, never disclose the path.
+    }
+  }
+  if (expired()) return denied;
+  const bridge = getGhostGrantConfirmBridge();
+  if (!bridge) {
+    return {
+      ok: false,
+      errorCode: 'LOCAL_PATH_REVEAL_CONFIRM_UNAVAILABLE',
+      message: '本机路径确认通道未就绪，请稍后重试',
+    };
+  }
+  let size: number;
+  try {
+    const stat = fs.statSync(params.absPath);
+    if (!stat.isFile()) throw new Error('not a file');
+    size = stat.size;
+  } catch {
+    return {
+      ok: false,
+      errorCode: 'MEDIA_FILE_NOT_FOUND',
+      message: '该受管媒体文件在确认前已不存在',
+    };
+  }
+  const decision = await bridge.request(params.sessionId, {
+    ghostId: 'cindy-media',
+    ghostName: 'Cindy Media',
+    lane: 'reveal_path',
+    items: [
+      {
+        name: path.basename(params.absPath),
+        absPath: params.absPath,
+        size,
+        mimeType: params.mimeType,
+      },
+    ],
+  });
+  if (expired()) return denied;
+  if (decision.confirmed) return { ok: true, isCurrent };
+  return {
+    ok: false,
+    errorCode: 'LOCAL_PATH_REVEAL_DENIED',
+    message:
+      decision.reason === 'timeout'
+        ? '本机路径确认超时，本次调用已取消；如仍需要，请提醒用户后重试'
+        : decision.reason === 'session_closed' || decision.reason === 'session_aborted'
+          ? `Cindy 已取消本机路径确认（${decision.reason}），并非用户手动拒绝。`
+          : '用户未允许把本机路径返回给 Agent，不要重试',
   };
 }
 
@@ -404,9 +852,10 @@ async function prepareLocalPathAttachments(params: {
   /** 项数上限(普通调用 MAX_GRANT_ATTACHMENTS;grant_only 批量预授权放宽)。 */
   maxCount: number;
 }): Promise<
-  { ok: true; resolved: Map<string, ResolvedGrantSource> } | { ok: false; message: string }
+  { ok: true; resolved: Map<string, ResolvedGrantSource>; isCurrent?: () => boolean } | { ok: false; message: string }
 > {
   const resolved = new Map<string, ResolvedGrantSource>();
+  let isCurrent: (() => boolean) | undefined;
   // 超项数上限时不弹确认,直接交给 grant 流程报标准错(别让用户白点一次)。
   if (params.urls.length > params.maxCount) return { ok: true, resolved };
   const outside: Array<{
@@ -532,6 +981,8 @@ async function prepareLocalPathAttachments(params: {
         getLiveSessionGrantState: params.getLiveSessionGrantState,
       });
       if (!confirm.ok) return confirm;
+      isCurrent = confirm.isCurrent;
+      if (isCurrent?.() === false) return { ok: false, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
       for (const o of needConfirm) {
         // 人工确认记 user;Full Access 自动交接记 tool,不能伪装成用户点击。
         // 两者都带 T1 字节落仓——确认/授权判定时读到的字节就是实际过户
@@ -566,7 +1017,7 @@ async function prepareLocalPathAttachments(params: {
       }
     }
   }
-  return { ok: true, resolved };
+  return { ok: true, resolved, isCurrent };
 }
 
 /**
@@ -584,8 +1035,8 @@ async function confirmDepositOutsideWorkdir(params: {
   workdirAbs: string | null;
   getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
 }): Promise<
-  | { ok: true; userGranted: false }
-  | { ok: true; userGranted: true; approvedRealPath: string }
+  | { ok: true; userGranted: false; isCurrent?: () => boolean }
+  | { ok: true; userGranted: true; approvedRealPath: string; isCurrent?: () => boolean }
   | { ok: false; message: string }
 > {
   if (!path.isAbsolute(params.dirAbs)) return { ok: true, userGranted: false };
@@ -639,6 +1090,7 @@ async function confirmDepositOutsideWorkdir(params: {
     getLiveSessionGrantState: params.getLiveSessionGrantState,
   });
   if (!confirm.ok) return confirm;
+  if (confirm.isCurrent?.() === false) return { ok: false, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
   // Full Access 是每次在实时档位上自动裁决,不伪造「用户确认过」的目录
   // 记忆。这样热切回 ask/auto 后,同一路径的新过户会立刻恢复询问。
   if (confirm.approvalSource === 'user' && params.sessionId) {
@@ -651,7 +1103,7 @@ async function confirmDepositOutsideWorkdir(params: {
       grantSource: 'user-confirmation',
     });
   }
-  return { ok: true, userGranted: true, approvedRealPath: real };
+  return { ok: true, userGranted: true, approvedRealPath: real, isCurrent: confirm.isCurrent };
 }
 
 type ManagedToolGrantCandidate = {
@@ -676,7 +1128,7 @@ async function prepareManagedToolGrantSources(params: {
   sessionInstanceId: string | null;
   getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
 }): Promise<
-  { ok: true; resolved: Map<string, ResolvedGrantSource> } | { ok: false; message: string }
+  { ok: true; resolved: Map<string, ResolvedGrantSource>; isCurrent?: () => boolean } | { ok: false; message: string }
 > {
   // Preserve attachmentGrant's standard count error and, importantly, do not
   // read or confirm an over-limit batch before that error is produced.
@@ -794,6 +1246,7 @@ async function prepareManagedToolGrantSources(params: {
     getLiveSessionGrantState: params.getLiveSessionGrantState,
   });
   if (!confirm.ok) return confirm;
+  if (confirm.isCurrent?.() === false) return { ok: false, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
 
   const originKind = confirm.approvalSource === 'user' ? 'user' : 'tool';
   const resolved = new Map<string, ResolvedGrantSource>();
@@ -806,7 +1259,7 @@ async function prepareManagedToolGrantSources(params: {
     };
     for (const url of candidate.urls) resolved.set(url, source);
   }
-  return { ok: true, resolved };
+  return { ok: true, resolved, isCurrent: confirm.isCurrent };
 }
 
 /**
@@ -823,7 +1276,7 @@ async function grantAttachmentUrls(params: {
   sessionInstanceId: string | null;
   getLiveSessionGrantState?: CindyGhostsHostDeps['getLiveSessionGrantState'];
   maxCount: number;
-}): Promise<{ ok: true; hashes: string[] } | { ok: false; message: string }> {
+}): Promise<{ ok: true; hashes: string[]; isCurrent: () => boolean } | { ok: false; message: string }> {
   const { ghostId } = params;
   const localGrant = await prepareLocalPathAttachments({
     urls: params.urls,
@@ -835,6 +1288,7 @@ async function grantAttachmentUrls(params: {
     maxCount: params.maxCount,
   });
   if (!localGrant.ok) return localGrant;
+  if (localGrant.isCurrent?.() === false) return { ok: false, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
   const managedToolGrant = await prepareManagedToolGrantSources({
     urls: params.urls,
     ghostId,
@@ -845,8 +1299,11 @@ async function grantAttachmentUrls(params: {
     getLiveSessionGrantState: params.getLiveSessionGrantState,
   });
   if (!managedToolGrant.ok) return managedToolGrant;
-  return grantAttachmentsToGhost(
+  // 保留两次预处理捕获的授权，不能用后取的快照替换先前代次。
+  const isCurrent = () => localGrant.isCurrent?.() !== false && managedToolGrant.isCurrent?.() !== false;
+  const result = await grantAttachmentsToGhost(
     {
+      isCurrent,
       // 宽容解析:模型可能只有本地路径、缩图副本路径、或把 xdt-image
       // 地址的会话段拼丢(多个会话实测都踩过)——统一归一化。
       // 总仓 blob 形态(聊天附件或当前 Agent 工具结果的受管地址)额外过
@@ -902,16 +1359,24 @@ async function grantAttachmentUrls(params: {
           refId: p.refId,
           originKind: p.originKind,
         });
+        if (!isCurrent()) throw new GrantPolicyError(GRANT_AUTHORIZATION_CHANGED_MESSAGE);
         return exists ? '' : ledger.addRef(p);
       },
       log,
     },
     { ghostId, urls: params.urls, maxCount: params.maxCount },
   );
+  if (!isCurrent()) return { ok: false, message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
+  return result.ok ? { ...result, isCurrent } : result;
 }
 
 function ghostHasTools(ghost: InstalledGhost): boolean {
   return (ghost.manifest.tools?.length ?? 0) > 0;
+}
+
+/** Manual discovery is independent of plugin tools, including Host-backed capabilities. */
+function ghostHasManual(ghost: InstalledGhost): boolean {
+  return (ghost.manifest.manual?.items.length ?? 0) > 0;
 }
 
 /** 工具结果图片描述:视觉桥描述并发上限(worker 审核强制项,不串行等待 N×30s)。 */
@@ -1112,7 +1577,9 @@ export function collectCindyMediaUrls(
   }
 }
 
-function visibleChipGhosts(workdir: string | null): InstalledGhost[] {
+function visibleChipGhosts(
+  workdir: string | null,
+): InstalledGhost[] {
   return getGhostManager()
     .list()
     .filter(
@@ -1120,7 +1587,7 @@ function visibleChipGhosts(workdir: string | null): InstalledGhost[] {
         ghost.enabled &&
         isGhostAvailableForActiveSession(ghost.manifest.id) &&
         ghost.manifest.kind === 'chip' &&
-        ghostHasTools(ghost) &&
+        (ghostHasTools(ghost) || ghostHasManual(ghost)) &&
         !isGhostDisabledForWorkdir(ghost.manifest.id, workdir),
     );
 }
@@ -1200,11 +1667,139 @@ export function getCindyGhostsMcpDeps(
 ): CindyGhostsMcpDeps {
   const resolveSessionContext = (): LiziMcpSessionContext | undefined =>
     getLiziMcpSessionContext() ?? sessionCtx;
+  const installConsentPrompt = (): GhostInstallConsentPrompt => {
+    const context = resolveSessionContext();
+    return createTaskInstallConsentPrompt(
+      context?.sessionId && context.sessionInstanceId
+        ? { sessionId: context.sessionId, sessionInstanceId: context.sessionInstanceId }
+        : null,
+      hostDeps.requestHostPermission,
+    );
+  };
+  const marketTools = hostDeps.pluginMarket && createPluginMarketAgentTools({
+    market: hostDeps.pluginMarket,
+    installedState: (ghostId) => {
+      const visibility = classifyGhostVisibility(ghostId, resolveSessionContext()?.workingDir ?? null, ghostVisibilityDeps);
+      return {
+        exists: getGhostManager().list().some(ghost => ghost.manifest.id === ghostId),
+        errorCode: visibility.ok ? null : visibility.errorCode,
+      };
+    },
+    captureRead: () => {
+      const owner = getActiveAppSession();
+      const assertCurrent = () => {
+        const current = getActiveAppSession();
+        if (isAppSessionBoundaryPending() || owner.generation !== current.generation ||
+            owner.mode !== current.mode || owner.dataOwnerId !== current.dataOwnerId) {
+          throwIpcError('PRECONDITION_FAILED', 'The active account changed during plugin discovery');
+        }
+      };
+      assertCurrent();
+      return assertCurrent;
+    },
+    captureInstall: (signal) => {
+      const context = resolveSessionContext();
+      const live = context?.sessionId && context.sessionInstanceId
+        ? hostDeps.getLiveSessionGrantState?.(context.sessionId, context.sessionInstanceId)
+        : null;
+      const assertCurrent = () => {
+        if (signal?.aborted || !live?.permissionMode || live.isCurrent?.() !== true ||
+            workdirWriteVerdict(live.permissionMode, false) === 'deny') {
+          throwIpcError('PERMISSION_DENIED', 'Plugin install requires a current writable task outside Plan mode');
+        }
+      };
+      assertCurrent();
+      // 确认卡可能等几分钟，不能占用 owner mutation lease；切号只要等十秒。
+      // 捕获当前 owner 只为边界期 fail closed。落位由市场装入出口自行取租约。
+      captureGhostMutationOwnerForMcp();
+      return { assertCurrent, release: () => undefined, consentPrompt: installConsentPrompt() };
+    },
+  });
   return {
+    ...(marketTools ? {
+      searchMarket: (query: string) => marketTools.search(query),
+      installMarket: (request: { pluginId: string; releaseId: string }, signal?: AbortSignal) => marketTools.install(request, signal),
+    } : {}),
+    connectAccount: async (target, signal) => {
+      const context = resolveSessionContext();
+      const sessionId = ghostSetupInteractionSessionId(context);
+      if (!sessionId) return { ok: false, errorCode: 'NO_SESSION_CONTEXT' };
+      if (signal?.aborted) return { ok: false, errorCode: 'SETUP_CANCELLED' };
+      // The persistent teammate service retains its own session/policy checks.
+      // Ordinary tasks use the same setup gate as ghost_call, without dispatching
+      // a business tool or granting files merely to obtain a connection card.
+      if (target.kind === 'host' || await isBotAuthorizationSession(sessionId)) {
+        if (signal?.aborted) return { ok: false, errorCode: 'SETUP_CANCELLED' };
+        const service = getBotAuthorizationService();
+        if (!service) return { ok: false, errorCode: 'HOST_NOT_READY' };
+        return service.request(sessionId, target);
+      }
+      const workingDir = context?.workingDir ?? null;
+      const visible = classifyGhostVisibility(target.id, workingDir, ghostVisibilityDeps);
+      if (!visible.ok) return visible;
+      const assessment = getGhostSetupAssessment(target.id);
+      if (assessment.state === 'ready' && assessment.groups.length === 0) {
+        // gh-cli and other Host-derived sources deliberately have no synchronous
+        // setup requirement. An empty assessment is not proof of platform login.
+        return {
+          ok: false,
+          errorCode: 'PLUGIN_CONNECTION_METHOD_REQUIRED',
+          ghostId: target.id,
+          settingsAvailable: Boolean(visible.ghost.manifest.settingsHtml),
+          message: 'This plugin has no Host setup action. Use its existing plugin settings or documented login tool on the machine running this task. Do not request or copy tokens in chat; setup readiness does not verify platform access.',
+        };
+      }
+      const coordinator = getGhostSetupCoordinator();
+      if (!coordinator) return { ok: false, errorCode: 'HOST_NOT_READY' };
+      const result = await coordinator.ensureReady({
+        sessionId, ghostId: target.id, workingDir, signal,
+        ...(target.reauthorize ? { reauthorize: true } : {}),
+      });
+      if (!result.ok) return result;
+      if (signal?.aborted) return { ok: false, errorCode: 'SETUP_CANCELLED' };
+      const current = classifyGhostVisibility(target.id, workingDir, ghostVisibilityDeps);
+      if (!current.ok) return current;
+      const final = getGhostSetupAssessment(target.id);
+      if (final.state !== 'ready') return { ok: false, errorCode: 'SETUP_REQUIRED' };
+      return { ok: true, status: 'ready', ghostId: target.id,
+        message: 'Host setup is ready. No plugin business operation was executed. Platform permissions are verified only by the requested operation.' };
+    },
     callMedia: async (request) => {
-      const result = await callCindyMedia(request);
-      const sessionId = resolveSessionContext()?.sessionId;
-      if (result.ok !== false && sessionId) {
+      const sessionContext = resolveSessionContext();
+      const sessionId = sessionContext?.sessionId;
+      const downloadContext = (request.action === 'request' || request.action === 'poll') && sessionId && sessionContext?.sessionInstanceId
+        ? hostDeps.createMediaDownloadContext?.(sessionId, sessionContext.sessionInstanceId)
+        : undefined;
+      let result: Record<string, unknown>;
+      try {
+        result = await callCindyMedia(request, downloadContext);
+      } finally {
+        downloadContext?.dispose?.();
+      }
+      if (request.action === 'resolve_local_path' && result.ok !== false) {
+        const localPath = typeof result.local_path === 'string' ? result.local_path : '';
+        const mimeType = typeof result.mime_type === 'string' ? result.mime_type : '';
+        if (!localPath || !mimeType) {
+          return {
+            ok: false,
+            errorCode: 'INTERNAL',
+            message: '媒体路径解析结果缺少必要字段',
+          };
+        }
+        const confirmed = await requestMediaPathRevealConfirm({
+          sessionId: sessionId ?? null,
+          sessionInstanceId: resolveSessionContext()?.sessionInstanceId ?? null,
+          getLiveSessionGrantState: hostDeps.getLiveSessionGrantState,
+          absPath: localPath,
+          mimeType,
+        });
+        if (!confirmed.ok) return confirmed;
+        if (confirmed.isCurrent?.() === false) return {
+          ok: false, errorCode: 'LOCAL_PATH_REVEAL_DENIED',
+          message: 'Task or Plan permissions changed; retry with the current scope.',
+        };
+      }
+      if (request.action !== 'resolve_local_path' && result.ok !== false && sessionId) {
         // Core 结果返回给当前 Agent 前先同步挂到本会话。后续消息落库钩子仍会
         // 幂等补账，但不能依赖那个异步时序：Agent 可能紧接着通过
         // ghost_call.attachments 把结果交给插件。
@@ -1235,9 +1830,14 @@ export function getCindyGhostsMcpDeps(
     // 兜底;若没有解析到 workingDir(包括 Codex/Pi bridge 建线期空值),花名册
     // 宁缺勿全,不注入工具描述;Codex 正常 startSession 的 developerInstructions
     // 会在拿到真实 workdir 后单独装配 system 段。
+    //
+    // 伙伴冻结 Toolset 只清空本花名册快照（不把全量插件写进工具描述）；
+    // ghost_list / ghost_info / ghost_call 仍按实时可见性发现已装插件，
+    // 内置工具冻结名单不套到插件 ID；授权卡同样由 Host 按实时插件可见性守门。
     getRosterItems() {
-      const workdir = resolveSessionContext()?.workingDir;
-      if (!workdir) return [];
+      const context = resolveSessionContext();
+      const workdir = context?.workingDir;
+      if (!workdir || readAllowedBuiltinPluginIds(context?.vendorOptions)) return [];
       return visibleChipGhosts(workdir)
         .map((g) => {
           const recall = ghostRecall(g);
@@ -1252,7 +1852,8 @@ export function getCindyGhostsMcpDeps(
     async listAwakeGhosts(): Promise<CindyGhostInfo[]> {
       // 现查同样按会话 workdir 滤掉目录级禁用的意识(ALS 恢复的真实语境
       // 优先)——模型主动 ghost_list 也看不到被禁用的条目,清单层面干净。
-      const workdir = resolveSessionContext()?.workingDir ?? null;
+      const context = resolveSessionContext();
+      const workdir = context?.workingDir ?? null;
       return visibleChipGhosts(workdir)
         .map(toCindyGhostInfo);
     },
@@ -1269,7 +1870,7 @@ export function getCindyGhostsMcpDeps(
       return {
         ok: false,
         errorCode: 'GHOST_NOT_FOUND',
-        message: GHOST_NO_TOOLS_MESSAGE,
+        message: GHOST_NO_AGENT_SURFACE_MESSAGE,
       };
     },
     async readGhostManual({ ghostId, path: manualPath }) {
@@ -1284,13 +1885,13 @@ export function getCindyGhostsMcpDeps(
           message: visibility.message,
         };
       }
-      if (!ghostHasTools(visibility.ghost)) {
+      if (!ghostHasManual(visibility.ghost)) {
         return {
           ok: false,
           manual: [],
           content: '',
           errorCode: 'GHOST_NOT_FOUND',
-          message: GHOST_NO_TOOLS_MESSAGE,
+          message: '该插件未声明可供读取的手册;不要重试,改用其它方式完成。',
         };
       }
       return readInstalledGhostManual(visibility.ghost, manualPath);
@@ -1305,6 +1906,7 @@ export function getCindyGhostsMcpDeps(
       agentToolUseId,
       grantOnly,
       setupPlan,
+      signal,
     }) {
       const sessionContext = resolveSessionContext();
       const sessionIdForConfirm = sessionContext?.sessionId ?? null;
@@ -1322,6 +1924,11 @@ export function getCindyGhostsMcpDeps(
       // args.attachments 交给意识。任何一张失败整批拒(ATTACHMENT_INVALID),
       // 不做半成品授权。全链路见 grantAttachmentUrls。
       let mergedArgs = args;
+      // 文件交接的原授权要贯穿后续目录审批、上下文查询和最终派发。
+      const handoffChecks: Array<() => boolean> = [];
+      const handoffExpired = () => handoffChecks.some((isCurrent) => !isCurrent());
+      const handoffDenied = { ok: false as const, errorCode: 'PERMISSION_DENIED' as const,
+        message: GRANT_AUTHORIZATION_CHANGED_MESSAGE };
       // Runtime setup gate: the shared visibility check above runs before any
       // durable attachment grant, directory ticket, sandbox, card call, or dispatch.
       // grant_only never dispatches and intentionally ignores its tool field.
@@ -1349,6 +1956,13 @@ export function getCindyGhostsMcpDeps(
           errorCode: 'INTERNAL',
           message: '插件设置通道尚未就绪，本次调用未执行。',
         };
+      }
+      const authorizationSessionId = ghostSetupInteractionSessionId(sessionContext);
+      const authorizationService = getBotAuthorizationService();
+      if (authorizationService && authorizationSessionId && await isBotAuthorizationSession(authorizationSessionId)) {
+        const service = authorizationService;
+        const card = await service.request(authorizationSessionId, { kind: 'plugin', id: ghostId, ...(setupPlan && getGhostSetupAssessment(ghostId).reauthSuggest ? { reauthorize: true } : {}) }, setupPlan);
+        if (!card.ok) return card;
       }
       const setup = await setupCoordinator.ensureReady({
         sessionId: ghostSetupInteractionSessionId(sessionContext),
@@ -1462,6 +2076,7 @@ export function getCindyGhostsMcpDeps(
             message: t('newChat.pluginSetup.assessmentReadFailed'),
           };
         }
+        if (!grant.isCurrent()) return handoffDenied;
         log.info('ghost grant-only: batch pre-granted', { ghostId, count: grant.hashes.length });
         return {
           ok: true,
@@ -1489,6 +2104,8 @@ export function getCindyGhostsMcpDeps(
         if (!grant.ok) {
           return { ok: false, errorCode: 'ATTACHMENT_INVALID', message: grant.message };
         }
+        handoffChecks.push(grant.isCurrent);
+        if (handoffExpired()) return handoffDenied;
         mergedArgs = { ...args, attachments: grant.hashes };
       }
       // 目录过户(xd-service 意识化二期):dir 收集文件发一次性票据,元数据
@@ -1496,6 +2113,7 @@ export function getCindyGhostsMcpDeps(
       // networkSlot 凭票读盘代组 multipart。钳制两层策略:workdir 内直通,
       // workdir 外(含无 workdir 语境)经确认卡放行。
       if (dir !== undefined) {
+        if (handoffExpired()) return handoffDenied;
         const dirConfirm = await confirmDepositOutsideWorkdir({
           ghostId,
           sessionId: sessionIdForConfirm,
@@ -1508,6 +2126,8 @@ export function getCindyGhostsMcpDeps(
         if (!dirConfirm.ok) {
           return { ok: false, errorCode: 'DIR_INVALID', message: dirConfirm.message };
         }
+        if (dirConfirm.isCurrent) handoffChecks.push(dirConfirm.isCurrent);
+        if (handoffExpired()) return handoffDenied;
         const deposited = getDirDepositVault().deposit({
           ghostId,
           dirAbs: dirConfirm.userGranted ? dirConfirm.approvedRealPath : dir,
@@ -1524,6 +2144,7 @@ export function getCindyGhostsMcpDeps(
       // args.save_deposit——意识 fetch as:'file' 报票据,主机把响应字节直接
       // 写进该目录,绝对路径与字节不进沙箱。钳制两层策略同 dir。
       if (saveDir !== undefined) {
+        if (handoffExpired()) return handoffDenied;
         const saveConfirm = await confirmDepositOutsideWorkdir({
           ghostId,
           sessionId: sessionIdForConfirm,
@@ -1536,6 +2157,8 @@ export function getCindyGhostsMcpDeps(
         if (!saveConfirm.ok) {
           return { ok: false, errorCode: 'DIR_INVALID', message: saveConfirm.message };
         }
+        if (saveConfirm.isCurrent) handoffChecks.push(saveConfirm.isCurrent);
+        if (handoffExpired()) return handoffDenied;
         const saveDeposited = getSaveDepositVault().deposit({
           ghostId,
           dirAbs: saveConfirm.userGranted ? saveConfirm.approvedRealPath : saveDir,
@@ -1590,15 +2213,15 @@ export function getCindyGhostsMcpDeps(
           message: t('newChat.pluginSetup.assessmentReadFailed'),
         };
       }
-      // Session-context slot: use the revalidated manifest to decide injection.
+      // Session-context capability: use the revalidated manifest to decide injection.
       // Re-read manifest after the async buildGhostSessionContext to guard against
-      // a same-ID plugin replacement removing the slot during the await.
-      if (preDispatch.manifest.slots?.includes('session-context')) {
+      // a same-ID plugin replacement removing the declaration during the await.
+      if (preDispatch.manifest.sessionContext === true) {
         const ctx = await buildGhostSessionContext(sessionIdForConfirm, sessionWorkdir);
         const postCtxManifest = getGhostManager()
           .list()
           .find((g) => g.manifest.id === ghostId)?.manifest;
-        if (postCtxManifest?.slots?.includes('session-context')) {
+        if (postCtxManifest?.sessionContext === true) {
           mergedArgs = { ...mergedArgs, session_context: ctx };
         }
       }
@@ -1635,6 +2258,7 @@ export function getCindyGhostsMcpDeps(
           message: t('newChat.pluginSetup.assessmentReadFailed'),
         };
       }
+      if (handoffExpired()) return handoffDenied;
       // ── 卡槽③:callId 在这里预铸并登记给卡片服务 ────────────────────
       // 时序契约:register(供片窗开)→ dispatch(意识拿到同一 callId,执行
       // 中可 card-update)→ finalize(问"这单供过卡吗",开晚到宽限窗)→
@@ -1642,12 +2266,17 @@ export function getCindyGhostsMcpDeps(
       // 据此配对取卡;没供过 = 结果零变化,模型永远看不到内部 UUID)。
       const callId = randomUUID();
       const cardService = getGhostCardService();
+      const callSessionContext = resolveSessionContext();
       cardService.registerCall(callId, {
         ghostId,
         toolUseId: agentToolUseId ?? null,
         // ALS 优先(codex 每单恢复)、闭包兜底(claude 建线期按 session 绑定)
         // ——此前 claude 路径这里恒为 null,卡片只能靠 toolUseId 启发式锚定。
-        sessionId: resolveSessionContext()?.sessionId ?? null,
+        sessionId: callSessionContext?.sessionId ?? null,
+        sessionInstanceId: callSessionContext?.sessionInstanceId,
+        // 未声明 network 的 Agent 调用只能借本机 Agent 授权走 Desktop 出网；
+        // SSH remote 会话保留 host id，由 networkSlot 明确拒绝本地出口。
+        remoteHostId: callSessionContext?.remoteHostId ?? null,
       });
       // GhostToolCallResult 与 CindyGhostCallResult 同构(错误码枚举一致),
       // 原样透传;类型层若有漂移 tsc 会拦。
@@ -1656,6 +2285,8 @@ export function getCindyGhostsMcpDeps(
         tool,
         args: mergedArgs,
         callId,
+        signal,
+        sessionId: callSessionContext?.sessionId,
       });
       // 收口取账(ghostMediaLedger):本次调用期间主机实际入库的媒体地址。
       // 失败也 drain(清账防泄漏),但只在成功结果上附带——cindy-tools 层
@@ -1706,10 +2337,52 @@ export function getCindyGhostsMcpDeps(
       return withForgeOwnerLease(async () => {
         const gate = await getForgeSessionFsGate(resolveSessionContext());
         if (!gate.ok) return gate;
-        const result = await scaffoldGhostDir(request, {
+        const declaredMinCindyVersion = request.minCindyVersion?.trim();
+        const stableCindyVersionPattern =
+          /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+        if (
+          declaredMinCindyVersion &&
+          (declaredMinCindyVersion === '0.0.0' ||
+            !stableCindyVersionPattern.test(declaredMinCindyVersion))
+        ) {
+          return {
+            ok: false,
+            errorCode: 'INVALID_INPUT',
+            message: 'minCindyVersion 必须是插件实际依赖的首个 Cindy 正式版本（major.minor.patch）',
+          };
+        }
+        const currentCindyVersion = hostDeps.getAppVersion?.().trim();
+        const stableCurrentCindyVersion =
+          currentCindyVersion &&
+          currentCindyVersion !== '0.0.0' &&
+          stableCindyVersionPattern.test(currentCindyVersion)
+            ? currentCindyVersion
+            : null;
+        const minCindyVersion = declaredMinCindyVersion || stableCurrentCindyVersion;
+        if (!minCindyVersion) {
+          return {
+            ok: false,
+            errorCode: 'INVALID_INPUT',
+            message:
+              '当前是未发布或预发布 Cindy 构建，请明确填写 minCindyVersion（插件实际依赖的首个 Cindy 正式版本）',
+          };
+        }
+        const access = await authorizeForgeOutsideWorkdir({
+          dir: request.dir,
+          sessionWorkdir: gate.workingDir,
+          sessionContext: resolveSessionContext(),
+          toolName: 'ghost_forge_scaffold',
+          operation: 'write',
+          getLiveSessionGrantState: hostDeps.getLiveSessionGrantState,
+        });
+        if (!access.ok) return access;
+        const currentAccess = assertForgeGrantCurrent(access);
+        if (!currentAccess.ok) return currentAccess;
+        const result = await scaffoldGhostDir({ ...request, minCindyVersion }, {
           sessionWorkdir: gate.workingDir,
           forbiddenRootDirs: ghostForgeForbiddenRootDirs(),
           writeScaffold: writeForgeScaffoldWithStableParent,
+          ...forgeOutsidePackFlags(currentAccess),
         });
         if (result.ok) {
           log.info('ghost forge scaffold created', {
@@ -1721,95 +2394,47 @@ export function getCindyGhostsMcpDeps(
         return result;
       });
     },
-    async forgePack({ dir, iconSource, intent = 'install' }): Promise<CindyForgePackResult> {
+    async forgePack({ dir, iconSource, intent }): Promise<CindyForgePackResult> {
       return withForgeOwnerLease(async () => {
-        const gate = await getForgeSessionFsGate(resolveSessionContext());
+        const sessionContext = resolveSessionContext();
+        const gate = await getForgeSessionFsGate(sessionContext);
         if (!gate.ok) return gate;
-        let iconPng: Buffer | undefined;
-        let iconNote = '';
-        if (iconSource !== undefined) {
-          try {
-            const resolved = blobStore.resolveSafe(iconSource);
-            if (!resolved.mimeType.startsWith('image/')) {
-              throw new Error('icon_source 不是图片');
-            }
-            const stat = await fs.promises.stat(resolved.absPath);
-            if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_FORGE_ICON_SOURCE_BYTES) {
-              throw new Error(`icon_source 体积必须在 1–${MAX_FORGE_ICON_SOURCE_BYTES} 字节之间`);
-            }
-            iconPng = await convertForgeIconToPng(resolved.absPath);
-            iconNote = 'AI 图标已嵌入安装包。';
-          } catch (err) {
-            iconNote = 'AI 图标处理失败，已保留默认图标并继续打包。';
-            log.warn('ghost forge icon fallback', {
-              dir,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-
-        const packOptions = {
+        const access = await authorizeForgeOutsideWorkdir({
+          dir,
           sessionWorkdir: gate.workingDir,
-          forbiddenRootDirs: ghostForgeForbiddenRootDirs(),
-        };
-        let packed = await packGhostDir(dir, iconPng ? { ...packOptions, iconPng } : packOptions);
-        // icon overlay 的任何失败都不是打包门槛：用原源码再打一次。若原源码
-        // 本身也不合法，则返回原本就会出现的结构化错误。
-        if (!packed.ok && iconPng) {
-          const fallbackPacked = await packGhostDir(dir, packOptions);
-          if (fallbackPacked.ok) {
-            packed = fallbackPacked;
-            iconNote = 'AI 图标处理失败，已保留默认图标并继续打包。';
-          } else {
-            return fallbackPacked;
-          }
-        }
-        if (!packed.ok) return packed;
-        // Agent 来源标记:这次装入是 Agent 调 ghost_forge_pack 发起的,不是用户
-        // 亲手点的。标题与源码相对路径都由主机侧算(agent 改不了),供确认框如实
-        // 展示"哪个任务里的 Agent 发起 + 打包了工作目录里的哪个源码目录"。
-        // 相对路径:forge 已强制源码在会话工作目录内,故 path.relative 可靠;
-        // 若源码目录恰是工作目录本身(relative='')回落目录名,不给空串。
-        const forgeSessionId = resolveSessionContext()?.sessionId;
-        const sessionTitle = forgeSessionId
-          ? (await getSessionTitle(forgeSessionId)) ?? undefined
-          : undefined;
-        const relFromWorkdir = path.relative(gate.workingDir, dir);
-        const sourceRelPath =
-          relFromWorkdir && !relFromWorkdir.startsWith('..')
-            ? relFromWorkdir
-            : path.basename(dir);
-        const origin: GhostInstallOrigin = {
-          kind: 'agent-forge',
-          ...(sessionTitle ? { sessionTitle } : {}),
-          ...(sourceRelPath ? { sourceRelPath } : {}),
-        };
-        const owner = captureGhostMutationOwnerForMcp();
-        const alreadyInstalled = getGhostManager()
-          .list()
-          .some((ghost) => ghost.manifest.id === packed.manifest.id);
-        let staged;
-        try {
-          // 安装链路只认这份内存字节直写的 staging。workdir 里的 .cindy 只是
-          // 作者副本；agent 换掉它不能改确认框将要检查的包。
-          // operationKind 只是打包时点的提示/审计，不是不可变拒绝条件：
-          // 打包到消费之间同 id 可能被另一入口装上或卸掉，真实分类在消费
-          // 入口持锁后重做，允许与票里的值不同。
-          staged = completeForgePackStaging({
-            buf: packed.buf,
-            manifestId: packed.manifest.id,
-            owner,
-            operationKind: alreadyInstalled ? 'update' : 'install',
-            authorCindyPath: packed.cindyPath,
-          });
-        } catch (err) {
-          return {
-            ok: false,
-            errorCode: 'INTERNAL',
-            message: err instanceof Error ? err.message : String(err),
-          };
-        }
+          sessionContext,
+          toolName: 'ghost_forge_pack',
+          operation: 'write',
+          getLiveSessionGrantState: hostDeps.getLiveSessionGrantState,
+        });
+        if (!access.ok) return access;
+        const currentAccess = assertForgeGrantCurrent(access);
+        if (!currentAccess.ok) return currentAccess;
+        const attempt = await packForgeSource(dir, gate.workingDir, iconSource, forgeOutsidePackFlags(currentAccess));
+        if (!attempt.ok) return attempt.result;
+        const stillGranted = assertForgeGrantCurrent(currentAccess);
+        if (!stillGranted.ok) return stillGranted;
+        const { packed, iconNote } = attempt;
         if (intent === 'publish') {
+          const alreadyInstalled = getGhostManager()
+            .list()
+            .some((ghost) => ghost.manifest.id === packed.manifest.id);
+          let staged;
+          try {
+            staged = completeForgePackStaging({
+              buf: packed.buf,
+              manifestId: packed.manifest.id,
+              owner: captureGhostMutationOwnerForMcp(),
+              operationKind: alreadyInstalled ? 'update' : 'install',
+              authorCindyPath: packed.cindyPath,
+            });
+          } catch (err) {
+            return {
+              ok: false,
+              errorCode: 'INTERNAL',
+              message: err instanceof Error ? err.message : String(err),
+            };
+          }
           log.info('ghost forge packed for publish', { dir, id: packed.manifest.id });
           return {
             ok: true,
@@ -1821,37 +2446,91 @@ export function getCindyGhostsMcpDeps(
             note: `${iconNote}已打包为待发布产物。仅企业组织成员可用 ghost_forge_publish 提交;个人账号不可用。`,
           };
         }
-        try {
-          // 与双击 .cindy 同一条转交通道:renderer 弹标准确认框(同 id 已装则
-          // 自动转"更新 vX → vY"),用户点头才真装。lease 持到转交完成。带上 agent
-          // 来源,确认框据此展示来源横幅 + 分级加重(高危需手输 id 确认)。
-          // 交给这条通道的必须是 staging,不能是 workdir 产物。
-          await handleIncomingCindyFile(staged.installPath, 'ghost-forge', origin);
-        } catch (err) {
-          invalidateForgePackTicket(staged.ticket);
-          return {
-            ok: false,
-            errorCode: 'INTERNAL',
-            message: err instanceof Error ? err.message : String(err),
-          };
-        }
-        log.info('ghost forge packed', { dir, id: packed.manifest.id });
-        const publishHint = currentPublisherIdentity()
-          ? "若接下来要发布到组织市场,请用 intent='publish' 重新打包。"
-          : '';
+        log.info('ghost forge packed', { dir, cindyPath: packed.cindyPath, id: packed.manifest.id });
         return {
           ok: true,
-          // 给 agent 的只是作者副本文件名提示，不可用于访问；staging 路径不下发。
-          cindyPath: staged.agentCindyPath,
+          cindyPath: packed.cindyPath,
           id: packed.manifest.id,
           name: packed.manifest.name,
           version: packed.manifest.version,
-          // 不在这里说明确认框的加重形式(如"需手输 id"):本 note 会回到 agent,
-          // 被注入的 agent 读到就能照着编引导话术,帮用户"过掉"那一步。
-          // 告知"必须在应用内确认才会安装"已足够让作者知道下一步做什么。
-          note: `${iconNote}已打包并弹出装入/更新确认框,请提示用户:只有在应用内确认后插件才会真正安装。${publishHint}`,
+          note: `${iconNote}已完成校验和打包；本工具不会安装或更新插件。`,
         };
       });
+    },
+    async forgeInstall({ dir, iconSource }): Promise<CindyForgeInstallResult> {
+      const sessionContext = resolveSessionContext();
+      const packedAttempt = await withForgeOwnerLease(async (mutationOwner) => {
+        const gate = await getForgeSessionFsGate(sessionContext);
+        if (!gate.ok) return gate;
+        const access = await authorizeForgeOutsideWorkdir({
+          dir,
+          sessionWorkdir: gate.workingDir,
+          sessionContext,
+          toolName: 'ghost_forge_install',
+          operation: 'write',
+          getLiveSessionGrantState: hostDeps.getLiveSessionGrantState,
+        });
+        if (!access.ok) return access;
+        const currentAccess = assertForgeGrantCurrent(access);
+        if (!currentAccess.ok) return currentAccess;
+        const attempt = await packForgeSource(dir, gate.workingDir, iconSource, forgeOutsidePackFlags(currentAccess));
+        if (!attempt.ok) return attempt.result;
+        const stillGranted = assertForgeGrantCurrent(currentAccess);
+        if (!stillGranted.ok) return stillGranted;
+        return {
+          ok: true as const,
+          packed: attempt.packed,
+          iconNote: attempt.iconNote,
+          mutationOwner,
+          ...(stillGranted.allowOutsideWorkdir && stillGranted.isCurrent
+            ? { isCurrent: stillGranted.isCurrent }
+            : {}),
+        };
+      });
+      if (!packedAttempt.ok) return packedAttempt;
+      try {
+        const installed = await installOrUpdateLocalGhostPackageFromForge(
+          packedAttempt.packed.cindyPath,
+          {
+            ghostId: packedAttempt.packed.manifest.id,
+            packageSha256: createHash('sha256').update(packedAttempt.packed.buf).digest('hex'),
+            consentPrompt: installConsentPrompt(),
+            mutationOwner: packedAttempt.mutationOwner,
+            ...(packedAttempt.isCurrent ? { isCurrent: packedAttempt.isCurrent } : {}),
+          },
+        );
+        log.info('ghost forge install completed', {
+          dir,
+          id: installed.ghost.manifest.id,
+          version: installed.ghost.manifest.version,
+          action: installed.action,
+        });
+        return {
+          ok: true,
+          action: installed.action,
+          id: installed.ghost.manifest.id,
+          name: installed.ghost.manifest.name,
+          version: installed.ghost.manifest.version,
+          enabled: installed.ghost.enabled,
+          note:
+            installed.action === 'installed'
+              ? `${packedAttempt.iconNote}插件已完成校验、打包和安装，并已启用。`
+              : `${packedAttempt.iconNote}插件已完成校验、打包和原位更新；原有启用状态、配置与数据保持不变。`,
+        };
+      } catch (err) {
+        if (isIpcError(err) && err.code === 'MUTATION_CANCELLED') {
+          return {
+            ok: false,
+            errorCode: 'MUTATION_CANCELLED',
+            message: '用户拒绝了这次插件安装或更新。除非用户再次要求，不要重试。',
+          };
+        }
+        return {
+          ok: false,
+          errorCode: isIpcError(err) ? err.code : 'INTERNAL',
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
     },
     async forgePublish({ token }): Promise<CindyForgePublishResult> {
       const boundaryPending = isAppSessionBoundaryPending();
@@ -1875,7 +2554,7 @@ export function getCindyGhostsMcpDeps(
               ? '账号切换中，请稍后重试'
               : consumed.reason === 'owner-mismatch'
                 ? '发布票据无效、已过期或已被使用，请重新打包'
-                : "发布票据无效、已过期或已被使用。发布票据只能由 ghost_forge_pack(intent='publish') 签发;若刚才是按缺省 install 打的包,请用 intent='publish' 重新打一次。",
+                : "发布票据无效、已过期或已被使用。发布票据只能由 ghost_forge_pack(intent='publish') 签发；若刚才使用的是缺省的纯打包模式，请用 intent='publish' 重新打一次。",
         };
       }
       const ticket = consumed.ticket;

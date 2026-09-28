@@ -164,8 +164,8 @@ describe('account provider readiness wiring', () => {
       /handle\.isLive\(\)\s*&&\s*accountProviderReadinessBarrier\.isCurrentAdoptable\(\)/,
     );
 
-    expect(bootstrapSource).toContain(
-      'accountProviderReadinessArm.publish(userId, startProviderReadiness, resumeIncompleteDiscovery)',
+    expect(bootstrapSource).toMatch(
+      /accountProviderReadinessArm\.publish\(\s*userId\s*,\s*startProviderReadiness\s*,\s*resumeIncompleteDiscovery\s*,?\s*\)/,
     );
     expect(bootstrapSource).toContain('accountProviderReadinessArm.clear()');
     expect(bootstrapSource).toContain('startPendingAccountProviderReadiness = null');
@@ -227,6 +227,22 @@ describe('account provider readiness wiring', () => {
     expect(makerShutdown).toBeGreaterThan(clearCustomProviders);
     expect(joinPrevious).toBeGreaterThan(makerShutdown);
     expect(clearAfterJoin).toBeGreaterThan(joinPrevious);
+  });
+
+  it('resets the goal controller before the outgoing Maker is shut down', () => {
+    const teardown = bootstrapSource.indexOf('async function teardownAuthAccountBoundary');
+    const resetGoal = bootstrapSource.indexOf('resetGoalController();', teardown);
+    const drainRecreatedGoal = bootstrapSource.indexOf('await resetGoalController();', resetGoal + 1);
+    const makerShutdown = bootstrapSource.indexOf(
+      "await maker.shutdown({ reason: 'account-boundary' })",
+      teardown,
+    );
+
+    expect(teardown).toBeGreaterThanOrEqual(0);
+    expect(resetGoal).toBeGreaterThan(teardown);
+    expect(drainRecreatedGoal).toBeGreaterThan(resetGoal);
+    expect(drainRecreatedGoal).toBeLessThan(makerShutdown);
+    expect(resetGoal).toBeLessThan(makerShutdown);
   });
 
   it('stops every PI Subagent runner of the outgoing owner at the account boundary', () => {

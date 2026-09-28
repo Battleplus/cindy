@@ -71,6 +71,11 @@ xcrun stapler validate /path/to/Cindy.app
 
 重点确认 Helper 与主 App 的 `TeamIdentifier` 一致，且 Helper 带有 Hardened Runtime。
 
+Xcode 27 的路径兼容与分能力登记见 [Xcode 27 兼容验证](ios-simulator-xcode27-compatibility.md)。
+`27.0 / 27A266a` + iOS `27.0 / 24A434` + Darwin `27.0.0` / arm64 已验证
+Sidecar/H.264 与屏幕寻址的 Native HID（单指、双指、取消、崩溃恢复）。这不等于最终
+Developer ID 签名包的 native release gate 已通过；发布 gate 保持严格，不能跳过输入断言。
+
 ## Helper 更新时
 
 Helper 发生任何代码变化后，必须重新执行完整的 Cindy.app 打包、签名和公证。不要替换已签名包
@@ -79,5 +84,7 @@ Helper 发生任何代码变化后，必须重新执行完整的 Cindy.app 打�
 ## 插件发布顺序
 
 如果同时发布 iOS 模拟器官方插件，应先发布包含 Host 能力和 Helper 的 Cindy 版本；验证成功后，
-再把插件的 `minCindyVersion` 设置为这个实际发布版本并发布插件。这样旧版 Cindy 用户会收到明确的
-升级提示，而不会安装一个 Host 尚不支持的插件版本。
+再把插件的 `minCindyVersion` 设置为这个实际发布版本并发布插件。官方市场会继续给旧版 Cindy
+投影最近的兼容历史版本；没有兼容版本时不展示该插件。用户若通过本地包或自定义市场主动安装
+其它版本，Desktop 不再按 `minCindyVersion` 二次拦截或弹确认；当前 Host 尚未提供的能力在运行时
+仍不可用，因此插件必须正确处理 Host 能力缺失。

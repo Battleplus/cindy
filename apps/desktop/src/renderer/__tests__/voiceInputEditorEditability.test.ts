@@ -13,7 +13,7 @@ describe('ChatInput voice lifecycle locks', () => {
     expect(chatInputSource).toContain(
       'const composerMutationLocked = composerEditorLocked || voiceBusyOnCurrentComposer;',
     );
-    expect(chatInputSource).toContain('editor?.setEditable(!composerMutationLocked);');
+    expect(chatInputSource).toContain('editor?.setEditable(!composerTypingLocked);');
     expect(chatInputSource).toContain('if (composerMutationLockedRef.current) return true;');
     expect(chatInputSource).toContain('active={voiceBusyOnCurrentComposer}');
   });
@@ -29,7 +29,7 @@ describe('ChatInput voice lifecycle locks', () => {
     const permissionEnd = chatInputSource.indexOf('/>', permissionStart);
     expect(permissionEnd).toBeGreaterThan(permissionStart);
     const permissionBlock = chatInputSource.slice(permissionStart, permissionEnd);
-    expect(permissionBlock).toContain('disabled={composerEditorLocked || settingsLocked}');
+    expect(permissionBlock).toContain('disabled={composerEditorLocked || settingsLocked || sharedGuest}');
     expect(permissionBlock).not.toContain('disabled={composerMutationLocked}');
   });
 

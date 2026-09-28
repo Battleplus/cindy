@@ -27,6 +27,7 @@ import {
 } from '@cindy/maker-shared/session-list';
 import type { DeviceAccessState } from '@cindy/maker-shared/device-list';
 import { collapseWorktreeDirForGrouping } from '@cindy/maker-shared/worktree-paths';
+import { mobilePresentationLocalizer } from '@/i18n/presentationLocalizer';
 import { createMobileMakerTransport } from '@/device-link/mobileMakerTransport';
 import { deviceMirrorCleanupDisposition } from '@/device-link/presenceDevices';
 import type { RemoteSession } from '@/session/types';
@@ -313,6 +314,7 @@ export function toSearchListItem(
     item.contentHit?.preview ?? cached?.preview ?? null,
     null,
     unnamedLabel,
+    mobilePresentationLocalizer,
   );
   const searchFocusClientId = item.contentHit?.messageClientId?.trim();
   return {
@@ -397,6 +399,8 @@ export function reconcileConversationSearchProjectSelection(
   if (selection === 'all') return 'all';
   const visible = new Set(visibleKeys);
   const next = selection.filter((key) => visible.has(key));
+  // Preserve identity when hydration or a host change leaves the selection intact.
+  if (next.length === selection.length && next.length > 0) return selection;
   return next.length > 0 ? next : 'all';
 }
 

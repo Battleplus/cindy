@@ -1,3 +1,6 @@
+import { readBotAuthorizationCard } from '../../shared/botAuthorization.js';
+import { notifyOauthCardClosed } from '../plugin-oauth/context.js';
+import { supportsRemotePluginOauth } from '../plugin-oauth/runtime.js';
 /**
  * Desktop interaction bridge for Host-owned plugin setup cards.
  *
@@ -35,6 +38,12 @@ export interface GhostSetupInteractionStep {
 }
 
 export interface GhostSetupInteractionSnapshot {
+  /** Presentation hint; only the dedicated Main bridge may execute OAuth remotely. */
+  remoteOauth?: true;
+  /** Only the ordinary Host-owned inline setup executor supports the signed input bridge. */
+  remoteSecret?: true;
+  /** Dedicated exact-host connection form; never generic remote settings access. */
+  remoteConnection?: true;
   kind: 'plugin_setup';
   requestId: string;
   revision: number;
@@ -105,6 +114,7 @@ interface PendingSetupInteraction {
     responseTarget?: GhostSetupInteractionResponseTarget,
   ) => Promise<void> | void;
   onInlineSubmit?: (submit: GhostSetupInlineSubmit) => Promise<void> | void;
+  onConnectionCommitted?: (actionId: string) => void;
 }
 
 export class GhostSetupInteractionBridge {
@@ -117,6 +127,7 @@ export class GhostSetupInteractionBridge {
     snapshot: GhostSetupInteractionSnapshot,
     onCommand: PendingSetupInteraction['onCommand'],
     onInlineSubmit?: PendingSetupInteraction['onInlineSubmit'],
+    onConnectionCommitted?: PendingSetupInteraction['onConnectionCommitted'],
   ): void {
     if (this.pending.has(snapshot.requestId)) {
       throw new Error(`plugin setup interaction already exists: ${snapshot.requestId}`);
@@ -127,6 +138,7 @@ export class GhostSetupInteractionBridge {
       completed: false,
       onCommand,
       ...(onInlineSubmit ? { onInlineSubmit } : {}),
+      ...(onConnectionCommitted ? { onConnectionCommitted } : {}),
     });
     try {
       this.broadcastSnapshot(sessionId, snapshot);
@@ -191,14 +203,25 @@ export class GhostSetupInteractionBridge {
     return true;
   }
 
-  /**
-   * Retire a settled request from pending/actionable semantics while keeping
-   * its last snapshot addressable for a delayed visual dismissal.
-   */
+  /** Main-only receipt after the exact connection card has committed its vault write. */
+  connectionCommitted(requestId: string, actionId: string, expectedRevision: number): boolean {
+    const entry = this.pending.get(requestId);
+    if (!entry || entry.completed || entry.snapshot.terminal ||
+        entry.snapshot.revision !== expectedRevision || !entry.onConnectionCommitted) return false;
+    const step = entry.snapshot.steps.find(step => step.action?.id === actionId &&
+      step.action.kind === 'manage_connection' && (step.phase === 'pending' || step.phase === 'failed'));
+    if (!step) return false;
+    // Main-only commit receipt. Never exposed through resolve or a Renderer command.
+    entry.onConnectionCommitted(actionId);
+    return true;
+  }
+
+  /** Retire a settled request while retaining its snapshot for delayed dismissal. */
   complete(requestId: string): boolean {
     const entry = this.pending.get(requestId);
     if (!entry || entry.completed) return false;
     entry.completed = true;
+    notifyOauthCardClosed(requestId);
     return true;
   }
 
@@ -206,6 +229,7 @@ export class GhostSetupInteractionBridge {
     const entry = this.pending.get(requestId);
     if (!entry) return false;
     this.pending.delete(requestId);
+    notifyOauthCardClosed(requestId);
     try {
       this.deps.broadcast(MAKER_PUSH.INTERACTION_DISMISSED, {
         sessionId: entry.sessionId,
@@ -282,6 +306,36 @@ export class GhostSetupInteractionBridge {
   }
 }
 
+/** Persist only presentation fields, plus validated Desktop credential-page links. */
+export function sanitizeGhostSetupSnapshotForDesktop(
+  snapshot: GhostSetupInteractionSnapshot,
+): GhostSetupInteractionSnapshot {
+  const safe = sanitizeGhostSetupSnapshotForRemote(snapshot);
+  safe.steps.forEach((step, index) => {
+    const source = snapshot.steps[index].action;
+    if (step.action?.kind !== 'inline_form' || source?.kind !== 'inline_form') return;
+    const url = source.form.fields[0].externalLink?.url;
+    if (!url || url.length > 200) return;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:' && !parsed.username && !parsed.password)
+        step.action.form.fields[0].externalLink = { url };
+    } catch { /* omit invalid credential-page links */ }
+  });
+  return safe;
+}
+
+/** Local durable cards retain Desktop helpers; every remote message path strips them. */
+export function sanitizeBotAuthorizationMetaForRemote(meta: Record<string, unknown>): Record<string, unknown> {
+  if (!('botAuthorization' in meta)) return meta;
+  const { botAuthorization: raw, ...rest } = meta;
+  const card = readBotAuthorizationCard(raw);
+  return card ? {
+    ...rest,
+    botAuthorization: { ...card, snapshot: sanitizeGhostSetupSnapshotForRemote(card.snapshot) },
+  } : rest;
+}
+
 /**
  * Device-link only projection of a Host-owned setup snapshot.
  *
@@ -295,6 +349,9 @@ export function sanitizeGhostSetupSnapshotForRemote(
 ): GhostSetupInteractionSnapshot {
   return {
     kind: snapshot.kind,
+    ...(supportsRemotePluginOauth() ? { remoteOauth: true as const } : {}),
+    ...(supportsRemotePluginOauth() && snapshot.remoteSecret ? { remoteSecret: true as const } : {}),
+    ...(supportsRemotePluginOauth() && snapshot.remoteConnection ? { remoteConnection: true as const } : {}),
     requestId: snapshot.requestId,
     revision: snapshot.revision,
     ...(snapshot.terminal ? { terminal: true as const } : {}),

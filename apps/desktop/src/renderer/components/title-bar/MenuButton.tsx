@@ -1,4 +1,5 @@
 import { Menu } from 'lucide-react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 
@@ -14,15 +15,22 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tip } from '@/components/ui/tooltip';
+import { JoinSharedTaskDialog } from '@/features/device-link/JoinSharedTaskDialog';
+import { useSharedTaskTasks } from '@/features/device-link/useSharedTaskTasks';
+import { SharedTaskEndedNotice } from '@/features/device-link/SharedTaskEndedNotice';
 
-export function MenuButton() {
+export function MenuButton({ onExitFullscreen }: { onExitFullscreen?: () => void }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [joinOpen, setJoinOpen] = useState(false);
+  useSharedTaskTasks();
+
   return (
-    <DropdownMenu>
+    <><DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <DropdownMenuTrigger asChild>
-        <Tip text={t('titleBar.menu')} side="bottom">
+        <Tip text={t('titleBar.menu')} side="bottom" controlledOpen={menuOpen ? false : undefined}>
           {/* 尺寸与 ChromeActions 的折叠按钮同规格(h-7 / 图标 15 / rounded-md),
               与折叠态标题行图标(「…」h-7 / 15)视觉重量一致。 */}
           <button
@@ -40,10 +48,15 @@ export function MenuButton() {
           </button>
         </Tip>
       </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="start"
-        className="bg-titlebar border-titlebar-border"
-      >
+      <DropdownMenuContent align="start" className="bg-titlebar border-titlebar-border">
+        <DropdownMenuItem className="focus:bg-titlebar-button-hover" onSelect={() => setJoinOpen(true)}>
+          {t('sharedTask.join')}
+        </DropdownMenuItem>
+        {onExitFullscreen && (
+          <DropdownMenuItem className="focus:bg-titlebar-button-hover" onSelect={onExitFullscreen}>
+            {t('contentHeader.exitFullscreen')}
+          </DropdownMenuItem>
+        )}
         {/* 设置入口:Windows / Linux 没有原生应用菜单(installApplicationMenu 非
             darwin 直接置 null),macOS「设置…」菜单项在这些平台不可见;侧栏底部
             用户卡片虽可进设置但无可见「设置」标识,可发现性不足(#1881)。此处
@@ -108,5 +121,7 @@ export function MenuButton() {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+    <SharedTaskEndedNotice onJoin={() => setJoinOpen(true)} />
+    {joinOpen && <JoinSharedTaskDialog open={joinOpen} onOpenChange={setJoinOpen} />}</>
   );
 }

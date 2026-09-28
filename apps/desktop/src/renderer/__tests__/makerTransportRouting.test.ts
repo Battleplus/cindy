@@ -13,6 +13,8 @@ beforeEach(() => {
 
 function stubElectron() {
   const makerSpies = {
+    submitRemotePluginSecret: vi.fn().mockResolvedValue({accepted: true}),
+    submitRemotePluginConnection: vi.fn().mockResolvedValue({accepted: true}),
     setModel: vi.fn(),
     setEffort: vi.fn(),
     fork: vi.fn(),
@@ -27,6 +29,7 @@ function stubElectron() {
     dispatchOrcaUiAssignment: vi.fn(),
     disableOrca: vi.fn(),
     regenerateSessionTitle: vi.fn().mockResolvedValue({ title: 'local title' }),
+    predictNextPrompt: vi.fn().mockResolvedValue({ prompt: 'local prompt' }),
     plugins: { getState: vi.fn().mockResolvedValue({ effectiveEnabled: true }) },
     input: { clearSession: vi.fn(), compact: vi.fn() },
   };
@@ -44,20 +47,52 @@ function stubElectron() {
   const localMessages = {
     estimatedSessionValue: vi.fn().mockResolvedValue({ totalValueUsd: 0, entries: [] }),
   };
+  const localSessions = {
+    get: vi.fn().mockRejectedValue(new Error('[NOT_FOUND] Session does not exist')),
+    update: vi.fn(),
+  };
   const invoke = vi.fn().mockResolvedValue(undefined);
+  const getState = vi.fn().mockResolvedValue({ disabledControlDeviceIds: [] });
   vi.stubGlobal('window', {
     electronAPI: {
       maker: makerSpies,
-      localDb: { orcaWorkflows, messages: localMessages },
-      deviceLink: { invoke },
+      localDb: { orcaWorkflows, messages: localMessages, sessions: localSessions },
+      deviceLink: { invoke, getState },
     },
   });
-  return { makerSpies, orcaWorkflows, localMessages, invoke };
+  return { makerSpies, orcaWorkflows, localMessages, localSessions, invoke, getState };
 }
 
 const sess = (id: string): Session => ({ id }) as unknown as Session;
 
 describe('makerApiFor 路由(完整对等会话级操作)', () => {
+  it('routes connection input only through the dedicated local Main bridge', async () => {
+    const {makerSpies, invoke} = stubElectron();
+    const {submitRemotePluginConnection} = await import('@/lib/makerTransport');
+    const {remoteProjectsStore} = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('cloud', 'Cloud', [sess('connection-task')]);
+    const request = { ghostId: 'plugin', requestId: 'card', actionId: 'manage_connection:connection:service', expectedRevision: 0,
+      value: { host: 'git.example.test', token: 'synthetic-pat' },
+      presentation: { ghostName: 'Plugin', title: 'Connect', description: '', intro: '', connectionKey: 'service' } };
+    await expect(submitRemotePluginConnection('connection-task', request)).resolves.toEqual({accepted: true});
+    expect(makerSpies.submitRemotePluginConnection).toHaveBeenCalledWith({deviceId: 'cloud', ...request});
+    expect(invoke).not.toHaveBeenCalled();
+    await expect(submitRemotePluginConnection('unknown-local-task', request)).rejects.toThrow();
+  });
+  it('routes cloud key input only through the dedicated local Main bridge, never generic invoke', async () => {
+    const {makerSpies, invoke} = stubElectron();
+    const {submitRemotePluginSecret} = await import('@/lib/makerTransport');
+    const {remoteProjectsStore} = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('cloud', 'Cloud', [sess('remote-task')]);
+    const request = {ghostId: 'plugin', requestId: 'card', actionId: 'action', expectedRevision: 0,
+      value: 'synthetic-pat', presentation: {ghostName: 'Plugin', title: 'Key', description: '', intro: '',
+        fieldLabel: 'API key', fieldDescription: '', maxLength: 200}};
+    await expect(submitRemotePluginSecret('remote-task', request)).resolves.toEqual({accepted: true});
+    expect(makerSpies.submitRemotePluginSecret).toHaveBeenCalledWith({deviceId: 'cloud', ...request});
+    expect(invoke).not.toHaveBeenCalled();
+    await expect(submitRemotePluginSecret('unknown-local-task', request)).rejects.toThrow();
+    expect(makerSpies.submitRemotePluginSecret).toHaveBeenCalledTimes(1);
+  });
   it('远程 device-link 会话:每个任务级操作命中对应隧道 channel + 原样转发 args', async () => {
     const { invoke } = stubElectron();
     const { makerApiFor } = await import('@/lib/makerTransport');
@@ -82,6 +117,8 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
       { userName: 'Carol' },
     );
     api.input.clearSession('rs');
+    const replacement = { clientId: 'q1' } as never;
+    api.input.updateContent('rs', 'q1', replacement);
 
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:fork', ['rs', 'msg']);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:fork-strip-encrypted', ['rs']);
@@ -112,6 +149,11 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
       { userName: 'Carol' },
     ]);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:input:clear-session', ['rs']);
+    expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:input:update-content', [
+      'rs',
+      'q1',
+      replacement,
+    ]);
   });
 
   it('已捕获的 deviceId 在 session origin 暂时消失后仍固定走远程隧道', async () => {
@@ -236,6 +278,20 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it('输入框推荐在远程会话由被控端生成，不回落到控制端', async () => {
+    const { makerSpies, invoke } = stubElectron();
+    const { makerApiFor } = await import('@/lib/makerTransport');
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('dev-1', 'Mac', [sess('rs')]);
+
+    const request = {
+      sessionId: 'rs', agentKind: 'codex' as const, messages: [], turnGen: 2, completionRevision: 9,
+    };
+    await makerApiFor('rs').predictNextPrompt(request);
+    expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:predict-prompt', [request]);
+    expect(makerSpies.predictNextPrompt).not.toHaveBeenCalled();
+  });
+
   it('远程会话 patchMeta(删/归档/改名/置顶)经隧道 local-db:sessions:patch-meta', async () => {
     const { invoke } = stubElectron();
     const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
@@ -262,6 +318,60 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     expect(invoke).toHaveBeenCalledWith('dev-1', 'local-db:sessions:patch-meta', [
       'rs',
       { status: 'active' },
+    ]);
+  });
+
+  it.each([
+    ['archived', { status: 'archived', pinnedAt: null }],
+    ['deleted', { status: 'deleted' }],
+  ] as const)(
+    'setStatus routes a disabled remote-id collision to the verified local row for %s',
+    async (status, expectedPatch) => {
+      const { getState, invoke, localSessions } = stubElectron();
+      const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+      const { getStickySessionDeviceId } = await import(
+        '@/features/device-link/stickySessionOrigin'
+      );
+      const sessionService = await import('@/lib/sessionService');
+      const localRow = sess('collision');
+
+      remoteProjectsStore.setDeviceSessions('dev-disabled', 'Old desktop', [localRow]);
+      expect(getStickySessionDeviceId('collision')).toBe('dev-disabled');
+      remoteProjectsStore.removeDevice('dev-disabled');
+      getState.mockResolvedValue({ disabledControlDeviceIds: ['dev-disabled'] });
+      localSessions.get.mockResolvedValue(localRow);
+      localSessions.update.mockResolvedValue({ ...localRow, status });
+
+      await sessionService.setStatus('collision', status);
+
+      expect(getState).toHaveBeenCalledOnce();
+      expect(localSessions.get).toHaveBeenCalledWith('collision');
+      expect(localSessions.update).toHaveBeenCalledWith('collision', expectedPatch);
+      expect(invoke).not.toHaveBeenCalled();
+    },
+  );
+
+  it('setStatus keeps a disabled true remote session pinned when no local row exists', async () => {
+    const { getState, invoke, localSessions } = stubElectron();
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    const { getStickySessionDeviceId } = await import(
+      '@/features/device-link/stickySessionOrigin'
+    );
+    const sessionService = await import('@/lib/sessionService');
+
+    remoteProjectsStore.setDeviceSessions('dev-disabled', 'Old desktop', [sess('remote-only')]);
+    expect(getStickySessionDeviceId('remote-only')).toBe('dev-disabled');
+    remoteProjectsStore.removeDevice('dev-disabled');
+    getState.mockResolvedValue({ disabledControlDeviceIds: ['dev-disabled'] });
+
+    await sessionService.setStatus('remote-only', 'archived');
+
+    expect(getState).toHaveBeenCalledOnce();
+    expect(localSessions.get).toHaveBeenCalledWith('remote-only');
+    expect(localSessions.update).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith('dev-disabled', 'local-db:sessions:patch-meta', [
+      'remote-only',
+      { status: 'archived', pinnedAt: null },
     ]);
   });
 

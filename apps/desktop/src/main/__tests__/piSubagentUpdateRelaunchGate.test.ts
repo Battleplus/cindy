@@ -153,8 +153,7 @@ describe('PI Subagent reclaim before an update relaunch', () => {
   it('keeps every relaunch entry point on the awaited path', () => {
     // `executeRelaunch` is now async; a forgotten `void` would silently drop
     // the gate's rejection handling.
-    expect([...source.matchAll(/(?<!void )executeRelaunch\(resolved\)/g)]).toHaveLength(0);
-    expect([...source.matchAll(/(?<!void )executeRelaunch\(theme\)/g)]).toHaveLength(0);
+    expect([...source.matchAll(/(?<!void )executeRelaunch\((?:resolved|theme)(?:,[^)]*)?\)/g)]).toHaveLength(0);
     expect(source).toContain('void executeRelaunch(resolved);');
     expect(source).toContain('void executeRelaunch(theme);');
   });

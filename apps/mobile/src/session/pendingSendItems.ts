@@ -12,9 +12,10 @@
  * 进了 data 之后:与正式消息同容器、同 key(`message-${clientId}`)、同一处位置,回流就是
  * 同一个列表位置上的内容替换 —— 原地变实,零跳动;listData 也不再为空,居中占位自然不出现。
  *
- * 顺序契约(与原 footer 一致):落定中(已出队、等回流)在前,排队中居中,本地 outbox 在后
- * —— outbox 是最晚发出的。
+ * 未派发条目保持队列 / outbox 顺序。已派发气泡在分组前占据本地用户消息的位置，
+ * 正式回流以同一个 clientId 原位替换，不比较控制端与主机的时钟。
  */
+import { queueItemVisibleText } from '@cindy/maker-shared/queue';
 import { syntheticTriggerKind } from '@cindy/maker-shared/synthetic-trigger';
 import {
   parseChatQuoteSegments,
@@ -27,6 +28,8 @@ import {
   type SentInlineToken,
 } from '@/session/sentMessageAtoms';
 import type { QueuedRemoteMessage } from '@/session/types';
+import type { GetSentMessageImagePreview } from '@/session/sentMessageImagePreviews';
+import type { MobileMessageRenderItem } from '@/session/messageRenderModel';
 
 export type MobilePendingSendPhase =
   /** 已确认入队,等被控端派发。 */
@@ -63,6 +66,7 @@ export interface MobilePendingSendItem {
   thumbs: MobileOutboxThumb[];
   /** 非图片附件数(pdf / office 等,渲染「N 个文件」计数行)。 */
   fileCount: number;
+  fileNames?: string[];
   /** 附件总数与已上传数(uploading 阶段渲染「上传中 k/N」)。 */
   attachmentCount: number;
   uploadedCount: number;
@@ -103,15 +107,47 @@ export function pendingSendItemKey(clientId: string): string {
 }
 
 /**
+ * History and queue snapshots can arrive independently. Deduplicate against the
+ * rows actually being rendered, even when the queue's hidden-id snapshot is stale.
+ * Duplicate keys reserve two list positions while mounting only one bubble.
+ */
+export function appendPendingSendItems<T extends { key: string }>(
+  rendered: readonly T[],
+  pending: readonly MobilePendingSendItem[],
+): readonly (T | MobilePendingSendItem)[] {
+  if (pending.length === 0) return rendered;
+  const renderedKeys = new Set(rendered.map((item) => item.key));
+  const remaining = pending.filter((item) => !renderedKeys.has(item.key));
+  return remaining.length === 0 ? rendered : [...rendered, ...remaining];
+}
+
+/** Replace only local placeholders; durable echoes win even with stale queue state. */
+export function mergePendingSendItems(
+  rendered: readonly MobileMessageRenderItem[],
+  pending: readonly MobilePendingSendItem[],
+  optimisticClientIds: ReadonlySet<string>,
+): readonly MobileMessageRenderItem[] {
+  const byId = new Map(pending.map((item) => [item.clientId, item]));
+  const replaced = optimisticClientIds.size === 0 ? rendered : rendered.map((item) =>
+    item.type === 'message' && optimisticClientIds.has(item.message.source.clientId)
+      ? byId.get(item.message.source.clientId) ?? item : item);
+  return appendPendingSendItems(replaced, pending);
+}
+
+/**
  * 气泡显示文本:合成 UI 指令行(桌面「失败后继续」等隐藏 prompt)用遮蔽标签替代原文
  * —— 裸英文指令不能给用户看(对齐桌面 PendingQueuePanel 的 i18n 遮蔽标签)。
+ * 自动化 / 其他任务发来的条目显示落库可见正文(不带发给 Agent 的前缀或协议),
+ * 与回流后的正式消息一致(queueItemVisibleText,与桌面排队面板同判据)。
  */
 export function pendingSendBubbleText(
-  item: Pick<QueuedRemoteMessage, 'text' | 'chatMessage'>,
+  item: Pick<QueuedRemoteMessage, 'text' | 'chatMessage'>
+    & Partial<Pick<QueuedRemoteMessage, 'persistedContent' | 'files' | 'origin'>>,
 ): string {
+  const agentText = queueItemVisibleText(item);
   const visibleText = item.chatMessage.quotesEncoded === true
-    ? stripChatQuoteMarkerLines(item.text)
-    : item.text;
+    ? stripChatQuoteMarkerLines(agentText)
+    : agentText;
   const kind = syntheticTriggerKind(visibleText);
   if (kind === 'continue') return i18n.t('message.queue.continueSystemInstruction');
   if (kind === 'generic') return i18n.t('message.queue.systemInstruction');
@@ -151,6 +187,7 @@ function buildPendingSentInlineTokens(input: {
 function queuedAttachmentThumbs(
   item: Pick<QueuedRemoteMessage, 'clientId' | 'files'>,
   previewByOssRef?: ReadonlyMap<string, string>,
+  getImagePreview?: GetSentMessageImagePreview,
 ): { thumbs: MobileOutboxThumb[]; fileCount: number } {
   const thumbs: MobileOutboxThumb[] = [];
   let fileCount = 0;
@@ -160,14 +197,16 @@ function queuedAttachmentThumbs(
       return;
     }
     const ossRef = file.url ?? file.path;
+    const preview = getImagePreview?.(item.clientId, thumbs.length, file.name, file.id);
     thumbs.push({
-      key: `${item.clientId}-file-${index}`,
+      key: `${item.clientId}-slot-${index}`,
       // 发送时刻抓下的本地预览优先:sentAttachmentThumbStore 那条兜底链要等「上传落定 →
       // 拷进自有目录 → AsyncStorage hydrate」全部完成才查得到,期间 getSentAttachmentThumbUri
       // 一律返回 null,排队气泡只能画空占位格(实测:兜底文件已生成,气泡仍是空方块)。
       // 乐观语义下图必须从第一帧就在,所以直接用手边的 file:// 预览,store 只作为
       // 「重开会话 / 预览已失效」时的后备。
-      uri: (ossRef && previewByOssRef?.get(ossRef)) || null,
+      uri: preview?.uri ?? ((ossRef && previewByOssRef?.get(ossRef)) || null),
+      ...(preview ? { previewRef: preview.sourceRef } : {}),
       ossRef,
       uploading: false,
     });
@@ -197,6 +236,7 @@ export interface BuildPendingSendItemsInput {
    * 排队气泡的图靠它即时显示,不等 sentAttachmentThumbStore 的拷贝 + hydrate 链。
    */
   previewByOssRef?: ReadonlyMap<string, string>;
+  getImagePreview?: GetSentMessageImagePreview;
 }
 
 /**
@@ -212,7 +252,7 @@ export function buildPendingSendItems(input: BuildPendingSendItemsInput): Mobile
   const pushQueued = (item: QueuedRemoteMessage, phase: MobilePendingSendPhase, queueIndex: number | null) => {
     if (seen.has(item.clientId) || input.hiddenClientIds.has(item.clientId)) return;
     seen.add(item.clientId);
-    const attachments = queuedAttachmentThumbs(item, input.previewByOssRef);
+    const attachments = queuedAttachmentThumbs(item, input.previewByOssRef, input.getImagePreview);
     const presentation = queueIndex === null
       ? null
       : input.presentationByClientId.get(item.clientId) ?? null;
@@ -222,7 +262,7 @@ export function buildPendingSendItems(input: BuildPendingSendItemsInput): Mobile
       clientId: item.clientId,
       text: pendingSendBubbleText(item),
       sentInlineTokens: buildPendingSentInlineTokens({
-        text: item.text,
+        text: queueItemVisibleText(item),
         quotesEncoded: item.chatMessage.quotesEncoded,
         pastedTextRanges: item.chatMessage.pastedTextRanges,
         slashCommandRanges: item.chatMessage.slashCommandRanges,
@@ -231,6 +271,7 @@ export function buildPendingSendItems(input: BuildPendingSendItemsInput): Mobile
       queueIndex,
       thumbs: attachments.thumbs,
       fileCount: attachments.fileCount,
+      fileNames: (item.files ?? []).filter((file) => file.category !== 'image').map((file) => file.name),
       attachmentCount: attachments.thumbs.length + attachments.fileCount,
       uploadedCount: attachments.thumbs.length + attachments.fileCount,
       errorText: null,
@@ -268,6 +309,7 @@ export function buildPendingSendItems(input: BuildPendingSendItemsInput): Mobile
       queueIndex: null,
       thumbs: item.thumbnails,
       fileCount: item.fileCount,
+      fileNames: item.fileNames,
       attachmentCount: item.attachmentCount,
       uploadedCount: item.uploadedCount,
       errorText: item.errorText,

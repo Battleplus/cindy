@@ -23,7 +23,7 @@ const manifest: GhostManifest = {
   version: '1.3.11',
   kind: 'chip',
   entry: 'main.js',
-  slots: ['notify'],
+  notify: true,
 };
 
 const detail: PluginMarketDetail = {
@@ -121,7 +121,11 @@ describe('MarketPluginDetailView', () => {
       name: /settings\.ghosts\.market\.install/,
     });
     expect(action.getAttribute('aria-busy')).toBe('true');
-    expect(action.querySelector('.animate-spin')).toBeTruthy();
-    expect(action.textContent).toBe('');
+    expect(action.querySelector('.animate-spinner')).toBeTruthy();
+    // Preserve the label width and accessible name while only the spinner is visible.
+    expect(action.firstElementChild?.classList.contains('opacity-0')).toBe(true);
+    expect(action.firstElementChild?.textContent).toBe('settings.ghosts.market.install');
+    expect(action.lastElementChild?.getAttribute('aria-hidden')).toBe('true');
+    expect(action.hasAttribute('disabled')).toBe(true);
   });
 });

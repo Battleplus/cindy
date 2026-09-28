@@ -219,6 +219,7 @@ async function startSessionWithStream(
     vendorOptions?: Record<string, unknown>;
     autoCompactThresholdPct?: number;
     capturePrompts?: boolean;
+    resolveModelContextLimit?: AgentDeps['resolveModelContextLimit'];
   },
 ) {
   const configDir = await makeTempDir();
@@ -257,6 +258,7 @@ async function startSessionWithStream(
 
   const agent = new ClaudeCodeAgent({
     ...createDeps({
+      resolveModelContextLimit: opts?.resolveModelContextLimit,
       runtimeConfig: {
         ...(opts?.autoCompactThresholdPct === undefined
           ? {}
@@ -2148,6 +2150,33 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
     await handle.close().catch(() => undefined);
   });
 
+  it('exposes the SDK output file of running background tasks and drops it on terminal', async () => {
+    const { handle, stream, events } = await startSessionWithStream();
+
+    await handle.send({ type: 'user', content: 'run a background command' });
+    stream.emit({
+      ...taskStarted('bash-1', 'local_bash'),
+      output_file: '/tmp/claude-501/project/session/tasks/bash-1.output',
+    });
+    await waitFor(() => taskEvents(events).length >= 1, 'task_started observed');
+    // task_updated 补丁不带 output_file,不得冲掉已登记的路径。
+    stream.emit(taskUpdatedRunning('bash-1'));
+    await waitFor(() => taskEvents(events).length >= 2, 'task_updated observed');
+    expect(handle.listBackgroundTasks?.()).toEqual([
+      expect.objectContaining({
+        taskId: 'bash-1',
+        taskType: 'local_bash',
+        outputFile: '/tmp/claude-501/project/session/tasks/bash-1.output',
+      }),
+    ]);
+
+    stream.emit(taskNotification('bash-1', 'completed'));
+    await waitFor(() => (handle.listBackgroundTasks?.() ?? []).length === 0, 'terminal task removed');
+
+    stream.end();
+    await handle.close().catch(() => undefined);
+  });
+
   it('stopTask rejection does not leak an awaiting claim after interrupt succeeds', async () => {
     const { handle, stream, events, fakeQuery } = await startSessionWithStream();
 
@@ -2972,7 +3001,7 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
       () => events.some(
         (event) => event.type === 'error' &&
           (event.data as { reason?: unknown } | null | undefined)?.reason ===
-            'upstream_response_idle_timeout',
+            'bridge_upstream_response_idle_timeout',
       ),
       'watchdog timeout observed',
     );
@@ -3195,4 +3224,18 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
       vi.useRealTimers();
     }
   });
+});
+
+
+it('applies an explicit model window to Claude runtime and compression accounting', async () => {
+  const { handle, fakeQueries } = await startSessionWithStream(undefined, {
+    resolveModelContextLimit: (_provider, model) => model === 'claude-opus-4-6' ? 600_000 : null,
+  });
+  expect(handle.getUsageSnapshot().contextWindow).toBe(600_000);
+  await handle.send({ type: 'user', content: 'hello' });
+  expect(fakeQueries).toHaveLength(1);
+  const query = sdkMock.query.mock.calls[0]![0] as { options: { env: Record<string, string> } };
+  expect(JSON.parse(query.options.env.XDT_MAKER_MODEL_CONTEXT_WINDOWS)).toMatchObject({ 'claude-opus-4-6[1m]': 600_000 });
+  expect(query.options.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('600000');
+  await handle.close();
 });

@@ -1,12 +1,24 @@
 export * from './base-agent.js';
 // toSdkModelString: host 侧标题 oneShot 需要把 catalog model id 还原成 Anthropic wire 串
 // (claude-haiku-4-5 → claude-haiku-4-5-20251001),复用 SSoT 映射,避免在 host 硬编码 dated id。
-export { ClaudeCodeAgent, toSdkModelString, setClaudeSupportedModelsListener } from './claude-code/index.js';
+export {
+  ClaudeCodeAgent,
+  toSdkModelString,
+  setClaudeSupportedModelsListener,
+  setClaudeRateLimitInfoListener,
+} from './claude-code/index.js';
 export type {
   ClaudeSubagentModelAccessResult,
   ClaudeSubagentModelAccessStatus,
 } from './claude-code/subagent-model-access.js';
 export { CodexAgent } from './codex/index.js';
+export { isCodexHistoryRecoveryRequired } from './codex/history-recovery.js';
+export {
+  CODEX_HISTORY_OVERSIZED_REASON,
+  CODEX_LIVE_TAIL_OVERSIZED_BYTES,
+  isOversizedLiveTailStats,
+  measureRolloutLiveTailStats,
+} from './codex/rollout-sanitize.js';
 // host 导入本地 Codex rollout 历史时也要做 citation 归一化(流式路径在 translator
 // 内部做,导入路径拿到的是 rollout 原文),复用同一实现避免口径分叉。
 // finalizeCodexCitationText = 剥截断残尾 + 归一化(与流式 completed 完全同口径)。
@@ -15,11 +27,13 @@ export { PiAgent } from './pi/index.js';
 export {
   canReuseCodexHostForCredentialMode,
   canReuseHostForCredentialMode,
+  isCindyProviderCodexRemoteCompactionRoute,
   resolveAgentCredentialMode,
 } from './credential-mode.js';
 // host 在 boot 阶段需要的 env 守卫(详见 claude-code/env-builder.ts 注释)
 export {
   SENSITIVE_ANTHROPIC_ENV_KEYS,
+  cleanProcessEnv,
   stripSensitiveAnthropicEnv,
 } from './claude-code/env-builder.js';
 // host 配置 LLM-context 图片预缩 resizer (注入 logger / 调阈值)
@@ -65,6 +79,7 @@ export {
   CONTEXT_OVERFLOW_REASON,
   isContextOverflowErrorMessage,
 } from './shared/context-overflow-error.js';
+export { isRemoteCompactEncryptedContentError } from './shared/remote-compact-encrypted-error.js';
 export { isDeterministicHostCompactFailure } from './shared/auto-compact-controller.js';
 // ErrorBanner 用人话替换 LiteLLM / Responses 空壳流中断,不驱动自动续跑。
 export {
@@ -73,7 +88,7 @@ export {
 } from './shared/stream-interrupt-error.js';
 // 同上理由(同 bundle 直接复用,不造第三份):desktop 的中断自愈判据要认「网络到不了
 // 上游」这一类 —— 那类同样是"连不上"而不是"请求有问题",续跑一次就能过去。
-export { isNetworkishErrorMessage } from './shared/network-error.js';
+export { isNetworkishErrorMessage, PI_GATEWAY_DROP_REASON } from './shared/network-error.js';
 export {
   AUTO_REVIEW_CONFIRM_UNDELIVERED_CODE,
   AUTO_REVIEW_UNAVAILABLE_CODE,
@@ -85,6 +100,12 @@ export {
   AUTO_REVIEW_RETRY_SCHEDULING_SLACK_MS,
   autoReviewRetryBudgetMs,
   DEFAULT_AUTO_REVIEW_TIMEOUT_POLICY,
+  extractAutoReviewUserIntent,
+  resolveAutoReviewDecision,
+  annotatePermissionRequestForUnavailableReview,
+  appendAutoReviewUserIntent,
+  normalizeAutoReviewUserIntent,
+  type AutoReviewUserIntent,
   getAutoReviewActionTextLength,
   getAutoReviewDelegateHardCeilingMs,
   isAutoReviewConfirmUndeliveredNotice,
@@ -97,6 +118,8 @@ export {
   type AutoReviewRequest,
   type AutoReviewTimeoutPolicy,
 } from './shared/auto-review-decision.js';
+export { toolAutoReviewAction } from './shared/auto-review-decision.js';
+export { AUTO_REVIEW_CONTINUATION_POLICY } from './shared/continuation-policy.js';
 export type { ReviewableAction } from './shared/auto-review.js';
 export {
   ORCA_NESTED_REPORT_DENIAL_REASON,

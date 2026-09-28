@@ -1,17 +1,26 @@
-import { BrowserWindow, ipcMain } from 'electron';
+import { createByokCache } from './byokCache.js';
+import { byokSnapshotSecretIo } from '../secrets/providerSecretStore.js';
+import { registerByokIpc } from './byokIpc.js';
+import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
+import { createByokRuntime } from './byokRuntime.js';
+import { broadcastReferenceModelPricing } from '../usage/referenceModelPricing.js';
+import { app, BrowserWindow, ipcMain } from 'electron';
 
 import { createLogger } from '../logger.js';
 import * as authManager from '../authManager.js';
+import { isExternalOrganizationByokUser } from './organizationManaged.js';
 import { serverApiFetch, ServerApiError } from '../serverApiClient.js';
 import { getClientEndpoint } from '../clientEndpointsService.js';
 import { getProviderSecretStore } from '../secrets/providerSecretStore.js';
 import { getCodexProxyAuthInjectionState } from '../maker-host/codex-proxy-host.js';
 import {
   prepareCodexForAuthModeChange,
+  prepareCodexForCustomProviderHostChange,
   finalizeCodexAfterAuthModeChange,
   cancelCodexAuthModeChange,
 } from '../maker-host/index.js';
 import {
+  getXdGatewayModels,
   markXdGatewayModelAccessUnknown,
   setXdGatewayModels,
 } from '../maker-host/active-catalog.js';
@@ -21,6 +30,7 @@ import { isPricedGatewayModel } from '../../shared/modelPriceQuote.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import {
   MODEL_ACCESS_STATUS_CHANNEL,
+  type ModelAccessAccountTier,
   type ModelAccessGatewayModel,
   type ModelAccessStatus,
 } from '../../shared/modelAccess.js';
@@ -34,7 +44,9 @@ import {
 import {
   buildModelsSyncRequest,
   ensureCredentialsReadyForModelsRefresh,
+  modelsWithoutStalePaymentUpsell,
   parseModelsSyncPayload,
+  shouldPreservePaymentRequiredRoutes,
   withModelsSyncOverallDeadline,
   waitForModelsSyncRefresh,
 } from './modelsSyncRefresh.js';
@@ -124,12 +136,25 @@ async function writeXdKeyWithCodexSideEffect(key: string): Promise<boolean> {
   return true;
 }
 
+let accountTier: ModelAccessAccountTier | null = null;
+
+function statusWithAccountTier(status: ModelAccessStatus): ModelAccessStatus {
+  return { ...status, accountTier };
+}
+
 function broadcastStatus(status: ModelAccessStatus): void {
+  const payload = statusWithAccountTier(status);
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
-      win.webContents.send(MODEL_ACCESS_STATUS_CHANNEL, status);
+      win.webContents.send(MODEL_ACCESS_STATUS_CHANNEL, payload);
     }
   }
+}
+
+function setAccountTier(next: ModelAccessAccountTier | null): void {
+  if (accountTier === next) return;
+  accountTier = next;
+  broadcastStatus(getSync().getStatus());
 }
 
 // ─── XD 网关模型目录同步(`/models` 是模型、能力与价格的唯一事实源)─────────
@@ -143,6 +168,8 @@ let modelsSyncInflight: Promise<void> | null = null;
 /** 模型请求的单调尝试号与最近成功号，供手动刷新区分“旧成功 + 本次失败”。 */
 let modelsSyncAttempt = 0;
 let lastModelsSyncSucceededAttempt = 0;
+let lastModelsSyncStartedAt = 0;
+export const XD_MODELS_FOREGROUND_REFRESH_INTERVAL_MS = 5 * 60_000;
 /** 在途目录请求所属的认证世代。 */
 let modelsSyncGen = -1;
 /** 旧世代请求在途时新账号的补发标记。 */
@@ -158,12 +185,16 @@ let lastAuthRealm: ReturnType<typeof authManager.getActiveAuthRealm> | null = nu
 
 function applyGatewayModels(
   models: ModelAccessGatewayModel[],
-  authenticatedUserId?: string,
-  authoritative = false,
+  options: {
+    authenticatedUserId?: string;
+    authoritative?: boolean;
+    preservePaymentRequiredRoutes?: boolean;
+    suppressEmbeddingFallback?: boolean;
+  } = {},
 ): void {
   // 同一次 /models 响应建立 XD 模型与价格投影。空成功响应会同时清空模型和价格；请求失败不会调用本函数，
   // 因而保留上一份完整成功快照。
-  const pricing = replaceGatewayModelPricing(models, authenticatedUserId);
+  const pricing = replaceGatewayModelPricing(models, options.authenticatedUserId);
   // 分母只算会产生报价的条目:免费/无价条目按设计不出报价,不该把健康目录
   // 也报成覆盖不足。此时覆盖缺口只剩一种成因——币种声明与目录冲突被丢弃,
   // 这在 #587 之前是全程静默的,这行日志让现场可判。
@@ -196,7 +227,11 @@ function applyGatewayModels(
     });
   }
   resetExecutableMediaModelCache();
-  setXdGatewayModels(models, { authoritative });
+  setXdGatewayModels(models, {
+    authoritative: options.authoritative ?? false,
+    preservePaymentRequiredRoutes: options.preservePaymentRequiredRoutes,
+    suppressEmbeddingFallback: options.suppressEmbeddingFallback,
+  });
 }
 
 async function runModelsSync(
@@ -215,27 +250,42 @@ async function runModelsSync(
     );
     const parsed = parseModelsSyncPayload(payload);
     if (!parsed.ok) {
-      log.warn('xd gateway models response rejected (keeping last valid list)', {
+      log.warn('xd gateway models response rejected (keeping executable last valid list)', {
         error: parsed.error,
       });
+      if (myGen === authGeneration) {
+        setAccountTier(null);
+        setXdGatewayModels(modelsWithoutStalePaymentUpsell(getXdGatewayModels()), {
+          authoritative: false,
+          preservePaymentRequiredRoutes: true,
+        });
+      }
       return;
     }
     models = parsed.models;
+    if (myGen === authGeneration) setAccountTier(parsed.accountTier);
   } catch (err) {
-    log.warn('xd gateway models fetch failed (keeping last valid list)', {
+    log.warn('xd gateway models fetch failed (keeping executable last valid list)', {
       error: err instanceof Error ? err.message : String(err),
     });
+    if (myGen === authGeneration) {
+      setAccountTier(null);
+      setXdGatewayModels(modelsWithoutStalePaymentUpsell(getXdGatewayModels()), {
+        authoritative: false,
+        preservePaymentRequiredRoutes: true,
+      });
+    }
     return;
   }
   if (myGen !== authGeneration) return; // 响应归属旧账号,丢弃
   if (models.length === 0) {
     log.warn('xd gateway models fetch returned empty list; clearing current list');
-    applyGatewayModels([], authenticatedUserId, true);
+    applyGatewayModels([], { authenticatedUserId, authoritative: true });
     lastModelsSyncSucceededAttempt = myAttempt;
     return;
   }
   log.info(`xd gateway models synced: ${models.length}`);
-  applyGatewayModels(models, authenticatedUserId, true);
+  applyGatewayModels(models, { authenticatedUserId, authoritative: true });
   try {
     const availability = await listExecutableMediaModels([], {
       includeDisabled: true,
@@ -285,6 +335,7 @@ function scheduleModelsSync(): void {
   }
   modelsSyncGen = gen;
   const attempt = ++modelsSyncAttempt;
+  lastModelsSyncStartedAt = Date.now();
   modelsSyncInflight = runModelsSync(gen, authenticatedUserId, attempt)
     .catch((err) => {
       log.warn('xd gateway models sync threw', {
@@ -298,6 +349,52 @@ function scheduleModelsSync(): void {
 }
 
 let syncInstance: CredentialsSync | null = null;
+let foregroundRefreshListener: (() => void) | null = null;
+
+/**
+ * 企业 Provider 目录的刷新形态与 Cindy 自有目录一致:窗口聚焦触发 + 5 分钟节流,
+ * 不挂后台定时轮询。登录 / 冷启动 / 换号 / 换区域不受节流约束(见 noteAuthState)。
+ */
+export const BYOK_FOREGROUND_REFRESH_INTERVAL_MS = 5 * 60_000;
+let lastByokSyncStartedAt = 0;
+type ByokRuntime = ReturnType<typeof createByokRuntime>;
+let byokCodexHostRefreshQueued = false;
+let byokCodexHostRefreshRunning = false;
+
+/** Coalesce directory/key changes and retire only the local Codex Host. */
+function scheduleByokCodexHostRefresh(): void {
+  byokCodexHostRefreshQueued = true;
+  if (byokCodexHostRefreshRunning) return;
+  byokCodexHostRefreshRunning = true;
+  void (async () => {
+    try {
+      while (byokCodexHostRefreshQueued) {
+        byokCodexHostRefreshQueued = false;
+        let prepared = false;
+        try {
+          await prepareCodexForCustomProviderHostChange();
+          prepared = true;
+          await finalizeCodexAfterAuthModeChange();
+        } catch (error) {
+          log.warn('enterprise Codex Host refresh failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          if (prepared) cancelCodexAuthModeChange();
+        }
+      }
+    } finally {
+      byokCodexHostRefreshRunning = false;
+    }
+  })();
+}
+
+function scheduleByokSync(byok: ByokRuntime, force = false): void {
+  const now = Date.now();
+  if (!force && now - lastByokSyncStartedAt < BYOK_FOREGROUND_REFRESH_INTERVAL_MS) return;
+  lastByokSyncStartedAt = now;
+  void byok.sync();
+}
 
 function getSync(): CredentialsSync {
   if (!syncInstance) {
@@ -308,13 +405,21 @@ function getSync(): CredentialsSync {
       writeXdKey: writeXdKeyWithCodexSideEffect,
       store: getModelAccessCredentialsStore(),
       onStatusChange: (status) => {
+        if (['failed', 'disabled', 'unsupported', 'idle'].includes(status.state)) {
+          accountTier = null;
+        }
         broadcastStatus(status);
         // 凭据就绪(下发/轮换成功)→ 拉取网关模型目录(XD 模型列表的权威来源)。
         if (status.state === 'ok') scheduleModelsSync();
-        // 凭据明确不可用时,旧模型清单也不再具备可用性证明。syncing 期间先保留
-        // 已成功拉到的清单,最终成功会覆盖、失败会走这里清空。
-        else if (['failed', 'disabled', 'unsupported', 'idle'].includes(status.state)) {
-          applyGatewayModels([]);
+        // failed 是同一账号下的临时同步失败，credentialsSync 明确保留本地 key；隐藏
+        // 过期营销列表的同时必须保留最近一次付费拒绝，避免已有会话绕过路由守卫。
+        // disabled / unsupported / idle 是真实能力边界，清空模型和拒绝快照。
+        else if (status.state === 'failed') {
+          applyGatewayModels([], {
+            preservePaymentRequiredRoutes: shouldPreservePaymentRequiredRoutes(status),
+          });
+        } else if (['disabled', 'unsupported', 'idle'].includes(status.state)) {
+          applyGatewayModels([], { suppressEmbeddingFallback: true });
         }
       },
       log: {
@@ -328,7 +433,7 @@ function getSync(): CredentialsSync {
 
 /** 当前同步状态(renderer 首帧经 IPC 拉;main 内部也可直接读)。 */
 export function getModelAccessStatus(): ModelAccessStatus {
-  return getSync().getStatus();
+  return statusWithAccountTier(getSync().getStatus());
 }
 
 /**
@@ -340,6 +445,10 @@ export async function refreshXdGatewayModels(): Promise<void> {
   if (!getAppCapabilities().canUseCindyGateway) {
     throwIpcError('PERMISSION_DENIED', 'Cindy AI requires a Cindy account.');
   }
+  // Capture the call boundary before credential recovery can schedule a request. A flight that
+  // already existed here may have read entitlement before a just-completed payment; explicit
+  // refresh must wait through it and require a strictly newer attempt.
+  const minimumAttempt = modelsSyncAttempt + 1;
   const status = await ensureCredentialsReadyForModelsRefresh(getSync());
   if (status.state !== 'ok') {
     throwIpcError('MODEL_ACCESS_FAILED', 'Cindy AI credentials are not ready.');
@@ -349,6 +458,7 @@ export async function refreshXdGatewayModels(): Promise<void> {
   // 旧账号 flight，先等它作废，再显式补发当前世代并等待当前尝试号的真实结果。
   const outcome = await waitForModelsSyncRefresh({
     expectedGeneration: gen,
+    minimumAttempt,
     schedule: scheduleModelsSync,
     snapshot: () => ({
       flight: modelsSyncInflight,
@@ -400,6 +510,11 @@ function mapServerError(err: unknown): never {
  */
 export function initModelAccess(): void {
   const sync = getSync();
+  const byok = createByokRuntime(
+    broadcastReferenceModelPricing,
+    createByokCache(byokSnapshotSecretIo),
+    scheduleByokCodexHostRefresh,
+  );
 
   const noteAuthState = (
     isAuthenticated: boolean,
@@ -415,12 +530,21 @@ export function initModelAccess(): void {
       )
     ) {
       authGeneration++;
+      accountTier = null;
       // 旧身份模型清单不能跨账号/区域继续显示;新身份拉取成功后再注入。
-      applyGatewayModels([]);
+      applyGatewayModels([], { suppressEmbeddingFallback: true });
     }
     lastAuthUserId = isAuthenticated ? (userId ?? lastAuthUserId) : null;
     lastAuthRealm = isAuthenticated ? (realm ?? lastAuthRealm) : null;
     sync.handleAuthChange({ isAuthenticated, userId, realm });
+    const user = authManager.getAuthState().user;
+    byok.setOwner(isAuthenticated && userId && isExternalOrganizationByokUser(user) ? {
+      scope: JSON.stringify([authGeneration, userId, realm, user.orgId]),
+      cacheScope: JSON.stringify([userId, realm, user.orgId]),
+      organizationId: user.orgId,
+    } : null);
+    // 身份切换/登录是显式事件,不受聚焦节流约束。
+    scheduleByokSync(byok, true);
   };
 
   authManager.onAuthStateChange((state) => {
@@ -435,13 +559,28 @@ export function initModelAccess(): void {
   if (initial.isAuthenticated) {
     noteAuthState(true, initial.user?.id ?? null, authManager.getActiveAuthRealm());
   }
-  ipcMain.handle('model-access:get-status', () => sync.getStatus());
+  foregroundRefreshListener = () => {
+    scheduleByokSync(byok);
+    if (!lastAuthUserId || getSync().getStatus().state !== 'ok') return;
+    if (Date.now() - lastModelsSyncStartedAt < XD_MODELS_FOREGROUND_REFRESH_INTERVAL_MS) return;
+    scheduleModelsSync();
+  };
+  app.on('browser-window-focus', foregroundRefreshListener);
+  ipcMain.handle('model-access:get-status', () => getModelAccessStatus());
+  registerByokIpc(ipcMain, {
+    getStatus: () => byok.getStatus(),
+    // 设置页的显式刷新不受节流限制,但要记时间戳,避免紧接着的聚焦再拉一轮。
+    sync: () => {
+      lastByokSyncStartedAt = Date.now();
+      return byok.sync();
+    },
+  }, assertTrustedAppRendererEvent);
 
   ipcMain.handle('model-access:retry', async (): Promise<ModelAccessStatus> => {
     if (!getAppCapabilities().canUseCindyGateway) {
       throwIpcError('PERMISSION_DENIED', 'Cindy AI requires a Cindy account.');
     }
-    return sync.retry();
+    return statusWithAccountTier(await sync.retry());
   });
 
   ipcMain.handle('model-access:rotate', async (): Promise<ModelAccessStatus> => {
@@ -449,7 +588,7 @@ export function initModelAccess(): void {
       throwIpcError('PERMISSION_DENIED', 'Cindy AI requires a Cindy account.');
     }
     try {
-      return await sync.rotate();
+      return statusWithAccountTier(await sync.rotate());
     } catch (err) {
       mapServerError(err);
     }
@@ -458,14 +597,22 @@ export function initModelAccess(): void {
 
 /** 仅测试:重置单例。 */
 export function resetModelAccessForTest(): void {
+  lastByokSyncStartedAt = 0;
+  byokCodexHostRefreshQueued = false;
+  if (foregroundRefreshListener) {
+    app.removeListener('browser-window-focus', foregroundRefreshListener);
+    foregroundRefreshListener = null;
+  }
   syncInstance = null;
   modelsSyncInflight = null;
   modelsSyncGen = -1;
   modelsSyncRerunQueued = false;
   modelsSyncAttempt = 0;
   lastModelsSyncSucceededAttempt = 0;
+  lastModelsSyncStartedAt = 0;
   authGeneration = 0;
   lastAuthUserId = null;
   lastAuthRealm = null;
+  accountTier = null;
   applyGatewayModels([]);
 }

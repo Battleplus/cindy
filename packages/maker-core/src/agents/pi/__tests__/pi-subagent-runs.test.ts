@@ -10,10 +10,13 @@ import {
   controlPiSubagentRuns,
   hasActivePiSubagentRunsSync,
   killVerifiedPiSubagentRunner,
+  verifyPiSubagentRunnerIdentity,
   listPiSubagentRunDiagnostics,
   listPiSubagentRuns,
+  scanPiSubagentRuns,
   acquirePiSubagentLaunchFence,
   clearStalePiSubagentLaunchFence,
+  piSubagentLaunchFenceArtifact,
   isPiSubagentLaunchFenceActive,
   piSubagentDeletedTombstonePath,
   writePiSubagentDeletedTombstone,
@@ -27,6 +30,8 @@ import {
   piSubagentRuntimeOwnerId,
   requestStopAllPiSubagentRunsSync,
   readPiSubagentTranscriptPage,
+  PiSubagentRunnerExitUnconfirmedError,
+  recordPiSubagentRunnerFailure,
   resumePiSubagentRun,
   stopAllPiSubagentRunsForExit,
   stopAndRemovePiSubagentRuns,
@@ -132,6 +137,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 const roots: string[] = [];
+const noopRunnerLaunch = async (): Promise<void> => undefined;
 
 async function makeRoot(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'cindy-pi-subagent-runs-'));
@@ -187,6 +193,75 @@ afterEach(async () => {
 });
 
 describe('PI durable subagent run store', () => {
+  it('selects only the newest generation of a logical task before delivering historical payloads', async () => {
+    const root = await makeRoot();
+    const older = status('123e4567-e89b-42d3-a456-4266141740ab', {
+      taskId: 'same-task', state: 'completed', startedAt: 10,
+    });
+    const newer = status('123e4567-e89b-42d3-a456-4266141740ac', {
+      taskId: 'same-task', state: 'completed', startedAt: 20,
+    });
+    await writeStatus(root, older);
+    await writeStatus(root, newer);
+    const discovered = [];
+    for await (const run of scanPiSubagentRuns(root, { latestPerTask: true })) discovered.push(run);
+    expect(discovered.map((run) => run.runId)).toEqual([newer.runId]);
+  });
+
+  it('streams historical status files lazily and closes the directory after early cancellation', async () => {
+    const root = await makeRoot();
+    const ids = ['123e4567-e89b-42d3-a456-4266141740ab', '123e4567-e89b-42d3-a456-4266141740ac'];
+    for (const id of ids) await writeStatus(root, status(id, { state: 'completed' }));
+    const iterator = scanPiSubagentRuns(root);
+    const first = await iterator.next();
+    expect(first.done).toBe(false);
+    // The other status has not been read or retained while the consumer is suspended.
+    const other = ids.find((id) => id !== first.value!.runId)!;
+    await writeFile(path.join(root, other, 'status.json'), 'corrupt');
+    expect((await iterator.next()).done).toBe(true);
+    const early = scanPiSubagentRuns(root);
+    await early.next();
+    await early.return(undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('records a host-observed runner failure without rewriting completed child results', async () => {
+    const root = await makeRoot();
+    const runId = '123e4567-e89b-42d3-a456-4266141740ab';
+    const runDir = path.join(root, runId);
+    const completedChild = `${runId}-1`;
+    const runningChild = `${runId}-2`;
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, 'config.json'), `${JSON.stringify({
+      version: 1,
+      runId,
+      taskId: 'tool-host-failure',
+      parentSessionId: 'session-1',
+      runtimeOwnerId: 'owner-a',
+      runDir,
+      cwd: root,
+      binary: '/pi',
+      tasks: [
+        { childId: completedChild, sessionId: completedChild, agent: 'scout', task: 'a', tools: 'read', profilePrompt: 'a', provider: 'cindy' },
+        { childId: runningChild, sessionId: runningChild, agent: 'scout', task: 'b', tools: 'read', profilePrompt: 'b', provider: 'cindy' },
+      ],
+    })}\n`);
+    await writeFile(path.join(runDir, 'status.json'), `${JSON.stringify({
+      ...status(runId),
+      taskId: 'tool-host-failure',
+      tasks: [
+        { childId: completedChild, sessionId: completedChild, agent: 'scout', status: 'completed', output: 'done', endedAt: 30 },
+        { childId: runningChild, sessionId: runningChild, agent: 'scout', status: 'running' },
+      ],
+    })}\n`);
+
+    await recordPiSubagentRunnerFailure(runDir, 'host process exited');
+    const [recorded] = await listPiSubagentRuns(root);
+    expect(recorded?.state).toBe('failed');
+    expect(recorded?.tasks[0]).toMatchObject({ status: 'completed', output: 'done', endedAt: 30 });
+    expect(recorded?.tasks[1]).toMatchObject({ status: 'failed', error: 'host process exited' });
+  });
+
   it('derives a contained parent-session root and rejects traversal ids', () => {
     expect(piSubagentRunRoot('/agent-home', 'session-1')).toBe(
       path.join('/agent-home', 'runtime', 'pi-subagent-runs', 'session-1'),
@@ -220,7 +295,8 @@ describe('PI durable subagent run store', () => {
     await writeStatus(root, status(runId, { state: 'completed' }));
     await writePiSubagentDeletedTombstone(agentHome, 'session-1');
     await expect(resumePiSubagentRun(root, 'tool-1', 'continue', {
-      nodeExecutable: process.execPath,
+      launchRunner: noopRunnerLaunch,
+      env: {},
       runtimeOwnerId: 'owner-a',
       permissionSnapshot: { mode: 'ask', readOnlyRoots: [] },
     })).rejects.toThrow(/parent task was deleted/i);
@@ -231,7 +307,7 @@ describe('PI durable subagent run store', () => {
       .replace(/\r\n/g, '\n');
     const claimed = source.indexOf('async function resumeClaimedPiSubagentRun(');
     const publish = source.indexOf("state: 'queued'", claimed);
-    const spawned = source.indexOf('spawn(launch.nodeExecutable', claimed);
+    const spawned = source.indexOf('await launch.launchRunner', claimed);
     const firstTombstone = source.indexOf(
       'isPiSubagentDeletedTombstonePresent(agentHome, path.basename(root))',
       claimed,
@@ -246,9 +322,22 @@ describe('PI durable subagent run store', () => {
     );
     expect(publish).toBeGreaterThan(claimed);
     expect(firstTombstone).toBeGreaterThan(publish);
+    expect(source.indexOf('recordPiSubagentRunnerFailure(runDir', spawned))
+      .toBeGreaterThan(spawned);
+    expect(source.indexOf('instanceof PiSubagentRunnerExitUnconfirmedError', spawned))
+      .toBeGreaterThan(spawned);
+    expect(source.indexOf('instanceof PiSubagentRunnerExitUnconfirmedError', spawned))
+      .toBeLessThan(source.indexOf('recordPiSubagentRunnerFailure(runDir', spawned));
     expect(lastStaging).toBeGreaterThan(firstTombstone);
     expect(lastTombstone).toBeGreaterThan(lastStaging);
     expect(spawned).toBeGreaterThan(lastTombstone);
+  });
+
+  it('keeps unconfirmed runner-exit errors distinguishable from ordinary launch failures', () => {
+    const error = new PiSubagentRunnerExitUnconfirmedError('PI Subagent runner did not become ready');
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(PiSubagentRunnerExitUnconfirmedError);
+    expect(error.name).toBe('PiSubagentRunnerExitUnconfirmedError');
   });
 
   it('reports UUID-contained corrupt runs without trusting disk PIDs', async () => {
@@ -448,6 +537,47 @@ describe('PI durable subagent run store', () => {
       ]);
     });
 
+    it('asks ps for untruncated arguments so utility-process command lines still match', () => {
+      stubAliveRunner();
+      const seen: string[][] = [];
+      childProcess.spawnSync.mockImplementation((file: unknown, args?: unknown) => {
+        if (file === 'ps' && Array.isArray(args)) seen.push(args as string[]);
+        return { status: 0, stdout: `node ${runnerScript} config.json` };
+      });
+      expect(verifyPiSubagentRunnerIdentity(expired())).toBe(true);
+      if (seen.length > 0) {
+        expect(seen[0]).toEqual(expect.arrayContaining(['-ww']));
+      }
+    });
+
+    it('treats another Subagent utility process at a recycled pid as gone', async () => {
+      stubAliveRunner();
+      childProcess.spawnSync.mockImplementation(() => ({
+        status: 0,
+        stdout: '/Applications/Cindy.app/Contents/Frameworks/Cindy Helper.app/Contents/MacOS/Cindy Helper --utility-sub-type=node /app/piSubagentRunnerProcess.js /runs/other-run/runner.cjs',
+      }));
+      const root = await makeRoot();
+      await writeStatus(root, expired());
+
+      await expect(listPiSubagentRuns(root)).resolves.toEqual([]);
+      await expect(stopPiSubagentRunsForAccountBoundary(root, { timeoutMs: 0 }))
+        .resolves.toBe(true);
+    });
+
+    it('still treats another Cindy utility process as a recycled pid', async () => {
+      stubAliveRunner();
+      childProcess.spawnSync.mockImplementation(() => ({
+        status: 0,
+        stdout: '/Applications/Cindy.app/Contents/Frameworks/Cindy Helper.app/Contents/MacOS/Cindy Helper --utility-sub-type=node /app/watcherHostProcess.js',
+      }));
+      const root = await makeRoot();
+      await writeStatus(root, expired());
+
+      await expect(listPiSubagentRuns(root)).resolves.toEqual([]);
+      await expect(stopPiSubagentRunsForAccountBoundary(root, { timeoutMs: 0 }))
+        .resolves.toBe(true);
+    });
+
     it('keeps an unverifiable runner active rather than declaring it stale', async () => {
       // The probe failing is not evidence the runner died. Calling it stale
       // hides a live run from the sweep — which then reports a success it did
@@ -636,6 +766,19 @@ describe('PI durable subagent run store', () => {
       expect(piSubagentOwnerIdentity('not-an-owner')).toBeNull();
     });
 
+    it('keeps the owner id stable when later start-time samples cross a rounding boundary', () => {
+      const nowSpy = vi.spyOn(Date, 'now')
+        .mockReturnValueOnce(1_700_000_100_499)
+        .mockReturnValueOnce(1_700_000_100_501);
+      const uptimeSpy = vi.spyOn(process, 'uptime').mockReturnValue(100);
+      restores.push(() => nowSpy.mockRestore(), () => uptimeSpy.mockRestore());
+
+      const first = piSubagentRuntimeOwnerId(process.pid, 'scope-stable');
+      const second = piSubagentRuntimeOwnerId(process.pid, 'scope-stable');
+
+      expect(second).toBe(first);
+    });
+
     it('treats a recycled pid as a dead owner, so the orphan stays reclaimable', async () => {
       const ownerPid = nextOwnerPid++;
       stubAliveOwner(ownerPid);
@@ -801,6 +944,10 @@ describe('PI durable subagent run store', () => {
     const foreignLivePid = process.ppid;
     /** A pid that is certainly not running: 2^22 is above every OS pid_max. */
     const deadPid = 4_194_303;
+    /** These cases pin ownership, not stale detection. A default `updatedAt: 20`
+     *  is already expired, so the sync identity probe (Windows: powershell, 5s)
+     *  would starve the 5s test budget. */
+    const live = (): { updatedAt: number } => ({ updatedAt: Date.now() });
 
     async function homeWithRuns(): Promise<{ agentHome: string; root: string }> {
       const agentHome = await makeRoot();
@@ -814,9 +961,11 @@ describe('PI durable subagent run store', () => {
       const foreign = '123e4567-e89b-42d3-a456-426614174061';
       await writeStatus(root, status(mine, {
         runtimeOwnerId: piSubagentRuntimeOwnerId(process.pid, 'scope-mine'),
+        ...live(),
       }));
       await writeStatus(root, status(foreign, {
         runtimeOwnerId: piSubagentRuntimeOwnerId(foreignLivePid, 'scope-foreign'),
+        ...live(),
       }));
 
       // Times out because our own run never goes terminal; what matters is who
@@ -835,6 +984,7 @@ describe('PI durable subagent run store', () => {
       const orphan = '123e4567-e89b-42d3-a456-426614174062';
       await writeStatus(root, status(orphan, {
         runtimeOwnerId: piSubagentRuntimeOwnerId(deadPid, 'scope-crashed'),
+        ...live(),
       }));
 
       await expect(stopAllPiSubagentRunsForExit(agentHome, 150, { hostPid: process.pid }))
@@ -847,7 +997,7 @@ describe('PI durable subagent run store', () => {
     it('fails closed on a legacy owner id that carries no host prefix', async () => {
       const { agentHome, root } = await homeWithRuns();
       const legacy = '123e4567-e89b-42d3-a456-426614174063';
-      await writeStatus(root, status(legacy, { runtimeOwnerId: 'owner-a' }));
+      await writeStatus(root, status(legacy, { runtimeOwnerId: 'owner-a', ...live() }));
 
       await expect(stopAllPiSubagentRunsForExit(agentHome, 150, { hostPid: process.pid }))
         .resolves.toBe(false);
@@ -862,6 +1012,7 @@ describe('PI durable subagent run store', () => {
       const foreign = '123e4567-e89b-42d3-a456-426614174065';
       await writeStatus(root, status(foreign, {
         runtimeOwnerId: piSubagentRuntimeOwnerId(foreignLivePid, 'scope-foreign'),
+        ...live(),
       }));
 
       // Only the foreign run exists: this host has nothing to stop and must not
@@ -873,6 +1024,7 @@ describe('PI durable subagent run store', () => {
 
       await writeStatus(root, status(mine, {
         runtimeOwnerId: piSubagentRuntimeOwnerId(process.pid, 'scope-mine'),
+        ...live(),
       }));
       expect(hasActivePiSubagentRunsSync(agentHome, { hostPid: process.pid })).toBe(true);
       expect(requestStopAllPiSubagentRunsSync(agentHome, { hostPid: process.pid })).toBe(1);
@@ -912,12 +1064,14 @@ describe('PI durable subagent run store', () => {
      * until a real signal reaches it, then ESRCH like any reaped process. The
      * default (never reaped) is the zombie/stubborn case.
      */
-    let sentSignals: Array<NodeJS.Signals | number> = [];
-    const killSignals = (): Array<NodeJS.Signals | number> => sentSignals;
+    let sentSignals: Array<NodeJS.Signals | number | 'unknown'> = [];
+    let sentKillPids: number[] = [];
+    const killSignals = (): Array<NodeJS.Signals | number | 'unknown'> => sentSignals;
 
     function stubKill(options: { reapedByKill?: boolean } = {}): void {
       const real = process.kill.bind(process);
       sentSignals = [];
+      sentKillPids = [];
       let reaped = false;
       const spy = vi.spyOn(process, 'kill').mockImplementation(
         ((pid: number, signal?: NodeJS.Signals | number) => {
@@ -926,6 +1080,7 @@ describe('PI durable subagent run store', () => {
             if (!reaped) return true;
             throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
           }
+          sentKillPids.push(pid);
           sentSignals.push(signal ?? 'unknown');
           if (options.reapedByKill) reaped = true;
           return true;
@@ -990,6 +1145,32 @@ describe('PI durable subagent run store', () => {
       await expect(killVerifiedPiSubagentRunner(runner())).resolves.toBe(true);
     });
 
+    it('treats a runner that exits during the command-line probe as gone', async () => {
+      usePlatform('linux');
+      const real = process.kill.bind(process);
+      let liveChecks = 0;
+      sentSignals = [];
+      sentKillPids = [];
+      const spy = vi.spyOn(process, 'kill').mockImplementation(
+        ((pid: number, signal?: NodeJS.Signals | number) => {
+          if (Math.abs(pid) !== runnerPid) return real(pid, signal);
+          if (signal === 0) {
+            liveChecks += 1;
+            if (liveChecks === 1) return true;
+            throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+          }
+          sentKillPids.push(pid);
+          sentSignals.push(signal ?? 'unknown');
+          return true;
+        }) as typeof process.kill,
+      );
+      restores.push(() => spy.mockRestore());
+      stubProbes({ aliveProbes: 0 });
+
+      await expect(killVerifiedPiSubagentRunner(runner())).resolves.toBe(true);
+      expect(killSignals()).toEqual([]);
+    });
+
     it('treats a zombie left by the kill as reclaimed', async () => {
       usePlatform('linux');
       stubKill();
@@ -1008,6 +1189,43 @@ describe('PI durable subagent run store', () => {
       await expect(killVerifiedPiSubagentRunner(runner())).resolves.toBe(false);
       // One pre-kill identity check plus the bounded confirmation poll.
       expect(childProcess.spawnSync.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    it('signals the runner pid with SIGTERM before SIGKILL and never a process group', async () => {
+      usePlatform('linux');
+      stubKill();
+      stubProbes({ aliveProbes: Number.MAX_SAFE_INTEGER });
+
+      await expect(killVerifiedPiSubagentRunner(runner())).resolves.toBe(false);
+      expect(sentKillPids.length).toBeGreaterThan(0);
+      expect(sentKillPids.every((pid) => pid > 0)).toBe(true);
+      expect(killSignals()[0]).toBe('SIGTERM');
+      expect(killSignals()).toContain('SIGKILL');
+    });
+
+    it('waits after SIGKILL until the runner is gone', async () => {
+      usePlatform('linux');
+      stubKill();
+      let postKillProbes = 0;
+      childProcess.spawnSync.mockImplementation((...args: unknown[]) => {
+        if (args[0] === 'taskkill') return { status: 0 };
+        const killed = killSignals().includes('SIGKILL');
+        if (!killed) return { status: 0, stdout: `node ${runnerScript} config.json` };
+        postKillProbes += 1;
+        // The first post-SIGKILL listing still matches: the process has not
+        // been scheduled out yet. A single immediate probe would report false.
+        // Empty stdout is unreadable/unverifiable, not gone — use a listing
+        // that is readable and does not carry this run's script.
+        return {
+          status: 0,
+          stdout: postKillProbes <= 1 ? `node ${runnerScript} config.json` : 'other-process',
+        };
+      });
+
+      await expect(killVerifiedPiSubagentRunner(runner())).resolves.toBe(true);
+      expect(killSignals()[0]).toBe('SIGTERM');
+      expect(killSignals()).toContain('SIGKILL');
+      expect(postKillProbes).toBeGreaterThan(1);
     });
 
     it('does not report an account-boundary sweep as complete while a runner survives', async () => {
@@ -1044,7 +1262,7 @@ describe('PI durable subagent run store', () => {
 
         // The stop was still asked for first — the control file was written —
         // and only the unconsumed mailbox escalated to a signal.
-        expect(killSignals()).toContain('SIGKILL');
+        expect(killSignals()).toContain('SIGTERM');
         expect(existsSync(root)).toBe(false);
       });
 
@@ -1111,7 +1329,7 @@ describe('PI durable subagent run store', () => {
         childProcess.probeDelayMs = delayMs;
         restores.push(() => { childProcess.probeDelayMs = 0; });
         childProcess.spawnSync.mockImplementation((...args: unknown[]) => {
-          // POSIX passes ['-p', '<pid>', '-o', 'args=']; Windows embeds the pid
+          // POSIX passes ['-ww', '-p', '<pid>', '-o', 'args=']; Windows embeds the pid
           // in the CIM filter. Either way it is the only all-digit fragment.
           const flat = (args[1] as string[] | undefined) ?? [];
           const pid = flat
@@ -1255,7 +1473,8 @@ describe('PI durable subagent run store', () => {
       await writeFile(path.join(opaque, 'status.json'), '{not-json');
 
       await expect(resumePiSubagentRun(root, 'tool-1', 'continue', {
-        nodeExecutable: process.execPath,
+        launchRunner: noopRunnerLaunch,
+        env: {},
         runtimeOwnerId: 'owner-a',
         permissionSnapshot: { mode: 'ask', readOnlyRoots: [] },
       })).rejects.toThrow(/cannot be read right now/i);
@@ -1269,7 +1488,8 @@ describe('PI durable subagent run store', () => {
         }))}\n`,
       );
       await expect(resumePiSubagentRun(root, 'tool-1', 'continue', {
-        nodeExecutable: process.execPath,
+        launchRunner: noopRunnerLaunch,
+        env: {},
         runtimeOwnerId: 'owner-a',
         permissionSnapshot: { mode: 'ask', readOnlyRoots: [] },
       })).rejects.not.toThrow(/cannot be read right now/i);
@@ -1282,7 +1502,8 @@ describe('PI durable subagent run store', () => {
 
       expect(isPiSubagentLaunchFenceActive(agentHome, process.pid)).toBe(true);
       await expect(resumePiSubagentRun(root, 'tool-1', 'continue', {
-        nodeExecutable: process.execPath,
+        launchRunner: noopRunnerLaunch,
+        env: {},
         runtimeOwnerId: 'owner-a',
         permissionSnapshot: { mode: 'ask', readOnlyRoots: [] },
       })).rejects.toThrow(/restarting for an update/i);
@@ -1828,18 +2049,37 @@ describe('PI durable subagent run store', () => {
           expect.objectContaining({ action: 'stop' }),
         ]);
 
-        // And once that record names a runner this host cannot verify, the
-        // second pass refuses to call the quit clean.
-        await writeStatus(root, status(lateRunId, {
-          state: 'running',
-          runnerPid: process.pid,
-          runnerScript: '/runs/never-matches.cjs',
-          updatedAt: Date.now(),
+        // And once that record names a live pid whose command line cannot be
+        // read, the second pass refuses to call the quit clean. Do not use
+        // `process.pid` here: Linux `/proc/<pid>/cmdline` would bypass the
+        // spawnSync stub and treat a non-matching listing as a recycled pid.
+        const unverifiablePid = 424_424;
+        const realKill = process.kill.bind(process);
+        const killSpy = vi.spyOn(process, 'kill').mockImplementation(
+          ((pid: number, signal?: NodeJS.Signals | number) => {
+            if (pid === unverifiablePid && signal === 0) return true;
+            return realKill(pid, signal);
+          }) as typeof process.kill,
+        );
+        childProcess.spawnSync.mockImplementation(() => ({
+          status: null,
+          stdout: '',
+          error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }),
         }));
-        await expect(stopAllPiSubagentRunsForExit(agentHome, 0, {
-          hostPid: process.pid,
-          killUnresponsiveRunners: true,
-        })).resolves.toBe(false);
+        try {
+          await writeStatus(root, status(lateRunId, {
+            state: 'running',
+            runnerPid: unverifiablePid,
+            runnerScript: '/runs/never-matches.cjs',
+            updatedAt: Date.now(),
+          }));
+          await expect(stopAllPiSubagentRunsForExit(agentHome, 0, {
+            hostPid: process.pid,
+            killUnresponsiveRunners: true,
+          })).resolves.toBe(false);
+        } finally {
+          killSpy.mockRestore();
+        }
       });
 
       it('sweeps only the fences whose owner is gone', async () => {
@@ -1852,6 +2092,81 @@ describe('PI durable subagent run store', () => {
         await expect(readFile(piSubagentLaunchFencePath(agentHome, 4_194_303), 'utf8'))
           .rejects.toMatchObject({ code: 'ENOENT' });
         expect(isPiSubagentLaunchFenceActive(agentHome, otherHostPid)).toBe(true);
+      });
+
+      it('names the fence artifacts the runs root may contain, and nothing else', () => {
+        expect(piSubagentLaunchFenceArtifact('.launch-fence.json')).toEqual({ kind: 'published' });
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-10596.json')).toEqual({ kind: 'published' });
+        expect(piSubagentLaunchFenceArtifact(
+          '.launch-fence-10596.json.tmp-10596-89aea6ae-a2c7-4fa4-8856-82503af66389',
+        )).toEqual({ kind: 'staging', writerPid: 10596 });
+        expect(piSubagentLaunchFenceArtifact(
+          '.launch-fence.json.tmp-10596-89aea6ae-a2c7-4fa4-8856-82503af66389',
+        )).toEqual({ kind: 'staging', writerPid: 10596 });
+        // A parent-session directory, a run directory, and near-misses stay out.
+        expect(piSubagentLaunchFenceArtifact('123e4567-e89b-42d3-a456-4266141740e0')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('session-1')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-10596.json.bak')).toBeNull();
+        // Only a numeric pid sits between the prefix and the suffix.
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-backup.json')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-.json')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-10596x.json')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact(
+          '.launch-fence-backup.json.tmp-10596-89aea6ae-a2c7-4fa4-8856-82503af66389',
+        )).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('.launch-fence-10596.json.tmp-10596-not-a-uuid')).toBeNull();
+        expect(piSubagentLaunchFenceArtifact('status.json.tmp-10596-89aea6ae-a2c7-4fa4-8856-82503af66389')).toBeNull();
+      });
+
+      describe('a staging file a crash left between write and rename', () => {
+        const stagingUuid = '89aea6ae-a2c7-4fa4-8856-82503af66389';
+        const stagingPath = (agentHome: string, writerPid: number, base = `.launch-fence-${writerPid}.json`) => path.join(
+          path.dirname(piSubagentLaunchFencePath(agentHome)),
+          `${base}.tmp-${writerPid}-${stagingUuid}`,
+        );
+        const payload = (hostPid: number, hostStartTimeSec?: number) => `${JSON.stringify({
+          version: 1,
+          hostPid,
+          ...(hostStartTimeSec === undefined ? {} : { hostStartTimeSec }),
+          leaseId: '5ae20afc-0789-4d90-98dc-9f577e05acef',
+          createdAt: 1_789_436_177_945,
+        })}\n`;
+
+        it('sweeps it once its writer is gone, whether complete or half-written', async () => {
+          const agentHome = await makeRoot();
+          await mkdir(path.dirname(piSubagentLaunchFencePath(agentHome)), { recursive: true });
+          const complete = stagingPath(agentHome, 4_194_303);
+          const halfWritten = stagingPath(agentHome, 4_194_303, '.launch-fence.json');
+          await writeFile(complete, payload(4_194_303, 1_789_385_816));
+          await writeFile(halfWritten, '{"version":1,"hostPid":4194');
+          // And one the OS handed our own pid to after the writer crashed.
+          const recycled = stagingPath(agentHome, process.pid);
+          await writeFile(recycled, payload(process.pid, 1));
+
+          await clearStalePiSubagentLaunchFence(agentHome);
+
+          for (const file of [complete, halfWritten, recycled]) {
+            await expect(readFile(file, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+          }
+        });
+
+        it('leaves it alone while its writer is still alive', async () => {
+          const agentHome = await makeRoot();
+          await mkdir(path.dirname(piSubagentLaunchFencePath(agentHome)), { recursive: true });
+          const complete = stagingPath(agentHome, process.pid);
+          await writeFile(complete, payload(process.pid));
+          // Half-written by a live host: the only proof of ownership is the pid
+          // in the name, and that host may be one rename away from publishing.
+          const halfWritten = stagingPath(agentHome, process.pid, '.launch-fence.json');
+          await writeFile(halfWritten, '{"version":1,"hostPid":');
+
+          await clearStalePiSubagentLaunchFence(agentHome);
+
+          await expect(readFile(complete, 'utf8')).resolves.toContain('"version":1');
+          await expect(readFile(halfWritten, 'utf8')).resolves.toBe('{"version":1,"hostPid":');
+          // It never counts as a fence either: only the named path does.
+          expect(isPiSubagentLaunchFenceActive(agentHome, process.pid)).toBe(false);
+        });
       });
 
       it('ignores and sweeps a fence its pid inherited from a previous life', async () => {
@@ -1932,7 +2247,8 @@ describe('PI durable subagent run store', () => {
       const root = piSubagentRunRoot(agentHome, 'session-1');
       await writeStatus(root, status(runId, { state: 'completed' }));
       await expect(resumePiSubagentRun(root, 'tool-1', 'continue', {
-        nodeExecutable: process.execPath,
+        launchRunner: noopRunnerLaunch,
+        env: {},
         runtimeOwnerId: 'owner-a',
         permissionSnapshot: { mode: 'ask', readOnlyRoots: [] },
       })).rejects.toThrow(/restarting for an update/i);
@@ -1967,8 +2283,14 @@ describe('PI durable subagent run store', () => {
     const terminalId = '123e4567-e89b-42d3-a456-426614174007';
     await writeStatus(root, status(activeId));
     await writeStatus(root, status(terminalId, { state: 'completed' }));
-    await expect(syncPiSubagentPermissions(root, { mode: 'ask', readOnlyRoots: [] })).resolves.toBe(1);
-    await expect(readFile(path.join(root, activeId, 'permission.json'), 'utf8')).resolves.toContain('"mode":"ask"');
+    await expect(syncPiSubagentPermissions(root, {
+      mode: 'auto',
+      readOnlyRoots: ['/ref'],
+      writableRoots: ['/out'],
+    })).resolves.toBe(1);
+    await expect(readFile(path.join(root, activeId, 'permission.json'), 'utf8')).resolves.toBe(
+      '{"mode":"auto","readOnlyRoots":["/ref"],"writableRoots":["/out"]}\n',
+    );
     await expect(readFile(path.join(root, terminalId, 'permission.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -1983,11 +2305,13 @@ describe('PI durable subagent run store', () => {
 
     await expect(syncPiSubagentPermissions(
       root,
-      { mode: 'bypassPermissions', readOnlyRoots: [] },
+      { mode: 'bypassPermissions', readOnlyRoots: ['/ref'], writableRoots: ['/out'] },
       'owner-a',
     )).resolves.toBe(1);
     await expect(readFile(path.join(root, ownedId, 'permission.json'), 'utf8'))
-      .resolves.toContain('bypassPermissions');
+      .resolves.toBe(
+        '{"mode":"bypassPermissions","readOnlyRoots":["/ref"],"writableRoots":["/out"]}\n',
+      );
     await expect(readFile(path.join(root, foreignId, 'permission.json'), 'utf8'))
       .rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(path.join(root, legacyId, 'permission.json'), 'utf8'))
@@ -2600,12 +2924,16 @@ describe('PI durable subagent run store', () => {
     expect(new Set(controls.map((control) => control.requestId)).size).toBe(2);
   });
 
-  it.skipIf(process.platform === 'win32')('refuses a control mailbox redirected through a symlink', async () => {
+  it('refuses a control mailbox redirected through a symlink', async () => {
     const root = await makeRoot();
     const runId = '123e4567-e89b-42d3-a456-426614174014';
     const outside = await makeRoot();
     await writeStatus(root, status(runId));
-    await symlink(outside, path.join(root, runId, 'controls'), 'dir');
+    await symlink(
+      outside,
+      path.join(root, runId, 'controls'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
 
     await expect(controlPiSubagentRuns(root, runId, 'stop')).rejects.toThrow(/control directory is unavailable/);
     await expect(readdir(outside)).resolves.toEqual([]);
