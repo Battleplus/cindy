@@ -15,7 +15,6 @@ import { useTranslation } from 'react-i18next';
 import {
   deriveAgentTaskStatus,
 
-  formatAgentTaskTitle,
   type AgentTaskStatus,
 
   type AgentTaskTerminalStatus,

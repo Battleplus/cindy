@@ -50,6 +50,11 @@ function agentResult(toolUseId: string, content: string, createdAt?: string): Re
   return msg({ role: 'tool_result', content, toolUseId, createdAt });
 }
 
+/** 显式 id / toolUseId 的 tool_result:模拟邻接的、非子任务自己的工具结果。 */
+function toolResult(id: string, toolUseId: string, content: string, createdAt?: string): RemoteMessage {
+  return msg({ id, role: 'tool_result', content, toolUseId, createdAt });
+}
+
 function subagentGroups(items: readonly MobileMessageRenderItem[]): MobileSubagentGroupItem[] {
   return items.filter((item): item is MobileSubagentGroupItem => item.type === 'subagent_group');
 }
