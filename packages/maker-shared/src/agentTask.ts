@@ -581,21 +581,32 @@ export function buildAgentTaskCardModel(input: {
   durableStatus?: AgentTaskStatus;
 }): AgentTaskCardModel {
   const { toolName, toolInput, update, result, persistedStatus, durableStatus } = input;
-  const status = deriveAgentTaskStatus(update?.status, result, {
-    persistedStatus,
-    durableStatus,
-    resultIsLaunchReceipt:
-      subagentSpawnReceiptName(toolName, toolInput, result) !== undefined
-      || subagentSpawnResultIndicatesRunning(toolName, result),
-    resultIsError: isSubagentResultError(result),
-  });
-  const provider: 'claude-code' | 'codex' | 'pi' =
+  // `<tool_use_error>` is only a trustworthy failure witness for Claude
+  // subagent tools (Agent/Task). PI `subagent` / Codex `collab:*` results are
+  // arbitrary work products that may legitimately start with that marker, so
+  // the shared card model narrows by tool name exactly like the desktop
+  // callers (AgentTaskCard / listSessionTasks). With no tool name (history
+  // replay of a legacy update card) fall back to the provider heuristic below,
+  // matching AgentTaskCard's claudeProtocolResult.
+  const providerFallback: 'claude-code' | 'codex' | 'pi' =
     update?.provider
     ?? (toolName?.startsWith('collab:')
       ? 'codex'
       : toolName === PI_SUBAGENT_TOOL_NAME
         ? 'pi'
         : 'claude-code');
+  const claudeProtocolResult = toolName !== undefined
+    ? isClaudeSubagentToolName(toolName)
+    : providerFallback === 'claude-code';
+  const status = deriveAgentTaskStatus(update?.status, result, {
+    persistedStatus,
+    durableStatus,
+    resultIsLaunchReceipt:
+      subagentSpawnReceiptName(toolName, toolInput, result) !== undefined
+      || subagentSpawnResultIndicatesRunning(toolName, result),
+    resultIsError: claudeProtocolResult && isSubagentResultError(result),
+  });
+  const provider = providerFallback;
   const title = compactText(
     formatAgentTaskTitle(provider, update?.title
       ?? readInputString(toolInput, ['description', 'task', 'name'])

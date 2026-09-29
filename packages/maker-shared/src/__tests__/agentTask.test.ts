@@ -471,6 +471,51 @@ describe('findAgentTaskUpdate', () => {
 });
 
 describe('buildAgentTaskCardModel', () => {
+  // Review #3024 (head 954ed53) P1: the shared card model must narrow
+  // `<tool_use_error>` by tool name like the desktop callers — PI subagent /
+  // Codex collab work products may legitimately start with that marker.
+  it('does not project a PI subagent protocol-marker work product as failed', () => {
+    const model = buildAgentTaskCardModel({
+      toolName: 'subagent',
+      toolInput: { prompt: 'write the report' },
+      result: '<tool_use_error>校验报告：3 处不一致</tool_use_error>',
+    });
+    expect(model.status).toBe('completed');
+    expect(model.provider).toBe('pi');
+  });
+
+  it('does not project a Codex collab protocol-marker work product as failed', () => {
+    const model = buildAgentTaskCardModel({
+      toolName: 'collab:spawn',
+      result: '<tool_use_error>errors: none</tool_use_error>',
+    });
+    expect(model.status).toBe('completed');
+    expect(model.provider).toBe('codex');
+  });
+
+  it('still projects a Claude tool protocol-marker result as failed', () => {
+    const model = buildAgentTaskCardModel({
+      toolName: 'Task',
+      result: '<tool_use_error>launch failed</tool_use_error>',
+    });
+    expect(model.status).toBe('failed');
+  });
+
+  it('keeps the provider fallback (claude-code) for history replay without toolName', () => {
+    const model = buildAgentTaskCardModel({
+      result: '<tool_use_error>launch failed</tool_use_error>',
+    });
+    expect(model.status).toBe('failed');
+  });
+
+  it('history replay with an explicit non-Claude provider stays completed', () => {
+    const model = buildAgentTaskCardModel({
+      result: '<tool_use_error>报告正文</tool_use_error>',
+      update: { provider: 'codex', taskId: 'c1', parentToolUseId: 'c1', status: 'running' },
+    });
+    expect(model.status).toBe('completed');
+  });
+
   it('REPRO: treats a paired final result as terminal when the live update is stale running', () => {
     const model = buildAgentTaskCardModel({
       toolName: 'collab:spawnAgent',
