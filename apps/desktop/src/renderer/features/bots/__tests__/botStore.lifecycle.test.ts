@@ -2,17 +2,18 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/state/newMakerDraft', () => ({
-  getDraft: () => ({
+vi.mock('@/state/newMakerDraft', () => {
+  const snapshot = () => ({
+    vendor: 'cc',
     lastByVendor: {
       cc: { model: '', providerId: null, effort: '', fastMode: false },
       codex: { model: '', providerId: null, effort: '', fastMode: false },
       pi: { model: '', providerId: null, effort: '', fastMode: false },
     },
     fastModeByModel: {},
-  }),
-  getPersistedVendorModel: () => '',
-}));
+  });
+  return { getDraft: snapshot, getDraftForPreferenceSync: snapshot, getPersistedVendorModel: () => '' };
+});
 
 vi.mock('@/lib/modelDefinitions', () => ({
   getDefaultModelForVendor: () => ({ id: 'claude-sonnet-4-6', defaultEffort: 'medium' }),
@@ -157,6 +158,30 @@ describe('Bot profile snapshot ownership', () => {
     release([bot]);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(store.getBotProfiles().map((row) => row.id)).toEqual(['bot-b']);
+  });
+
+  it('loads the signed-in owner projection on demand after the startup hydration missed it', async () => {
+    const owner = await import('@/contexts/dataOwnerGeneration');
+    owner.setDataOwnerGeneration(null);
+    const list = vi.fn()
+      .mockRejectedValueOnce(new Error('database not ready'))
+      .mockResolvedValue([bot]);
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { localDb: { bots: { list } } },
+    });
+    const store = await import('../botStore');
+    await vi.waitFor(() => expect(list).toHaveBeenCalledOnce());
+    owner.setDataOwnerGeneration('owner-a');
+    // Sign-in clears the projection without reloading it; nothing is listening outside Bots views.
+    expect(store.getBotProfiles()).toEqual([]);
+    await expect(store.ensureBotProfilesLoaded()).resolves.toMatchObject([{ id: 'bot-1' }]);
+    expect(list).toHaveBeenCalledTimes(2);
+    // Already loaded: a plain entry does not re-read, an explicit refresh does.
+    await store.ensureBotProfilesLoaded();
+    expect(list).toHaveBeenCalledTimes(2);
+    await store.ensureBotProfilesLoaded(true);
+    expect(list).toHaveBeenCalledTimes(3);
   });
 
   it('rejects a prior-owner update without changing the new owner projection', async () => {

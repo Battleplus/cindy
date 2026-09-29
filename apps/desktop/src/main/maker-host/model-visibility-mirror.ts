@@ -60,7 +60,13 @@ function keyOf(agent: AgentKind, providerId: string, modelId: string): string {
  */
 export function setModelVisibilityMirror(raw: unknown, policy?: unknown): boolean {
   const candidate = policy as { fallback?: unknown; followCatalogKeys?: unknown; pending?: unknown } | undefined;
-  if (candidate?.pending === true) return false;
+  if (candidate?.pending === true) {
+    if (!ready) return false;
+    // Legacy preferences can appear after an empty origin first becomes ready.
+    // Stop serving its earlier defaults until the renderer finishes migration.
+    clearModelVisibilityMirror();
+    return true;
+  }
   const wasReady = ready;
   const nextStrict = candidate?.fallback === false;
   const nextFollow = new Set<string>(nextStrict && Array.isArray(candidate?.followCatalogKeys)
@@ -158,6 +164,11 @@ export function getModelVisibilityMirrorSnapshot(providers: readonly ProviderVie
         const value = getModelVisibilityOverride(agent, provider.id, model.id);
         if (value !== undefined) snapshot[keyOf(agent, provider.id, model.id)] = value;
       }
+    }
+    const mediaAgent = provider.agents[0] ?? 'claude-code';
+    for (const model of [...(provider.imageModels ?? []), ...(provider.videoModels ?? [])]) {
+      const value = getModelVisibilityOverride(mediaAgent, provider.id, model.id);
+      if (value !== undefined) snapshot[keyOf(mediaAgent, provider.id, model.id)] = value;
     }
   }
   return snapshot;

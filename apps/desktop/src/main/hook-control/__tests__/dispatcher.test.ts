@@ -7,6 +7,10 @@
 import path from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
+import { Session, type AgentEvent, type AgentSessionHandle, type Capabilities } from '@cindy/maker-core';
+import { observeHookTurn } from '../turnObserver';
+import { bindRuntimeRecoveryNotice } from '../../im/shared/runtimeRecoveryNotice';
+import { setMainLocale } from '../../i18n';
 
 import {
   HOOK_FEATURE_MESSAGE_OPS,
@@ -240,6 +244,112 @@ function makeDispatcher(overrides?: {
   return { d, bindings, fr };
 }
 
+describe('post-terminal runtime recovery delivery', () => {
+  it.each([
+    ['en', 'Pi extensions could not be refreshed. Restart Cindy before using Pi again.'],
+    ['zh-CN', 'Pi 扩展未能完成刷新。请重启 Cindy 后再使用 Pi。'],
+    ['zh-TW', 'Pi 擴充功能未能完成重新整理。請重新啟動 Cindy 後再使用 Pi。'],
+    ['ja', 'Pi 拡張機能を更新できませんでした。Pi を再び使用する前に Cindy を再起動してください。'],
+    ['ko', 'Pi 확장을 새로 고치지 못했습니다. Pi를 다시 사용하기 전에 Cindy를 다시 시작하세요.'],
+  ] as const)('delivers localized %s recovery after the observer unsubscribes, without replay', async (locale, expected) => {
+    setMainLocale(locale);
+    let terminal!: () => void;
+    const terminalReady = new Promise<void>(resolve => { terminal = resolve; });
+    let end!: () => void;
+    const ended = new Promise<void>(resolve => { end = resolve; });
+    let failClose!: () => void;
+    const closeReady = new Promise<void>(resolve => { failClose = resolve; });
+    let running = false;
+    const handle = {
+      id: 'pi', agentKind: 'pi', model: 'm',
+      send: vi.fn(async () => { running = true; }),
+      close: vi.fn(async () => { await closeReady; throw new Error('exit unconfirmed'); }),
+      isTurnRunning: () => running, setInteractionResolver() {},
+      async *events() {
+        await terminalReady;
+        yield { type: 'text', source: 'pi', data: { text: 'saved result', isFinal: true } } as AgentEvent;
+        running = false;
+        yield { type: 'done', source: 'pi', data: { status: 'completed' } } as AgentEvent;
+        await ended;
+      },
+    } as unknown as AgentSessionHandle;
+    const logger = { ...noopLog, debug() {}, trace() {}, error() {}, fatal() {}, child() { return this; } };
+    const session = new Session({ id: 'task', agentKind: 'pi', workDir: WS_DIR,
+      handle, capabilities: {} as Capabilities, logger, turnStallMs: 0 });
+    let delivery: Promise<boolean> | undefined;
+    const noticeResult = vi.fn();
+    const run = vi.fn(async (req: HookRunRequest): Promise<HookRunOutcome> => {
+      const observer = observeHookTurn(session, { onSilentStopSettled: () => () => {}, log: noopLog });
+      await session.send(req.prompt, { beforeProviderStart: () => {
+        bindRuntimeRecoveryNotice(session, text => {
+          delivery = req.onRuntimeRecovery!(text);
+          void delivery.then(noticeResult);
+          return delivery;
+        }, noopLog);
+      } });
+      await session.closeAfterCurrentTurn({ failureEvent: () => ({ type: 'text', data: {
+        text: 'restart-cindy-to-refresh-packages', isFinal: true,
+      } }) });
+      terminal();
+      await observer.finished;
+      return { status: 'ok', finalText: observer.finalText(), errorMessage: null, durationMs: 1 };
+    });
+    const { d } = makeDispatcher({ runner: { isBusy: () => false, inspect: async () => null, run } });
+    const c = collector();
+    d.onConnected('conn-1', c.send, [HOOK_FEATURE_MESSAGE_OPS]);
+    try {
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await vi.waitFor(() => expect(c.ofType('turn.end')).toHaveLength(1));
+      expect(c.ofType('turn.end')[0]?.payload).toMatchObject({ status: 'ok', finalText: 'saved result' });
+      failClose();
+      await vi.waitFor(() => expect(session.getStatus()).toBe('error'));
+      const notices = c.ofType('msg.op').filter(m => m.payload.action.kind === 'send');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.payload).toMatchObject({ scope: { externalKey: telegramDispatch().externalKey },
+        action: { kind: 'send', text: expected } });
+      expect(JSON.stringify(notices)).not.toContain('restart-cindy-to-refresh-packages');
+      expect(notices[0]?.payload.requestId).toBeUndefined();
+      expect(noticeResult).not.toHaveBeenCalled(); // Socket send is not channel delivery.
+      d.onMessageOpResult({ opId: notices[0]!.payload.opId, ok: true, messageId: 'notice-1' });
+      await expect(delivery).resolves.toBe(true);
+      d.onMessageOpResult({ opId: notices[0]!.payload.opId, ok: true, messageId: 'notice-1' });
+      expect(c.ofType('turn.end')).toHaveLength(1);
+      expect(handle.send).toHaveBeenCalledOnce();
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      failClose();
+      vi.mocked(handle.close).mockImplementation(async () => { end(); });
+      await session.close().catch(() => session.close());
+      d.dispose();
+      setMainLocale('en');
+    }
+  });
+
+  it.each(['unsupported', 'offline', 'account-changed', 'rejected', 'timeout'] as const)(
+    'does not claim delivery or rewrite success when %s', async (failure) => {
+      const { d, fr } = makeDispatcher();
+      const c = collector();
+      d.onConnected('conn-1', c.send, failure === 'unsupported' ? [] : [HOOK_FEATURE_MESSAGE_OPS]);
+      d.handleDispatch('conn-1', telegramDispatch(), c.send);
+      await tick();
+      fr.finish();
+      await tick();
+      if (failure === 'offline') d.onDisconnected('conn-1');
+      if (failure === 'account-changed') await d.deactivateAccount();
+      if (failure === 'timeout') vi.useFakeTimers();
+      try {
+        const pending = fr.calls[0]!.onRuntimeRecovery!('restart-cindy-to-refresh-packages');
+        const notice = c.ofType('msg.op').find(m => m.payload.action.kind === 'send');
+        if (failure === 'rejected') d.onMessageOpResult({ opId: notice!.payload.opId, ok: false });
+        if (failure === 'timeout') await vi.advanceTimersByTimeAsync(10_000);
+        await expect(pending).resolves.toBe(false);
+        expect(c.ofType('turn.end')).toHaveLength(1);
+        expect(fr.calls).toHaveLength(1);
+      } finally { d.dispose(); vi.useRealTimers(); }
+    },
+  );
+});
+
 describe('isPathWithin', () => {
   it('相等 / 子目录 / 外部路径', () => {
     expect(isPathWithin(WS_DIR, WS_DIR)).toBe(true);
@@ -294,6 +404,21 @@ describe('buildHookSessionTitle', () => {
 });
 
 describe('normalizeTaskSource', () => {
+  it('excludes the X trigger from references without mutating the wire chain', () => {
+    const current = { messageId: 'current', author: '@user', text: '@bot request' };
+    const source = {
+      im: 'x' as const, triggerMessageId: 'current', userText: 'request',
+      threadContext: [current],
+    };
+    expect(normalizeTaskSource(source).threadContext).toEqual([]);
+    expect(source.threadContext).toEqual([current]);
+    expect(normalizeTaskSource({ ...source, userText: undefined }).threadContext).toEqual([current]);
+    expect(normalizeTaskSource({ ...source, im: 'slack' }).threadContext).toEqual([current]);
+    expect(normalizeTaskSource({ ...source, triggerMessageId: undefined }).threadContext).toEqual([current]);
+    const legacy = { author: '@user', text: 'request' };
+    expect(normalizeTaskSource({ ...source, threadContext: [legacy] }).threadContext).toEqual([legacy]);
+  });
+
   it('bounds server-controlled display metadata before session persistence', async () => {
     const source = normalizeTaskSource({
       im: 'telegram',
@@ -565,6 +690,48 @@ describe('dispatcher 核心语义', () => {
     });
   });
 
+  it('preserves partial output alongside an error in the Telegram turn.end frame', async () => {
+    const fr = fakeRunner();
+    const { d } = makeDispatcher({ runner: fr.runner });
+    const c = collector();
+    d.handleDispatch('conn-1', dispatch({ source: { im: 'telegram', userText: 'hello' } }), c.send);
+    await tick();
+    fr.finish({ status: 'error', finalText: 'partial answer', errorMessage: '回复可能不完整' });
+    await tick();
+    expect(c.last('turn.end')?.payload).toMatchObject({
+      status: 'error', finalText: 'partial answer', errorMessage: '回复可能不完整',
+    });
+  });
+
+  it('X 新字段在展示截断前组装，runner 收到客户端 prompt 与原话元数据', async () => {
+    const fr = fakeRunner();
+    const { d } = makeDispatcher({ runner: fr.runner });
+    const c = collector();
+    const longText = 'a'.repeat(5000) + '末尾事实';
+    d.handleDispatch('conn-1', dispatch({
+      prompt: '旧服务端模板',
+      source: {
+        im: 'x', triggerMessageId: '2', userText: '查看 PR',
+        xContext: { requesterId: 'u', requesterName: 'User', truncated: false },
+        threadContext: [
+          { messageId: '1', replyToMessageId: null, authorId: 'other', author: '@other', text: longText },
+          { messageId: '2', replyToMessageId: '1', authorId: 'u', author: '@user', text: '@bot 查看 PR' },
+        ],
+      },
+    }), c.send);
+    await tick();
+    expect(fr.calls[0]?.prompt).toContain('当前请求者：User（@user）');
+    expect(fr.calls[0]?.prompt).toContain(longText);
+    expect(fr.calls[0]?.prompt).not.toContain('旧服务端模板');
+    expect(fr.calls[0]?.prompt.endsWith('[@user · 当前请求]\n查看 PR')).toBe(true);
+    expect(fr.calls[0]?.source).toMatchObject({
+      userText: '查看 PR', triggerMessageId: '2', xContext: { requesterId: 'u' },
+    });
+    expect(fr.calls[0]?.source?.threadContext).toEqual([
+      expect.objectContaining({ messageId: '1', author: '@other', text: longText.slice(0, 4000) }),
+    ]);
+  });
+
   it('标题用 source.userText, 不吃 prompt 里 server 挂的 thread 上下文块', async () => {
     // server 会把 thread 上下文拼进 prompt(Slack 的 injectThreadContext 一直
     // 如此, X 也已接上)。按 prompt 前 24 字取标题的话, 整条 thread 派出来的
@@ -625,7 +792,7 @@ describe('dispatcher 核心语义', () => {
     fr.finish();
   });
 
-  it('会话被移出工作目录映射 -> 断开绑定、换新对话并说明, 不跟随到映射外', async () => {
+  it('会话被移出工作目录映射 -> 断开绑定、静默换新对话, 不跟随到映射外', async () => {
     const bindings = memoryBindings();
     const sessions: Record<string, { workingDir: string; usable: boolean }> = {};
     const fr = fakeRunner({ sessions });
@@ -653,10 +820,7 @@ describe('dispatcher 核心语义', () => {
 
     fr.finish({ finalText: '新对话的回答' });
     await tick();
-    const finalText = c.last('turn.end')!.payload.finalText;
-    expect(finalText).toContain('原任务已不在可用的工作目录里');
-    expect(finalText).toContain('把它所在的目录加进来');
-    expect(finalText).toContain('新对话的回答');
+    expect(c.last('turn.end')!.payload.finalText).toBe('新对话的回答');
   });
 
   it('旧任务还在跑时被移出映射: 新消息不排进旧会话(快路径也过边界)', async () => {
@@ -971,7 +1135,7 @@ describe('dispatcher 核心语义', () => {
     fr.finish();
   });
 
-  it('工作目录映射被改(会话目录没变) -> 仍丢绑定重建, 并说明原因', async () => {
+  it('工作目录映射被改(会话目录没变) -> 仍丢绑定静默重建', async () => {
     const bindings = memoryBindings();
     const sessions: Record<string, { workingDir: string; usable: boolean }> = {};
     const fr = fakeRunner({ sessions });
@@ -1000,9 +1164,7 @@ describe('dispatcher 核心语义', () => {
 
     fr.finish({ finalText: '新会话的回答' });
     await tick();
-    const finalText = c.last('turn.end')!.payload.finalText;
-    expect(finalText).toContain('原任务已不在可用的工作目录里');
-    expect(finalText).toContain('新会话的回答');
+    expect(c.last('turn.end')!.payload.finalText).toBe('新会话的回答');
   });
 
   it('存量绑定(带早期版本残留字段)照常判定: 在映射内即复用, 越界即重建', async () => {
@@ -1036,7 +1198,7 @@ describe('dispatcher 核心语义', () => {
     fr2.finish();
   });
 
-  it('绑定的会话已归档/删除 -> 重建并说明是原对话没了', async () => {
+  it('绑定的会话已归档/删除 -> 静默重建, 不向渠道追加说明', async () => {
     const bindings = memoryBindings();
     const fr = fakeRunner({ sessions: { 'gone-session': { workingDir: WS_DIR, usable: false } } });
     const { d } = makeDispatcher({ runner: fr.runner, bindings });
@@ -1049,8 +1211,7 @@ describe('dispatcher 核心语义', () => {
 
     fr.finish({ finalText: '新的回答' });
     await tick();
-    // 措辞留余地: inspect 的 null 也可能是读库瞬时失败, 不能一口咬定会话没了
-    expect(c.last('turn.end')!.payload.finalText).toContain('原任务现在读不到');
+    expect(c.last('turn.end')!.payload.finalText).toBe('新的回答');
   });
 
   it('切账号期间异步定位失败也不回写旧代 rejected ack', async () => {
@@ -1849,13 +2010,39 @@ describe('dispatcher 核心语义', () => {
     ]);
   });
 
+  it.each(['absent', 'empty', 'failed'] as const)(
+    'does not classify user prompt tags as context when host prefix is %s',
+    async (mode) => {
+      const fr = fakeRunner();
+      const { d } = makeDispatcher({
+        runner: fr.runner,
+        ...(mode === 'absent' ? {} : {
+          buildContextPrefix: async () => {
+            if (mode === 'failed') throw new Error('context unavailable');
+            return { prefix: '', messageCount: 0, commit: () => undefined };
+          },
+        }),
+      });
+      const c = collector();
+      const prompt = '<group_chat_context>\n[群里最近的消息]\n[A] user text\n</group_chat_context>\nquestion';
+      d.handleDispatch('conn-1', dispatch({ prompt }), c.send);
+      await tick();
+      expect(fr.calls).toHaveLength(1);
+      expect(fr.calls[0]?.prompt).toBe(prompt);
+      expect(fr.calls[0]?.contextSnapshot).toEqual({});
+      fr.finish({ finalText: 'done' });
+      await tick();
+    },
+  );
+
   it('排队任务只在真正开始时 commit, 取消队列前项不丢后项上下文', async () => {
     const fr = fakeRunner();
     const committed: string[] = [];
     const { d } = makeDispatcher({
       runner: fr.runner,
       buildContextPrefix: async (payload) => ({
-        prefix: '<group_chat_context>背景</group_chat_context>',
+        prefix: '<group_chat_context>\n[群里最近的消息]\n[A] 背景\n第二行\n</group_chat_context>\n',
+        messageCount: 1,
         commit: () => {
           committed.push(payload.requestId);
         },
@@ -1882,6 +2069,10 @@ describe('dispatcher 核心语义', () => {
     expect(fr.calls).toHaveLength(2);
     await fr.calls[1]?.onProviderAccepted?.();
     expect(committed).toEqual(['running', 'queued-b']);
+    for (const call of fr.calls) {
+      expect(call.contextSnapshot).toEqual({ groupContext: '[A] 背景\n第二行', groupMessageCount: 1 });
+      expect(call.prompt).toContain('[A] 背景\n第二行');
+    }
 
     fr.finish({ finalText: 'queued b done' });
     await tick();

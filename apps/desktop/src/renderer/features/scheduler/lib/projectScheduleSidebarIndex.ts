@@ -1,31 +1,34 @@
 import type { AutomationScheduleSessionInfo } from '../../cc-agent/lib/automationSidebarGrouping';
 import type { ScheduleSidebarIndexRun } from './scheduleSidebarIndexRuns';
-import { isFailedScheduleRun, isUnreadFailedScheduleRun, isUnreadScheduleRun } from './runUnread';
+import { isUnreadFailedScheduleRun, isUnreadScheduleRun } from './runUnread';
 import { compareFailedScheduleRuns } from './failedScheduleDismissal';
+import { activeScheduleFailures } from '@cindy/maker-shared/schedule-model';
 
 /** Local and remote snapshots have the same unread projection. */
 export function projectScheduleSidebarIndex(
   runs: readonly ScheduleSidebarIndexRun[],
 ): Map<string, AutomationScheduleSessionInfo> {
   const next = new Map<string, AutomationScheduleSessionInfo>();
+  const activeFailures = activeScheduleFailures(runs.map((run) => ({ ...run, id: run.runId })));
   const latestUnreadFailedFiredAt = new Map<string, number>();
   for (const run of runs) {
     if (!run.sessionId) continue;
     const existing = next.get(run.sessionId);
     const unreadRunIds = existing?.unreadRunIds ? [...existing.unreadRunIds] : [];
     const unreadFailedRunIds = existing?.unreadFailedRunIds ? [...existing.unreadFailedRunIds] : [];
-    // 只对未读 run 累加(与 isUnreadScheduleRun 对齐)。failed / interrupted
-    // 未读 run 拉高本 session 的 urgency 让侧栏涂红而不是涂绿。
-    const isRunUnread = isUnreadScheduleRun(run);
+    // Match the in-task warning: recovered failures stay in history, but must
+    // not keep a red dot (or become a false completion dot after recovery).
+    const isUnreadFailure = activeFailures.has(run.runId) && isUnreadFailedScheduleRun(run);
+    const isRunUnread = isUnreadScheduleRun(run) && (run.status === 'success' || isUnreadFailure);
     if (isRunUnread) unreadRunIds.push(run.runId);
     let latestFailedRun = existing?.latestFailedRun;
-    if (isFailedScheduleRun(run)) {
-      const candidate = { runId: run.runId, firedAt: run.firedAt ?? 0 };
+    if (activeFailures.has(run.runId)) {
+      const candidate = { runId: run.runId, firedAt: run.firedAt ?? 0, scheduleId: run.scheduleId, failureKind: run.failureKind };
       if (!latestFailedRun || compareFailedScheduleRuns(candidate, latestFailedRun) > 0)
         latestFailedRun = candidate;
     }
     let latestUnreadFailedRunId = existing?.latestUnreadFailedRunId;
-    if (isUnreadFailedScheduleRun(run)) {
+    if (isUnreadFailure) {
       unreadFailedRunIds.push(run.runId);
       const firedAt = run.firedAt ?? 0;
       if (firedAt >= (latestUnreadFailedFiredAt.get(run.sessionId) ?? Number.NEGATIVE_INFINITY)) {
@@ -45,7 +48,7 @@ export function projectScheduleSidebarIndex(
       unreadFailedRunIds,
       latestUnreadFailedRunId,
       latestFailedRun,
-      hasFailedRun: Boolean(existing?.hasFailedRun || isFailedScheduleRun(run)),
+      hasFailedRun: !!latestFailedRun,
       hasUnreadRun: unreadRunIds.length > 0,
       hasUnreadFailedRun: unreadFailedRunIds.length > 0,
     });

@@ -13,8 +13,10 @@
  * 判定顺序（从最窄到最宽）：
  *   1. READ_ONLY_MCP_TOOLS —— 精确到工具的只读发现入口，server 未整体可信也放行
  *   2. cindy_contacts     —— 按内层 action 细粒度判定（见 contacts/approval.ts）
- *   3. TRUSTED_MCP_SERVERS —— 已 review 的第一方 server，整体静默
- *   4. 其余                —— 逐次弹窗（第三方 server、cindy_ssh、插件 ghost_call…）
+ *   3. cindy-art ghost_call —— 第一方作图/视频内层工具静默；其它插件继续走会话审批
+ *   4. TRUSTED_MCP_SERVERS —— 已 review 的第一方 server，整体静默
+ *   5. 其余                —— 进入会话审批（第三方 server、cindy_ssh、其它 ghost_call…）
+ * 风险分类不覆盖会话档位：Full Access 免操作审批，Auto 走统一审阅，Ask 才交用户确认。
  */
 
 import type {
@@ -50,6 +52,8 @@ const READ_ONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
   // 接受的存在性披露，只读元数据不因此回退为逐次审批或统一成 NOT_FOUND。
   'cindy::ghost_info',
   'cindy::ghost_manual',
+  // Query stays local; market discovery fetches catalog metadata without reconciliation.
+  'cindy::ghost_market_search',
   'cindy::ghost_forge_guide',
   'cindy_browser::list_tools',
   'cindy_android::list_tools',
@@ -75,7 +79,7 @@ const READ_ONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
  *
  * 这里不能按 `cindy_` 前缀放行：namespace 只表示品牌归属，不代表新 provider
  * 已完成权限 review。SSH（在已配置主机上跑任意命令）、插件宿主 `cindy`
- * （`ghost_call` 转发到第三方插件沙箱）与第三方 server 都不在表内，继续逐次确认；
+ * （`ghost_call` 转发到第三方插件沙箱）与第三方 server 都不在表内，继续走会话审批；
  * Contacts 走 inner-tool 细粒度策略。
  */
 const TRUSTED_MCP_SERVERS: ReadonlySet<string> = new Set([
@@ -92,6 +96,9 @@ const TRUSTED_MCP_SERVERS: ReadonlySet<string> = new Set([
   // (resolveWorkerLink 按 session ctx 校验 worker link 归属), 逐次弹窗只会
   // 让远端 daemon 等审批超时、worker 回报断链。
   'orca_worker_bridge',
+  // 个人版制作任务的完成回报通道。只落一条完成记录,不碰文件;执行边界在工具内部
+  // fail-closed(按 session ctx 的 cindy-make 标记),普通任务调不到。
+  'cindy_make',
   'cindy_lsp',
 ]);
 
@@ -173,6 +180,29 @@ function skipsRoutelessDeviceApproval(args: unknown): boolean {
   return !hasIOSSimulatorInstanceRoute(parsed);
 }
 
+/** 第一方 Cindy Art 的媒体生成工具。风险是额度而非越权，用户点名作图即授权。 */
+const CINDY_ART_MEDIA_TOOLS: ReadonlySet<string> = new Set([
+  'gen_image',
+  'edit_image',
+  'gen_video',
+  'edit_video',
+]);
+
+/**
+ * ghost_call 是聚合入口，默认逐次确认。Cindy Art 的作图/改图/视频是第一方媒体
+ * 能力，用户发「画一张」即构成授权；Auto-review 下再弹卡会把常规作图变成手动授权。
+ * 读不出 ghost_id / tool 时 fail closed，其它插件不受影响。
+ */
+function canAutoApproveCindyArtGhostCall(context: McpToolApprovalContext): boolean {
+  if (context.serverName !== 'cindy') return false;
+  if (context.toolName !== 'ghost_call' && context.toolName !== undefined) return false;
+  const params = readJsonObject(context.toolParams);
+  if (!params) return false;
+  const ghostId = typeof params.ghost_id === 'string' ? params.ghost_id.trim() : '';
+  const tool = typeof params.tool === 'string' ? params.tool.trim() : '';
+  return ghostId === 'cindy-art' && CINDY_ART_MEDIA_TOOLS.has(tool);
+}
+
 /** Claude SDK 工具名格式固定为 `mcp__<server>__<tool>`。 */
 function toClaudeToolName(key: string): string {
   const [serverName, toolName] = key.split('::');
@@ -193,15 +223,69 @@ export function getDesktopMcpToolApprovalPolicy(
   context: McpToolApprovalContext,
 ): McpToolApprovalPolicy {
   const { serverName, toolName, toolParams } = context;
-  // Codex 的 elicitation 不总是带 toolName（0.142.5 / 0.144.1 会省略），拿不到工具名
-  // 时这条精确规则自然不命中，回落到下面的 server 级判定，与改动前行为一致。
+  // Codex 的 elicitation 不总是带 toolName（0.142.5 / 0.144.1 会省略）。
+  // 精确只读规则此时不命中；helper 等敏感 server 在下方按 payload 单独判定。
   if (toolName && READ_ONLY_MCP_TOOLS.has(`${serverName}::${toolName}`)) {
     return 'auto-approve';
   }
+  if (serverName === 'cindy' && toolName === 'ghost_market_install') return 'prompt-each-time';
+  // This bridge multiplexes independent imported connections and commands with
+  // their credentials. A server-wide grant for one tool must not authorize other
+  // tools/connections. Use the existing per-call policy, including when Codex
+  // omits toolName; Auto and Full Access retain their normal mode semantics.
+  if (serverName === 'companion_connections') return 'prompt-each-time';
+  // sources/preview/start share one native tool identity. Never persist a grant
+  // from discovery that could bypass the policy callback for a later import.
+  if (serverName === 'companion_import') return 'prompt-each-time';
   if (serverName === 'cindy_contacts') {
     return canAutoApproveContactsMcpTool({ toolName, toolParams })
       ? 'auto-approve'
       : 'prompt-each-time';
+  }
+  if (canAutoApproveCindyArtGhostCall(context)) {
+    return 'auto-approve';
+  }
+  // Rebinding a task's workspace delegates its execution root; publishing a Skill
+  // uploads local files under the signed-in account. Review each action instead
+  // of reusing the trusted helper server shortcut/grant. Session modes still apply.
+  if (serverName === 'cindy_helper') {
+    const params = readJsonObject(toolParams);
+    const progressive = toolName === 'call_tool' || !toolName;
+    const innerName = typeof params?.name === 'string' ? params.name.trim() : '';
+    const args = progressive ? readJsonObject(params?.args) : params;
+    // Codex can omit tool_name when same-server calls overlap. A direct tool's
+    // input may also have a `name` field (routine_save does), so only treat an
+    // exact name/args envelope as a progressive call without the outer name.
+    if (!toolName && (!params || !innerName || !args ||
+      Object.keys(params).some((key) => key !== 'name' && key !== 'args'))) {
+      return 'prompt-each-time';
+    }
+    const action = progressive ? innerName : toolName;
+    if (toolName === 'call_tool' && (!innerName || !args)) return 'prompt-each-time';
+    // Installing or saving a host command uses the session's existing approval flow.
+    if (action === 'schedule_set_pre_run_hook' || (action === 'routine_save' && args?.preRunHook != null)) {
+      return 'prompt-each-time';
+    }
+    if (action === 'move_session' || action === 'publish_skill') return 'prompt-each-time';
+  }
+  // Choosing a new Worker root delegates filesystem access. Do not let the
+  // trusted-server shortcut or a cached server grant authorize another root.
+  // Full Access / Auto / Ask still use their existing permission flow.
+  if (serverName === 'cindy_orca') {
+    if (!toolName) return 'prompt-each-time';
+    if (toolName === 'create_worker' || toolName === 'create_workers') {
+      const params = readJsonObject(toolParams);
+      if (!params) return 'prompt-each-time';
+      const workers = toolName === 'create_worker' ? [params] : params.workers;
+      if (!Array.isArray(workers)) return 'prompt-each-time';
+      if (
+        workers.some((worker) => {
+          const spec = readJsonObject(worker);
+          return !spec || Object.hasOwn(spec, 'working_dir');
+        })
+      )
+        return 'prompt-each-time';
+    }
   }
   const iosSimulatorCall = readIOSSimulatorInnerCall(context);
   if (iosSimulatorCall) {

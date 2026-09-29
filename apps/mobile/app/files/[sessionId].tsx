@@ -1,3 +1,6 @@
+import { FileTypeIcon, pickFileIcon } from '@/components/FileTypeIcon';
+import { FileTypeTile } from '@/components/FileTypeTile';
+import { SystemNavigationBack, useSystemNavigationBack } from '@/platform/chrome/SystemNavigationBack';
 /**
  * 远程文件浏览(网格为主视图,对标 iOS Files)。
  *
@@ -7,6 +10,8 @@
  * Quick Look 预览路由。缩略图经 thumbnail op 懒加载(fileThumbnails 内存缓存)。
  */
 import * as Clipboard from 'expo-clipboard';
+import { useAdaptiveWindow } from '@/platform/AdaptiveWindowContext';
+import { ModalContentArea } from '@/platform/ModalContentArea';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { fsWatchTopic } from '@cindy/device-link';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -18,15 +23,10 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
-  Database,
   Ellipsis,
   Eye,
-  File as FileIcon,
-  FileCode,
-  FileText,
   Folder,
   History,
-  Image as ImageIcon,
   LayoutGrid,
   List as ListIcon,
   MessageSquarePlus,
@@ -132,7 +132,9 @@ export default function RemoteFileBrowserScreen() {
   const deviceName = readRouteString(params.deviceName) ?? deviceId;
   const relPath = readRouteString(params.relPath) ?? '';
   const router = useRouter();
-  const { width: screenWidth } = useWindowDimensions();
+  const systemBack = useSystemNavigationBack();
+  const fileWindow = useAdaptiveWindow();
+  const screenWidth = fileWindow.width - fileWindow.insets.left - fileWindow.insets.right;
   const auth = useAuth();
   const { connectionIssue, openLink, status, subscribe, unsubscribe } = useDeviceLink();
   const maker = useMobileMakerTransport(deviceId);
@@ -244,7 +246,7 @@ export default function RemoteFileBrowserScreen() {
       });
       if (seq !== loadSeqRef.current) return;
       rawEntriesRef.current = normalizeRemoteOpDirEntries(raw);
-      storeCachedListing(workdir, relPath, rawEntriesRef.current);
+      storeCachedListing(maker.fileBrowser.cacheScope, workdir, relPath, rawEntriesRef.current);
       setItems(buildFileBrowserGridItems(rawEntriesRef.current, sortModeRef.current, Date.now()));
       setLastSyncedAt(Date.now());
     } catch (err) {
@@ -280,12 +282,12 @@ export default function RemoteFileBrowserScreen() {
   useEffect(() => {
     if (!workdir) return undefined;
     let cancelled = false;
-    const memoryCached = getCachedListingSync(workdir, relPath);
+    const memoryCached = getCachedListingSync(maker.fileBrowser.cacheScope, workdir, relPath);
     if (memoryCached) {
       rawEntriesRef.current = memoryCached;
       setItems(buildFileBrowserGridItems(memoryCached, sortModeRef.current, Date.now()));
     } else {
-      void readCachedListing(workdir, relPath).then((persisted) => {
+      void readCachedListing(maker.fileBrowser.cacheScope, workdir, relPath).then((persisted) => {
         if (cancelled || !persisted || rawEntriesRef.current.length > 0) return;
         rawEntriesRef.current = persisted;
         setItems(buildFileBrowserGridItems(persisted, sortModeRef.current, Date.now()));
@@ -547,6 +549,9 @@ export default function RemoteFileBrowserScreen() {
         displayUri,
         strokes,
         mimeType: context.mimeType,
+        ...(context.naturalWidth && context.naturalHeight
+          ? { naturalWidth: context.naturalWidth, naturalHeight: context.naturalHeight }
+          : {}),
       });
       setLightbox(null);
       router.navigate({
@@ -727,6 +732,7 @@ export default function RemoteFileBrowserScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea} testID="files.screen">
+      <SystemNavigationBack label={t('shared.back')} onPress={() => goBackGuarded(router)} />
       {searchOpen ? (
         <SearchHeader
           loading={searchLoading}
@@ -745,11 +751,11 @@ export default function RemoteFileBrowserScreen() {
         />
       ) : (
         <View style={styles.navRow} testID="files.navRow">
-          <ScreenBackButton
+          {!systemBack ? <ScreenBackButton
             hitSlop={8}
             onPress={() => goBackGuarded(router)}
             testID="files.backButton"
-          />
+          /> : null}
           <Pressable
             accessibilityLabel={t('files.browser.a11yTitleMenu')}
             onPress={() => setTitleMenuOpen(true)}
@@ -1021,14 +1027,14 @@ function FileThumb({
     return <RealDocThumb item={item} maker={maker} workdir={workdir} />;
   }
   if (item.thumb === 'image') {
-    // 缩略图未就绪/失败(如老版本被控端)回退迷你文档页(静默,不出 loading 态)。
-    return <DocThumbCard headed={false} seed={item.name} />;
+    // 缩略图未就绪/失败(如老版本被控端)回退统一文件类型图标(静默,不出 loading 态)。
+    return <FileTypeTile name={item.name} />;
   }
-  return <GenericThumbCard name={item.name} />;
+  return <FileTypeTile name={item.name} />;
 }
 
 /** 真实内容迷你页:小文件拉首块渲成微缩文本(缓存见 fileBrowserCache);
- *  过大/失败/加载中回退抽象线条,不出 loading 态。 */
+ *  过大/失败/加载中回退统一文件类型卡片,不出 loading 态。 */
 function RealDocThumb({
   item,
   maker,
@@ -1041,7 +1047,7 @@ function RealDocThumb({
   const styles = useThemedStyles(makeStyles);
   const snippet = useDocSnippet(maker, workdir, item.relPath, item.mtimeMs, item.sizeBytes, true);
   if (!snippet) {
-    return <DocThumbCard headed={/\.(md|mdx)$/i.test(item.name)} seed={item.name} />;
+    return <FileTypeTile name={item.name} />;
   }
   return (
     <View style={styles.docThumb}>
@@ -1054,29 +1060,6 @@ function RealDocThumb({
       </Text>
     </View>
   );
-}
-
-/** 迷你文档页:抽象线条模拟首屏内容(v1 不拉取真实文本,零流量)。 */
-function DocThumbCard({ headed, seed }: { headed: boolean; seed: string }) {
-  const styles = useThemedStyles(makeStyles);
-  const hash = hashString(seed);
-  const widths = [0.86, 0.78, 0.7, 0.82, 0.62, 0.74].map(
-    (base, i) => Math.max(0.35, base - (((hash >> (i * 3)) & 7) / 40)),
-  );
-  return (
-    <View style={styles.docThumb}>
-      {headed ? <View style={styles.docHeadingBar} /> : null}
-      {widths.map((w, i) => (
-        <View key={i} style={[styles.docLine, { width: `${Math.round(w * 100)}%` }]} />
-      ))}
-    </View>
-  );
-}
-
-function GenericThumbCard({ name }: { name: string }) {
-  const { colors } = useTheme();
-  const Icon = /\.(db|sqlite3?|realm)$/i.test(name) ? Database : FileIcon;
-  return <Icon color={colors.borderStrong} size={iconSize.glyph} strokeWidth={iconStroke.thin} absoluteStrokeWidth />;
 }
 
 function ListSeparator() {
@@ -1158,7 +1141,7 @@ function SearchHeader({
             autoFocus
             onChangeText={onChangeQuery}
             placeholder={t('files.browser.searchPlaceholder')}
-            placeholderTextColor={colors.textTertiary}
+            placeholderTextColor={colors.textPlaceholder}
             style={styles.searchInput}
             testID="files.searchInput"
             value={query}
@@ -1220,7 +1203,7 @@ function ContentMatchRow({
       testID={`files.contentResult.${sanitizeTestId(name)}`}
     >
       <View style={styles.listIconWrap}>
-        <FileText color={colors.textSecondary} size={iconSize.lg} strokeWidth={iconStroke.regular} />
+        <FileTypeIcon name={name} color={colors.textSecondary} size={iconSize.lg} strokeWidth={iconStroke.regular} />
       </View>
       <View style={styles.listTextCol}>
         <Text numberOfLines={1} style={styles.listName}>
@@ -1331,8 +1314,9 @@ function TitleMenu({
   );
 
   return (
-    <Modal animationType="fade" onRequestClose={onClose} transparent visible={open}>
+    <Modal supportedOrientations={['portrait', 'portrait-upside-down', 'landscape-left', 'landscape-right']} animationType="fade" onRequestClose={onClose} transparent visible={open}>
       <Pressable onPress={onClose} style={styles.overlay} testID="files.titleMenuOverlay">
+        <ModalContentArea>
         <Pressable onPress={() => undefined} style={styles.titleMenuCard}>
           {levels.map((level, index) => (
             <View key={`level:${level.relPath}`}>
@@ -1371,6 +1355,7 @@ function TitleMenu({
           {row('folder.copy', t('files.browser.copyPath'), false, onCopyCurrentPath,
             <Copy color={colors.textSecondary} size={iconSize.md} strokeWidth={iconStroke.regular} />)}
         </Pressable>
+        </ModalContentArea>
       </Pressable>
     </Modal>
   );
@@ -1405,14 +1390,15 @@ function ContextMenu({
   ];
 
   return (
-    <Modal animationType="fade" onRequestClose={onClose} transparent visible>
+    <Modal supportedOrientations={['portrait', 'portrait-upside-down', 'landscape-left', 'landscape-right']} animationType="fade" onRequestClose={onClose} transparent visible>
       <Pressable onPress={onClose} style={styles.overlayCenter} testID="files.contextMenuOverlay">
+        <ModalContentArea>
         <View style={styles.liftedCard}>
           <View style={styles.liftedThumbZone}>
             {item.kind === 'dir' ? (
               <Folder color={colors.borderStrong} fill={colors.surfaceChip} size={iconSize.glyph} strokeWidth={iconStroke.thin} absoluteStrokeWidth />
             ) : (
-              <DocThumbCard headed={/\.(md|mdx)$/i.test(item.name)} seed={item.name} />
+              <FileTypeTile name={item.name} />
             )}
           </View>
           <Text numberOfLines={1} style={styles.listName}>{item.name}</Text>
@@ -1434,6 +1420,7 @@ function ContextMenu({
             </View>
           ))}
         </View>
+        </ModalContentArea>
       </Pressable>
     </Modal>
   );
@@ -1442,18 +1429,7 @@ function ContextMenu({
 /* ------------------------------ 工具 ------------------------------ */
 
 function listIconFor(item: FileBrowserGridItem) {
-  if (item.kind === 'dir') return Folder;
-  if (item.thumb === 'image') return ImageIcon;
-  if (/\.(json|ya?ml|ts|tsx|js|jsx|py|rs|go|java|kt|swift|c|h|cpp|cs|sh|lua)$/i.test(item.name)) return FileCode;
-  if (item.thumb === 'doc') return FileText;
-  if (/\.(db|sqlite3?|realm)$/i.test(item.name)) return Database;
-  return FileIcon;
-}
-
-function hashString(value: string): number {
-  let hash = 5381;
-  for (let i = 0; i < value.length; i += 1) hash = ((hash << 5) + hash + value.charCodeAt(i)) >>> 0;
-  return hash;
+  return item.kind === 'dir' ? Folder : pickFileIcon(item.name);
 }
 
 function sanitizeTestId(value: string): string {
@@ -1505,6 +1481,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     minWidth: 0,
     color: colors.textPrimary,
     fontSize: typeScale.body,
+    lineHeight: lineHeight.body,
     fontWeight: fontWeight.semibold,
     maxWidth: '72%',
   },
@@ -1547,8 +1524,6 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     paddingVertical: 10,
     width: 80,
   },
-  docHeadingBar: { backgroundColor: colors.borderStrong, height: 4, width: '54%' },
-  docLine: { backgroundColor: colors.border, height: 2 },
   // 微缩真实文本:模拟 iOS Files 的文档首屏缩略;禁用系统字号缩放。
   docSnippetText: {
     color: colors.textSecondary,
@@ -1566,6 +1541,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   cellName: {
     color: colors.textPrimary,
     fontSize: typeScale.footnote,
+    lineHeight: lineHeight.caption,
     fontWeight: fontWeight.medium,
     textAlign: 'center',
   },
@@ -1588,7 +1564,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     paddingBottom: spacing.xs,
     paddingTop: spacing.sm,
   },
-  footerStrong: { color: colors.textPrimary, fontSize: typeScale.footnote, fontWeight: fontWeight.semibold },
+  footerStrong: { color: colors.textPrimary, fontSize: typeScale.footnote, lineHeight: lineHeight.caption, fontWeight: fontWeight.semibold },
   footerText: {
     color: colors.textTertiary,
     fontSize: typeScale.caption,
@@ -1616,13 +1592,14 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   searchInput: {
     color: colors.textPrimary,
     flex: 1,
-    fontSize: typeScale.code,
+    fontSize: typeScale.bodySmall,
     paddingVertical: spacing.sm,
   },
-  cancelText: { color: colors.textPrimary, fontSize: typeScale.body },
+  cancelText: { color: colors.textPrimary, fontSize: typeScale.body, lineHeight: lineHeight.body },
   scopeHint: {
     color: colors.textTertiary,
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
     paddingBottom: spacing.sm,
     paddingHorizontal: spacing.lg,
   },
@@ -1643,12 +1620,13 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     paddingHorizontal: spacing.md,
   },
   searchModePillActive: { backgroundColor: colors.surfaceChip, borderColor: colors.borderStrong },
-  searchModeLabel: { color: colors.textSecondary, fontSize: typeScale.caption },
+  searchModeLabel: { color: colors.textSecondary, fontSize: typeScale.caption, lineHeight: lineHeight.caption },
   searchModeLabelActive: { color: colors.textPrimary, fontWeight: fontWeight.medium },
   scopeHintInline: {
     color: colors.textTertiary,
     flex: 1,
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
     textAlign: 'right',
   },
   contentMatchRow: {
@@ -1659,7 +1637,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.xs,
   },
-  contentMatchLineNo: { color: colors.textTertiary, fontSize: typeScale.footnote },
+  contentMatchLineNo: { color: colors.textTertiary, fontSize: typeScale.footnote, lineHeight: lineHeight.caption },
   contentMatchLineText: {
     color: colors.textSecondary,
     fontFamily: monoFont,
@@ -1670,7 +1648,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   searchHint: {
     color: colors.textSecondary,
     fontSize: typeScale.footnote,
-    lineHeight: lineHeight.code,
+    lineHeight: lineHeight.caption,
     padding: spacing.lg,
     textAlign: 'center',
   },
@@ -1706,8 +1684,8 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     borderColor: colors.border,
     borderRadius: radius.container,
     borderWidth: StyleSheet.hairlineWidth,
-    marginHorizontal: spacing.xxl * 2 + spacing.sm,
-    marginTop: 96,
+    width: '100%',
+    maxWidth: 360,
     overflow: 'hidden',
   },
   menuRow: {
@@ -1718,7 +1696,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     paddingHorizontal: spacing.md,
   },
   menuCheckSlot: { alignItems: 'center', justifyContent: 'center', width: 16 },
-  menuLabel: { color: colors.textPrimary, flex: 1, fontSize: typeScale.body, fontWeight: fontWeight.medium },
+  menuLabel: { color: colors.textPrimary, flex: 1, fontSize: typeScale.body, lineHeight: lineHeight.body, fontWeight: fontWeight.medium },
   menuLabelDim: { color: colors.textSecondary },
   menuSep: { backgroundColor: colors.border, height: StyleSheet.hairlineWidth },
   menuGroupSep: { backgroundColor: colors.surfaceChip, height: 6 },

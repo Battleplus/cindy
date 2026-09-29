@@ -4,6 +4,7 @@ import {
   effectiveSourceIdForModel,
   findModelRegistryRoute,
   isModelSelectableForNewRoute,
+  isLocalOnlyProviderForAgent,
   type Catalog,
   type ProviderView,
 } from '@cindy/model-providers';
@@ -13,6 +14,25 @@ import {
   providerRouteRequiresExplicitSelection,
   type OrcaWorkerProviderRoutingContext,
 } from './orcaWorkerCreationService.js';
+
+/** The SSH discovery projection is native OpenAI only and already ordered by remote default. */
+export function sshCodexWorkerRoutingContext(views: ProviderView[]): OrcaWorkerProviderRoutingContext {
+  const models = views[0]?.models.codex ?? [];
+  return {
+    remoteCodexModels: models,
+    availability: {
+      'claude-code': [], pi: [],
+      codex: models.length ? [{
+        id: 'openai', name: views[0]!.name, models: models.map((model) => model.id),
+        fastModels: models.filter((model) => model.supportsFastMode).map((model) => model.id),
+        effortMetaByModel: Object.fromEntries(models.map((model) =>
+          [model.id, { efforts: model.efforts, defaultEffort: model.defaultEffort }])),
+      }] : [],
+    },
+    resolveDefaultProviderIdForModel: (agent, model) =>
+      agent === 'codex' && models.some((candidate) => candidate.id === model) ? 'openai' : null,
+  };
+}
 
 /**
  * Build the Orca worker route snapshot from one post-claim full catalog.
@@ -72,8 +92,8 @@ export async function readOrcaWorkerProviderRoutingContext(deps: {
         requiresExplicitRoute: providerRouteRequiresExplicitSelection(
           provider.routing[agent]?.authStrategy,
         ),
-        chatBridgedCodex:
-          agent === 'codex' && provider.routing[agent]?.wireProtocol === 'openai-chat',
+        localOnlyForSsh:
+          isLocalOnlyProviderForAgent(provider, agent),
       };
     });
 

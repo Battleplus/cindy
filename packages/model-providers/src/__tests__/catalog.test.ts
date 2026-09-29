@@ -1,3 +1,4 @@
+import { buildUserProvider } from '../user-provider.js';
 import { expandedRegistryEntries } from "../modelMetadataLayers.js";
 /**
  * 目录校验 + 内置供应商契约(2026-07-19 模型列表统一重构后的新契约)。
@@ -15,7 +16,7 @@ import { expandedRegistryEntries } from "../modelMetadataLayers.js";
 
 import { describe, it, expect } from "vitest";
 
-import { BUNDLED_CATALOG, parseCatalog } from "../catalog.js";
+import { BUNDLED_CATALOG, claudeSubscriptionOnlyForClaudeCode, parseCatalog } from "../catalog.js";
 import {
   buildRegistry,
   sourcesForModel,
@@ -29,6 +30,7 @@ const DYNAMIC_PROVIDER_IDS = ["anthropic", "openai", "xd"] as const;
 
 /** xAI 随包 fallback 元数据清单。 */
 const EXPECTED_XAI_IDS = [
+  "xai/grok-4.7",
   "xai/grok-4.6",
   "xai/grok-4.5",
   "xai/grok-4.3",
@@ -43,6 +45,7 @@ const EXPECTED_XAI_PI_IDS = [
   "grok-4.3",
   "grok-4.5",
   "grok-4.6",
+  "grok-4.7",
   "grok-build-0.1",
 ];
 
@@ -209,7 +212,10 @@ describe("bundled catalog validity (dynamic-first contract)", () => {
         (model) => model.id === "chatgpt/gpt-6",
       ),
     ).toBe(false);
-    expect(provider("anthropic").models.pi).toHaveLength(14);
+    // Claude 订阅只供 Claude Code(CLI 自己的登录),不向 Pi / Codex 提供。
+    expect(provider("anthropic").agents).toEqual(["claude-code"]);
+    expect(provider("anthropic").models.pi).toBeUndefined();
+    expect(provider("anthropic").models.codex).toBeUndefined();
   });
 
   it("xai ships a static fallback list and Pi official metadata", () => {
@@ -234,6 +240,32 @@ describe("bundled catalog validity (dynamic-first contract)", () => {
       efforts: ["low", "medium", "high"],
       defaultEffort: "high",
     });
+  });
+
+  it("openai ships GPT Image 2.5 plus previous GPT Image 2", () => {
+    expect(provider("openai").imageModels).toEqual([
+      {
+        id: "openai/gpt-image-2.5-sunburst",
+        name: "GPT Image 2.5 Sunburst",
+        mode: "image_generation",
+        nativeApi: "openai-images",
+        modalities: { input: ["text", "image"], output: ["image"] },
+      },
+      {
+        id: "openai/gpt-image-2.5-flare",
+        name: "GPT Image 2.5 Flare",
+        mode: "image_generation",
+        nativeApi: "openai-images",
+        modalities: { input: ["text", "image"], output: ["image"] },
+      },
+      {
+        id: "openai/gpt-image-2",
+        name: "GPT Image 2",
+        mode: "image_generation",
+        nativeApi: "openai-images",
+        modalities: { input: ["text", "image"], output: ["image"] },
+      },
+    ]);
   });
 
   it("xai ships both Grok Imagine subscription image models", () => {
@@ -356,40 +388,41 @@ describe("bundled catalog validity (dynamic-first contract)", () => {
   });
 
   it("DeepSeek 预设携带厂商文档确认的 1M contextWindow (#735)", () => {
-    // 官方 V4 起全线 1M(api-docs.deepseek.com news260424);预设不带时
-    // buildUserProvider 回落 200K 保守默认,长上下文模型被错误降级。
+    // 官方 Codex 目录的 context_window 为 1,048,576;预设不带时 buildUserProvider
+    // 回落 200K 保守默认,长上下文模型被错误降级。deepseek-v4-flash 已是临时别名,
+    // 推荐改用官方的 deepseek-flash(V4.1-Flash)。
     const presets = BUNDLED_CATALOG.presets ?? [];
     const deepseek = presets.find((p) => p.id === "deepseek");
     expect(deepseek).toBeDefined();
     for (const [agent, rt] of Object.entries(deepseek!.runtimes)) {
-      for (const id of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      for (const id of ["deepseek-flash", "deepseek-v4-pro"]) {
         const m = rt!.models.find((x) => x.id === id);
-        expect(m?.contextWindow, `${agent}/${id}`).toBe(1_000_000);
+        expect(m?.contextWindow, `${agent}/${id}`).toBe(1_048_576);
       }
     }
-    // OpenRouter 托管的同款模型页面同样标注 1,048,576,取与仓库口径一致的 1M。
+    // OpenRouter 模型接口标注 1,048,576。
     const openrouter = presets.find((p) => p.id === "openrouter");
     expect(
       openrouter?.runtimes["claude-code"]?.models.find(
         (m) => m.id === "deepseek/deepseek-v4-pro",
       )?.contextWindow,
-    ).toBe(1_000_000);
-    expect(deepseek?.runtimes.pi).toMatchObject({
-      wireProtocol: "openai-chat",
-      models: [
-        { id: "deepseek-v4-flash" },
-        { id: "deepseek-v4-flash-vision-exp" },
-        { id: "deepseek-v4-pro" },
-      ],
-    });
+    ).toBe(1_048_576);
+    // 推荐清单三个引擎共用；vision-exp 只由 Pi 模型资料补入且默认隐藏。
+    expect(deepseek?.runtimes.pi?.wireProtocol).toBe("openai-chat");
+    expect(
+      deepseek?.runtimes.pi?.models
+        .filter((m) => m.defaultEnabled !== false)
+        .map((m) => m.id),
+    ).toEqual(["deepseek-flash", "deepseek-v4-pro"]);
   });
 
-  it("Kimi Code(编程计划)按各 harness 的权威目录保留 contextWindow", () => {
+  it("Kimi Code(编程计划)各 harness 共用官方核实的 contextWindow", () => {
     const presets = BUNDLED_CATALOG.presets ?? [];
     const kimiCode = presets.find((p) => p.id === "moonshot-kimi-code");
     expect(kimiCode).toBeDefined();
+    const projected = buildUserProvider({ id: kimiCode!.id, name: kimiCode!.name, runtimes: kimiCode!.runtimes });
     for (const [agent, rt] of Object.entries(kimiCode!.runtimes)) {
-      for (const m of rt!.models) {
+      for (const m of projected.models[agent as AgentKind] ?? []) {
         expect(
           Number.isFinite(m.contextWindow) && (m.contextWindow ?? 0) > 0,
           `${agent}/${m.id} 缺 contextWindow`,
@@ -398,7 +431,8 @@ describe("bundled catalog validity (dynamic-first contract)", () => {
       expect(
         rt!.models.find((m) => m.id === "k3")?.contextWindow,
         `${agent}/k3`,
-      ).toBe(agent === "pi" ? 1_048_576 : 262_144);
+        // 官方：K3 的 1,048,576 只对高档位开放，取所有档位都成立的 262,144。
+      ).toBe(262_144);
     }
   });
 
@@ -504,6 +538,34 @@ describe("bundled catalog validity (dynamic-first contract)", () => {
         expect(p.agents, `${p.id} stray models[${key}]`).toContain(key);
       }
     }
+  });
+});
+
+describe("claudeSubscriptionOnlyForClaudeCode", () => {
+  const builtin = BUNDLED_CATALOG.providers.find((p) => p.id === "anthropic")!;
+
+  it("narrows a remote anthropic entry that still declares Codex / Pi", () => {
+    const remote = {
+      ...builtin,
+      agents: ["claude-code", "codex", "pi"] as AgentKind[],
+      routing: {
+        ...builtin.routing,
+        codex: { upstream: "https://api.anthropic.com", authStrategy: "provider-oauth-header" as const },
+        pi: { upstream: "https://api.anthropic.com", authStrategy: "provider-oauth-header" as const },
+      },
+      models: { "claude-code": [], codex: [{ id: "claude-opus-5" } as CatalogModel], pi: [{ id: "claude-opus-5" } as CatalogModel] },
+    };
+    const narrowed = claudeSubscriptionOnlyForClaudeCode(remote);
+    expect(narrowed.agents).toEqual(["claude-code"]);
+    expect(Object.keys(narrowed.routing)).toEqual(["claude-code"]);
+    expect(narrowed.models).toEqual({ "claude-code": [] });
+    expect(remote.agents).toEqual(["claude-code", "codex", "pi"]);
+  });
+
+  it("returns other providers and an already-narrow anthropic entry unchanged", () => {
+    expect(claudeSubscriptionOnlyForClaudeCode(builtin)).toBe(builtin);
+    const openai = BUNDLED_CATALOG.providers.find((p) => p.id === "openai")!;
+    expect(claudeSubscriptionOnlyForClaudeCode(openai)).toBe(openai);
   });
 });
 
@@ -970,12 +1032,12 @@ describe("provider OAuth and upstream URL validation", () => {
       },
     ],
     [
-      "Claude-incompatible protocol",
-      { baseUrl: "https://api.example/v1", wireProtocol: "openai-responses" },
+      "native API used as portable wire",
+      { baseUrl: "https://api.example/v1", wireProtocol: "google-vertex" },
     ],
   ])("rejects %s model routes", (_label, route) => {
     const catalog = oauthCatalog();
-    if (_label === "Claude-incompatible protocol") {
+    if (_label === "native API used as portable wire") {
       catalog.providers[0]!.agents = ["claude-code"];
       catalog.providers[0]!.routing = {
         "claude-code": {

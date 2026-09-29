@@ -36,6 +36,9 @@ const {
     order: ['anthropic', 'xd', 'custom'],
     customConnected: true,
     mediaReady: false,
+    customOverride: null as ProviderView | null,
+    loading: false,
+    error: null as { reason: 'storage-quota' } | null,
   },
   wizardSpy: vi.fn(),
 }));
@@ -104,10 +107,14 @@ vi.mock('@/hooks/useProviders', () => ({
         availableMediaModelIds: providerSnapshotState.mediaReady ? ['gpt-image-2'] : [],
       } satisfies ProviderView,
     ];
-    const byId = new Map(providers.map((provider) => [provider.id, provider]));
+    const byId = new Map<string, ProviderView>(providers.map((provider) => [provider.id, provider]));
+    if (providerSnapshotState.customOverride) {
+      byId.delete('custom');
+      byId.set(providerSnapshotState.customOverride.id, providerSnapshotState.customOverride);
+    }
     return {
       providers:
-        providerSnapshotState.dataOwnerId === authState.dataOwnerId ? [...byId.values()] : [],
+        providerSnapshotState.dataOwnerId === authState.dataOwnerId && !providerSnapshotState.loading ? [...byId.values()] : [],
       providerOrder:
         providerSnapshotState.dataOwnerId === authState.dataOwnerId
           ? providerSnapshotState.order
@@ -116,7 +123,8 @@ vi.mock('@/hooks/useProviders', () => ({
         providerSnapshotState.dataOwnerId === authState.dataOwnerId
           ? providerSnapshotState.ownerGeneration
           : null,
-      loading: providerSnapshotState.dataOwnerId !== authState.dataOwnerId,
+      loading: providerSnapshotState.dataOwnerId !== authState.dataOwnerId || providerSnapshotState.loading,
+      error: providerSnapshotState.error,
       refetch: refetchProvidersSpy,
     };
   },
@@ -156,7 +164,8 @@ vi.mock('@/lib/toast', () => ({
   toast: { error: vi.fn(), info: vi.fn(), success: vi.fn() },
 }));
 
-vi.mock('@/lib/customProviders', () => ({
+vi.mock('@/lib/customProviders', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/customProviders')>(),
   deleteCustomProvider: vi.fn(),
   readCustomProviderKey: vi.fn(async () => null),
   updateCustomProvider: vi.fn(),
@@ -178,8 +187,8 @@ vi.mock('@/state/modelVisibilityPrefs', () => ({
   useModelVisibilityVersion: () => 0,
 }));
 
-vi.mock('@/components/settings/CustomProviderDialog', () => ({
-  CustomProviderDialog: () => null,
+vi.mock('@/components/settings/ProviderConnectionDialog', () => ({
+  ProviderConnectionDialog: () => null,
 }));
 
 vi.mock('@/components/settings/AddProviderWizard', () => ({
@@ -190,6 +199,8 @@ vi.mock('@/components/settings/AddProviderWizard', () => ({
 }));
 
 import { setModelVisibilities } from '@/state/modelVisibilityPrefs';
+import { readCustomProviderKey, updateCustomProvider } from '@/lib/customProviders';
+import { buildUserProvider, providerPresetOAuth } from '@cindy/model-providers';
 
 import { ProvidersSection } from '@/components/settings/ProvidersSection';
 
@@ -202,6 +213,9 @@ beforeEach(() => {
   providerSnapshotState.ownerGeneration = 1;
   providerSnapshotState.customConnected = true;
   providerSnapshotState.mediaReady = false;
+  providerSnapshotState.customOverride = null;
+  providerSnapshotState.loading = false;
+  providerSnapshotState.error = null;
   providerSnapshotState.order = ['anthropic', 'xd', 'custom'];
   scanResult = { detections: [] };
   (window as unknown as { electronAPI: unknown }).electronAPI = {
@@ -210,6 +224,7 @@ beforeEach(() => {
       refreshBuiltinProviderModels: refreshBuiltinModelsSpy,
       requestProviderModelsAutoRefresh: requestAutoRefreshSpy,
       setProviderOrder: setProviderOrderSpy,
+      onProviderOAuthProgress: vi.fn(() => () => {}),
     },
   };
 });
@@ -220,26 +235,125 @@ afterEach(() => {
 });
 
 describe('ProvidersSection — 双栏管理', () => {
+  it('keeps a recovery action accessible when the first complete catalog could not be published', async () => {
+    providerSnapshotState.loading = true;
+    providerSnapshotState.error = { reason: 'storage-quota' };
+    refetchProvidersSpy.mockResolvedValue(true);
+    render(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    expect(screen.getByRole('status').textContent).toContain('catalogRecovery.quota');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'settings.providers.catalogRecovery.retry' }));
+    });
+    expect(refetchProvidersSpy).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('switch', { name: 'Custom model' })).toBeNull();
+  });
+
+  it.each([
+    ['openrouter-existing', 'oauth', true],
+    ['openrouter-new', 'oauth', false],
+    ['openrouter-reconnected', 'oauth', true],
+    ['openrouter-retry', 'oauth', true],
+    ['openrouter-key', 'apiKey', true],
+    ['nous-existing', 'oauth', true],
+  ] as const)('%s can refresh models using its saved %s connection (existing models: %s)', async (id, method, hasModels) => {
+    const isNous = id.startsWith('nous');
+    const oauth = providerPresetOAuth(isNous ? 'nous' : 'openrouter')!;
+    const baseUrl = isNous ? 'https://inference-api.nousresearch.com/v1' : 'https://openrouter.ai/api/v1';
+    providerSnapshotState.customOverride = {
+      id, name: id, source: 'user', agents: ['codex'], connected: true,
+      auth: method === 'oauth' ? { method, oauth } : { method },
+      routing: { codex: { upstream: baseUrl, modelsUrl: `${baseUrl}/models`, authStrategy: method === 'oauth' ? 'oauth-token' : 'api-key-header' } },
+      models: { codex: hasModels ? [{ id: 'old-model', name: 'Old', contextWindow: 64000, efforts: [], defaultEffort: null, defaultEnabled: false }] : [] },
+    };
+    providerSnapshotState.order = [id, 'xd'];
+    const fetchModels = vi.fn(async () => ({ ok: true, models: [
+      { id: 'old-model', name: 'Old' },
+      { id: 'new-model', name: 'New', discoveredMetadata: { nativeApi: 'openai-responses' } },
+      { id: 'chat-model', name: 'Chat', discoveredMetadata: { nativeApi: 'openai-completions' } },
+    ] }));
+    if (id === 'openrouter-retry') fetchModels.mockResolvedValueOnce({ ok: false, models: [] });
+    Object.assign(window.electronAPI.maker, { fetchProviderModels: fetchModels });
+    if (id === 'openrouter-reconnected') providerSnapshotState.customOverride.connected = false;
+    const view = render(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    if (id === 'openrouter-reconnected') {
+      providerSnapshotState.customOverride.connected = true;
+      view.rerender(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    }
+    const refresh = await screen.findByRole('button', { name: 'settings.providers.models.refreshAria' });
+    await act(async () => { fireEvent.click(refresh); });
+    if (id === 'openrouter-retry') {
+      expect(updateCustomProvider).not.toHaveBeenCalled();
+      expect((refresh as HTMLButtonElement).disabled).toBe(false);
+      await act(async () => { fireEvent.click(refresh); });
+      expect(fetchModels).toHaveBeenCalledTimes(2);
+    }
+    expect(fetchModels).toHaveBeenCalledWith(expect.objectContaining({
+      savedProviderId: id, authMethod: method, baseUrl, modelsUrl: `${baseUrl}/models`,
+    }));
+    if (method === 'oauth') expect(readCustomProviderKey).not.toHaveBeenCalled();
+    expect(updateCustomProvider).toHaveBeenCalledWith(expect.objectContaining({ id,
+      ...(method === 'oauth' ? { auth: { method, oauth } } : {}),
+      runtimes: expect.objectContaining({ codex: expect.objectContaining({ models: expect.arrayContaining([
+        expect.objectContaining({ id: 'new-model', discoveredMetadata: { nativeApi: 'openai-responses' } }),
+        ...(hasModels ? [expect.objectContaining({ id: 'old-model', contextWindow: 64000, defaultEnabled: false })] : []),
+      ]) }) }),
+    }), {});
+    const saved = vi.mocked(updateCustomProvider).mock.calls[0]![0];
+    // Refresh adds membership without freezing a visibility choice. Native
+    // projection decides defaults; compatibility still requires an override.
+    for (const modelId of ['new-model', 'chat-model']) {
+      const model = saved.runtimes.codex?.models.find(model => model.id === modelId);
+      expect(model).toBeDefined();
+      expect(model).not.toHaveProperty('defaultEnabled');
+    }
+    const projected = buildUserProvider(saved).models.codex!;
+    expect(projected.find(model => model.id === 'new-model')?.defaultEnabled).toBe(true);
+    expect(projected.find(model => model.id === 'chat-model')?.defaultEnabled).toBe(false);
+    if (hasModels) expect(projected.find(model => model.id === 'old-model')?.defaultEnabled).toBe(false);
+    expect(refetchProvidersSpy).toHaveBeenCalled();
+  });
   it('dims GPT Image 2 without a ready image channel, independently of chat connection', async () => {
     providerSnapshotState.order = ['custom', 'xd'];
     providerSnapshotState.customConnected = true;
-    const view = render(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    const view = render(
+      <MemoryRouter>
+        <ProvidersSection />
+      </MemoryRouter>,
+    );
     await screen.findByRole('switch', { name: 'Custom model' });
     fireEvent.click(screen.getByRole('button', { name: 'newChat.modelSelector.category.image1' }));
     providerSnapshotState.customConnected = false;
-    view.rerender(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    view.rerender(
+      <MemoryRouter>
+        <ProvidersSection />
+      </MemoryRouter>,
+    );
     const imageRow = () => screen.getByText('GPT Image 2').closest('div.group')!;
     expect(imageRow().classList.contains('opacity-55')).toBe(true);
-    expect(screen.getByText('GPT Image 2').getAttribute('style')).toBe(screen.getByText('Custom model').getAttribute('style'));
+    expect(screen.getByText('GPT Image 2').getAttribute('style')).toBe(
+      screen.getByText('Custom model').getAttribute('style'),
+    );
     providerSnapshotState.mediaReady = true;
-    view.rerender(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    view.rerender(
+      <MemoryRouter>
+        <ProvidersSection />
+      </MemoryRouter>,
+    );
     expect(imageRow().classList.contains('opacity-55')).toBe(false);
-    expect(screen.getByRole('switch', { name: 'Custom model' }).getAttribute('aria-checked')).toBe('false');
+    expect(screen.getByRole('switch', { name: 'Custom model' }).getAttribute('aria-checked')).toBe(
+      'false',
+    );
     providerSnapshotState.mediaReady = false;
     providerSnapshotState.customConnected = true;
-    view.rerender(<MemoryRouter><ProvidersSection /></MemoryRouter>);
+    view.rerender(
+      <MemoryRouter>
+        <ProvidersSection />
+      </MemoryRouter>,
+    );
     expect(imageRow().classList.contains('opacity-55')).toBe(true);
-    expect(screen.getByRole('switch', { name: 'Custom model' }).getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('switch', { name: 'Custom model' }).getAttribute('aria-checked')).toBe(
+      'true',
+    );
   });
 
   it('keeps selections but blocks toggles when a connected source becomes unavailable', async () => {
@@ -288,10 +402,10 @@ describe('ProvidersSection — 双栏管理', () => {
     render(React.createElement(MemoryRouter, null, React.createElement(ProvidersSection)));
     expect(requestAutoRefreshSpy).toHaveBeenCalledWith('providers-open');
 
-    // 详情头 + 左栏行都显示 xd 标题(默认选中第一行 = xd)。
+    // 左栏保留品牌翻译，详情头使用连接的实际显示名。
     expect(
       (await screen.findAllByText('settings.providers.xd.title')).length,
-    ).toBeGreaterThanOrEqual(2);
+    ).toBeGreaterThanOrEqual(1);
     // 详情标题的模型数/订阅标签必须在可用宽度内折行，不能溢出覆盖右侧连接操作。
     const identity = screen.getByTestId('provider-detail-identity');
     const metadata = screen.getByTestId('provider-detail-metadata');

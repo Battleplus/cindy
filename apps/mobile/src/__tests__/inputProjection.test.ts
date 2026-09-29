@@ -15,8 +15,9 @@ import {
 import { buildMobileUploadedAttachment } from '@/session/attachments';
 import { parseAttachmentOssRef } from '@/session/attachmentOssRef';
 import { textComposerDocument } from '@/session/composerDocument';
-import { localizeToolLoopError } from '@/session/toolLoopErrorI18n';
+import { localizeAgentError } from '@/session/agentErrorI18n';
 import type { RemoteSession } from '@/session/types';
+import { buildOutboxItem } from '@/session/sessionOutbox';
 
 const ATTACHMENT_SHA256 = 'a'.repeat(64);
 
@@ -41,6 +42,17 @@ function session(patch: Partial<RemoteSession> = {}): RemoteSession {
 }
 
 describe('inputProjection', () => {
+  it.each([true, false, undefined])('keeps the stored Plan snapshot %s across a later host toggle and serialization', (planModeAtSend) => {
+    const original = buildOutboxItem({ clientId: 'plan-id', sessionId: 's1', text: 'plan snapshot',
+      permissionModeAtSend: 'ask', planModeAtSend, readyAttachments: [], claimedUploads: [] });
+    const recovered = JSON.parse(JSON.stringify(original));
+    const queued = buildQueuedTextMessage(session({ planModeEnabled: !planModeAtSend }), recovered.text,
+      new Date(), recovered.clientId, { planMode: recovered.planModeAtSend });
+    expect(queued.createOpts.planMode).toBe(planModeAtSend);
+    expect(queued.permissionMode).toBe('ask');
+    if (planModeAtSend === undefined) expect(queued.createOpts).not.toHaveProperty('planMode');
+  });
+
   beforeAll(async () => {
     await i18n.changeLanguage('zh-CN');
   });
@@ -396,8 +408,23 @@ describe('inputProjection', () => {
     }).toolLoop).toBeNull();
   });
 
+  it('localizes the output-limit reason carried by the live projection', () => {
+    const projection = normalizeInputProjection({
+      sessionId: 'output-limit', error: 'Pi reached the model output limit.', errorReason: 'output-limit',
+    });
+    expect(localizeAgentError(projection.errorReason, projection.toolLoop ?? null)).toBe(
+      i18n.t('session.tail.outputLimit'),
+    );
+  });
+
+  it('localizes incomplete execution without exposing the host cell diagnostic', () => {
+    expect(localizeAgentError('yield-continuation-incomplete', null)).toBe(
+      i18n.t('session.tail.executionResultUnavailable'),
+    );
+  });
+
   it('localizes live tool-loop errors instead of rendering the host message', () => {
-    const localized = localizeToolLoopError(
+    const localized = localizeAgentError(
       'tool_use_loop_detected',
       { kind: 'contract', count: 3 },
     );

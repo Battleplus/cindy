@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode, type Ref } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft } from 'lucide-react-native';
 import {
@@ -12,15 +12,17 @@ import {
   type AccessibilityState,
   type PressableProps,
   type StyleProp,
+  type TextStyle,
   type ViewStyle,
 } from 'react-native';
 import { Text } from '@/components/AppText';
 import { QuietSyncIndicator } from '@/components/QuietSyncIndicator';
+import { mobileInteractionStyles } from './mobileInteractionStyles';
 import { fontWeight, iconSize, iconStroke, useTheme, useThemedStyles, type ThemeColors } from '@/theme';
 import { lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
 
 type PillTone = 'default' | 'primary' | 'attention';
-type MainWindowActionTone = 'danger' | 'primary' | 'secondary';
+type MainWindowActionTone = 'danger' | 'danger-solid' | 'primary' | 'secondary';
 type MainWindowActionDensity = 'compact' | 'default';
 
 export interface MainWindowAction {
@@ -585,12 +587,19 @@ export function MainWindowActionButton({
   action,
   density = 'default',
   grow = false,
+  hitSlop,
   style,
+  textStyle,
+  buttonRef,
 }: {
   action: MainWindowAction;
   density?: MainWindowActionDensity;
   grow?: boolean;
+  /** Compact buttons (38pt) inside content rows extend their touch target to 44pt this way. */
+  hitSlop?: PressableProps['hitSlop'];
   style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
+  buttonRef?: Ref<View>;
 }) {
   const styles = useThemedStyles(makeStyles);
   const { colors } = useTheme();
@@ -599,6 +608,8 @@ export function MainWindowActionButton({
   const disabled = action.disabled || action.busy || !action.onPress;
   return (
     <Pressable
+      ref={buttonRef}
+      hitSlop={hitSlop}
       accessibilityLabel={action.accessibilityLabel ?? action.label}
       accessibilityRole="button"
       accessibilityState={{
@@ -615,6 +626,7 @@ export function MainWindowActionButton({
         action.active && tone === 'secondary' && styles.mainActionButtonActive,
         tone === 'primary' && styles.mainActionButtonPrimary,
         tone === 'danger' && styles.mainActionButtonDanger,
+        tone === 'danger-solid' && { backgroundColor: colors.sharedTaskConfirmBackground, borderColor: colors.sharedTaskConfirmBackground },
         pressed && styles.pressed,
         disabled && styles.disabled,
         style,
@@ -622,7 +634,7 @@ export function MainWindowActionButton({
       testID={action.testID}
     >
       {action.busy ? (
-        <ActivityIndicator color={tone === 'primary' ? colors.ctaText : colors.textSecondary} size="small" />
+        <ActivityIndicator color={tone === 'danger-solid' ? colors.sharedTaskConfirmForeground : tone === 'primary' ? colors.ctaText : colors.textSecondary} size="small" />
       ) : (
         <Text
           numberOfLines={1}
@@ -631,6 +643,8 @@ export function MainWindowActionButton({
             compact && styles.mainActionButtonTextCompact,
             tone === 'primary' && styles.mainActionButtonPrimaryText,
             tone === 'danger' && styles.mainActionButtonDangerText,
+            tone === 'danger-solid' && { color: colors.sharedTaskConfirmForeground },
+            textStyle,
           ]}
         >
           {action.label}
@@ -725,21 +739,24 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   },
   eyebrow: {
     color: colors.textTertiary,
-    fontSize: typeScale.caption,
-    fontWeight: fontWeight.medium,
+    fontSize: typeScale.footnote,
+    lineHeight: lineHeight.caption,
+    fontWeight: fontWeight.semibold,
     textTransform: 'uppercase',
   },
   headerTitle: {
     color: colors.textPrimary,
     fontSize: typeScale.title,
-    fontWeight: fontWeight.medium,
+    lineHeight: lineHeight.title,
+    fontWeight: fontWeight.semibold,
   },
   headerTitleCompact: {
     fontSize: typeScale.subtitle,
+    lineHeight: lineHeight.subtitle,
   },
   headerSubtitle: {
     color: colors.textSecondary,
-    fontSize: typeScale.caption,
+    fontSize: typeScale.footnote,
     lineHeight: lineHeight.caption,
     marginTop: 2,
   },
@@ -764,6 +781,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   actionPillText: {
     color: colors.textPrimary,
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
     fontWeight: fontWeight.medium,
   },
   infoPill: {
@@ -791,6 +809,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   infoPillText: {
     color: colors.textSecondary,
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
     fontWeight: fontWeight.medium,
   },
   infoPillTextStrong: {
@@ -799,9 +818,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   infoPillTextInverted: {
     color: colors.ctaText,
   },
-  pressed: {
-    opacity: 0.72,
-  },
+  pressed: mobileInteractionStyles.pressed,
   disabled: {
     opacity: 0.45,
   },
@@ -829,6 +846,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   mainOptionButtonText: {
     color: colors.textSecondary,
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
     fontWeight: fontWeight.medium,
   },
   mainOptionButtonTextSelected: {
@@ -922,7 +940,8 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   mainMetricLabel: {
     color: colors.textSecondary,
     fontSize: typeScale.caption,
-    fontWeight: fontWeight.medium,
+    lineHeight: lineHeight.caption,
+    fontWeight: fontWeight.regular,
   },
   mainMetricTextInverted: {
     color: colors.ctaText,
@@ -943,6 +962,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   mainEmptyTitle: {
     color: colors.textPrimary,
     fontSize: typeScale.body,
+    lineHeight: lineHeight.body,
     fontWeight: fontWeight.medium,
   },
   mainEmptyCopy: {
@@ -961,6 +981,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   remoteSyncingText: {
     color: colors.textTertiary,
     fontSize: typeScale.body,
+    lineHeight: lineHeight.body,
   },
   mainActionGroup: {
     gap: spacing.sm,
@@ -1009,10 +1030,12 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   mainActionButtonText: {
     color: colors.textPrimary,
     fontSize: typeScale.body,
+    lineHeight: lineHeight.body,
     fontWeight: fontWeight.medium,
   },
   mainActionButtonTextCompact: {
     fontSize: typeScale.caption,
+    lineHeight: lineHeight.caption,
   },
   mainActionButtonPrimaryText: {
     color: colors.ctaText,

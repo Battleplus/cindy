@@ -1,23 +1,39 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
+  owner: 'owner-a',
+  root: '',
+  pending: false,
   db: null as ReturnType<typeof drizzle> | null,
   tx: null as null | ((name: string, args: unknown) => Promise<unknown>),
 }));
 
 vi.mock('../client/current.js', () => ({
-  getDbClient: () => ({ drizzle: h.db, tx: h.tx }),
+  getDbClient: () => h,
 }));
 
+vi.mock('../../appSessionState.js', () => ({
+  activeOwnerScopeKey: () => h.owner,
+  ownerScopedUserDataPath: () => path.join(h.root, h.owner),
+  isAppSessionBoundaryPending: () => h.pending,
+}));
+
+import { provisionDefaultBot, withDefaultBotProvisioningLock } from '../../maker-ipc/botDefaultProvisioning.js';
 import { commitBotProfileDeletion } from '../botProfileDeletionStore.js';
 import { tx as runWorkerTx } from '../worker/opHandlers/tx.js';
 
 describe('Bot profile deletion transaction', () => {
   let sqlite: Database.Database;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    h.root = await fs.mkdtemp(path.join(os.tmpdir(), 'teammate-deletion-'));
+    h.owner = 'owner-a';
+    h.pending = false;
     sqlite = new Database(':memory:');
     sqlite.exec(`
       PRAGMA foreign_keys = ON;
@@ -44,14 +60,14 @@ describe('Bot profile deletion transaction', () => {
       );
       CREATE TABLE bot_direct_message_threads (
         id TEXT PRIMARY KEY,
-        bot_a_id TEXT NOT NULL REFERENCES bot_profiles(id) ON DELETE CASCADE,
-        bot_b_id TEXT NOT NULL REFERENCES bot_profiles(id) ON DELETE CASCADE
+        bot_a_id TEXT NOT NULL,
+        bot_b_id TEXT NOT NULL
       );
       CREATE TABLE bot_direct_messages (
         id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL REFERENCES bot_direct_message_threads(id) ON DELETE CASCADE,
-        sender_bot_id TEXT NOT NULL REFERENCES bot_profiles(id) ON DELETE CASCADE,
-        recipient_bot_id TEXT NOT NULL REFERENCES bot_profiles(id) ON DELETE CASCADE,
+        thread_id TEXT NOT NULL,
+        sender_bot_id TEXT NOT NULL,
+        recipient_bot_id TEXT NOT NULL,
         content TEXT NOT NULL
       );
       CREATE TABLE media_refs (id TEXT PRIMARY KEY, ref_kind TEXT NOT NULL, ref_id TEXT NOT NULL);
@@ -73,7 +89,64 @@ describe('Bot profile deletion transaction', () => {
     h.tx = async (name, args) => runWorkerTx(sqlite, { name: name as never, args } as never);
   });
 
-  afterEach(() => sqlite.close());
+  afterEach(async () => { sqlite.close(); await fs.rm(h.root, { recursive: true, force: true }); });
+
+  it('does not mark or delete for an account switched while waiting for the owner lock', async () => {
+    const deletion = { botId: 'bot-1', sessionIds: [], keepTaskHistory: false };
+    const tx = vi.fn(h.tx!);
+    h.tx = tx;
+    let attempt!: Promise<unknown>;
+    // Hold the real lock so the account switch occurs before deletion can write.
+    await withDefaultBotProvisioningLock(path.join(h.root, 'owner-a'), () => {}, async () => {
+      attempt = commitBotProfileDeletion(deletion);
+      h.owner = 'owner-b';
+    });
+    await expect(attempt).rejects.toThrow('Account changed');
+    expect(tx).not.toHaveBeenCalled();
+    for (const owner of ['owner-a', 'owner-b']) {
+      await expect(fs.access(path.join(h.root, owner, 'bots', '.initial-companion'))).rejects.toThrow();
+    }
+  });
+
+  it('keeps initialization from recreating the last teammate during deletion', async () => {
+    let releaseDelete!: () => void;
+    let enteredDelete!: () => void;
+    const deleting = new Promise<void>(resolve => { enteredDelete = resolve; });
+    const release = new Promise<void>(resolve => { releaseDelete = resolve; });
+    const tx = h.tx!;
+    h.tx = async (name, args) => { enteredDelete(); await release; return tx(name, args); };
+    const deletion = commitBotProfileDeletion({ botId: 'bot-1', sessionIds: [], keepTaskHistory: false });
+    await deleting;
+    const create = vi.fn();
+    const history = vi.fn(async () => false);
+    const provision = provisionDefaultBot({ ownerRoot: path.join(h.root, h.owner), assertOwner: () => {}, hasBotHistory: history, create });
+    releaseDelete();
+    await Promise.all([deletion, provision]);
+    expect(create).not.toHaveBeenCalled();
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  it('waits for an initialization decision before deleting and never revives afterward', async () => {
+    let enterHistory!: () => void;
+    let releaseHistory!: () => void;
+    const entered = new Promise<void>(resolve => { enterHistory = resolve; });
+    const release = new Promise<void>(resolve => { releaseHistory = resolve; });
+    const create = vi.fn();
+    const input = { ownerRoot: path.join(h.root, h.owner), assertOwner: () => {},
+      hasBotHistory: async () => { enterHistory(); await release; return !!sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-1'").get(); }, create };
+    const provisioning = provisionDefaultBot(input);
+    await entered;
+    const tx = vi.fn(h.tx!);
+    h.tx = tx;
+    const deletion = commitBotProfileDeletion({ botId: 'bot-1', sessionIds: [], keepTaskHistory: false });
+    // Let deletion reach the file lock while initialization is paused past fs.access.
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(tx).not.toHaveBeenCalled();
+    releaseHistory();
+    await Promise.all([provisioning, deletion]);
+    await provisionDefaultBot({ ...input, hasBotHistory: async () => false });
+    expect(create).not.toHaveBeenCalled();
+  });
 
   function snapshot() {
     return Object.fromEntries([
@@ -83,44 +156,69 @@ describe('Bot profile deletion transaction', () => {
   }
 
   describe.each([true, false])('shared history with keepTaskHistory=%s', (keepTaskHistory) => {
-    async function expectDeletionRejected() {
-      const before = snapshot();
-      await expect(commitBotProfileDeletion({
+    async function deleteBot() {
+      await commitBotProfileDeletion({
         botId: 'bot-1', sessionIds: ['canonical', 'route'], keepTaskHistory,
-      })).rejects.toMatchObject({ code: 'BOT_SHARED_HISTORY_REFERENCED' });
-      expect(snapshot()).toEqual(before);
+      });
     }
 
-    it.each(['target', 'requester'])('preserves shared delegation when deleting its %s', async (role) => {
+    it.each(['target', 'requester'])('deletes the profile without cascading the other bot when it is the delegation %s', async (role) => {
       sqlite.prepare('INSERT INTO bot_delegations VALUES (?, ?, ?)').run(
         'delegation-1', role === 'target' ? 'bot-2' : 'bot-1', role === 'target' ? 'bot-1' : 'bot-2',
       );
-      await expectDeletionRejected();
+      await deleteBot();
+      expect(sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-1'").get()).toBeUndefined();
+      expect(sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-2'").get()).toEqual({ id: 'bot-2' });
+      expect(sqlite.prepare('SELECT * FROM bot_delegations').all()).toEqual(role === 'target'
+        ? [{ id: 'delegation-1', requesting_bot_id: 'bot-2', target_bot_id: null }]
+        : []);
     });
 
-    it.each(['a', 'b'])('preserves a private thread and its messages when deleting member %s', async (member) => {
+    it.each(['a', 'b'])('keeps a private thread and its messages when deleting member %s', async (member) => {
       sqlite.prepare('INSERT INTO bot_direct_message_threads VALUES (?, ?, ?)').run(
         'thread-1', member === 'a' ? 'bot-1' : 'bot-2', member === 'a' ? 'bot-2' : 'bot-1',
       );
       sqlite.exec(`INSERT INTO bot_direct_messages VALUES
         ('dm-1', 'thread-1', 'bot-1', 'bot-2', 'Request'),
         ('dm-2', 'thread-1', 'bot-2', 'bot-1', 'Reply')`);
-      await expectDeletionRejected();
+      const messages = sqlite.prepare('SELECT * FROM bot_direct_messages').all();
+      await deleteBot();
+      expect(sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-1'").get()).toBeUndefined();
+      expect(sqlite.prepare('SELECT * FROM bot_direct_message_threads').all()).toEqual([
+        { id: 'thread-1', bot_a_id: member === 'a' ? 'bot-1' : 'bot-2', bot_b_id: member === 'a' ? 'bot-2' : 'bot-1' },
+      ]);
+      expect(sqlite.prepare('SELECT * FROM bot_direct_messages').all()).toEqual(messages);
     });
 
-    it('preserves a private thread even before its first message', async () => {
+    it('keeps a private thread even before its first message', async () => {
       sqlite.exec("INSERT INTO bot_direct_message_threads VALUES ('thread-1', 'bot-1', 'bot-2')");
-      await expectDeletionRejected();
+      await deleteBot();
+      expect(sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-1'").get()).toBeUndefined();
+      expect(sqlite.prepare('SELECT * FROM bot_direct_message_threads').all()).toEqual([
+        { id: 'thread-1', bot_a_id: 'bot-1', bot_b_id: 'bot-2' },
+      ]);
     });
 
-    it.each(['sender', 'recipient'])('checks actual message %s references independently of thread membership', async (role) => {
+    it.each(['sender', 'recipient'])('keeps a message %s reference that is not a thread member', async (role) => {
       sqlite.exec("INSERT INTO bot_direct_message_threads VALUES ('thread-1', 'bot-2', 'bot-3')");
       sqlite.prepare('INSERT INTO bot_direct_messages VALUES (?, ?, ?, ?, ?)').run(
         'dm-1', 'thread-1', role === 'sender' ? 'bot-1' : 'bot-2',
         role === 'sender' ? 'bot-2' : 'bot-1', 'Retained shared message',
       );
-      await expectDeletionRejected();
+      await deleteBot();
+      expect(sqlite.prepare("SELECT id FROM bot_profiles WHERE id = 'bot-1'").get()).toBeUndefined();
+      expect(sqlite.prepare('SELECT content FROM bot_direct_messages').all()).toEqual([
+        { content: 'Retained shared message' },
+      ]);
     });
+  });
+
+  it('keeps inbound delegation targets until the final delete transaction', async () => {
+    sqlite.prepare('INSERT INTO bot_delegations VALUES (?, ?, ?)').run('delegation-1', 'bot-2', 'bot-1');
+    await h.tx!('bots.prepareProfileDeletion', { botId: 'bot-1' });
+    expect(sqlite.prepare('SELECT target_bot_id FROM bot_delegations').pluck().get()).toBe('bot-1');
+    await commitBotProfileDeletion({ botId: 'bot-1', sessionIds: [], keepTaskHistory: false });
+    expect(sqlite.prepare('SELECT target_bot_id FROM bot_delegations').pluck().get()).toBeNull();
   });
 
   it('atomically detaches kept transcripts and removes the Profile', async () => {

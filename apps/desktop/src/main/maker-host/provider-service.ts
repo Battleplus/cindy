@@ -24,6 +24,7 @@ import {
   type ProviderModelDiscoveryFailure,
   type ProviderView,
   type Provider,
+  isCustomRoutedProvider,
 } from '@cindy/model-providers';
 
 const log = createLogger('provider-service');
@@ -37,6 +38,8 @@ const log = createLogger('provider-service');
  */
 export interface ConnectionReadOptions {
   allowSideEffects: boolean;
+  /** Host-only snapshot read: never refresh CLI status or load account presentation. */
+  snapshotOnly?: boolean;
   /**
    * Wait for post-claim model discovery before materializing this snapshot.
    * This is an internal readiness hint for routing callers; ordinary provider reads
@@ -63,7 +66,7 @@ export interface ProviderListOptions extends ConnectionReadOptions {
 export interface ProviderConnectionReaders {
   /** XD 网关：托管 api_key 是否存在。 */
   xd: (opts: ConnectionReadOptions) => boolean | Promise<boolean>;
-  /** Anthropic：系统 Claude.ai OAuth 是否登录。 */
+  /** Anthropic：内置 Claude Code CLI 是否已登录且 Cindy 获准使用。 */
   anthropic: (opts: ConnectionReadOptions) => boolean | Promise<boolean>;
   /** OpenAI：Codex 是否 OAuth 登录。 */
   openai: (opts: ConnectionReadOptions) => boolean | Promise<boolean>;
@@ -72,6 +75,7 @@ export interface ProviderConnectionReaders {
 }
 
 export interface ProviderServiceDeps {
+  getProviderPresentation?: (providerId: string) => { name?: string; removed?: boolean };
   /** 返回当前生效目录（同步）。桌面端注入 active-catalog 的 getActiveCatalog。 */
   getCatalog: () => Catalog;
   /** 连接状态判定器。 */
@@ -81,6 +85,10 @@ export interface ProviderServiceDeps {
    * （生产 = generic-oauth 的 hasGenericOAuthLogin）。缺省 = 一律未连接。
    */
   genericOAuthConnected?: (providerId: string) => boolean;
+  codexAccountConnected?: (providerId: string) => boolean;
+  subscriptionAccountConnected?: (providerId: string) => boolean;
+  subscriptionAccountInfo?: (providerId: string) => Promise<ProviderView['subscriptionAccount']>;
+  openAiAccountInfo?: (providerId: string) => Promise<ProviderView['openAiAccount']>;
   /**
    * 内置 API-key 供应商(auth.method 'apiKey' 且 source 'builtin',如 Gemini 图像来源,
    * 2026-07)的连接态判定:连接 = 该供应商的 key 已存(生产 = providerSecretStore.has)。
@@ -134,7 +142,8 @@ export interface ProviderService {
 export function createProviderService(deps: ProviderServiceDeps): ProviderService {
   async function listProviders(opts?: Partial<ProviderListOptions>): Promise<ProviderView[]> {
     const readOpts: ConnectionReadOptions = {
-      allowSideEffects: opts?.allowSideEffects === true,
+      allowSideEffects: opts?.allowSideEffects === true && opts?.snapshotOnly !== true,
+      snapshotOnly: opts?.snapshotOnly === true,
       waitForDiscovery: opts?.waitForDiscovery === true,
     };
     const [xd, anthropic, openai, xai] = await Promise.all([
@@ -156,9 +165,13 @@ export function createProviderService(deps: ProviderServiceDeps): ProviderServic
       }
       // 通用 OAuth 供应商（带 auth.oauth 描述符，内置目录下发或用户自建皆同）：
       // 连接态 = 本机是否有凭证 blob（登录过才算连接）。
-      else if (p.auth.method === 'oauth' && p.auth.oauth && !(p.id in connected)) {
+      else if (p.auth.native === 'claude' || p.auth.native === 'xai') {
+        connected[p.id] = deps.subscriptionAccountConnected?.(p.id) ?? false;
+      } else if (p.auth.native === 'codex') {
+        connected[p.id] = deps.codexAccountConnected?.(p.id) ?? false;
+      } else if (p.auth.method === 'oauth' && p.auth.oauth && !(p.id in connected)) {
         connected[p.id] = deps.genericOAuthConnected?.(p.id) ?? false;
-      } else if (p.source === 'user') {
+      } else if (isCustomRoutedProvider(p)) {
         connected[p.id] = deps.customApiKeyConnected?.(p) ?? false;
       }
       // 内置 API-key 供应商(如 Gemini 图像来源):连接 = key 已存。与自定义供应商
@@ -185,7 +198,23 @@ export function createProviderService(deps: ProviderServiceDeps): ProviderServic
         { error: mediaErrorForLog(error) },
       );
     }
-    return buildRegistry(catalog, connected, discoveryFailures, deps.getModelAccess?.()).map(
+    const accountInfo = new Map<string, ProviderView['openAiAccount']>();
+    if (!readOpts.snapshotOnly && deps.openAiAccountInfo) {
+      await Promise.all(catalog.providers.filter((p) => p.id === 'openai' || p.auth.native === 'codex').map(async (p) => {
+        accountInfo.set(p.id, await deps.openAiAccountInfo!(p.id));
+      }));
+    }
+    const subscriptionInfo = new Map<string, ProviderView['subscriptionAccount']>();
+    if (!readOpts.snapshotOnly && deps.subscriptionAccountInfo) await Promise.all(catalog.providers
+      .filter(p => p.id === 'anthropic' || p.id === 'xai' || p.auth.native === 'claude' || p.auth.native === 'xai')
+      .map(async p => subscriptionInfo.set(p.id, await deps.subscriptionAccountInfo!(p.id))));
+    return buildRegistry(catalog, connected, discoveryFailures, deps.getModelAccess?.()).map((provider) => ({
+      ...(subscriptionInfo.get(provider.id) ? { subscriptionAccount: subscriptionInfo.get(provider.id) } : {}),
+      ...provider, ...(provider.source === 'builtin' ? deps.getProviderPresentation?.(provider.id) ?? {} : {}), ...(accountInfo.get(provider.id) ? { openAiAccount: accountInfo.get(provider.id) } : {}),
+      // Deletion disconnects first. A live binding wins over a stale removed flag if
+      // restoring display preferences failed after authentication was committed.
+      ...(provider.connected ? { removed: false } : {}),
+    })).map(
       (provider) =>
         media === undefined
           ? provider

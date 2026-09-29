@@ -1,3 +1,4 @@
+import { chatCompatibilityCapabilities, normalizeProviderRequest } from '@cindy/model-compat';
 import type { ServerResponse } from 'node:http';
 
 import { ChatSseTranslator } from './chat-sse-translator.js';
@@ -6,6 +7,7 @@ import {
   resolveConversationSessionHeaders,
   withChatBridgeUserAgent,
 } from './session-header.js';
+import { classifySystemOrderError, shouldRetrySystemNormalization } from './system-order.js';
 import { coalesceLeadingSystemMessages, translateResponsesRequestWithContext } from './translate-request.js';
 import {
   UnsupportedResponsesFeatureError,
@@ -32,28 +34,6 @@ function classifyUpstreamErrorBody(text: string): 'empty' | 'json' | 'text' {
   } catch {
     return 'text';
   }
-}
-
-function isSystemMessageOrderError(status: number, text: string): boolean {
-  if (status !== 400) return false;
-  try {
-    const body: unknown = JSON.parse(text);
-    return isPlainObject(body)
-      && isPlainObject(body.error)
-      && typeof body.error.message === 'string'
-      && /^system message must be at the beginning\.?$/i.test(body.error.message.trim());
-  } catch {
-    return false;
-  }
-}
-
-/** Only retry a prefix merge; moving later instructions across a turn changes their scope. */
-function hasConsecutiveSystemPrefix(messages: ChatMessage[]): boolean {
-  let prefixLength = 0;
-  while (messages[prefixLength]?.role === 'system') prefixLength += 1;
-  return prefixLength > 1 && messages.every((message, index) => (
-    index < prefixLength || (message.role !== 'system' && message.role !== 'developer')
-  ));
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -197,11 +177,12 @@ export function createResponsesChatHandler(
       }
       const request = parsedBody as ResponsesRequest;
       const realModel = provider.rewriteModel?.(request.model) ?? request.model;
+      const compatibilityRoute = { harness: 'codex' as const, protocol: 'openai-chat' as const, upstreamBase: provider.upstreamBase, model: realModel };
       let translated;
       try {
         translated = translateResponsesRequestWithContext(request, {
           model: realModel,
-          capabilities: provider.capabilities,
+          capabilities: chatCompatibilityCapabilities(compatibilityRoute, provider.capabilities),
           onDroppedTool: (type, index) => {
             if (type === 'web_search') {
               log.warn?.('responses-chat bridge dropped unsupported built-in tool', {
@@ -278,21 +259,22 @@ export function createResponsesChatHandler(
             'content-type': 'application/json',
             accept: 'text/event-stream',
           },
-          body: JSON.stringify(chatRequest),
+          body: JSON.stringify(normalizeProviderRequest(chatRequest, compatibilityRoute, { reasoningEffortAlreadyMapped: provider.capabilities?.reasoningEffortMap !== undefined })),
           signal: abort.signal,
         });
         upstream = await send();
         if (!upstream.ok) {
           upstreamErrorText = await readErrorText(upstream);
-          // Qwen can reject instructions + developer even before the first user (#3583).
-          // Retry only a precise pre-generation rejection, once and within this request.
-          // Explicit policies and native developer-role semantics remain authoritative.
+          // 上游只允许 system 出现在开头:Qwen 拒 instructions + developer (#3583),
+          // Google 兼容层拒中段 system(Claude Code 的 mid-conversation-system 会带进来)。
+          // 只重试一次、只限本次请求内;显式策略与原生 developer 语义仍然优先。
+          const systemOrderRejection = classifySystemOrderError(upstream.status, upstreamErrorText);
           if (
             provider.capabilities?.systemMessagePolicy === undefined
             && provider.capabilities?.developerRole !== 'developer'
-            && isSystemMessageOrderError(upstream.status, upstreamErrorText)
+            && systemOrderRejection !== null
             && !abort.signal.aborted
-            && hasConsecutiveSystemPrefix(chatRequest.messages)
+            && shouldRetrySystemNormalization(systemOrderRejection, chatRequest.messages)
           ) {
             const coalesced = coalesceLeadingSystemMessages(chatRequest.messages);
             if (coalesced !== chatRequest.messages) {

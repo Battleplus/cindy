@@ -2,9 +2,56 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   createBotCompactRuntimeRefreshCoordinator,
+  prepareBotCapabilityEpochBeforeSend,
+  refreshBotRuntimeAfterModelSelection,
   replaceBotRuntimeAfterPreflight,
   type BotCompactRuntimeSession,
 } from '../botCompactRuntimeRefresh';
+
+describe('profile refresh after model selection', () => {
+  it.each([true, false])('keeps the newly bootstrapped handle alive (prior handle: %s)', async (hadRuntime) => {
+    let current = hadRuntime ? createSession().session : undefined;
+    const next = createSession('bot-session', 'new-codex-thread').session;
+    const refresh = vi.fn(async () => 'refreshed' as const);
+    await expect(refreshBotRuntimeAfterModelSelection({
+      current: () => current,
+      select: async () => { current = next; },
+      refresh,
+    })).resolves.toBe('not-bot');
+    expect(current).toBe(next);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('keeps a busy selection queued until the safe boundary', async () => {
+    const runtime = createSession();
+    runtime.setRunning(true);
+    const refresh = vi.fn(async () => 'refreshed' as const);
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false, refresh });
+    await expect(refreshBotRuntimeAfterModelSelection({
+      current: () => runtime.session,
+      select: async () => {},
+      refresh: async (session) => {
+        coordinator.noteBoundary(session);
+        return coordinator.attempt(session);
+      },
+    })).resolves.toBe('deferred');
+    expect(refresh).not.toHaveBeenCalled();
+    runtime.setRunning(false);
+    await expect(coordinator.attempt(runtime.session)).resolves.toBe('refreshed');
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('does not refresh or close the current handle when switching fails', async () => {
+    const runtime = createSession();
+    const refresh = vi.fn(async () => 'refreshed' as const);
+    await expect(refreshBotRuntimeAfterModelSelection({
+      current: () => runtime.session,
+      select: async () => { throw new Error('provider unavailable'); },
+      refresh,
+    })).rejects.toThrow('provider unavailable');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+});
 
 function createSession(id = 'bot-session', instanceId = 'runtime-1') {
   let running = false;
@@ -150,5 +197,120 @@ describe('Bot compact runtime refresh coordinator', () => {
     expect(coordinator.hasPending(oldRuntime.session.id)).toBe(true);
     coordinator.clearForClosedSession(oldRuntime.session);
     expect(coordinator.hasPending(oldRuntime.session.id)).toBe(false);
+  });
+});
+
+describe('capability refresh input admission', () => {
+  const botChat = { role: 'canonical', source: 'bot', status: 'active', workingDir: '/virtual/bot' };
+
+  it.each([undefined, { ...botChat, role: 'delegation' }, { ...botChat, source: 'desktop' }])(
+    'does not block ordinary or delegated input after mid-turn compaction (%j)', async row => {
+      const h = createSession();
+      h.setRunning(true);
+      const refresh = vi.fn(async () => 'not-bot' as const);
+      const preflight = vi.fn(async () => true);
+      const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false, refresh });
+      coordinator.noteBoundary(h.session);
+      const admit = () => prepareBotCapabilityEpochBeforeSend(h.session, {
+        readSession: async () => row, preflight, coordinator,
+      });
+      await expect(admit()).resolves.toBe('not-bot');
+      expect(refresh).not.toHaveBeenCalled();
+      expect(preflight).not.toHaveBeenCalled();
+      // The task's normal idle callback can retire the marker without replacing it.
+      h.setRunning(false);
+      await expect(coordinator.attempt(h.session)).resolves.toBe('not-bot');
+      expect(coordinator.hasPending(h.session.id)).toBe(false);
+      await expect(admit()).resolves.toBe('not-bot');
+    },
+  );
+
+  it.each(['canonical', 'group'])('keeps %s refresh blocked while busy and recovers at idle', async role => {
+    const h = createSession();
+    let interaction = false;
+    const refresh = vi.fn(async () => 'refreshed' as const);
+    const preflight = vi.fn(async () => true);
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => interaction, refresh });
+    const admit = () => prepareBotCapabilityEpochBeforeSend(h.session, {
+      readSession: async () => ({ ...botChat, role }), preflight, coordinator,
+    });
+    h.setRunning(true);
+    await expect(admit()).resolves.toBe('deferred');
+    h.setRunning(false);
+    interaction = true;
+    await expect(admit()).resolves.toBe('deferred');
+    interaction = false;
+    h.setBackgroundTasks(1);
+    await expect(admit()).resolves.toBe('deferred');
+    expect(refresh).not.toHaveBeenCalled();
+    h.setBackgroundTasks(0);
+    await expect(admit()).resolves.toBe('refreshed');
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(preflight).toHaveBeenCalledOnce();
+  });
+
+  it('keeps failed refresh retryable without treating failure as permission to send', async () => {
+    const h = createSession();
+    const refresh = vi.fn().mockRejectedValueOnce(new Error('preflight unavailable')).mockResolvedValue('refreshed');
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false, refresh });
+    const admit = () => prepareBotCapabilityEpochBeforeSend(h.session, {
+      readSession: async () => botChat, preflight: async () => true, coordinator,
+    });
+    await expect(admit()).resolves.toBe('deferred');
+    expect(coordinator.hasPending(h.session.id)).toBe(true);
+    await expect(admit()).resolves.toBe('refreshed');
+    expect(coordinator.hasPending(h.session.id)).toBe(false);
+  });
+
+  it('does not let a retired instance marker block the current unchanged runtime', async () => {
+    const old = createSession();
+    const current = createSession(old.session.id, 'replacement');
+    const refresh = vi.fn(async () => 'refreshed' as const);
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false, refresh });
+    coordinator.noteBoundary(old.session);
+    await expect(prepareBotCapabilityEpochBeforeSend(current.session, {
+      readSession: async () => botChat, preflight: async () => false, coordinator,
+    })).resolves.toBe('not-bot');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it.each(['same-instance', 'replacement'] as const)('preserves newer refresh work when an old callback settles (%s)', async kind => {
+    const old = createSession();
+    const next = kind === 'same-instance' ? old : createSession(old.session.id, 'replacement');
+    let finish!: (outcome: 'refreshed') => void;
+    const refresh = vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValue('refreshed');
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false, refresh });
+    coordinator.noteBoundary(old.session);
+    const first = coordinator.attempt(old.session);
+    coordinator.noteBoundary(next.session);
+    const second = coordinator.attempt(next.session);
+    finish('refreshed');
+    await first;
+    await second;
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(refresh.mock.calls[1][0]).toBe(next.session);
+    expect(coordinator.hasPending(next.session.id)).toBe(false);
+  });
+
+  it('does not clear a newer boundary unless its own refresh succeeds', async () => {
+    const h = createSession();
+    let finish!: (outcome: 'refreshed') => void;
+    const coordinator = createBotCompactRuntimeRefreshCoordinator({ hasPendingInteraction: () => false,
+      refresh: () => new Promise(resolve => { finish = resolve; }),
+    });
+    coordinator.noteBoundary(h.session);
+    const first = coordinator.attempt(h.session);
+    coordinator.noteBoundary(h.session);
+    finish('refreshed');
+    await first;
+    expect(coordinator.hasPending(h.session.id)).toBe(true);
+    // Closing cancels pending work; the old callback cannot recreate it.
+    const second = coordinator.attempt(h.session);
+    coordinator.clearForClosedSession(h.session);
+    finish('refreshed');
+    await second;
+    expect(coordinator.hasPending(h.session.id)).toBe(false);
+    await expect(coordinator.attempt(h.session)).resolves.toBe('not-bot');
   });
 });

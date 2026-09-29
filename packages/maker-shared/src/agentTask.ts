@@ -167,6 +167,12 @@ export interface AgentTaskUpdate {
  * Derive the visible task status from the live update and its paired tool result.
  * A result is a terminal fact, so it closes a stale `running` update without
  * overriding an explicit failure or stopped state.
+ *
+ * `durableStatus` is the host's `subagent_runs` record for the same task, which
+ * is built from structured lifecycle events rather than result text. A terminal
+ * record is authoritative. A `running` record only proves the paired result is a
+ * launch receipt; the live update still decides whether the task is running, so
+ * a record left behind by a process that died never pins a spinner.
  */
 export function deriveAgentTaskStatus(
   updateStatus: AgentTaskStatus | undefined,
@@ -174,11 +180,19 @@ export function deriveAgentTaskStatus(
   options?: {
     resultIsLaunchReceipt?: boolean;
     persistedStatus?: AgentTaskTerminalStatus;
+
     resultIsError?: boolean;
+
+    durableStatus?: AgentTaskStatus;
+
   },
 ): AgentTaskStatus {
   const persistedStatus = normalizeAgentTaskTerminalStatus(options?.persistedStatus);
   if (persistedStatus) return persistedStatus;
+  const durableTerminalStatus = normalizeAgentTaskTerminalStatus(options?.durableStatus);
+  if (durableTerminalStatus) return durableTerminalStatus;
+  const resultIsLaunchReceipt =
+    options?.resultIsLaunchReceipt === true || options?.durableStatus === 'running';
   const hasResult = typeof result === 'string' && result.trim().length > 0;
   // resultIsError 只应收口 stale `running` / 缺失 live update 的历史回放;显式
   // failed / stopped 是用户或系统声明的终态,不得被配对的 tool result 覆盖 ——
@@ -190,11 +204,12 @@ export function deriveAgentTaskStatus(
   ) {
     return 'failed';
   }
-  if (updateStatus === 'running' && hasResult && !options?.resultIsLaunchReceipt) return 'completed';
+  if (updateStatus === 'running' && hasResult && !resultIsLaunchReceipt) return 'completed';
   return updateStatus ?? (hasResult ? 'completed' : 'running');
 }
 
 /**
+
  * 判断子任务工具结果是否以协议级错误收尾(历史回放恢复 failed 的依据)。
  *
  * 仅识别 Claude SDK 协议标记 `<tool_use_error>` — 这是 SDK 在 tool call 失败时
@@ -225,6 +240,58 @@ export function isSubagentResultError(result: string | undefined): boolean {
   // `<error>校验报告</error>` as work output would be misclassified as failure.
   // Only <tool_use_error> is a reliable protocol-owned error marker.
   return text.startsWith('<tool_use_error>');
+}
+
+/**
+ * Durable `subagent_runs` status, keyed by every id a spawning tool call or its
+ * live update may carry (parent tool-use id, harness task id, Cindy aliases).
+ */
+export type SubagentRunStatusIndex = ReadonlyMap<string, AgentTaskStatus>;
+
+export interface SubagentRunStatusSource {
+  parentToolUseId?: string;
+  logicalAgentId?: string;
+  identityAliases?: readonly string[];
+  status: string;
+  updatedAt?: number;
+}
+
+/** When several runs claim one alias, the most recently updated run wins. */
+export function buildSubagentRunStatusIndex(
+  runs: readonly SubagentRunStatusSource[],
+): SubagentRunStatusIndex {
+  const index = new Map<string, AgentTaskStatus>();
+  const updatedAtByKey = new Map<string, number>();
+  for (const run of runs) {
+    const status = run.status === 'running' ? 'running' : normalizeAgentTaskTerminalStatus(run.status);
+    if (!status) continue;
+    const updatedAt = typeof run.updatedAt === 'number' ? run.updatedAt : 0;
+    const keys = [run.parentToolUseId, run.logicalAgentId, ...(run.identityAliases ?? [])];
+    for (const key of keys) {
+      if (typeof key !== 'string' || key.length === 0) continue;
+      const previous = updatedAtByKey.get(key);
+      if (previous !== undefined && previous > updatedAt) continue;
+      index.set(key, status);
+      updatedAtByKey.set(key, updatedAt);
+    }
+  }
+  return index;
+}
+
+/** First durable status found under the call's tool-use id or its update's ids. */
+export function lookupSubagentRunStatus(
+  index: SubagentRunStatusIndex | undefined,
+  toolUseId: string | undefined,
+  update?: Pick<AgentTaskUpdate, 'taskId' | 'parentToolUseId'>,
+): AgentTaskStatus | undefined {
+  if (!index || index.size === 0) return undefined;
+  for (const key of [toolUseId, update?.parentToolUseId, update?.taskId]) {
+    if (typeof key !== 'string' || key.length === 0) continue;
+    const status = index.get(key);
+    if (status) return status;
+  }
+  return undefined;
+
 }
 
 /**
@@ -473,11 +540,15 @@ export function subagentSpawnResultIndicatesRunning(
     && trimmed === 'Cindy subagent launched. The agent is working in the background.') {
     return true;
   }
+  // Claude Code 2.1.280 appends a notice to the first line (`Async agent
+  // launched successfully. (This tool result is internal metadata …)`) and to
+  // the agentId line, so match the lines by prefix instead of exact text.
   if ((toolName === 'Agent' || toolName === 'Task')
     && (
       trimmed === 'Async agent launched successfully.'
       || (
-        trimmed.startsWith('Async agent launched successfully.\nagentId: ')
+        trimmed.startsWith('Async agent launched successfully.')
+        && /\nagentId: \S/.test(trimmed)
         && trimmed.includes('\nThe agent is working in the background.')
       )
     )) {
@@ -507,10 +578,13 @@ export function buildAgentTaskCardModel(input: {
   update?: AgentTaskUpdate;
   result?: string;
   persistedStatus?: AgentTaskTerminalStatus;
+  durableStatus?: AgentTaskStatus;
 }): AgentTaskCardModel {
-  const { toolName, toolInput, update, result, persistedStatus } = input;
+  const { toolName, toolInput, update, result, persistedStatus, durableStatus } = input;
   const status = deriveAgentTaskStatus(update?.status, result, {
-    persistedStatus,      resultIsLaunchReceipt:
+    persistedStatus,
+    durableStatus,
+    resultIsLaunchReceipt:
       subagentSpawnReceiptName(toolName, toolInput, result) !== undefined
       || subagentSpawnResultIndicatesRunning(toolName, result),
     resultIsError: isSubagentResultError(result),
@@ -539,7 +613,12 @@ export function buildAgentTaskCardModel(input: {
   const spawnedAgentName = update ? undefined : formatAgentTaskTitle(provider, spawnReceiptName);
   // 启动回执命中时 summary 不携带裸路径(路径已在 spawnedAgentName / title 中),
   // 否则手机端会把 agentPath 原样当摘要展示。
-  const summary = spawnReceiptName ? detailText(update?.summary) : detailText(result, update?.summary);
+  // Claude 异步 Agent 的启动回执是写给模型的内部元数据(agentId / output 文件),不当摘要展示。
+  const claudeLaunchReceipt = (toolName === 'Agent' || toolName === 'Task')
+    && subagentSpawnResultIndicatesRunning(toolName, result);
+  const summary = spawnReceiptName || claudeLaunchReceipt
+    ? detailText(update?.summary)
+    : detailText(result, update?.summary);
   return {
     status,
     provider,

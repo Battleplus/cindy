@@ -44,7 +44,7 @@ interface RuntimeSetModelActiveSession {
 export interface RuntimeSetModelMaker {
   getSession: (sessionId: string) => RuntimeSetModelSession | undefined;
   listActiveSessions: () => RuntimeSetModelActiveSession[];
-  closeSession: (sessionId: string) => Promise<void>;
+  closeSession: (sessionId: string, reason?: 'runtime-refresh') => Promise<void>;
 }
 
 interface RuntimeSetModelLogger {
@@ -65,6 +65,8 @@ export interface ApplyRuntimeSetModelChangeInput {
   forceSessionRebuild?: boolean;
   /** Fail closed before an otherwise-required runtime replacement mutates route state. */
   assertSessionCloseSupported?: () => void;
+  /** Called after async preflight, immediately before the first setting side effect. */
+  admit?: () => void;
   isSessionInTurn?: (sessionId: string) => boolean;
   /**
    * 会话自己正在跑 turn 时的延迟生效登记(PendingCredentialSwitchService.register)。
@@ -103,10 +105,10 @@ export interface ApplyRuntimeSetModelChangeInput {
    */
   codexAuthInjection?: CodexProxyAuthInjection | null;
   /**
-   * The host has proved that this local Codex selection crosses the explicit XD/OpenAI
-   * credential boundary and has a persisted native thread to rebuild.
+   * The host found a native writer in another local process. Closing the business
+   * handle may retain that writer, so verify release or relink before publishing.
    */
-  requiresCodexThreadRelink?: boolean;
+  requiresCodexThreadRelink?: boolean | (() => Promise<boolean>);
   /** Closes over the captured Profile DB and atomically commits thread + full target route. */
   relinkCodexThread?: () => Promise<void>;
   logger?: RuntimeSetModelLogger;
@@ -191,10 +193,8 @@ export async function applyRuntimeSetModelChange(
         codexAuthInjection: input.codexAuthInjection,
       })
     : false;
-  const requiresCodexThreadRelink = input.requiresCodexThreadRelink === true;
-  if (requiresCodexThreadRelink && !input.relinkCodexThread) {
-    throw new Error(`Codex provider thread relink is required for session ${sessionId}`);
-  }
+  let requiresCodexThreadRelink = typeof input.requiresCodexThreadRelink === 'function'
+    ? await input.requiresCodexThreadRelink() : input.requiresCodexThreadRelink === true;
   const modelSwitchRequiresRebuild =
     sess &&
     input.forceSessionRebuild !== true &&
@@ -207,6 +207,12 @@ export async function applyRuntimeSetModelChange(
     modelSwitchRequiresRebuild ||
     credentialModeRequiresRebuild
   );
+  if (shouldCloseSession && typeof input.requiresCodexThreadRelink === 'function') {
+    requiresCodexThreadRelink = await input.requiresCodexThreadRelink();
+  }
+  if (requiresCodexThreadRelink && !input.relinkCodexThread) {
+    throw new Error(`Codex provider thread relink is required for session ${sessionId}`);
+  }
   let selfBusyMemo: boolean | undefined;
   const isSelfBusy = (): boolean => {
     if (selfBusyMemo !== undefined) return selfBusyMemo;
@@ -225,6 +231,7 @@ export async function applyRuntimeSetModelChange(
   }
 
   if (!sess && requiresCodexThreadRelink) {
+    input.admit?.();
     await input.relinkCodexThread?.();
     if (providerId !== undefined) setSessionProvider(sessionId, nextProviderId);
     input.wakeSessionInputQueue?.(sessionId);
@@ -232,23 +239,24 @@ export async function applyRuntimeSetModelChange(
   }
 
   if (
-    sess?.agentKind === 'codex' &&
+    (sess?.agentKind === 'codex' || sess?.agentKind === 'pi') &&
     !sess.remoteHostId &&
     !shouldCloseSession &&
     currentProviderId !== nextProviderId &&
     isSelfBusy()
   ) {
-    // 超集 host 可以跨来源复用，不代表 route 可以在 turn 中途热切。Codex 的一个
+    // Codex/Pi 可以复用已装配的账号路由，不代表 route 可以在 turn 中途热切。一个
     // turn 可能包含多次上游请求；立即改 provider store 会让后续工具回合带着旧
     // wire model 命中新来源，造成同 turn 跨计费，甚至因模型不受支持而 4xx。
     // 把 route/model 的生效边界固定在 turn 结束；pending 收口只关闭本 Session，
-    // shared host 保留，不重新 spawn app-server。
+    // 当前账号保持到回合边界，不能让工具续轮命中新账号。
     if (input.registerPendingCredentialSwitch) {
+      input.admit?.();
       await input.registerPendingCredentialSwitch(sessionId, {
         model,
         providerId: nextProviderId,
       });
-      logger?.info('set-model: Codex provider route switch deferred until turn end', {
+      logger?.info('set-model: provider route switch deferred until turn end', {
         sessionId,
         currentProviderId,
         nextProviderId,
@@ -259,17 +267,20 @@ export async function applyRuntimeSetModelChange(
     }
     throw new CredentialModeSwitchBusyError(
       [sessionId],
-      `Cannot switch Codex provider route while the session is busy: ${sessionId}`,
+      `Cannot switch provider route while the session is busy: ${sessionId}`,
     );
   }
 
   if (sess && (shouldCloseSession || requiresCodexThreadRelink)) {
     input.assertSessionCloseSupported?.();
+    input.admit?.();
     if (isSelfBusy() && input.registerPendingCredentialSwitch) {
+      // A required credential rebuild must also survive close failure: keeping
+      // the old process alive cannot be treated as applying the new account.
       await input.registerPendingCredentialSwitch(sessionId, {
         model,
         providerId: nextProviderId,
-        ...((input.forceSessionRebuild || modelSwitchRequiresRebuild) ? { forceSessionRebuild: true } : {}),
+        ...(shouldCloseSession ? { forceSessionRebuild: true } : {}),
       });
       logger?.info('set-model: session rebuild deferred until turn end', {
         sessionId,
@@ -300,7 +311,7 @@ export async function applyRuntimeSetModelChange(
         // A configuration reload targets this task's remote handle only. The
         // local-only credential helper deliberately does not close SSH handles.
         if (isSelfBusy()) throw new CredentialModeSwitchBusyError([sessionId]);
-        await withRehydrateCloseSuppressed(sessionId, () => maker.closeSession(sessionId));
+        await withRehydrateCloseSuppressed(sessionId, () => maker.closeSession(sessionId, 'runtime-refresh'));
       } else {
         await prepareLocalSessionCredentialModeSwitch({
           maker,
@@ -319,7 +330,7 @@ export async function applyRuntimeSetModelChange(
         input.registerPendingCredentialSwitch(sessionId, {
           model,
           providerId: nextProviderId,
-          ...((input.forceSessionRebuild || modelSwitchRequiresRebuild) ? { forceSessionRebuild: true } : {}),
+          ...(shouldCloseSession ? { forceSessionRebuild: true } : {}),
         });
         logger?.info('set-model: credential switch deferred after busy race', {
           sessionId,
@@ -333,16 +344,20 @@ export async function applyRuntimeSetModelChange(
       }
       throw err;
     }
-    if (requiresCodexThreadRelink) {
-      try {
-        await input.relinkCodexThread?.();
-      } catch (error) {
-        // A failed history transfer must not discard an earlier accepted pending route.
-        if (clearedPending && input.registerPendingCredentialSwitch) {
-          await input.registerPendingCredentialSwitch(sessionId, clearedPending);
-        }
-        throw error;
+    let relinkAfterClose = false;
+    try {
+      relinkAfterClose = requiresCodexThreadRelink ||
+        (typeof input.requiresCodexThreadRelink === 'function' && await input.requiresCodexThreadRelink());
+      if (relinkAfterClose) {
+        if (!input.relinkCodexThread) throw new Error(`Codex provider thread relink is required for session ${sessionId}`);
+        await input.relinkCodexThread();
       }
+    } catch (error) {
+      // A failed history transfer must not discard an earlier accepted pending route.
+      if (clearedPending && input.registerPendingCredentialSwitch) {
+        await input.registerPendingCredentialSwitch(sessionId, clearedPending);
+      }
+      throw error;
     }
     if (providerId !== undefined) setSessionProvider(sessionId, nextProviderId);
     // close + route 都落定后再唤醒队列:排队消息按新凭证形态 lazy-create 派发。
@@ -362,11 +377,12 @@ export async function applyRuntimeSetModelChange(
       fromModel: sess.model,
       toModel: model,
     });
-    return requiresCodexThreadRelink
+    return relinkAfterClose && input.relinkCodexThread
       ? { status: 'applied', persistedRoute: true }
       : { status: 'applied' };
   }
 
+  input.admit?.();
   if (providerId !== undefined) {
     setSessionProvider(sessionId, nextProviderId);
     // 显式选源且无需切换 → 取消尚未兑现的 pending(后选覆盖先选)。

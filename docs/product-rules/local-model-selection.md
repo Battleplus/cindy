@@ -30,73 +30,24 @@
 8. **每次更新同时写入取舍记录。** 新模型应替换它胜出的旧位置，而非不断追加。
    研究中的候选只保留有希望填补空位或替换现有模型的少数项；确认无优势后退出目录。
 
-## 当前配置与证据边界（2026-09-05）
+## 目录与证据入口
 
-本轮由 9 个内置条目收敛到 7 个逻辑模型。正式推荐保留 Qwen3.8 27B；其他
-6 个只是待比较候选。5 个选择位置中，低内存中档和速度档各保留两名候选等待比较。
-“保留推荐”是当前证据下的产品选择，不表示已完成所有量化与硬件组合的 Pareto 证明。
-
-| 位置     | 模型                                         | 当前处理              | 仍需补齐的证据                                            |
-| -------- | -------------------------------------------- | --------------------- | --------------------------------------------------------- |
-| 更低内存 | Qwen3.5 4B                                   | 候选                  | 同条件能力、速度、峰值内存                                |
-| 低内存   | Qwen3.5 9B / Gemma 4 12B                     | 两名候选，未决出胜者  | 同硬件、同量化条件的三维比较                              |
-| 能力     | Qwen3.8 27B                                  | 保留能力推荐          | 本地量化对能力的影响、长上下文峰值；不宣称所有 Mac 上最优 |
-| 速度     | Qwen3.6 35B A3B / Nemotron 3.5 Lightning 30B | 两名候选，未决出胜者  | 同一台 Mac 上的完整比较                                   |
-| 大内存   | Qwen3.8 Flash-Next                           | 仅 Apple Silicon 候选 | Ollama 对应标签的加载/运行峰值及能力损失                  |
-
-移出内置目录：GPT-OSS 20B、Gemma 4 E2B/E4B/26B/31B、Ornith 1.5 35B、
-GLM-4.7-Flash。本轮未证明它们相对上述候选有独立的三维优势，不为这些条目另设推荐位；
-这不等于已经用完整同机实验证明它们都被支配。Laguna XS 2.1、Muse Glimmer 30B
-也不因新品或厂商宣传进入目录。
-
-### 证据快照
-
-- [Artificial Analysis Qwen3.8 27B xhigh](https://artificialanalysis.ai/models/qwen3-8-27b)：
-  Intelligence Index **v4.2 = 42**，是保留能力推荐的独立依据。该配置是 xhigh，
-  不是本地 MLX/MXFP8 已复现的成绩。
-- [Qwen3.8 Flash-Next](https://artificialanalysis.ai/models/qwen3-8-flash-next) 的 v4.2
-  **46**、[Qwen3.6 35B A3B](https://artificialanalysis.ai/models/qwen3-6-35b-a3b) 的
-  **26**在本轮查询中标为 estimated；仅用于候选判断，不据此宣称已实测击败 27B。
-- [M4 Air 32GB 对比原始项目](https://github.com/jordanilchev/local-qwen)：Ollama 0.32.14，
-  关闭思考、短输入、最多 200 输出 tokens；Qwen3.6 Q4_K_M 为 29.9 tokens/s，
-  Qwen3.8 27B NVFP4 为 17.2 tokens/s。量化不同且未提供完整内存峰值，
-  只能支持速度候选资格。
-- [Nemotron 长上下文测试](https://omarshabab.com/local-llm-256k-leaderboard/) 使用
-  M3 Ultra 512GB 和 MLX；不能与上述 M4 Air 数字直接排出快慢。
-- [Flash-Next 4-bit 测试](https://huggingface.co/rapid-mlx/Qwen3.8-Flash-Next-4bit)
-  使用 M3 Ultra 256GB、Rapid，报告加载峰值约 148.1GB；不能推断 Ollama 在 128GB
-  上适合日用。本目录的 192GB 是保守候选提示，尚未由对应 Ollama 标签验证。
-
-### 包装与内存提示
-
-标签和下载字节于 2026-09-05 从 Ollama 官方 registry 的 manifest 核对，下载大小
-为 `layers[].size` 之和。目录中各 `variants[].sizeBytes` 按具体包装分别记录，不能混用。
-标签可变；后续更新应重新读取 manifest 并记录摘要。大小仅用于下载提示。
-
-| 模型                   | 通用标签                     | Apple Silicon 标签                      | 内存提示 GB   |
-| ---------------------- | ---------------------------- | --------------------------------------- | ------------- |
-| Qwen3.5 4B             | `qwen3.5:4b-q4_K_M`          | `qwen3.5:4b-mlx`                        | 8             |
-| Qwen3.5 9B             | `qwen3.5:9b-q4_K_M`          | `qwen3.5:9b-mlx`                        | 16            |
-| Gemma 4 12B            | `gemma4:12b-it-q4_K_M`       | `gemma4:12b-mlx`                        | 16            |
-| Qwen3.8 27B            | `qwen3.8:27b`                | `qwen3.8:27b-mlx` / `qwen3.8:27b-mxfp8` | 32 / MXFP8 64 |
-| Qwen3.6 35B A3B        | `qwen3.6:35b-a3b-q4_K_M`     | `qwen3.6:35b-mlx`                       | 32            |
-| Nemotron 3.5 Lightning | `nemotron-3.5-lightning:30b` | `nemotron-3.5-lightning:30b-mlx`        | 48            |
-| Qwen3.8 Flash-Next     | 未纳入通用包装               | `qwen3.8-flash-next:125b-mlx`           | 192           |
-
-查询入口为 `https://registry.ollama.ai/v2/library/<模型家族>/manifests/<标签>`。
-以上内存提示全部是当前配置的估算门槛，不是测得的最低运行内存，不保证任意上下文可用。
-Qwen27 的 32GB MLX、64GB MXFP8 选择沿用现有行为，不把更大包装描述成已经证实更优。
-非 Apple 主机的普通 RAM 也不等于 GPU 显存；内存适配不是 GPU 性能认证。
+当前候选、推荐和门槛读取活动 Registry；不要根据文档中的旧型号表重建名单。
+2026-09-05 的型号取舍、量化标签、性能来源和未验证项保留在
+[历史证据快照](../model-catalog-history.md)，它不是今天的推荐清单。
+最近一轮网页研究、包装核验及未验证项见
+[2026-09-24 复核](../local-model-audit-2026-09-24.md)。
+架构、代码导航和完整发布步骤见 [模型配置与下发](../dev-rules/model-catalog-maintenance.md)。
 
 ## 实现边界与以后更新
 
-- 数据正本：Server 的 `model-access-server/catalog/providers.json` 中
-  `modelRegistry.localModels`；客户端离线副本位于
+- 数据正本：Server 的 `model-access-server/catalog/source/registry/local-models.json`
+  分片（由 `scripts/generateCatalog.mjs` 组装为 `modelRegistry.localModels`）；客户端离线副本位于
   `packages/model-providers/catalog/model-registry.json` 的 `localModels`。
   算法入口仍为 `apps/desktop/src/shared/localModelRuntime.ts`。
   `featuredIds` 按能力、速度顺序列推荐；`models` 中的候选不会自动补位。
-- 当前 Apple Silicon 32GB 起保留 Qwen27 推荐，64GB 起沿用 MXFP8；低于门槛或
-  内存未知返回空推荐。Flash-Next 仅出现在 Apple Silicon 候选目录。
+- 包装的平台限制和内存门槛从活动目录读取；低于推荐门槛或内存未知返回空推荐。
+  不在本规则另存一份型号白名单或硬件阈值。
 - 新用户看到更新后的目录；未修改默认值的老用户也看到新目录，但不自动安装或切换模型。
   已手动配置的用户保留选择；目录淘汰不卸载模型、不删除供应商、不改变任务使用的模型。
   用户仍可通过手动标签拉取目录外模型。
@@ -106,9 +57,11 @@ Qwen27 的 32GB MLX、64GB MXFP8 选择沿用现有行为，不把更大包装�
 - 配套验证须覆盖：低内存/未知内存空推荐、推荐名单不得被目录兜底绕过、平台包装过滤、
   推荐变化不影响手动拉取或已安装模型。文案避免“最强”“最适合你”等超出证据的结论。
 
-## 服务端下发与发布（2026-09-08）
+## 服务端下发与发布
 
-- 复用现有匿名目录接口，客户端请求 `registrySchemaVersion=4`，本地域为
+以下是双方需满足的协议合同，是否已部署按 [发布验收](../dev-rules/model-catalog-maintenance.md#release) 核对。
+
+- 复用现有匿名目录接口，当前客户端请求 `registrySchemaVersion=5&registryMedia=1`，本地域为
   `modelRegistry.localModels = { version: 1, models, featuredIds }`。共享 Registry
   的 `updatedAt`、校验、缓存与刷新事件，不另建请求或持久化层。
 - 服务端下发名称、搜索别名、具体包装、内存提示、五语简介、证据链接及推荐顺序。
@@ -117,14 +70,16 @@ Qwen27 的 32GB MLX、64GB MXFP8 选择沿用现有行为，不把更大包装�
   的三个 Qwen3.8 27B 标签，远程数据不能提供命令、路径或任意下载 URL。
 - 明确的空 `models` / `featuredIds` 分别撤下目录 / 推荐；字段缺失表示旧服务端，
   使用随包本地域。网络失败、非法数据和 revision 冲突沿用已有合法快照。
-- 发布顺序为服务端先行、客户端随后。旧客户端默认收到 Registry V2；显式请求
-  V1/V2/V3 时剥离新字段。各响应版本有独立内容 ETag，不能跨版本误命中 304。
+- 发布顺序为服务端先行、客户端随后。未声明 media 能力的旧客户端收到冻结目录；
+  默认为 Registry V2，显式请求 V1/V2/V3 时剥离本地域。声明 media 能力的 V4/V5
+  响应才包含本轮更新。各响应版本有独立内容 ETag，不能跨版本误命中 304。
 - 每次先在 Server 正本更新取舍记录和本地域，增加整个 Registry 的 `updatedAt`，
   再把完整 Registry（含 `baseModels` 与 `modelRef`）同步到客户端离线副本，核对同 revision、同内容。
-  本次将客户端已维护的型号、协议资料和 medium 优先的默认思考策略同步到 Server，两个随包 Registry 完全一致；这不改写用户显式档位或供应商实报默认档。
+  同步不改写用户显式档位或供应商实报默认档；历次同步状态见历史记录，不能当作生产发布证据。
   后续服务端 revision 必须高于已发布版本，禁止只复制本地域或使用相同 revision 发布不同内容。
 - 本地与云端接入可用 `modelRef` 引用同一公共型号；量化包装、内存与推荐证据独立留在本地域。
   用户文件可覆盖推荐及单项资料，优先级见 [模型资料优先级](model-metadata-precedence.md)。
-- 若生产配置了 `MODEL_CATALOG_URL`，还须同步该覆盖源；只修改制品内置目录不能证明
-  线上生效。部署后核对 V4 响应、旧版响应与新客户端刷新；离线首次启动核对随包兜底。
+- 当前 Server 源码从分片生成并仅加载制品内目录，已不读取 `MODEL_CATALOG_URL`；
+  这不证明目标环境已部署该版本。部署后核对带 media 能力的 V4/V5 响应、旧版冻结响应
+  与新客户端刷新；离线首次启动核对随包兜底。
 - 目录撤下或调整顺序不卸载、切换用户模型，也不修改已有供应商和执行中的配置。

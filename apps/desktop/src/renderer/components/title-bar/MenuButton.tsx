@@ -1,4 +1,5 @@
 import { Menu } from 'lucide-react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 
@@ -14,15 +15,20 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tip } from '@/components/ui/tooltip';
+import { useSharedTaskTasks } from '@/features/device-link/useSharedTaskTasks';
+import { SharedTaskEndedNotice } from '@/features/device-link/SharedTaskEndedNotice';
 
 export function MenuButton({ onExitFullscreen }: { onExitFullscreen?: () => void }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  const [menuOpen, setMenuOpen] = useState(false);
+  useSharedTaskTasks();
+
   return (
-    <DropdownMenu>
+    <><DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <DropdownMenuTrigger asChild>
-        <Tip text={t('titleBar.menu')} side="bottom">
+        <Tip text={t('titleBar.menu')} side="bottom" controlledOpen={menuOpen ? false : undefined}>
           {/* 尺寸与 ChromeActions 的折叠按钮同规格(h-7 / 图标 15 / rounded-md),
               与折叠态标题行图标(「…」h-7 / 15)视觉重量一致。 */}
           <button
@@ -110,5 +116,7 @@ export function MenuButton({ onExitFullscreen }: { onExitFullscreen?: () => void
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+    <SharedTaskEndedNotice onReturnToTasks={() => navigate('/')} />
+    </>
   );
 }

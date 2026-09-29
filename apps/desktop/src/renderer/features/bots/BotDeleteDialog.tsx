@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { useEffect, useRef, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -6,7 +7,7 @@ import { useTranslation } from 'react-i18next';
 import type { BotProfile } from './botStore';
 import { runBotLifecycleAction } from './botStore';
 
-/** Destructive confirmation owned by the roster, where teammate deletion lives. */
+/** Shared destructive confirmation for the roster and teammate settings. */
 export function BotDeleteDialog({
   bot,
   onOpenChange,
@@ -17,6 +18,7 @@ export function BotDeleteDialog({
   onDeleted: (botId: string) => void;
 }) {
   const { t } = useTranslation();
+  const inFlight = useRef(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
 
@@ -27,6 +29,8 @@ export function BotDeleteDialog({
   if (!bot) return null;
 
   const deleteBot = async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(true);
     setFailed(false);
     try {
@@ -42,6 +46,7 @@ export function BotDeleteDialog({
     } catch {
       setFailed(true);
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
@@ -50,7 +55,7 @@ export function BotDeleteDialog({
     <Dialog.Root open onOpenChange={(open) => !busy && onOpenChange(open)}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-[70] bg-[var(--overlay-modal)]" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 z-[71] w-[min(480px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] p-5 outline-none">
+        <Dialog.Content onPointerDownOutside={(event) => event.preventDefault()} className="fixed left-1/2 top-1/2 z-[71] w-[min(480px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] p-5 outline-none">
           <div className="flex items-start justify-between gap-4">
             <div>
               <Dialog.Title className="text-16 font-medium text-[var(--text-danger)]">
@@ -70,7 +75,7 @@ export function BotDeleteDialog({
           </div>
           {failed ? (
             <p className="mt-3 text-11 text-[var(--text-danger)]" role="alert">
-              {t('bots.lifecycle.actionFailed')}
+              {t('bots.lifecycle.deleteFailed')}
             </p>
           ) : null}
           <div className="mt-5 flex justify-end gap-2">
@@ -80,14 +85,18 @@ export function BotDeleteDialog({
             >
               {t('bots.cancel')}
             </Dialog.Close>
-            <button
+            <Button
+              variant="cta"
+              size="lg"
+              compact
+              tone="danger-solid"
+              loading={busy}
               type="button"
               onClick={() => void deleteBot()}
               disabled={busy}
-              className="h-9 rounded-lg bg-[var(--text-danger)] px-4 text-12 font-medium text-white disabled:opacity-50"
             >
               {busy ? t('bots.lifecycle.working') : t('bots.lifecycle.delete')}
-            </button>
+            </Button>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

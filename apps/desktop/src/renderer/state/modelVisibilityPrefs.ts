@@ -5,8 +5,8 @@
  * 背景:
  *   每个来源(provider)在某个 agent 下可能提供很多模型(XD 网关 Claude Code 有 20 个),
  *   用户本地全列出来会很长。设置 → 模型供应商 展开来源后,用户可逐个开关哪些模型显示。
- *   显式开关与新用户首次初始化的启用清单分开保存。既有账号不再跟随目录自动加模型；
- *   只有用户点名恢复默认的路线继续读取目录 defaultEnabled。
+ *   显式开关与目录 defaultEnabled 分开：没拨过的跟当前下发默认，拨过的升级也不清。
+ *   目录新增的默认开模型会显示出来；客户端不得把「没开关记录」做成全关。
  *
  * 为什么 key 必须带 agent:
  *   同一来源可同时服务多个 agent(XD = claude-code + codex),且两个 agent 下模型集不同、
@@ -15,7 +15,7 @@
  *
  * 与系统默认值的关系（configuration-and-overrides.md 模型可见性例外）:
  *   - 原 key 只记显式 override(布尔)，独立 owner key 保存一次性的初始化清单。
- *   - 新用户初始化后默认不再漂移；老用户缺少开关记录的路线不会被自动补开。
+ *   - 没拨过的路线跟随当前目录 defaultEnabled；手动开/关作为 override 跨升级保留。
  *   - 收藏、历史选择不能改变开关；恢复默认只授权点名路线跟随当前/未来目录。
  *   - 「全部开启 / 全部关闭」是显式批量动作 → 为当前 agent 该来源的每个模型写显式 override。
  *
@@ -41,6 +41,46 @@ import type { AgentKind } from '@/hooks/useAgentCapabilities';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('ModelVisibilityPrefs');
+
+export type ModelVisibilityInitializationFailure =
+  | 'owner-pending'
+  | 'profile-pending'
+  | 'legacy-owner-unavailable'
+  | 'legacy-busy'
+  | 'preferences-corrupt'
+  | 'storage-quota'
+  | 'storage-unavailable'
+  | 'lock-unavailable';
+
+let initializationFailure: ModelVisibilityInitializationFailure | null = null;
+
+/** Keep diagnostics owner-scoped and never log preference contents or storage error messages. */
+function recordInitializationFailure(reason: ModelVisibilityInitializationFailure): void {
+  if (initializationFailure !== reason) {
+    log.warn('model visibility initialization blocked', { reason });
+  }
+  initializationFailure = reason;
+}
+
+/** Startup profile classification is pending, rather than a storage or lock failure. */
+class ProfilePendingError extends Error {}
+
+function initializationErrorReason(
+  error: unknown,
+  fallback: ModelVisibilityInitializationFailure = 'storage-unavailable',
+): ModelVisibilityInitializationFailure {
+  if (error instanceof ProfilePendingError) return 'profile-pending';
+  return error && typeof error === 'object' && 'name' in error && error.name === 'QuotaExceededError'
+    ? 'storage-quota' : fallback;
+}
+
+export function getModelVisibilityInitializationFailure(
+  ownerId: string | null,
+  ownerGeneration: number,
+): ModelVisibilityInitializationFailure | null {
+  return ownerId === activeOwnerId && ownerGeneration === activeOwnerGeneration
+    ? initializationFailure : null;
+}
 
 const LEGACY_STORAGE_KEY = 'xdt:modelVisibilityPrefs:v1';
 const STORAGE_KEY_PREFIX = `${LEGACY_STORAGE_KEY}.owner`;
@@ -71,6 +111,14 @@ function sanitize(raw: unknown): VisibilityMap {
 
 // 进程内缓存(惰性加载)。读多写少,避免每次读都 parse localStorage。
 let cache: VisibilityMap | null = null;
+/** Owner/legacy JSON 无法解析时 fail-closed：不能当成「从没拨过」去跟目录默认。 */
+let mapCorrupt = false;
+/** adopt-local 源损坏时保持 latch，不因目标 map 合法而提前清掉。 */
+let adoptionSourceCorrupt = false;
+/** Initialization corruption is scoped to the owner generation that observed it. */
+let initializationCorruptOwner: { ownerId: string; ownerGeneration: number } | null = null;
+/** A corrupt local initialization must block cloud adoption until the source is repaired. */
+let adoptionInitializationSourceCorrupt = false;
 let activeOwnerId: string | null = null;
 let activeOwnerGeneration = 0;
 let activeOwnerReadyForWrites = false;
@@ -90,31 +138,65 @@ function emptyInitialization(eligibleForDefaults = false): InitializationState {
   return { eligibleForDefaults, defaults: {}, scopes: [], followCatalogKeys: [] };
 }
 
+interface InitializationReadResult {
+  state: InitializationState | null;
+  corrupt: boolean;
+}
+
+function isActiveInitializationCorrupt(): boolean {
+  return !!activeOwnerId
+    && initializationCorruptOwner?.ownerId === activeOwnerId
+    && initializationCorruptOwner.ownerGeneration === activeOwnerGeneration;
+}
+
+function latchInitializationCorruption(ownerId: string): void {
+  if (ownerId !== activeOwnerId || !activeOwnerId) return;
+  initializationCorruptOwner = { ownerId, ownerGeneration: activeOwnerGeneration };
+  recordInitializationFailure('preferences-corrupt');
+}
+
+function clearInitializationCorruption(ownerId: string): void {
+  if (ownerId !== activeOwnerId || !isActiveInitializationCorrupt()) return;
+  initializationCorruptOwner = null;
+}
+
 function initializationKey(ownerId: string): string {
   return `${INITIALIZATION_KEY_PREFIX}.${encodeURIComponent(ownerId)}`;
 }
-function readInitialization(ownerId: string): InitializationState | null {
+function readInitialization(ownerId: string): InitializationReadResult {
   const raw = window.localStorage.getItem(initializationKey(ownerId));
-  if (raw === null) return null;
+  if (raw === null) {
+    // A deleted record is a successful read of current storage, not evidence of
+    // the previously observed corrupt bytes. Reloading must be able to recover.
+    clearInitializationCorruption(ownerId);
+    return { state: null, corrupt: false };
+  }
   try {
     const parsed = JSON.parse(raw);
     const strings = (value: unknown): string[] => Array.isArray(value)
       ? value.filter((item): item is string => typeof item === 'string') : [];
-    return { eligibleForDefaults: parsed?.eligibleForDefaults === true,
-      defaults: sanitize(parsed?.defaults), scopes: strings(parsed?.scopes), followCatalogKeys: strings(parsed?.followCatalogKeys) };
+    clearInitializationCorruption(ownerId);
+    return { state: { eligibleForDefaults: parsed?.eligibleForDefaults === true,
+      defaults: sanitize(parsed?.defaults), scopes: strings(parsed?.scopes), followCatalogKeys: strings(parsed?.followCatalogKeys) }, corrupt: false };
   } catch {
-    return emptyInitialization();
+    latchInitializationCorruption(ownerId);
+    return { state: null, corrupt: true };
   }
 }
-function saveInitialization(next: InitializationState): boolean {
+function saveInitialization(next: InitializationState, allowCorruptRecovery = false): boolean {
   if (!activeOwnerId) return false;
+  if (!allowCorruptRecovery && isActiveInitializationCorrupt()) {
+    recordInitializationFailure('preferences-corrupt');
+    return false;
+  }
   try {
     window.localStorage.setItem(initializationKey(activeOwnerId), JSON.stringify(next));
     initialization = next;
     mayInitializeDefaults = next.eligibleForDefaults;
+    if (allowCorruptRecovery && isActiveInitializationCorrupt()) initializationCorruptOwner = null;
     return true;
   } catch (error) {
-    log.warn('model visibility initialization write failed', error);
+    recordInitializationFailure(initializationErrorReason(error));
     return false;
   }
 }
@@ -127,11 +209,20 @@ function adoptLocalModelVisibility(ownerId: string): void {
   const claim = window.electronAPI?.maker?.claimLegacyModelVisibilityOwner?.();
   if (claim?.dataOwnerId !== ownerId || claim.ownerGeneration !== activeOwnerGeneration
     || !claim.canWriteOwnerScoped) return;
-  if (claim.profileOrigin === 'pending') throw new Error('Local profile adoption is not ready');
+  if (claim.profileOrigin === 'pending') throw new ProfilePendingError('Local profile adoption is not ready');
   if (claim.profileOrigin !== 'adopted-local') return;
 
-  const source = readInitialization(LOCAL_OWNER_ID) ?? emptyInitialization();
-  const target = readInitialization(ownerId);
+  const sourceResult = readInitialization(LOCAL_OWNER_ID);
+  if (sourceResult.corrupt) {
+    adoptionInitializationSourceCorrupt = true;
+    recordInitializationFailure('preferences-corrupt');
+    return;
+  }
+  adoptionInitializationSourceCorrupt = false;
+  const targetResult = readInitialization(ownerId);
+  if (targetResult.corrupt) return;
+  const source = sourceResult.state ?? emptyInitialization();
+  const target = targetResult.state;
   const targetPrefixes = (target?.scopes ?? []).flatMap((scope) => {
     try {
       const parsed: unknown = JSON.parse(scope);
@@ -147,11 +238,20 @@ function adoptLocalModelVisibility(ownerId: string): void {
     followCatalogKeys: [...new Set([...source.followCatalogKeys.filter((key) => !hasTargetScope(key)), ...target?.followCatalogKeys ?? []])],
   };
   const targetFollowCatalogKeys = new Set(target?.followCatalogKeys ?? []);
-  const sourceOverrides = readStoredMap(window.localStorage.getItem(ownerStorageKey(LOCAL_OWNER_ID)));
+  const sourceParsed = parseStoredMap(window.localStorage.getItem(ownerStorageKey(LOCAL_OWNER_ID)));
+  const targetParsed = parseStoredMap(window.localStorage.getItem(ownerStorageKey(ownerId)));
+  if (sourceParsed.corrupt || targetParsed.corrupt) {
+    // Don't copy an empty sanitization of a broken local map, and don't mark adoption
+    // complete — the source can still be retried after it is repaired.
+    mapCorrupt = true;
+    adoptionSourceCorrupt = sourceParsed.corrupt;
+    return;
+  }
+  adoptionSourceCorrupt = false;
   const overrides = {
     // Restore defaults is an explicit target choice even though it has no override.
-    ...Object.fromEntries(Object.entries(sourceOverrides).filter(([key]) => !targetFollowCatalogKeys.has(key))),
-    ...readStoredMap(window.localStorage.getItem(ownerStorageKey(ownerId))),
+    ...Object.fromEntries(Object.entries(sourceParsed.map).filter(([key]) => !targetFollowCatalogKeys.has(key))),
+    ...targetParsed.map,
   };
   // A failed write leaves the handoff pending. Re-reading and merging under the locks
   // makes retry/restart safe without overwriting intervening target choices.
@@ -163,19 +263,20 @@ function adoptLocalModelVisibility(ownerId: string): void {
 
 /** Adopt the latest owner state only after all storage reads succeed. */
 function readOwnerState(ownerId: string): void {
-  const nextInitialization = readInitialization(ownerId);
+  const nextInitializationResult = readInitialization(ownerId);
+  const nextInitialization = nextInitializationResult.state;
   const raw = window.localStorage.getItem(ownerStorageKey(ownerId));
   let newProfile = false;
-  if (!nextInitialization) {
+  if (!nextInitialization && !nextInitializationResult.corrupt) {
     const claim = window.electronAPI?.maker?.claimLegacyModelVisibilityOwner?.();
     if (claim?.dataOwnerId === ownerId && claim.ownerGeneration === activeOwnerGeneration) {
       // Auth can precede DB creation. Do not consume eligibility by writing migration
       // artifacts until Main has classified this profile. Old Main versions fail closed.
-      if (claim.profileOrigin === 'pending') throw new Error('Model defaults profile is not ready');
+      if (claim.profileOrigin === 'pending') throw new ProfilePendingError('Model defaults profile is not ready');
       newProfile = claim.profileOrigin === 'new';
     }
   }
-  const eligible = nextInitialization?.eligibleForDefaults ?? (newProfile && raw === null
+  const eligible = nextInitializationResult.corrupt ? false : nextInitialization?.eligibleForDefaults ?? (newProfile && raw === null
     && window.localStorage.getItem(ownerMigrationCompleteKey(ownerId)) === null
     && window.localStorage.getItem(`${DEFAULTS_MIGRATION_KEY_PREFIX}.${encodeURIComponent(ownerId)}`) === null
     && !hasAnyProviderModelOverride() && !hasProviderModelHistory()
@@ -197,24 +298,33 @@ async function withOwnerLock(
   operation: () => boolean,
 ): Promise<boolean> {
   if (!ownerId) return false;
+  let operationFailed = false;
   const run = (): boolean => {
     if (ownerId !== activeOwnerId || ownerGeneration !== activeOwnerGeneration
       || activeOwnerMode === 'signed-out') return false;
     const snapshot = (): string => JSON.stringify([
       cache, initialization, mayInitializeDefaults, activeOwnerReadyForWrites, activeOwnerMigrationPending,
+      mapCorrupt, adoptionSourceCorrupt, initializationCorruptOwner, adoptionInitializationSourceCorrupt,
     ]);
     const before = snapshot();
+    let completed = false;
     try {
       adoptLocalModelVisibility(ownerId);
       readOwnerState(ownerId);
-      return operation();
+      completed = operation();
+      return completed;
     } catch (error) {
+      operationFailed = true;
       activeOwnerReadyForWrites = false;
       activeOwnerMigrationPending = true;
+      recordInitializationFailure(initializationErrorReason(error));
       throw error;
     } finally {
+      // A no-op catalog/owner refresh must still deliver the effective table:
+      // Main may have cleared its mirror at startup while this persisted table
+      // was already current. Main deduplicates unchanged snapshots.
+      if (completed || snapshot() !== before) mirrorToMain(cache ?? {});
       if (snapshot() !== before) {
-        mirrorToMain(cache ?? {});
         version += 1;
         for (const listener of listeners) listener();
       }
@@ -230,14 +340,16 @@ async function withOwnerLock(
       return needsLocalLock ? locks.request(initializationKey(LOCAL_OWNER_ID), run) : run();
     }) : run();
   } catch (error) {
-    log.warn('model visibility update failed', error);
+    // Errors from the operation were classified above; a rejected Web Lock has
+    // no storage operation and must remain distinguishable from disk/quota errors.
+    if (!operationFailed && ownerId === activeOwnerId && ownerGeneration === activeOwnerGeneration) {
+      recordInitializationFailure(initializationErrorReason(error, 'lock-unavailable'));
+    }
     return false;
   }
 }
 function effectiveMap(map: VisibilityMap): VisibilityMap {
-  const defaults = { ...initialization?.defaults };
-  for (const key of initialization?.followCatalogKeys ?? []) delete defaults[key];
-  return { ...defaults, ...map };
+  return { ...map };
 }
 
 
@@ -249,13 +361,20 @@ function ownerMigrationCompleteKey(ownerId: string): string {
   return `${MIGRATION_COMPLETE_KEY_PREFIX}.${encodeURIComponent(ownerId)}`;
 }
 
-function readStoredMap(raw: string | null): VisibilityMap {
-  if (!raw) return {};
+function parseStoredMap(raw: string | null): { map: VisibilityMap; corrupt: boolean } {
+  if (raw === null || raw === '') return { map: {}, corrupt: false };
   try {
-    return sanitize(JSON.parse(raw));
+    return { map: sanitize(JSON.parse(raw)), corrupt: false };
   } catch {
-    return {};
+    return { map: {}, corrupt: true };
   }
+}
+
+function readStoredMap(raw: string | null): VisibilityMap {
+  const parsed = parseStoredMap(raw);
+  if (parsed.corrupt) mapCorrupt = true;
+  else if (!adoptionSourceCorrupt) mapCorrupt = false;
+  return parsed.map;
 }
 
 /**
@@ -272,7 +391,11 @@ const BLOCKED_MIGRATION: MigrationState = {
   migrationPending: true,
 };
 
-function migrateLegacyVisibility(ownerId: string, ownerGeneration: number): MigrationState {
+function migrateLegacyVisibility(
+  ownerId: string,
+  ownerGeneration: number,
+  allowInitializationRecovery = false,
+): MigrationState {
   if (typeof window === 'undefined') return BLOCKED_MIGRATION;
   try {
     const scopedKey = ownerStorageKey(ownerId);
@@ -289,12 +412,15 @@ function migrateLegacyVisibility(ownerId: string, ownerGeneration: number): Migr
       || claim.ownerGeneration !== ownerGeneration
       || claim.canWriteOwnerScoped !== true
     ) {
+      recordInitializationFailure('owner-pending');
       return BLOCKED_MIGRATION;
     }
     // Preserve first-run eligibility before writing any migration artifacts or allowing
     // manual overrides. An empty scopes list is pending; each nonempty catalog records
     // its own completion later. Failed persistence leaves migration retryable.
-    const stored = readInitialization(ownerId);
+    const storedResult = readInitialization(ownerId);
+    if (storedResult.corrupt && !allowInitializationRecovery) return BLOCKED_MIGRATION;
+    const stored = storedResult.state;
     if (stored) {
       initialization = stored;
       mayInitializeDefaults = stored.eligibleForDefaults;
@@ -304,7 +430,7 @@ function migrateLegacyVisibility(ownerId: string, ownerGeneration: number): Migr
     if ((!stored && mayInitializeDefaults) || (stored?.eligibleForDefaults && !mayInitializeDefaults)) {
       if (!saveInitialization(stored
         ? { ...stored, eligibleForDefaults: false }
-        : emptyInitialization(true))) return BLOCKED_MIGRATION;
+        : emptyInitialization(true), allowInitializationRecovery)) return BLOCKED_MIGRATION;
     }
     if (claim.claimedByOtherOwner === true) {
       // 旧快照永久属于另一账号；写入本 owner 的完成标记，后续无需依赖全局 marker 继续读写。
@@ -314,20 +440,41 @@ function migrateLegacyVisibility(ownerId: string, ownerGeneration: number): Migr
         migrationPending: false,
       };
     }
+    if (!claim.canInitialize && window.localStorage.getItem(LEGACY_STORAGE_KEY) === null) {
+      // A fresh renderer origin (for example a parallel dev port) has no legacy
+      // preferences to import. Publish its owner-scoped catalog without claiming
+      // migration completion; another window may still create the legacy key.
+      return { readyForWrites: true, migrationPending: false };
+    }
     if (claim.claimed !== true) {
       // A missing/blocked legacy marker only defers importing the pre-account snapshot. The
       // stable current owner can still write its isolated key; a later import merges scoped
       // values last, so these new settings win without mutating the legacy input.
+      recordInitializationFailure('legacy-owner-unavailable');
       return { readyForWrites: true, migrationPending: true };
     }
     if (claim.canInitialize !== true) {
       // 归属已经明确时，新设置可以安全写进 owner namespace；只把旧全局快照的导入推迟到独占时。
+      recordInitializationFailure('legacy-busy');
       return { readyForWrites: true, migrationPending: true };
     }
 
-    const legacyRaw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
-    const legacy = readStoredMap(legacyRaw);
-    const scoped = readStoredMap(window.localStorage.getItem(scopedKey));
+    const legacyParsed = parseStoredMap(window.localStorage.getItem(LEGACY_STORAGE_KEY));
+    const scopedParsed = parseStoredMap(window.localStorage.getItem(scopedKey));
+    if (scopedParsed.corrupt) {
+      mapCorrupt = true;
+      recordInitializationFailure('preferences-corrupt');
+      return BLOCKED_MIGRATION;
+    }
+    if (legacyParsed.corrupt) {
+      // Don't import a broken snapshot as empty, and don't mark complete just because
+      // the scoped key already has incremental writes from the deferred-import window.
+      mapCorrupt = true;
+      recordInitializationFailure('preferences-corrupt');
+      return { readyForWrites: true, migrationPending: true };
+    }
+    const legacy = legacyParsed.map;
+    const scoped = scopedParsed.map;
     // 非独占期间可能已经有新设置；完成迁移时由新设置覆盖同槽旧值，其余历史值仍被保留。
     window.localStorage.setItem(scopedKey, JSON.stringify({ ...legacy, ...scoped }));
     // 快照先落盘再标完成；任一步失败都会在下次写入/登录时幂等重试。
@@ -336,17 +483,20 @@ function migrateLegacyVisibility(ownerId: string, ownerGeneration: number): Migr
       readyForWrites: window.localStorage.getItem(migrationCompleteKey) === '1',
       migrationPending: false,
     };
-  } catch {
+  } catch (error) {
     // localStorage / 同步 owner 仲裁不可用时 fail closed：不读取未归属的旧数据。
+    recordInitializationFailure(initializationErrorReason(error));
     return BLOCKED_MIGRATION;
   }
 }
 
-function ensureActiveOwnerReadyForWrites(): boolean {
+function ensureActiveOwnerReadyForWrites(allowInitializationRecovery = false): boolean {
   if (!activeOwnerId) return false;
-  if (activeOwnerReadyForWrites && !activeOwnerMigrationPending) return true;
+  if (activeOwnerReadyForWrites && !activeOwnerMigrationPending
+    && (window.localStorage.getItem(ownerMigrationCompleteKey(activeOwnerId)) === '1'
+      || window.localStorage.getItem(LEGACY_STORAGE_KEY) === null)) return true;
   if (activeOwnerMode === 'signed-out') return false;
-  const migration = migrateLegacyVisibility(activeOwnerId, activeOwnerGeneration);
+  const migration = migrateLegacyVisibility(activeOwnerId, activeOwnerGeneration, allowInitializationRecovery);
   activeOwnerReadyForWrites = migration.readyForWrites;
   activeOwnerMigrationPending = migration.migrationPending;
   if (!activeOwnerReadyForWrites) return false;
@@ -390,8 +540,12 @@ function mirrorToMain(map: VisibilityMap): void {
   const generation = activeOwnerGeneration;
   const pending = !!ownerId && (activeOwnerMigrationPending
     || (mayInitializeDefaults && !initialization?.scopes.length));
-  const policy = ownerId ? { fallback: false as const,
-    followCatalogKeys: initialization?.followCatalogKeys ?? [], ...(pending ? { pending: true as const } : {}) } : undefined;
+  const preferencesCorrupt = mapCorrupt || isActiveInitializationCorrupt() || adoptionInitializationSourceCorrupt;
+  const policy = ownerId ? {
+    followCatalogKeys: initialization?.followCatalogKeys ?? [],
+    ...(pending ? { pending: true as const } : {}),
+    ...(preferencesCorrupt ? { fallback: false as const } : {}),
+  } : undefined;
   const snapshot = effectiveMap(map);
   const send = (attempt: number): void => {
     if (revision !== mirrorRevision || ownerId !== activeOwnerId || generation !== activeOwnerGeneration) return;
@@ -437,17 +591,30 @@ function persist(map: VisibilityMap, context: VisibilityWriteContext): boolean {
   try {
     window.localStorage.setItem(ownerStorageKey(activeOwnerId), JSON.stringify(map));
   } catch (error) {
+    const storageReason = initializationErrorReason(error);
+    recordInitializationFailure(storageReason);
     log.warn('model visibility write failed', {
       reason: 'storage-write-failed',
+      storageReason,
       ...context,
       ownerGeneration: activeOwnerGeneration,
       mode: activeOwnerMode,
-    }, error);
+    });
     return false;
   }
   // 先确认落盘成功，再更新受控开关状态，避免界面显示成功但重启后设置丢失。
   cache = map;
+  if (!adoptionSourceCorrupt) mapCorrupt = false;
+  retryPendingLocalAdoption();
   return true;
+}
+
+function retryPendingLocalAdoption(): void {
+  if (!activeOwnerId || activeOwnerMode !== 'cloud' || activeOwnerId === LOCAL_OWNER_ID) return;
+  const completed = `${LOCAL_ADOPTION_KEY_PREFIX}.${encodeURIComponent(activeOwnerId)}`;
+  if (window.localStorage.getItem(completed) === '1') return;
+  adoptLocalModelVisibility(activeOwnerId);
+  if (window.localStorage.getItem(completed) === '1') readOwnerState(activeOwnerId);
 }
 
 function subscribe(cb: () => void): () => void {
@@ -457,7 +624,7 @@ function subscribe(cb: () => void): () => void {
   };
 }
 
-function getVersion(): number {
+export function getModelVisibilityVersion(): number {
   return version;
 }
 
@@ -473,11 +640,16 @@ export async function setModelVisibilityOwner(
     && activeOwnerMode === mode
   ) return;
   activeOwnerId = ownerId;
+  initializationFailure = null;
+  initializationCorruptOwner = null;
   activeOwnerGeneration = ownerGeneration;
   activeOwnerMode = mode;
   activeOwnerReadyForWrites = false;
   activeOwnerMigrationPending = !!ownerId && mode !== 'signed-out';
   cache = null;
+  mapCorrupt = false;
+  adoptionSourceCorrupt = false;
+  adoptionInitializationSourceCorrupt = false;
   initialization = null;
   mayInitializeDefaults = false;
   if (ownerId && mode !== 'signed-out') {
@@ -485,17 +657,19 @@ export async function setModelVisibilityOwner(
       readOwnerState(ownerId);
     } catch { /* Storage unavailable: never infer permission to initialize an existing profile. */ }
   }
-  mirrorToMain(cache ?? {});
   version += 1;
   for (const listener of listeners) listener();
   await withOwnerLock(ownerId, ownerGeneration, ensureActiveOwnerReadyForWrites);
+  // Reloading a renderer is not evidence that the current owner's valid Main
+  // mirror became stale. Publish pending only after checking under the owner lock.
+  if (activeOwnerId === ownerId && activeOwnerGeneration === ownerGeneration
+    && activeOwnerMode === mode) mirrorToMain(cache ?? {});
 }
 
 /**
- * Initialize a new profile's first nonempty provider/agent catalogs once. Existing profiles
- * keep their explicit switches; history/favorites never grant permission to enable a model.
- * Missing routes remain off. Baselines are separate from user overrides so customization
- * and Restore defaults retain their meaning. No remote catalog enters this path.
+ * Record first-seen provider/agent catalogs for restore-default and alias mapping.
+ * Visibility itself is override ?? current catalog defaultEnabled; this snapshot no longer
+ * hides models the catalog says should be on. History/favorites never write an on switch.
  */
 export async function migrateModelVisibilityDefaults(
   ownerId: string | null,
@@ -505,10 +679,20 @@ export async function migrateModelVisibilityDefaults(
 ): Promise<boolean> {
   // Signed-out catalogs have no owner preferences to initialize.
   if (!ownerId) return true;
-  return withOwnerLock(ownerId, ownerGeneration, () => {
+  const initialized = await withOwnerLock(ownerId, ownerGeneration, () => {
     if (!isCurrent() || !ensureActiveOwnerReadyForWrites() || activeOwnerMigrationPending) return false;
+    if (mapCorrupt) {
+      recordInitializationFailure('preferences-corrupt');
+      return false;
+    }
+    if (isActiveInitializationCorrupt() || adoptionInitializationSourceCorrupt) {
+      recordInitializationFailure('preferences-corrupt');
+      return false;
+    }
     try {
-      const stored = readInitialization(ownerId);
+      const storedResult = readInitialization(ownerId);
+      if (storedResult.corrupt) return false;
+      const stored = storedResult.state;
       // Re-read other windows' completed scopes and overrides before adding anything.
       const state = stored ?? initialization ?? emptyInitialization();
       const next: InitializationState = { ...state, defaults: { ...state.defaults }, scopes: [...state.scopes], followCatalogKeys: [...state.followCatalogKeys] };
@@ -546,16 +730,20 @@ export async function migrateModelVisibilityDefaults(
       cache = aliases;
       return true;
     } catch (error) {
-      log.warn('model visibility initialization deferred', error);
+      recordInitializationFailure(initializationErrorReason(error));
       return false;
     }
   });
+  if (initialized && activeOwnerId === ownerId && activeOwnerGeneration === ownerGeneration) {
+    initializationFailure = null;
+  }
+  return initialized;
 }
 
 /**
- * 该 (agent, 来源, 模型) 当前是否应显示:显式开关优先，其次初始化清单；未知路线关闭。
+ * 该 (agent, 来源, 模型) 当前是否应显示:显式开关优先，否则跟随当前目录 defaultEnabled。
+ * 偏好 JSON 无法解析、或旧开关尚未迁入 owner namespace 时 fail-closed（不当成从没拨过）。
  * model 至少需带 id + 可选 defaultEnabled(直接传 CatalogModel 即可)。
- * 只有首次新用户与明确恢复默认的路线读取目录默认值。
  */
 export function isModelEnabled(
   agent: AgentKind,
@@ -565,12 +753,15 @@ export function isModelEnabled(
   const key = keyOf(agent, providerId, model.id);
   const override = load()[key];
   if (override !== undefined) return override;
-  if (initialization?.followCatalogKeys.includes(key)) return isModelVisible(undefined, model.defaultEnabled);
-  if (initialization && (!mayInitializeDefaults || initialization.scopes.length > 0)) {
-    return initialization.defaults[key] ?? false;
+  if (isActiveInitializationCorrupt() || adoptionInitializationSourceCorrupt) return false;
+  // Restore defaults 记在独立 initialization 里：偏好 map 损坏时仍跟随目录。
+  if (initialization?.followCatalogKeys.includes(key)) {
+    return isModelVisible(undefined, model.defaultEnabled);
   }
-  return !activeOwnerId || (mayInitializeDefaults && !activeOwnerMigrationPending)
-    ? isModelVisible(undefined, model.defaultEnabled) : false;
+  if (mapCorrupt) return false;
+  // 旧全局开关还在等独占导入：不能用目录默认把用户关过的模型暂时打开。
+  if (activeOwnerMigrationPending && !mayInitializeDefaults) return false;
+  return isModelVisible(undefined, model.defaultEnabled);
 }
 
 async function setVisibilityTargets(
@@ -598,14 +789,24 @@ async function setVisibilityTargets(
     const map = load();
     let changed = false;
     const next = { ...map };
+    const keys: string[] = [];
     for (const { agent, modelId } of targets) {
       const k = keyOf(agent, providerId, modelId);
+      keys.push(k);
       if (next[k] !== enabled) {
         next[k] = enabled;
         changed = true;
       }
     }
-    return changed ? persist(next, context) : true;
+    if (changed && !persist(next, context)) return false;
+    const state = initialization ?? emptyInitialization();
+    const follows = new Set(state.followCatalogKeys);
+    let followChanged = false;
+    for (const key of keys) {
+      if (follows.delete(key)) followChanged = true;
+    }
+    if (followChanged && !saveInitialization({ ...state, followCatalogKeys: [...follows] })) return false;
+    return true;
   });
 }
 
@@ -676,13 +877,20 @@ export async function resetModelVisibilities(
   targets: readonly { agent: AgentKind; modelId: string }[],
 ): Promise<boolean> {
   return withOwnerLock(activeOwnerId, activeOwnerGeneration, () => {
-    if (!ensureActiveOwnerReadyForWrites()) return false;
+    // Restore defaults is the explicit action that may replace a corrupt
+    // initialization record after owner readiness has been established.
+    const hadCorruptInitialization = isActiveInitializationCorrupt();
+    if (!ensureActiveOwnerReadyForWrites(hadCorruptInitialization)) return false;
     const map = load();
     const next = { ...map };
     if (targets.length === 0) return true;
     let state: InitializationState;
+    let recoveringInitialization = false;
     try {
-      state = readInitialization(activeOwnerId!) ?? initialization ?? emptyInitialization();
+      const storedResult = readInitialization(activeOwnerId!);
+      recoveringInitialization = hadCorruptInitialization
+        || storedResult.corrupt || isActiveInitializationCorrupt();
+      state = storedResult.state ?? (recoveringInitialization ? emptyInitialization() : initialization ?? emptyInitialization());
     } catch (error) {
       log.warn('model visibility reset read failed', error);
       return false;
@@ -695,8 +903,13 @@ export async function resetModelVisibilities(
     }
     // Write permission to follow defaults first; the old explicit value keeps winning until
     // its removal succeeds. A failed override write can be retried without losing the choice.
-    if (!saveInitialization({ ...state, followCatalogKeys: [...follows] })) return false;
-    return persist(next, { operation: 'bulk', providerId, enabled: false, modelCount: targets.length });
+    if (!saveInitialization({ ...state, followCatalogKeys: [...follows] }, recoveringInitialization)) return false;
+    const persisted = persist(next, { operation: 'bulk', providerId, enabled: false, modelCount: targets.length });
+    if (persisted && recoveringInitialization && !isActiveInitializationCorrupt()
+      && !adoptionInitializationSourceCorrupt && !mapCorrupt && !activeOwnerMigrationPending) {
+      initializationFailure = null;
+    }
+    return persisted;
   });
 }
 
@@ -704,19 +917,26 @@ export async function resetModelVisibilities(
 // trusting event.newValue, which may already be stale when the event is delivered.
 const removeStorageListener = (() => {
   if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  const watchesPendingSource = (key: string): boolean => {
+    if (!activeOwnerId) return false;
+    if (key === LEGACY_STORAGE_KEY) {
+      return activeOwnerMode !== 'signed-out'
+        && window.localStorage.getItem(ownerMigrationCompleteKey(activeOwnerId)) !== '1';
+    }
+    if (activeOwnerMode !== 'cloud' || activeOwnerId === LOCAL_OWNER_ID) return false;
+    if (window.localStorage.getItem(`${LOCAL_ADOPTION_KEY_PREFIX}.${encodeURIComponent(activeOwnerId)}`) === '1') {
+      return false;
+    }
+    return key === initializationKey(LOCAL_OWNER_ID) || key === ownerStorageKey(LOCAL_OWNER_ID);
+  };
   const onStorage = (event: StorageEvent): void => {
     if (!activeOwnerId || (event.storageArea && event.storageArea !== window.localStorage)) return;
     if (event.key !== null && event.key !== initializationKey(activeOwnerId)
       && event.key !== ownerStorageKey(activeOwnerId)
-      && event.key !== ownerMigrationCompleteKey(activeOwnerId)) return;
+      && event.key !== ownerMigrationCompleteKey(activeOwnerId)
+      && !watchesPendingSource(event.key)) return;
     const ownerId = activeOwnerId;
-    void withOwnerLock(ownerId, activeOwnerGeneration, () => {
-      if (window.localStorage.getItem(ownerMigrationCompleteKey(ownerId)) === '1') {
-        activeOwnerReadyForWrites = true;
-        activeOwnerMigrationPending = false;
-      }
-      return true;
-    });
+    void withOwnerLock(ownerId, activeOwnerGeneration, ensureActiveOwnerReadyForWrites);
   };
   window.addEventListener('storage', onStorage);
   return () => window.removeEventListener('storage', onStorage);
@@ -733,17 +953,22 @@ export function isModelVisibilityCustomized(agent: AgentKind, providerId: string
  * 开关变更后自动重算(计数 / 过滤后的模型列表)。
  */
 export function useModelVisibilityVersion(): number {
-  return useSyncExternalStore(subscribe, getVersion, getVersion);
+  return useSyncExternalStore(subscribe, getModelVisibilityVersion, getModelVisibilityVersion);
 }
 
 /** 测试用 —— 重置缓存 + 清 localStorage(其它代码不应调用)。 */
 export function __resetForTest(): void {
+  initializationFailure = null;
+  initializationCorruptOwner = null;
   mirrorRevision += 1;
   clearTimeout(mirrorRetryTimer);
   const currentScopedKey = activeOwnerId ? ownerStorageKey(activeOwnerId) : null;
   const currentMigrationKey = activeOwnerId ? ownerMigrationCompleteKey(activeOwnerId) : null;
   if (activeOwnerId) window.localStorage.removeItem(initializationKey(activeOwnerId));
   cache = null;
+  mapCorrupt = false;
+  adoptionSourceCorrupt = false;
+  adoptionInitializationSourceCorrupt = false;
   initialization = null;
   mayInitializeDefaults = false;
   activeOwnerId = null;

@@ -224,6 +224,8 @@ export interface MobileCodexRateLimitResetOffer {
 
 /** Full read-only Codex quota view plus an optional manually redeemable reset offer. */
 export interface MobileCodexRateLimitsResult {
+  /** Echoed account scope; custom-account clients reject unscoped legacy responses. */
+  providerId?: string;
   account: MobileCodexRateLimitAccount;
   rateLimits: MobileCodexRateLimitSnapshot;
   rateLimitsByLimitId: Record<string, MobileCodexRateLimitSnapshot> | null;
@@ -236,6 +238,7 @@ export interface MobileCodexRateLimitsResult {
 
 /** Stable terminal result for one desktop-issued reset offer. */
 export interface MobileCodexRateLimitResetResult {
+  providerId?: string;
   outcome: 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
   /** Fresh snapshot when the post-consume read succeeded. */
   rateLimits: MobileCodexRateLimitsResult | null;
@@ -276,6 +279,8 @@ export const MOBILE_REMOTE_INVOKE_CHANNELS = [
   // 会话菜单重命名的「自动起名」:被控端读该会话素材重新生成标题(与桌面 Magic 按钮
   // 同一 handler;老被控端 CHANNEL_NOT_ALLOWED → 手机端展示失败提示,不阻塞手动改名)。
   'maker:regenerate-title',
+  // 输入框推荐提示词：由被控端读取真实会话素材生成。
+  'maker:predict-prompt',
   'local-db:messages:list',
   'local-db:messages:view',
   'local-db:messages:work-details',
@@ -340,6 +345,20 @@ export const MOBILE_REMOTE_INVOKE_CHANNELS = [
   'maker:rewind:commit',
   'maker:message:delete',
   'maker:close-session',
+  // —— Orca 协同(Lead / Worker 团队真身在被控端,手机只做编排入口)——
+  // 均已在被控端 REMOTE_INVOKE_ALLOWLIST 的 Orca 段;worker-changed 推送经
+  // `session:<leadId>` topic 转发。老被控端 CHANNEL_NOT_ALLOWED → 协同入口 fail-closed
+  // 提示设备版本过旧,不放行到 enable-orca 才撞错。
+  'maker:plugins:get-state',
+  'maker:session:enable-orca',
+  'maker:session:disable-orca',
+  'maker:worker:create',
+  'maker:worker:switch-focus',
+  'maker:worker:acknowledge-done',
+  'maker:worker:archive',
+  'maker:collaboration-settings:get',
+  'local-db:orca-workflows:list-workers-by-lead',
+  'local-db:orca-workflows:get-by-worker-session',
   'maker:schedule:list',
   'maker:schedule:get',
   'maker:schedule:list-templates',

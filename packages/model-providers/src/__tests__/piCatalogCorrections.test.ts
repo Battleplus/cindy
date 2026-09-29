@@ -2,14 +2,48 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyKnownXaiCorrections,
+  applyGrok47CatalogAddition,
   preferredDefaultEffort,
 } from '../../../../tools/pi/xai-catalog-corrections.mjs';
 import { applyAstraCatalogAdditions } from '../../../../tools/pi/openai-catalog-corrections.mjs';
-import piCatalog from '../../catalog/pi-model-catalog.json';
+import { providerCatalogForPi } from '../providerModelCatalog.js';
+const piCatalog = providerCatalogForPi();
 import { BUNDLED_CATALOG } from '../catalog.js';
 import { modelProtocolComparison } from '../modelProtocol.js';
+import { toCindyProviderModel } from '../../../../tools/pi/catalog-format.mjs';
 
 describe('Pi xAI catalog corrections', () => {
+  it('adds Grok 4.7 reproducibly and preserves newer upstream definitions', () => {
+    const providers = applyGrok47CatalogAddition({});
+    const model = providers.xai[0];
+    expect(toCindyProviderModel(model)).toMatchObject({
+      id: 'grok-4.7', contextWindow: 500_000, maxOutput: 500_000,
+      supportsImageInput: true,
+      efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high',
+      execution: { pi: { api: 'openai-responses', thinkingLevelMap: { xhigh: 'xhigh' } } },
+    });
+    expect(piCatalog.providers.xai.find(row => row.id === model.id)).toMatchObject({
+      api: model.api, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+      thinkingLevelMap: model.thinkingLevelMap, cost: model.cost,
+    });
+    expect(applyGrok47CatalogAddition(providers)).toEqual(providers);
+    expect(toCindyProviderModel({ ...model, defaultEffort: 'max' }).defaultEffort).toBe('medium');
+    const future = { ...model, contextWindow: 600_000 };
+    expect(applyGrok47CatalogAddition({ xai: [future] }).xai).toEqual([future]);
+    const { defaultEffort: _default, ...upstream } = future;
+    const imported = applyGrok47CatalogAddition({ xai: [upstream] });
+    expect(imported.xai).toEqual([{ ...upstream, defaultEffort: 'high' }]);
+    expect(toCindyProviderModel(imported.xai[0]).defaultEffort).toBe('high');
+    expect(upstream).not.toHaveProperty('defaultEffort');
+    expect(applyGrok47CatalogAddition(imported)).toEqual(imported);
+    const explicit = { ...upstream, defaultEffort: 'xhigh' };
+    expect(applyGrok47CatalogAddition({ xai: [explicit] }).xai).toEqual([explicit]);
+    for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+      expect(BUNDLED_CATALOG.providers.find(row => row.id === 'xai')?.models[agent]
+        ?.find(row => row.id === (agent === 'pi' ? 'grok-4.7' : 'xai/grok-4.7')))
+        .toMatchObject({ efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' });
+    }
+  });
   it('keeps official Grok 4.6 xhigh + default high when pi.dev still ships no thinking map', () => {
     const stale = [
       {
@@ -96,7 +130,7 @@ describe('Pi Astra catalog additions', () => {
     const native = { id: 'gpt-6-astra', contextWindow: 872_000, upstreamField: true };
     expect(applyAstraCatalogAdditions({ openai: [native] }).openai).toEqual([native]);
     expect(applyAstraCatalogAdditions(providers)).toEqual(providers);
-    expect(piCatalog.providers.openai).toEqual(providers.openai);
-    expect(piCatalog.providers['openai-codex'].find((model) => model.id === 'gpt-6-astra')).toEqual(providers['openai-codex'][0]);
+    expect(piCatalog.providers.openai.find(model => model.id === 'gpt-6-astra')).toMatchObject(providers.openai[0]);
+    expect(piCatalog.providers['openai-codex'].find((model) => model.id === 'gpt-6-astra')).toMatchObject(providers['openai-codex'][0]);
   });
 });

@@ -2,15 +2,18 @@
  * 目录运行时校验(parseCatalog)+ presets 清洗排序。
  *
  * 2026-07-19 起 bundled 目录由 `builtin.ts` 组装:内置供应商身份卡是 TS 常量,
- * `catalog/providers.json`(v2)承载 xAI 的离线 fallback 元数据 + presets 模板——它仍是
- * ① OSS `cfg/providers.json` 的发布物 ② dev 直读的仓库文件。anthropic/openai/xd
+ * `catalog/providers.json`(v2)承载 xAI 的离线 fallback 元数据 + presets 模板,是随包
+ * 目录与 dev 直读的仓库文件。旧 OSS `cfg/providers.json` 自 2026-07 起冻结、不再由本文件
+ * 发布;本文件的预设是源格式(顶层单一推荐清单),旧客户端读不懂,不能直接发布到 OSS。anthropic/openai/xd
  * 的模型清单运行时动态注入(见 apps/desktop maker-host active-catalog),不再进目录文件。
  * xAI 登录后同样由账号 `/v1/models` 决定成员；此处静态段只在尚无成功账号快照时救急，
  * 并为已发现成员补上下文、价格、能力与路由。
  * 所有跨端模型元数据统一进入严格版本化的 `modelRegistry`;目录顶层不接受旁路元数据块。
  */
 
+import { expandPresetModels } from './presetModels.js';
 import { projectProviderMediaModels } from './providerMediaModels.js';
+import { mimoPresetName } from './mimoPresentation.js';
 import { validModelMetadata } from './modelMetadataLayers.js';
 import { parseModelRegistry } from './modelAccessValidator.js';
 
@@ -29,21 +32,21 @@ import { withVerifiedStaticWindows } from './builtin.js';
 import { findReservedOAuthExtraParam } from './provider-oauth.js';
 import { isProviderRequestPath } from './provider-url.js';
 
-export { BUNDLED_CATALOG, BUILTIN_PROVIDERS } from './builtin.js';
+export { BUNDLED_CATALOG, BUILTIN_PROVIDERS, claudeSubscriptionOnlyForClaudeCode } from './builtin.js';
 
 const AGENT_KINDS: readonly AgentKind[] = ['claude-code', 'codex', 'pi'];
 const EFFORTS: readonly Effort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-const WIRE_PROTOCOLS = ['anthropic-messages', 'openai-responses', 'openai-chat'] as const;
+const WIRE_PROTOCOLS = ['anthropic-messages', 'openai-responses', 'openai-chat', 'google-generative-ai'] as const;
 
 function isWireProtocol(value: unknown): value is (typeof WIRE_PROTOCOLS)[number] {
   return typeof value === 'string' && (WIRE_PROTOCOLS as readonly string[]).includes(value);
 }
 
 function isWireProtocolAllowedForAgent(
-  agent: AgentKind,
+  _agent: AgentKind,
   value: unknown,
 ): value is (typeof WIRE_PROTOCOLS)[number] {
-  return isWireProtocol(value) && (agent !== 'claude-code' || value === 'anthropic-messages');
+  return isWireProtocol(value);
 }
 
 function isValidModelRoute(
@@ -152,6 +155,13 @@ function validateModel(
   if (m.nativeApi !== undefined && m.nativeApi !== null) {
     assert(isPiModelApi(m.nativeApi), `model.nativeApi invalid for '${m.id}'`);
   }
+  if (m.api !== undefined) {
+    assert(isPiModelApi(m.api), `model.api invalid for '${m.id}'`);
+  }
+  if (m.fastModelId !== undefined && m.fastModelId !== null) {
+    assert(typeof m.fastModelId === 'string' && m.fastModelId.trim().length > 0 && m.fastModelId !== m.id,
+      `model.fastModelId invalid for '${m.id}'`);
+  }
   if (m.piApi !== undefined) {
     assert(isPiModelApi(m.piApi), `model.piApi invalid for '${m.id}'`);
   }
@@ -187,7 +197,7 @@ function validateOAuthDescriptor(p: Provider): void {
     `provider '${p.id}' auth.oauth.flow invalid`,
   );
   for (const field of ['tokenUrl', 'clientId', 'scopes'] as const) {
-    assert(typeof raw[field] === 'string' && raw[field].length > 0, `provider '${p.id}' auth.oauth.${field} missing`);
+    assert(typeof raw[field] === 'string' && (field === 'scopes' || raw[field].length > 0), `provider '${p.id}' auth.oauth.${field} missing`);
   }
   const requireHttpsUrl = (field: string): void => {
     const value = raw[field];
@@ -549,6 +559,7 @@ function isValidPreset(v: unknown): v is ProviderPreset {
       const mm = m as Record<string, unknown>;
       if (typeof mm.id !== 'string' || mm.id.length === 0) return false;
       if (typeof mm.name !== 'string' || mm.name.length === 0) return false;
+      if (mm.api !== undefined && !isPiModelApi(mm.api)) return false;
       if (mm.piApi !== undefined && !isPiModelApi(mm.piApi)) return false;
       if (
         mm.contextWindow !== undefined
@@ -560,7 +571,6 @@ function isValidPreset(v: unknown): v is ProviderPreset {
       if (!hasValidPresetReasoningCapability(agent, mm)) return false;
     }
     if (r.wireProtocol !== undefined && !isWireProtocol(r.wireProtocol)) return false;
-    if (agent === 'claude-code' && r.wireProtocol === 'openai-chat') return false;
     if (
       r.supportsImageGeneration !== undefined &&
       typeof r.supportsImageGeneration !== 'boolean'
@@ -681,9 +691,6 @@ function normalizePresetRuntimeOptions(p: ProviderPreset): ProviderPreset {
             const sourceUrl = httpUrl(source.baseUrl);
             if (!runtimeUrl || !sourceUrl || sourceUrl.origin !== runtimeUrl.origin) return false;
             if (!isWireProtocol(source.wireProtocol)) return false;
-            if (agent === 'claude-code' && source.wireProtocol !== 'anthropic-messages') {
-              return false;
-            }
             if (
               source.modelsUrl !== undefined &&
               (!isHttpUrl(source.modelsUrl) ||
@@ -724,7 +731,11 @@ export function sanitizePresets(input: unknown): ProviderPreset[] {
   if (!Array.isArray(input)) return [];
   const out: ProviderPreset[] = [];
   const seen = new Set<string>();
-  for (const v of input) {
+  for (const raw of input) {
+    const v = expandPresetModels(raw);
+    // 展开成功会删掉顶层 `models`；仍留着说明引擎字段畸形或清单不是数组，整条拒绝——
+    // 即使 runtimes 另带了旧格式清单，也不能让它以同 id 覆盖随包版本。
+    if (v && typeof v === 'object' && 'models' in v) continue;
     if (!isValidPreset(v) || seen.has(v.id)) continue;
     seen.add(v.id);
     // 可选呈现字段逐项归一化,**不许分支 continue**:多个字段同时非法时早退会漏清洗
@@ -755,10 +766,12 @@ export function sanitizePresets(input: unknown): ProviderPreset[] {
  * (缺省回落 `name`)。纯呈现选择,不影响预设 id / 创建后的供应商命名语义。
  */
 export function presetDisplayName(
-  preset: Pick<ProviderPreset, 'name' | 'nameEn' | 'nameZhTW'>,
+  preset: Pick<ProviderPreset, 'name' | 'nameEn' | 'nameZhTW'> & { id?: string },
   locale: string,
 ): string {
   const normalizedLocale = locale.toLowerCase().replaceAll('_', '-');
+  const mimoName = mimoPresetName(preset.id, normalizedLocale);
+  if (mimoName) return mimoName;
   if (normalizedLocale === 'zh-tw' || normalizedLocale.startsWith('zh-hant')) {
     return preset.nameZhTW ?? preset.name;
   }
@@ -822,11 +835,11 @@ export function parseCatalog(input: string | unknown): Catalog {
   for (const provider of catalog.providers) {
     for (const field of ['imageModels', 'videoModels', 'audioModels', 'embeddingModels'] as const)
       validateMediaModels(provider.id, field, provider[field], field === 'audioModels' ? '' : field.replace('Models', 'Defaults'),
-        field === 'imageModels' ? provider.imageDefaults : field === 'videoModels' ? provider.videoDefaults : field === 'embeddingModels' ? provider.embeddingDefaults : undefined, catalog.modelRegistry?.schemaVersion === 4);
+        field === 'imageModels' ? provider.imageDefaults : field === 'videoModels' ? provider.videoDefaults : field === 'embeddingModels' ? provider.embeddingDefaults : undefined, (catalog.modelRegistry?.schemaVersion ?? 0) >= 4);
   }
   const projected = { ...catalog, providers: catalog.providers.map((provider) =>
     projectProviderMediaModels(provider, catalog.modelRegistry, { addDeclared: true })) };
-  for (const provider of projected.providers) validateProvider(provider, catalog.modelRegistry?.schemaVersion === 4);
+  for (const provider of projected.providers) validateProvider(provider, (catalog.modelRegistry?.schemaVersion ?? 0) >= 4);
   validateModelConsistency(projected);
   // 远端下发目录与 bundled 同格式:静态条目的窗口是产品侧写定的真实上限,标记为已核实
   // (幂等;条目自己表过态时尊重原值)。动态发现的模型不经这里 —— 见 withVerifiedStaticWindows。

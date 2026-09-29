@@ -1,4 +1,13 @@
 {
+  "pluginInvocation": {
+    "listSeparator": "、",
+    "status": {
+      "running": "呼叫中…",
+      "called": "已呼叫",
+      "done": "已完成",
+      "selected": "已選取"
+    }
+  },
   "renderer": {
     "moreActions": "更多訊息操作",
     "previousQuestionJump": "跳到上一條提問：{{preview}}",
@@ -23,6 +32,10 @@
     "expand": "展開",
     "automationOriginNamed": "由自動化「{{name}}」傳送",
     "automationOrigin": "由自動化傳送",
+    "sessionOriginNamed": "由任務「{{name}}」傳送",
+    "botOriginNamed": "由夥伴「{{name}}」傳送",
+    "sessionOrigin": "由其他任務傳送",
+    "openSessionOrigin": "開啟來源任務",
     "modelMismatch": "本輪由 {{actual}} 響應，而非所選的 {{selected}}(服務端臨時降級)",
     "copyStateCopying": "複製中",
     "copyStateCopied": "已複製",
@@ -146,13 +159,20 @@
     "loadFailed": "圖片載入失敗",
     "retryLoadImage": "重試載入圖片",
     "retry": "重試",
-    "closeImage": "關閉圖片"
+    "closeImage": "關閉圖片",
+    "discardAnnotationTitle": "放棄標註？",
+    "discardAnnotationBody": "未儲存的筆跡將會遺失。",
+    "continueAnnotating": "繼續標註",
+    "discardAnnotation": "放棄標註",
+    "annotateUnavailableTitle": "暫時無法標註",
+    "annotateImageUnavailable": "標註圖片（暫不可用）"
   },
   "queue": {
     "continueSystemInstruction": "繼續未完成的任務(系統指令)",
     "systemInstruction": "系統指令",
     "retrySend": "重試傳送",
     "clearError": "清除錯誤",
+    "noRetryContent": "沒有可重新傳送的內容，請清除錯誤後重新輸入。",
     "piImageInputUnsupported": "當前 Pi 模型未啟用圖片輸入。請切換到支援圖片的模型；如果這是自定義模型，請在供應商設定中開啟“支援圖片輸入”，然後新建 Pi 任務。",
     "codexResumeNotReady": "Codex 暫時無法恢復這個任務，請稍後重試",
     "credentialSwitchWait": "正在等待其它 Codex 任務結束，結束後自動傳送",
@@ -239,12 +259,13 @@
     },
     "row": {
       "syntheticEditDisabled": "系統指令訊息不支援編輯或插話傳送。",
+      "autoSentEditDisabled": "自動傳送的訊息不支援編輯或插話傳送。",
       "first": "已經是佇列第一條。",
       "last": "已經是佇列最後一條。",
       "steering": "插話傳送中",
       "orcaTitle": "協同佇列 {{index}}",
       "title": "佇列 {{index}}",
-      "orcaReadOnly": "協同訊息由桌面端編排，手機端唯讀顯示。",
+      "orcaEditDisabled": "協同訊息不支援編輯或插話傳送。",
       "busy": "佇列操作同步中，完成後再繼續操作。",
       "steeringDisabled": "插話正在傳送到目前 turn，等待桌面端回流後再操作。",
       "editLocked": "這條佇列訊息正在編輯中，完成後再操作。",

@@ -1,3 +1,6 @@
+import { FileTypeIcon } from '@/components/ui/file-type-icon';
+import { Button } from '@/components/ui/button';
+import { shouldShowOpenPathError } from '../../../shared/openPathResult';
 /**
  * TextLightbox
  * ---------------------------------------------------------------------------
@@ -17,9 +20,10 @@
  * the backdrop and Esc close.
  */
 
+import { CHAT_LIGHTBOX_ICON_BUTTON_CLASS, CHAT_FOCUS_CLASS } from './chatChrome';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, ExternalLink, FileText, Folder, TriangleAlert, X } from 'lucide-react';
+import { Copy, ExternalLink, Folder, TriangleAlert, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { cn, basename } from '@/lib/utils';
@@ -342,7 +346,7 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
     const target = remoteOrigin ? remoteCopy?.cachePath : filePath;
     if (!target) return;
     const res = await window.electronAPI.openPath(target);
-    if (!res.success) {
+    if (shouldShowOpenPathError(res)) {
       toast.error(res.error || t('chat.textLightbox.openSystemFailed'));
     }
   }
@@ -405,7 +409,7 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
       <div
         data-text-lightbox-card
         className={cn(
-          'cursor-auto flex flex-col overflow-hidden rounded-[12px]',
+          'cursor-auto flex flex-col overflow-hidden rounded-xl',
           'border border-[var(--msg-tool-card-border)]',
           'bg-[var(--msg-tool-card-bg)]',
         )}
@@ -435,12 +439,13 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
                 onClick={copyPath}
                 className={cn(
                   'flex items-center gap-2 min-w-0',
-                  'rounded-[6px] px-1 -mx-1 py-0.5',
+                  'rounded-full px-1 -mx-1 py-0.5',
+                  CHAT_FOCUS_CLASS,
                   'hover:bg-[var(--msg-code-inline-bg)] transition-colors',
                   'text-left cursor-pointer',
                 )}
               >
-                <FileText size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                <FileTypeIcon name={filePath} size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
                 <span
                   className={cn(
                     'font-semibold text-14',
@@ -484,14 +489,9 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
                 <button
                   type="button"
                   onClick={showInFolder}
+                  aria-label={remoteOrigin ? t('chat.remoteFile.revealLocalCopy') : t('chat.lightbox.openInExplorer')}
                   disabled={!localActionsReady}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                    'transition-colors',
-                    localActionsReady
-                      ? 'hover:bg-[var(--msg-code-inline-bg)] cursor-pointer'
-                      : 'opacity-40 cursor-not-allowed',
-                  )}
+                  className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                 >
                   <Folder size={18} className="text-[var(--msg-tool-card-chevron)]" />
                 </button>
@@ -505,14 +505,9 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
                 <button
                   type="button"
                   onClick={copyContent}
+                  aria-label={t('chat.textLightbox.copyAll')}
                   disabled={loadState.phase !== 'ready'}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                    'transition-colors cursor-pointer',
-                    loadState.phase === 'ready'
-                      ? 'hover:bg-[var(--msg-code-inline-bg)]'
-                      : 'opacity-40 cursor-not-allowed',
-                  )}
+                  className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                 >
                   <Copy size={18} className="text-[var(--msg-tool-card-chevron)]" />
                 </button>
@@ -526,11 +521,8 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
                 <button
                   type="button"
                   onClick={handleClose}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                    'hover:bg-[var(--msg-code-inline-bg)] transition-colors',
-                    'cursor-pointer',
-                  )}
+                  aria-label={t('chat.lightbox.close')}
+                  className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                 >
                   <X size={20} className="text-[var(--msg-tool-card-chevron)]" />
                 </button>
@@ -602,23 +594,18 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
             >
               {t('chat.textLightbox.oversizeBody', { size: oversizeSizeText, limit: oversizeLimitMb })}
             </div>
-            <button
+            <Button
+              variant="cta"
+              size="lg"
+              compact
               type="button"
               onClick={openInSystem}
               disabled={!localActionsReady}
-              className={cn(
-                'mt-2 inline-flex items-center gap-2 rounded-[9999px]',
-                'bg-[var(--lightbox-cta-bg)] px-5 py-[10px]',
-                'text-14 font-medium text-[var(--lightbox-cta-fg)]',
-                'transition-colors',
-                localActionsReady
-                  ? 'hover:bg-[var(--lightbox-cta-hover)] cursor-pointer'
-                  : 'opacity-40 cursor-not-allowed',
-              )}
+              className="mt-2"
             >
               <ExternalLink size={14} />
               {t('chat.textLightbox.openInSystem')}
-            </button>
+            </Button>
           </div>
         )}
 

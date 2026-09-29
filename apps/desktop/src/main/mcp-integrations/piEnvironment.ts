@@ -53,6 +53,10 @@ import {
   readAllowedBuiltinPluginIds,
   readDisabledBuiltinPluginIds,
 } from './codexBuiltinToolPolicy.js';
+import {
+  CINDY_MAKE_MCP_SERVER_NAME,
+  isCindyMakeVendorOptions,
+} from '../../shared/cindyMakeSession.js';
 import { pluginIdForKnownProviderName } from '../maker-host/plugins/builtin-plugins.js';
 // 直接取 plugins 模块的 registry 单例,不经 maker-host/index.ts —— 后者 import pi-host,
 // 从 mcp-integrations 反向 import 会成环。
@@ -184,11 +188,26 @@ export async function getPiExtraSpawnConfig(
   // orca_worker_bridge),避免禁用后 pi 仍能建队/发消息(R5 配置审计 H-7)。
   // 只按名字剥协同 server —— cindy_memory / ghost / 外部 HTTP MCP 与 collab
   // 无关,照常注入(CC 的 selectRemoteInjectableServerNames 同语义)。
+  // issue #4734: 全局「协同模式」开关只约束**后续新建** Team / Worker(设置页文案:
+  // 关闭后仅影响后续新建的任务, 不会中止当前 Worker)。已经属于 active Team 的
+  // Lead / Worker(start_team / create_worker 写入 vendorOptions.orcaRole)在每一轮
+  // 重建 Pi MCP 描述时必须保留协同 server —— 否则 Worker 下一轮直接失去
+  // orca_worker_bridge, send_to_lead 报 UNKNOWN_SERVER 而文本回复仍被界面桥接,
+  // 失效不易察觉。只有显式结束 Team(orcaRole 被清)才移除。项目级 / 冻结伙伴的
+  // 显式停用列表仍优先: 那是明确的策略, 不是"以后不再协同"的全局开关。
+  const orcaRole = (sessionCtx?.vendorOptions as Record<string, unknown> | undefined)?.orcaRole;
+  const activeTeamMember = orcaRole === 'lead' || orcaRole === 'worker';
   const collabEnabled =
-    createPluginRegistry().isEnabled('collab') && !disabledPluginIds.includes('collab');
+    (createPluginRegistry().isEnabled('collab') || activeTeamMember)
+    && !disabledPluginIds.includes('collab');
   const capabilityGated = (servers: NonNullable<PiExtraSpawnConfig['mcpBridge']>['servers']) =>
     servers.filter((server) => {
       if (server.name === 'cindy_memory' && sessionCtx?.memoryEnabled !== true) return false;
+      // Cindy Make 个人版工具只给带标记的任务;匿名会话与普通任务一律不见(fail-closed)。
+      if (
+        server.name === CINDY_MAKE_MCP_SERVER_NAME
+        && !isCindyMakeVendorOptions(sessionCtx?.vendorOptions)
+      ) return false;
       if (!isBotMcpServerAllowed(sessionCtx?.botMcpPolicy, server.name)) return false;
       if (!collabEnabled && REMOTE_COLLAB_SERVER_NAMES.has(server.name)) return false;
       // Custom HTTP MCPs are `s.remote` and skip the SSH URL rewriter. Desktop

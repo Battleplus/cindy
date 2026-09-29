@@ -106,6 +106,37 @@ function runtimeCatalog(): Catalog {
 }
 
 describe("resolveCatalogUrl", () => {
+  it("opts explicit catalog endpoints into media without changing unrelated query parameters", () => {
+    const resolved = new URL(
+      resolveCatalogUrl({
+        url: "https://example.com/api/model-catalog/catalog?region=cn&registryMedia=0&registrySchemaVersion=4",
+      })!,
+    );
+    expect(Object.fromEntries(resolved.searchParams)).toEqual({
+      region: "cn",
+      registryMedia: "1",
+      registrySchemaVersion: "5",
+    });
+  });
+
+  it("scopes LKG reads and writes to the media-capable URL", async () => {
+    const cfg = { baseUrl: "https://model-access.example.com" };
+    const readCache = vi.fn().mockResolvedValue(null);
+    const writeCache = vi.fn();
+    await loadCatalog(cfg, {
+      fetchText: vi.fn().mockResolvedValue(JSON.stringify(MINIMAL)),
+      readCache,
+      writeCache,
+    });
+    expect(readCache).toHaveBeenCalledWith(resolveCatalogUrl(cfg));
+    expect(writeCache).toHaveBeenCalledWith(
+      resolveCatalogUrl(cfg),
+      expect.any(String),
+    );
+    expect(readCache).not.toHaveBeenCalledWith(
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5",
+    );
+  });
   it("prefers explicit url", () => {
     expect(
       resolveCatalogUrl({ url: "https://x/y.json", baseUrl: "https://b" }),
@@ -115,7 +146,7 @@ describe("resolveCatalogUrl", () => {
     expect(
       resolveCatalogUrl({ baseUrl: "https://model-access.example.com/" }),
     ).toBe(
-      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=4",
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5&registryMedia=1",
     );
   });
   it("builds the migration OSS fallback URL", () => {
@@ -1042,7 +1073,7 @@ describe("loadCatalog", () => {
     );
     expect(fetchText).toHaveBeenNthCalledWith(
       1,
-      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=4",
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5&registryMedia=1",
       15_000,
     );
     expect(fetchText).toHaveBeenNthCalledWith(
@@ -1102,7 +1133,7 @@ describe("loadCatalog", () => {
     );
     expect(fetchText).toHaveBeenNthCalledWith(
       1,
-      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=4",
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5&registryMedia=1",
       15_000,
     );
     expect(fetchText).toHaveBeenNthCalledWith(
@@ -1160,7 +1191,7 @@ describe("loadCatalog", () => {
     );
     expect(fetchText).toHaveBeenNthCalledWith(
       1,
-      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=4",
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5&registryMedia=1",
       15_000,
     );
     expect(fetchText).toHaveBeenNthCalledWith(
@@ -1189,7 +1220,7 @@ describe("loadCatalog", () => {
     );
     expect(fetchText).toHaveBeenCalledTimes(1);
     expect(fetchText).toHaveBeenCalledWith(
-      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=4",
+      "https://model-access.example.com/api/model-catalog/catalog?registrySchemaVersion=5&registryMedia=1",
       15_000,
     );
     expect(cat.version).toBe(BUNDLED_CATALOG.version);
@@ -1313,7 +1344,7 @@ describe("registry visibility & sources(运行时注入 fixture)", () => {
       providersForAgent(views, "codex")
         .map((p) => p.id)
         .sort(),
-    ).toEqual(["anthropic", "openai", "xai", "xd"]);
+    ).toEqual(["openai", "xai", "xd"]);
   });
 
   it("connectedProvidersForAgent honors connection", () => {
@@ -1426,7 +1457,7 @@ describe("registry visibility & sources(运行时注入 fixture)", () => {
     ).toBe("openai");
   });
 
-  it("effectiveSourceIdForModel 保留有效显式来源，失效时回落到同模型默认来源", () => {
+  it("effectiveSourceIdForModel 保留有效显式来源，失效时不替换账号", () => {
     const all = buildRegistry(runtimeCatalog(), {
       xd: true,
       anthropic: true,
@@ -1448,7 +1479,7 @@ describe("registry visibility & sources(运行时注入 fixture)", () => {
         "claude-opus-4-8",
         "claude-code",
       ),
-    ).toBe("xd");
+    ).toBeNull();
   });
 
   it("effectiveSourceIdForModel 不把请求路由到非聊天来源(issue #882 第 3 点,2026-07 review):同一 id 在不同来源上 mode 不一致时,只信聊天来源", () => {
@@ -1490,10 +1521,10 @@ describe("registry visibility & sources(运行时注入 fixture)", () => {
       ],
     };
     const views = buildRegistry(mixedModeCatalog, { xd: true, openai: true });
-    // 显式指定的 providerId 恰好是非聊天来源(xd)时,不接受它——落到真正聊天的来源(openai)。
+    // 显式指定的来源不是聊天来源时拒绝，不改用另一个账号。
     expect(
       effectiveSourceIdForModel(views, "xd", "shared-id", "claude-code"),
-    ).toBe("openai");
+    ).toBeNull();
     // 未显式指定 providerId 时,默认来源同样只能是聊天来源。
     expect(
       effectiveSourceIdForModel(views, null, "shared-id", "claude-code"),
@@ -1577,17 +1608,12 @@ describe("resolveRoute(运行时注入 fixture)", () => {
     expect(r?.routing.authStrategy).toBe("oauth-passthrough");
   });
 
-  it("anthropic claude (codex) → Anthropic Messages bridge + host-owned OAuth", () => {
-    const r = resolveRoute(views, "anthropic", "claude-opus-4-8", "codex");
-    expect(r?.routing).toMatchObject({
-      upstream: "https://api.anthropic.com",
-      wireProtocol: "anthropic-messages",
-      authStrategy: "provider-oauth-header",
-      headerOverride: {
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-      },
-    });
+  it("anthropic claude has no Codex / Pi route (subscription stays inside the Claude Code CLI)", () => {
+    expect(resolveRoute(views, "anthropic", "claude-opus-4-8", "codex")).toBeNull();
+    expect(resolveRoute(views, "anthropic", "claude-opus-4-8", "pi")).toBeNull();
+    expect(resolveRoute(views, "anthropic", "claude-opus-4-8", "claude-code")?.routing.upstream).toBe(
+      "https://api.anthropic.com",
+    );
   });
 
   it("xd claude (claude-code) → gateway, gateway-key, 不删 anthropic-beta(fast 经网关透传)", () => {

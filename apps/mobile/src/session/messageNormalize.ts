@@ -1,4 +1,6 @@
-import { readBotCollaborationMeta, type BotCollaborationMeta } from '@cindy/maker-shared/botCollaboration';
+import { collectPluginInvocations, type PluginInvocation } from './pluginInvocations';
+import { extractPayloadToolResultFiles, extractPayloadToolCardIds, type PayloadToolFile } from '@cindy/maker-shared/payload-summary';
+import { placeBotTaskCardsAfterIntroduction, readBotCollaborationMeta, type BotCollaborationMeta } from '@cindy/maker-shared/botCollaboration';
 import { readBotDirectMessageMeta, type BotDirectMessageMeta } from '@cindy/maker-shared/botDirectMessage';
 import type { RemoteMessage, RemoteMessageRole } from '@/session/types';
 import type { MobileSystemCardType } from '@/session/systemCard';
@@ -50,9 +52,11 @@ import {
   type RemoteMoney,
 } from '@/session/remoteMoney';
 import {
-  localizeToolLoopError,
+  localizeAgentError,
+  localizeUnclassifiedAgentError,
+  unclassifiedAgentErrorI18nKey,
   parseMobileToolLoopErrorDetails,
-} from '@/session/toolLoopErrorI18n';
+} from '@/session/agentErrorI18n';
 import type { MobileToolInputProjection } from '@/session/messageToolPayloadProjection';
 
 export type NormalizedRemoteMessageKind =
@@ -71,6 +75,8 @@ export interface NormalizedRemoteMessage {
   role: RemoteMessageRole;
   label: string;
   body: string;
+  rawError?: string;
+  errorSummaryKey?: string;
   /** user 消息正文包含产品引用编码；驱动跨端 marker/legacy 解析。 */
   quotesEncoded?: boolean;
   /** user 长文本粘贴原子的精确 wire ranges；正文仍保留完整 Agent payload。 */
@@ -87,6 +93,9 @@ export interface NormalizedRemoteMessage {
   /** user 专用：目标桌面落库的引用范围摘要，不含被引用消息正文。 */
   sessionReferences?: MobilePersistedSessionReferenceMetadata[];
   media?: NormalizedToolMedia[];
+  files?: PayloadToolFile[];
+  cardIds?: string[];
+  pluginInvocations?: PluginInvocation[];
   diff?: NormalizedToolDiff;
   align: 'user' | 'agent';
   createdAt: string;
@@ -96,7 +105,7 @@ export interface NormalizedRemoteMessage {
    */
   settledAt?: string;
   isStreaming?: boolean;
-  /** Host 在 SDK done 边界写入；后台自动续跑时每个 sealed assistant 都是正式回复。 */
+  /** Host 在 SDK done 边界写入；后台自动续跑时同一 turn 可有多次 seal，最后一次是最终答复。 */
   turnCompleted?: boolean;
   turnMoney?: RemoteMoney;
   /** 旧 Desktop 消息兼容字段。 */
@@ -121,6 +130,12 @@ export interface NormalizedRemoteMessage {
   isTurnFinalAssistant?: boolean;
   /** user 专用:scheduler 注入的消息来源(agentMeta.origin);驱动更紧的收起阈值与来源标签。 */
   automationOrigin?: NormalizedAutomationOrigin;
+  /**
+   * user 专用:另一个任务经工具(send_to_session / 伙伴委派 / Orca 协同等)发来的消息来源
+   * (agentMeta.origin kind=session,或带 senderSessionId 的 orca);渲染可点击的来源标签。
+   * 不进分享投影:来源任务标题属于用户本机上下文,不随分享图外发。
+   */
+  sessionOrigin?: NormalizedSessionOrigin;
   /** 共享 Cindy relay 派发的来源；用于移动端还原 Slack / Telegram 任务卡。 */
   hookSource?: NormalizedHookSource;
   /**
@@ -131,6 +146,15 @@ export interface NormalizedRemoteMessage {
    * messageRenderModel 会把它从 render items 里剔除,用户不可见。
    */
   isSyntheticTrigger?: boolean;
+}
+
+/** 另一个任务经工具发来的消息来源(对齐桌面 MessageSessionOrigin)。 */
+export interface NormalizedSessionOrigin {
+  /** 共享任务访客收到的来源已由主机脱敏、不带 id:只显示通用文案,不可点按。 */
+  senderSessionId?: string;
+  senderSessionTitle?: string;
+  /** 来源任务属于伙伴时的伙伴名快照;有则标签显示伙伴名。 */
+  senderBotName?: string;
 }
 
 /** scheduler 注入消息的来源标记(对齐桌面 MessageAutomationOrigin)。 */
@@ -159,6 +183,7 @@ export interface NormalizedAttachment {
 export interface NormalizedToolMedia {
   kind: 'image' | 'video' | 'audio';
   url: string;
+  mimeType?: string;
   title?: string;
   previewable: boolean;
   actions?: NormalizedToolMediaActions;
@@ -191,8 +216,28 @@ interface ToolUsePayload extends MessageNormalizeToolUse {
 const toolResultPreviewByContent = new WeakMap<object, { language: string; preview: string }>();
 const toolUsePayloadByMessage = new WeakMap<RemoteMessage, ToolUsePayload>();
 
-export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): NormalizedRemoteMessage[] {
-  const sorted = sortMessagesByCreatedAt(messages);
+export function normalizeRemoteMessages(
+  messages: readonly RemoteMessage[],
+  options: { preserveSourceOrder?: boolean; sessionSource?: string | null } = {},
+): NormalizedRemoteMessage[] {
+  // History views already place live tails after their persisted prefix. A live
+  // row's provisional timestamp must not undo that order during normalization.
+  const sorted = placeBotTaskCardsAfterIntroduction(
+    options.preserveSourceOrder ? messages : sortMessagesByCreatedAt(messages),
+    (message) => {
+      if (message.role === 'user') {
+        return message.agentMeta?.delivery !== 'steer' || message.agentMeta?.synthetic
+          ? 'boundary' : 'other';
+      }
+      if (message.role !== 'assistant' || message.agentMeta?.parentUuid || message.systemCardType)
+        return 'other';
+      const task = readBotCollaborationMeta(message.agentMeta?.botCollaboration);
+      if (task?.role === 'delegation-request') return 'task';
+      if (task || message.agentMeta?.botDirectMessage || message.agentMeta?.botAuthorization)
+        return 'other';
+      return typeof message.content === 'string' && message.content.trim() ? 'prose' : 'other';
+    },
+  );
   const toolResultPairing = buildMessageToolResultPairing(sorted, {
     contentToPreview: toolResultContentToPreview,
   });
@@ -212,12 +257,14 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
 
       const task = readBotCollaborationMeta(message.agentMeta?.botCollaboration);
       const direct = readBotDirectMessageMeta(message.agentMeta?.botDirectMessage);
-      if (task?.role === 'delegation-request' || task?.role === 'interjection' || direct) {
+      const isTaskTrace = task?.role === 'delegation-request' || task?.role === 'delegation-result' || task?.role === 'interjection';
+      if (isTaskTrace || direct) {
         result.push({
           key: messageNormalizeKey(message), source: message, kind: 'system', role: message.role,
-          label: 'companion', body: typeof message.content === 'string' ? message.content : '',
+          // Task traces are status-only, including legacy rows containing execution instructions.
+          label: 'companion', body: isTaskTrace ? '' : typeof message.content === 'string' ? message.content : '',
           align: 'agent', createdAt: message.createdAt,
-          companion: task && (task.role === 'delegation-request' || task.role === 'interjection')
+          companion: isTaskTrace
             ? { kind: 'task', meta: task } : { kind: 'direct', meta: direct! },
         });
         continue;
@@ -258,6 +305,8 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
         body: tool.summary,
         secondaryBody,
         media: extractToolResultMedia(secondaryBody ?? ''),
+        files: extractPayloadToolResultFiles(secondaryBody ?? ''),
+        cardIds: extractPayloadToolCardIds(secondaryBody ?? ''),
         diff: tool.diff,
         align: 'agent',
         createdAt: message.createdAt,
@@ -290,13 +339,13 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
     // turn 失败终态的持久化行(desktop main 落库):content = { message, reason? },
     // 提取 message 文案按 system 样式展示 —— 不加分支会 fall through 到通用兜底,
     // body 变成整段生 JSON。稳定的 tool-loop reason/toolLoop 走本地化，agent 未鉴权错误
-    // 换成带引导的中文提示(describeAgentAuthError)，其余未知错误保留原始 message。
+    // 换成本地化引导(describeAgentAuthError)，其余未知错误使用本地化摘要，原文留给折叠详情。
     if (message.role === 'error') {
       const c = parseMaybeJsonObject(message.content);
       const rawText = typeof c?.message === 'string' ? c.message : contentToPreview(message.content);
       const toolLoop = parseMobileToolLoopErrorDetails(c?.toolLoop);
-      const errText =
-        describeAgentAuthError(rawText) ?? localizeToolLoopError(c?.reason, toolLoop) ?? rawText;
+      const guidance = describeAgentAuthError(rawText) ?? localizeAgentError(c?.reason, toolLoop);
+      const errText = guidance ?? localizeUnclassifiedAgentError(rawText, options.sessionSource);
       result.push({
         key: messageNormalizeKey(message),
         source: message,
@@ -304,6 +353,8 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
         role: message.role,
         label: 'error',
         body: errText,
+        rawError: rawText,
+        ...(!guidance ? { errorSummaryKey: unclassifiedAgentErrorI18nKey(rawText, options.sessionSource) } : {}),
         align: 'agent',
         createdAt: message.createdAt,
       });
@@ -393,6 +444,7 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
           orcaCard: reportCard,
           align: 'agent',
           createdAt: message.createdAt,
+          ...readSessionOrigin(message),
         });
         continue;
       }
@@ -473,10 +525,17 @@ export function normalizeRemoteMessages(messages: readonly RemoteMessage[]): Nor
       ...turnCost,
       ...readModelMismatch(message),
       ...(message.role === 'user' ? readAutomationOrigin(message) : {}),
+      ...(message.role === 'user' ? readSessionOrigin(message) : {}),
       ...(hookSource ? { hookSource } : {}),
     });
   }
 
+  const pluginInvocations = collectPluginInvocations(sorted, toolResultPairing);
+  for (const row of result) {
+    if (row.kind === 'user' && !row.isSyntheticTrigger && !row.hookSource && !row.automationOrigin) {
+      row.pluginInvocations = pluginInvocations.get(row.source.clientId || row.source.id);
+    }
+  }
   dedupeToolImagesAgainstAssistantMarkdown(result);
   return result;
 }
@@ -495,10 +554,15 @@ function dedupeToolImagesAgainstAssistantMarkdown(
       if (message.kind !== 'assistant') continue;
       for (const image of collectMobileMarkdownImages(message.body)) inlineUrls.add(image.url);
     }
-    if (inlineUrls.size === 0) return;
+    const cards = new Set<string>();
     for (const message of messages.slice(lo, hi)) {
-      if (message.kind !== 'tool' || !message.media?.length) continue;
-      message.media = message.media.filter(
+      if (message.kind !== 'tool') continue;
+      message.cardIds = message.cardIds?.filter((id) => {
+        if (cards.has(id)) return false;
+        cards.add(id);
+        return true;
+      });
+      message.media = message.media?.filter(
         (item) => item.kind !== 'image' || !inlineUrls.has(item.url),
       );
     }
@@ -945,6 +1009,26 @@ function readModelMismatch(message: RemoteMessage): Pick<NormalizedRemoteMessage
   const actual = readString(mm.actual);
   if (!selected || !actual) return {};
   return { modelMismatch: { selected, actual } };
+}
+
+// 工具投递落库时在 agentMeta.origin 写 { kind:'session', senderSessionId, senderSessionTitle? };
+// Orca 互发写 { kind:'orca', senderSessionId? }(老数据没有 senderSessionId,不出标签)。
+function readSessionOrigin(message: RemoteMessage): Pick<NormalizedRemoteMessage, 'sessionOrigin'> {
+  const origin = readRecord(message.agentMeta?.origin);
+  if (!origin || (origin.kind !== 'session' && origin.kind !== 'orca')) return {};
+  const senderSessionId = readString(origin.senderSessionId)?.trim();
+  if (!senderSessionId) return origin.kind === 'session' ? { sessionOrigin: {} } : {};
+  const senderSessionTitle = origin.kind === 'session' ? readString(origin.senderSessionTitle)?.trim() : undefined;
+  const senderBotName = origin.kind === 'session' && readString(origin.senderBotId)
+    ? (readString(origin.senderBotName)?.trim() || readString(origin.senderBotId)?.trim())
+    : undefined;
+  return {
+    sessionOrigin: {
+      senderSessionId,
+      ...(senderSessionTitle ? { senderSessionTitle } : {}),
+      ...(senderBotName ? { senderBotName } : {}),
+    },
+  };
 }
 
 // scheduler runner 落库时在 agentMeta.origin 写 { kind:'scheduler', scheduleId, scheduleName? }

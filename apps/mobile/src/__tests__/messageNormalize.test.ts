@@ -7,6 +7,7 @@ import {
 import { composerDocumentFromSerializedMessage } from '@/session/composerDocument';
 import { buildMobileMessageCopyText } from '@/session/messageActions';
 import { normalizeRemoteMessages } from '@/session/messageNormalize';
+import { isShareableMessage } from '@/session/shareSelectionStore';
 import { buildMobileMessageRenderItems } from '@/session/messageRenderModel';
 import {
   MOBILE_TOOL_INPUT_PROJECTION_THRESHOLD_BYTES,
@@ -1034,8 +1035,17 @@ describe('normalizeRemoteMessages', () => {
     expect(items[0]).toMatchObject({ kind: 'system', label: 'error' });
     expect(items[0].body).toContain('还没有配置可用的 API Key');
     expect(items[0].body).toContain('设置 → 模型供应商');
-    // 非鉴权错误维持原文
-    expect(items[1].body).toBe('something exploded');
+    // 未分类错误使用本地化摘要，技术原文留给详情。
+    expect(items[1].body).toBe(i18n.t('session.tail.replyFailed'));
+    expect(items[1].rawError).toBe('something exploded');
+  });
+
+  it('localizes a persisted output limit in message history', () => {
+    const items = normalizeRemoteMessages([message({
+      id: 'output-limit', role: 'error',
+      content: JSON.stringify({ message: 'Pi reached the model output limit.', reason: 'output-limit' }),
+    })]);
+    expect(items[0]).toMatchObject({ kind: 'system', label: 'error', body: i18n.t('session.tail.outputLimit') });
   });
 
   it('localizes persisted tool-loop errors from reason and bounded details', () => {
@@ -1121,6 +1131,88 @@ describe('normalizeRemoteMessages', () => {
       ['assistant-ignored', undefined],
     ]);
   });
+
+  it('reads the sending session of tool-sent and Orca messages without mixing it into automation', () => {
+    const items = normalizeRemoteMessages([
+      message({
+        id: 'tool-sent',
+        role: 'user',
+        content: 'please review',
+        agentMeta: {
+          origin: {
+            kind: 'session',
+            senderSessionId: 'caller',
+            displayText: 'please review',
+            senderSessionTitle: 'Release checklist',
+          },
+        },
+      }),
+      message({
+        id: 'orca-report',
+        role: 'user',
+        content: JSON.stringify({ orcaSource: 'worker', content: 'Done' }),
+        agentMeta: { origin: { kind: 'orca', senderLabel: 'Reviewer', senderSessionId: 'worker-1' } },
+      }),
+      message({
+        id: 'teammate-sent',
+        role: 'user',
+        content: 'please sort feedback',
+        agentMeta: {
+          origin: {
+            kind: 'session',
+            senderSessionId: 'bot-task',
+            displayText: 'please sort feedback',
+            senderSessionTitle: 'Weekly feedback',
+            senderBotId: 'bot-1',
+            senderBotName: 'Cindy',
+          },
+        },
+      }),
+      message({
+        id: 'shared-guest',
+        role: 'user',
+        content: 'redacted by host',
+        agentMeta: { origin: { kind: 'session' } },
+      }),
+      message({
+        id: 'legacy-orca',
+        role: 'user',
+        content: 'legacy',
+        agentMeta: { origin: { kind: 'orca', senderLabel: 'Lead' } },
+      }),
+    ]);
+
+    expect(items.map((item) => [item.source.id, item.sessionOrigin, item.automationOrigin])).toEqual([
+      ['tool-sent', { senderSessionId: 'caller', senderSessionTitle: 'Release checklist' }, undefined],
+      ['orca-report', { senderSessionId: 'worker-1' }, undefined],
+      ['teammate-sent', { senderSessionId: 'bot-task', senderSessionTitle: 'Weekly feedback', senderBotName: 'Cindy' }, undefined],
+      ['shared-guest', {}, undefined],
+      ['legacy-orca', undefined, undefined],
+    ]);
+  });
+
+  it.each(['telegram', 'slack', 'feishu', 'lark', 'discord', 'wechat', 'wecom', 'dingtalk'])(
+    'ignores additive local %s context metadata and retains ordinary user presentation',
+    (im) => {
+      const text = 'a'.repeat(20_100);
+      const url = 'https://example.invalid/image.png';
+      const [item] = normalizeRemoteMessages([message({
+        id: 'local-im',
+        role: 'user',
+        content: { text, images: [{ url, originalName: 'image.png' }] },
+        agentMeta: {
+          imSource: {
+            im, userText: text, contentFormat: 'user-text',
+            contextSnapshot: { groupContext: 'background', groupMessageCount: 1 },
+          },
+        },
+      })]);
+      expect(item).toMatchObject({ body: text, kind: 'user', align: 'user' });
+      expect(item.hookSource).toBeUndefined();
+      expect(item.attachments).toEqual(expect.arrayContaining([expect.objectContaining({ uri: url })]));
+      expect(isShareableMessage(item)).toBe(true);
+    },
+  );
 
   it('normalizes Telegram hook source into a left-aligned Cindy card payload', () => {
     const [item, unknown] = normalizeRemoteMessages([
@@ -1339,6 +1431,23 @@ describe('normalizeRemoteMessages — /goal 持久记录与 plan_review 状态',
 
 
 describe('companion timeline', () => {
+  it.each([false, true])('keeps task instructions out of live/history display (source order: %s)', (preserveSourceOrder) => {
+    const content = '已向后台任务发送消息：读取 /workspace/project/AGENTS.md 并核对执行授权。';
+    const task = { v: 1, role: 'interjection', delegationId: 'job', fromBotId: 'bot', fromBotName: 'Writer', toBotId: null, toBotName: 'Cindy', parentSessionId: 's1', childSessionId: 'child', objective: 'Write report' };
+    const legacy = message({ id: 'trace', role: 'assistant', content, agentMeta: { botCollaboration: task } });
+    const rows = normalizeRemoteMessages([
+      legacy,
+      message({ id: 'anchor', role: 'assistant', content, agentMeta: { botCollaboration: { ...task, role: 'delegation-request' } } }),
+      message({ id: 'user', role: 'user', content }),
+      message({ id: 'assistant', role: 'assistant', content }),
+      message({ id: 'invalid', role: 'assistant', content, agentMeta: { botCollaboration: { ...task, v: 2 } } }),
+    ], { preserveSourceOrder });
+    expect(rows.find(row => row.source.id === 'trace')).toMatchObject({ body: '', companion: { kind: 'task' } });
+    expect(rows.find(row => row.source.id === 'anchor')).toMatchObject({ body: '', companion: { kind: 'task' } });
+    for (const id of ['user', 'assistant', 'invalid']) expect(rows.find(row => row.source.id === id)?.body).toBe(content);
+    expect(legacy.content).toBe(content);
+  });
+
   it('preserves empty task anchors and private thread links for the mobile renderer', () => {
     const task = { v: 1, role: 'delegation-request', delegationId: 'job', fromBotId: 'bot', fromBotName: 'Writer', toBotId: null, toBotName: 'Cindy', parentSessionId: 's1', childSessionId: 'child', objective: 'Write report' };
     const direct = { v: 1, threadId: 'private', viewerBotId: 'bot', peerBotId: 'peer', peerBotName: 'Dash', direction: 'sent', sequence: 1, preview: 'Discuss report' };
@@ -1352,4 +1461,29 @@ describe('companion timeline', () => {
     expect(rows[2]).toMatchObject({ kind: 'assistant', body: 'Regular reply' });
     expect(rows[2].companion).toBeUndefined();
   });
+});
+
+it('keeps one companion task after its initiating explanation and before its completion reply', () => {
+  const meta = { v: 1, role: 'delegation-request', delegationId: 'd', fromBotId: 'bot', fromBotName: 'Cindy', toBotId: null, toBotName: 'Cindy', parentSessionId: 's1', childSessionId: 'child', objective: 'Change' };
+  const input = [
+    message({ id: 'start', role: 'user', content: 'Change' }),
+    message({ id: 'task', role: 'assistant', content: '', agentMeta: { botCollaboration: meta } }),
+    message({ id: 'intro', role: 'assistant', content: 'Started' }),
+    message({ id: 'trigger', role: 'user', content: 'finished', agentMeta: { synthetic: true } }),
+    message({ id: 'done', role: 'assistant', content: 'Done' }),
+  ];
+  const items = buildMobileMessageRenderItems(input, { preserveSourceOrder: true, isSessionStreaming: true });
+  expect(items.flatMap((item) => item.type === 'message' ? [item.message.source.id] : [])).toEqual(['start', 'intro', 'task', 'trigger', 'done']);
+});
+
+it.each(['steer', 'new', 'completion'])('pairs companion introduction across steer only: %s', (kind) => {
+  const meta = { v: 1, role: 'delegation-request', delegationId: 'd', fromBotId: 'bot', fromBotName: 'Cindy', toBotId: null, toBotName: 'Cindy', parentSessionId: 's1', childSessionId: 'child', objective: 'Change' };
+  const rows = normalizeRemoteMessages([
+    message({ id: 'start', role: 'user', content: 'Change' }),
+    message({ id: 'task', role: 'assistant', content: '', agentMeta: { botCollaboration: meta } }),
+    message({ id: 'interruption', role: 'user', content: 'Also', agentMeta: kind === 'steer' ? { delivery: 'steer' } : kind === 'completion' ? { synthetic: true } : {} }),
+    message({ id: 'intro', role: 'assistant', content: 'Started' }),
+  ], { preserveSourceOrder: true });
+  const ids = rows.map((row) => row.source.id);
+  expect(ids.indexOf('task') > ids.indexOf('intro')).toBe(kind === 'steer');
 });

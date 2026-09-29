@@ -9,14 +9,15 @@
  *      在遮罩下查不出来。向导曾漏掉这个切换,只有编辑弹窗有(见 SettingsTextInput)。
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildUserProvider, BUNDLED_CATALOG, type ProviderView } from '@cindy/model-providers';
+import { buildUserProvider, BUNDLED_CATALOG, parseModelsListResponse, modelProtocolComparison, type ProviderView } from '@cindy/model-providers';
 
+const testI18n = vi.hoisted(() => ({ language: 'zh-CN' }));
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'zh-CN' } }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: testI18n }),
 }));
 
 vi.mock('@/hooks/useCodexAuth', () => ({
@@ -35,6 +36,9 @@ vi.mock('@/lib/toast', () => ({
 
 vi.mock('@/lib/customProviders', () => ({
   createCustomProvider: vi.fn(),
+  updateCustomProvider: vi.fn(),
+  deleteCustomProvider: vi.fn(async () => undefined),
+  providerViewToCustomProviderConfig: (p: ProviderView) => ({ id: p.id, name: p.name, auth: p.auth, runtimes: Object.fromEntries(p.agents.map(a => [a, { baseUrl: p.routing[a]!.upstream, wireProtocol: p.routing[a]!.wireProtocol, models: p.models[a] }])) }),
 }));
 
 vi.mock('@/lib/customProviderId', () => ({
@@ -51,7 +55,7 @@ vi.mock('@/components/icons/ProviderLogoMark', () => ({
 }));
 
 import { AddProviderWizard, OFFICIAL_API_PRESETS } from '@/components/settings/AddProviderWizard';
-import { createCustomProvider } from '@/lib/customProviders';
+import { createCustomProvider, updateCustomProvider, deleteCustomProvider } from '@/lib/customProviders';
 
 const anthropicProvider = {
   id: 'anthropic',
@@ -239,9 +243,61 @@ function renderWizard(presetId: string) {
   );
 }
 
+it.each([
+  ['zh-CN', '小米'],
+  ['zh-TW', '小米'],
+  ['en', 'Xiaomi'],
+])('finds the displayed MiMo brand in %s', async (language, query) => {
+  testI18n.language = language;
+  const presets = BUNDLED_CATALOG.presets!.filter(p =>
+    ['xiaomi-token-plan-ams', 'xiaomi-token-plan-sgp'].includes(p.id),
+  );
+  expect(presets).toHaveLength(2);
+  vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValue({ presets: [...presets, deepseekPreset] });
+  render(<AddProviderWizard providers={[]} onOpenCustomForm={vi.fn()} onClose={vi.fn()} onDone={vi.fn()} />);
+  await screen.findByText('DeepSeek');
+  fireEvent.change(screen.getByPlaceholderText('settings.providers.wizard.searchPlaceholder'), { target: { value: query } });
+  expect(screen.getAllByText('settings.providers.models.subscriptionProduct')).toHaveLength(2);
+  expect(screen.queryByText('DeepSeek')).toBeNull();
+});
+
+it.each(['xiaomi-mimo-token-plan-cn', 'xiaomi-token-plan-ams', 'xiaomi-token-plan-sgp'])(
+  'presents %s as a subscription with the dedicated key hint', async id => {
+    const preset = BUNDLED_CATALOG.presets!.find(p => p.id === id)!;
+    vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValue({ presets: [preset, deepseekPreset] });
+    render(<AddProviderWizard providers={[]} onOpenCustomForm={vi.fn()} onClose={vi.fn()} onDone={vi.fn()} />);
+    const hint = await screen.findByText('settings.providers.models.subscriptionProduct');
+    fireEvent.click(hint.closest('button')!);
+    expect(await screen.findByPlaceholderText('tp-…')).toBeTruthy();
+    expect(screen.getByText('settings.providers.wizard.mimoTokenPlanNote')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'settings.providers.wizard.setupLink.apiKey' }).getAttribute('href')).toBe('https://platform.xiaomimimo.com/token-plan');
+    expect(screen.queryByPlaceholderText('sk-…')).toBeNull();
+  },
+);
+
+it.each(['openrouter', 'minimax-cn', 'minimax-global', 'moonshot-kimi-code', 'github-copilot', 'nous'])(
+  'shows the same sign-in/API choice in the supplier list and connection page for %s', async id => {
+    const preset = BUNDLED_CATALOG.presets!.find(p => p.id === id)!;
+    expect(preset).toBeDefined();
+    vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValue({ presets: [preset, deepseekPreset] });
+    render(<AddProviderWizard providers={[]} onOpenCustomForm={vi.fn()} onClose={vi.fn()} onDone={vi.fn()} />);
+    const hint = await screen.findByText('settings.providers.wizard.metaLoginOrApi');
+    const row = hint.closest('button')!;
+    expect(row).not.toBeNull();
+    expect(within(row).queryByText('settings.providers.wizard.metaApiKey')).toBeNull();
+    expect(screen.getByText('settings.providers.wizard.metaApiKey')).toBeTruthy();
+    fireEvent.click(row);
+    expect(await screen.findByRole('button', { name: id === 'openrouter' ? 'settings.providers.button.authorize' : 'settings.providers.wizard.authorizeWithDeviceCode' })).toBeTruthy();
+    expect(screen.getByText('settings.providers.wizard.useApiKey')).toBeTruthy();
+    expect(screen.queryByPlaceholderText('sk-…')).toBeNull();
+  },
+);
+
 beforeEach(() => {
+  testI18n.language = 'zh-CN';
   (window as unknown as { electronAPI: unknown }).electronAPI = {
     maker: {
+      onProviderOAuthProgress: vi.fn(() => () => undefined),
       localModelList: vi.fn(async () => ({
         status: { runtime: 'ollama', kind: 'absent', appInstalled: false },
         models: [],
@@ -342,7 +398,8 @@ describe('AddProviderWizard — preset 直达', () => {
       expect(screen.getByText('settings.providers.wizard.nameLabel')).not.toBeNull(),
     );
     expect(screen.getByDisplayValue('Anthropic API')).not.toBeNull();
-    expect(screen.getAllByText(/api\.anthropic\.com/)).toHaveLength(3);
+    expect(screen.queryByText(/api\.anthropic\.com/)).toBeNull();
+    expect(screen.getByRole('link', { name: 'settings.providers.wizard.setupLink.apiKey' }).getAttribute('href')).toBe('https://console.anthropic.com/settings/keys');
   });
 
   it('官方 API 预设:列模型失败 → 第三步仍有推荐模型预勾,可完成(Greptile P1 回归)', async () => {
@@ -369,7 +426,7 @@ describe('AddProviderWizard — preset 直达', () => {
     // 降级:推荐模型仍在清单里,完成按钮可用(不被空列表堵死)。
     expect(screen.getByText('Claude Opus 5')).not.toBeNull();
     expect(screen.getByText('Claude Sonnet 5')).not.toBeNull();
-    expect(screen.getByText('Claude Haiku 4.5')).not.toBeNull();
+    expect(screen.getAllByText('Claude Haiku 4.5').length).toBeGreaterThan(0);
     expect(
       (screen.getByText('settings.providers.wizard.finish').closest('button') as HTMLButtonElement)
         .disabled,
@@ -491,7 +548,7 @@ describe('AddProviderWizard — preset 直达', () => {
     expect(keys.pi).toBe('sk-test');
   });
 
-  it('预设显式 Pi 模型全部取消后不从 Claude 重新生成 Pi runtime', async () => {
+  it('取消 Pi 模型保留目录但不开启，也不从 Claude 复制模型', async () => {
     renderWizard('explicit-pi');
 
     await waitFor(() => expect(screen.getByDisplayValue('Explicit Pi')).not.toBeNull());
@@ -508,8 +565,8 @@ describe('AddProviderWizard — preset 直达', () => {
       baseUrl: 'https://explicit.example/anthropic',
       models: [{ id: 'claude-model', name: 'Claude Model', discoveredMetadata: {} }],
     });
-    expect(config.runtimes.pi).toBeUndefined();
-    expect(keys.pi).toBeUndefined();
+    expect(config.runtimes.pi?.models).toEqual([{ id: 'pi-model', name: 'Pi Model', discoveredMetadata: {}, defaultEnabled: false }]);
+    expect(keys.pi).toBe('sk-test');
   });
 
   it('Claude runtime 带自定义请求路径时不自动生成 Pi runtime', async () => {
@@ -582,6 +639,67 @@ describe('AddProviderWizard — preset 直达', () => {
       baseUrl: 'http://localhost:11434/custom',
       requestPath: '/tenant/acme/infer',
     });
+  });
+
+  it('copies a filled account slot across editable engines', async () => {
+    const preset = {
+      id: 'azure-slots',
+      name: 'Azure Slots',
+      runtimes: {
+        pi: {
+          baseUrl: 'https://{resource}.openai.azure.com/openai/v1',
+          baseUrlEditable: true,
+          wireProtocol: 'openai-chat' as const,
+          models: [{ id: 'm', name: 'M' }],
+        },
+        codex: {
+          baseUrl: 'https://{resource}.openai.azure.com/openai/v1',
+          baseUrlEditable: true,
+          wireProtocol: 'openai-responses' as const,
+          models: [{ id: 'm', name: 'M' }],
+        },
+      },
+    };
+    vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValueOnce({ presets: [preset] });
+    renderWizard('azure-slots');
+    const inputs = await screen.findAllByDisplayValue('https://{resource}.openai.azure.com/openai/v1');
+    expect(inputs).toHaveLength(2);
+    fireEvent.change(inputs[0], { target: { value: 'https://myres.openai.azure.com/openai/v1' } });
+    expect(screen.getAllByDisplayValue('https://myres.openai.azure.com/openai/v1')).toHaveLength(2);
+  });
+
+  it('accepts the official Vertex global host and rejects an unrelated host on the Vertex template', async () => {
+    const preset = {
+      id: 'google-vertex',
+      name: 'Google Vertex AI',
+      runtimes: {
+        pi: {
+          baseUrl: 'https://{location}-aiplatform.googleapis.com',
+          baseUrlEditable: true,
+          wireProtocol: 'google-generative-ai' as const,
+          models: [{ id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }],
+        },
+        codex: {
+          baseUrl: 'https://{location}-aiplatform.googleapis.com',
+          baseUrlEditable: true,
+          wireProtocol: 'google-generative-ai' as const,
+          models: [{ id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }],
+        },
+      },
+    };
+    vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValueOnce({ presets: [preset] });
+    renderWizard('google-vertex');
+    const inputs = await screen.findAllByDisplayValue('https://{location}-aiplatform.googleapis.com');
+    const next = screen.getByText('settings.providers.wizard.next').closest('button') as HTMLButtonElement;
+    fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'vertex-key' } });
+    expect(next.disabled).toBe(true);
+
+    fireEvent.change(inputs[0], { target: { value: 'https://attacker.example' } });
+    expect(next.disabled).toBe(true);
+
+    fireEvent.change(inputs[0], { target: { value: 'https://aiplatform.googleapis.com' } });
+    expect(screen.getAllByDisplayValue('https://aiplatform.googleapis.com')).toHaveLength(2);
+    expect(next.disabled).toBe(false);
   });
 
   it('LiteLLM:模型发现失败时可手填模型 ID，并以 none 鉴权保存', async () => {
@@ -662,8 +780,8 @@ describe('AddProviderWizard — preset 直达', () => {
 
     await waitFor(() => expect(createCustomProvider).toHaveBeenCalledTimes(1));
     const config = vi.mocked(createCustomProvider).mock.calls[0][0];
-    expect(config.runtimes['claude-code']?.models.map((model) => model.id)).toEqual(['minimax-m3']);
-    expect(config.runtimes.codex?.models.map((model) => model.id)).toEqual(['glm-5.2']);
+    expect(config.runtimes['claude-code']?.models.filter(m => m.defaultEnabled !== false).map((model) => model.id)).toEqual(['minimax-m3']);
+    expect(config.runtimes.codex?.models.filter(m => m.defaultEnabled !== false).map((model) => model.id)).toEqual(['glm-5.2']);
   });
 
   it('拉取新增模型带端点上报的 contextWindow 入库(Codex P1 回归)', async () => {
@@ -768,7 +886,7 @@ describe('AddProviderWizard — preset 直达', () => {
       }),
     );
     const [config, keys] = vi.mocked(createCustomProvider).mock.calls[0];
-    expect(config.runtimes.codex).toMatchObject({
+    expect({ ...config.runtimes.codex, models: config.runtimes.codex?.models.filter(m => m.defaultEnabled !== false) }).toMatchObject({
       baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
       wireProtocol: 'openai-chat',
       models: [
@@ -813,7 +931,7 @@ describe('AddProviderWizard — preset 直达', () => {
       baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
       wireProtocol: 'openai-chat',
     });
-    expect(runtime?.models).toEqual([{ id: 'glm-5.2', name: 'GLM-5.2', discoveredMetadata: {} }]);
+    expect(runtime?.models.filter(m => m.defaultEnabled !== false)).toEqual([{ id: 'glm-5.2', name: 'GLM-5.2', discoveredMetadata: {} }]);
   });
 
   it('可编辑预设改为同源 endpoint 后继续合并 Responses 目录', async () => {
@@ -925,6 +1043,26 @@ describe('AddProviderWizard — preset 直达', () => {
   });
 });
 
+it.each(['apiKey', 'oauth'] as const)('keeps retained single-instance %s connections out of the add list across disconnect and delete', async (method) => {
+  const provider = {
+    ...anthropicProvider, id: 'gemini', name: 'Single Connection', agents: [], models: {},
+    auth: { method, oauth: { kind: 'native' } },
+    audioModels: [{ id: 'media', name: 'Media' }],
+  } as unknown as ProviderView;
+  const props = { onOpenCustomForm: vi.fn(), onClose: vi.fn(), onDone: vi.fn() };
+  const view = render(<AddProviderWizard {...props} providers={[provider]} />);
+  expect(await screen.findByText('Single Connection')).toBeTruthy();
+  for (const state of [
+    { connected: true, removed: false },
+    { connected: false, removed: false },
+    { connected: false, removed: true },
+    { connected: true, removed: false },
+  ]) {
+    view.rerender(<AddProviderWizard {...props} providers={[{ ...provider, ...state }]} />);
+    expect(screen.queryByText('Single Connection') !== null).toBe(state.removed);
+  }
+});
+
 it.each(['audioModels', 'embeddingModels'] as const)('opens key setup for a disconnected media-only builtin with %s', async (field) => {
   const mediaProvider = {
     ...anthropicProvider, id: 'gemini', name: 'Media Only', agents: [], models: {},
@@ -966,4 +1104,314 @@ it('preserves each runtime preset media type when discovery is unavailable', asy
   const config = vi.mocked(createCustomProvider).mock.calls[0][0];
   expect(config.runtimes['claude-code']?.models[0]).toMatchObject(image);
   expect(config.runtimes.codex?.models[0]).toMatchObject(video);
+});
+
+it('imports the same discovered OpenRouter identity, capabilities and prices into all three engines', async () => {
+  const preset = structuredClone(BUNDLED_CATALOG.presets!.find(p => p.id === 'openrouter')!);
+  for (const runtime of Object.values(preset.runtimes)) {
+    runtime!.models = [{ id: 'stale/model', name: 'Stale preset' }];
+  }
+  window.electronAPI.maker.listProviderPresets = vi.fn(async () => ({ presets: [preset] }));
+  const models = parseModelsListResponse({ data: [{
+    id: 'deepseek/deepseek-v4-pro', name: 'Discovered DeepSeek', context_length: 1048576,
+    architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+    pricing: { prompt: '0.00000075864', completion: '0.00000151728' },
+  }] }, 'https://openrouter.ai/api/v1/models')!;
+  window.electronAPI.maker.fetchProviderModels = vi.fn(async () => ({ ok: true, models }));
+  renderWizard('openrouter');
+  expect(await screen.findByText('settings.providers.wizard.useApiKey')).toBeTruthy();
+  expect(screen.queryByPlaceholderText('sk-…')).toBeNull();
+  fireEvent.click(screen.getByText('settings.providers.wizard.useApiKey'));
+  fireEvent.click(screen.getByText('settings.providers.wizard.back'));
+  expect(screen.queryByPlaceholderText('sk-…')).toBeNull();
+  fireEvent.click(screen.getByText('settings.providers.wizard.useApiKey'));
+  expect(screen.queryByText('settings.providers.button.authorize')).toBeNull();
+  await screen.findByDisplayValue('OpenRouter');
+  fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'sk-test' } });
+  fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+  await screen.findByText('Discovered DeepSeek');
+  expect(screen.queryByText('Stale preset')).toBeNull();
+  expect(screen.queryByText('settings.providers.wizard.recommended')).toBeNull();
+  fireEvent.click(screen.getByText('Discovered DeepSeek'));
+  fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+  await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+  const saved = vi.mocked(createCustomProvider).mock.calls[0][0];
+  const provider = buildUserProvider(saved, { presets: [preset], modelRegistry: BUNDLED_CATALOG.modelRegistry });
+  for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+    expect(saved.runtimes[agent]?.models.map(m => m.id)).toEqual(['deepseek/deepseek-v4-pro']);
+    const model = provider.models[agent]![0];
+    expect(model).toMatchObject({ contextWindow: 1048576, nativeApi: 'openai-completions',
+      cost: { input: 0.75864, output: 1.51728 } });
+    expect(modelProtocolComparison(provider, { [agent]: model }).forAgent(agent)?.mode)
+      .toBe(agent === 'pi' ? 'matching' : 'compatibility');
+    expect(model.defaultEnabled).toBe(agent === 'pi');
+  }
+});
+
+describe.each([true, false])('native defaults with discovery available=%s', discoveryAvailable => {
+  it.each([
+    ['openai/gpt-6-astra', 'openai-responses', [false, true, true]],
+    ['anthropic/claude-fable-5', 'anthropic-messages', [true, false, true]],
+    ['deepseek/deepseek-v4-pro', 'openai-completions', [false, false, true]],
+    ['google/gemini-3.8-flash', 'google-generative-ai', [false, false, true]],
+  ] as const)('enables only matching engines when selecting %s', async (id, nativeApi, enabled) => {
+    const agents = ['claude-code', 'codex', 'pi'] as const;
+    const preset = structuredClone(BUNDLED_CATALOG.presets!.find(p => p.id === 'openrouter')!);
+    for (const agent of agents) {
+      const model = preset.runtimes[agent]!.models.find(m => m.id === id)!;
+      expect(model).toBeDefined();
+      preset.runtimes[agent]!.models = [{ ...model, name: 'Selected model', defaultEnabled: false }];
+    }
+    vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValue({ presets: [preset] });
+    vi.mocked(window.electronAPI.maker.fetchProviderModels).mockResolvedValue(discoveryAvailable
+      ? { ok: true, models: [{ id, name: 'Selected model' }] }
+      : { ok: false });
+    renderWizard('openrouter');
+    fireEvent.click(await screen.findByText('settings.providers.wizard.useApiKey'));
+    fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'sk-test' } });
+    fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+    await waitFor(() => expect(screen.queryByText('settings.providers.wizard.fetching')).toBeNull());
+    fireEvent.click(await screen.findByText('Selected model'));
+    fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+    await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+    const saved = vi.mocked(createCustomProvider).mock.calls[0][0];
+    const provider = buildUserProvider(saved, { presets: [preset], modelRegistry: BUNDLED_CATALOG.modelRegistry });
+    agents.forEach((agent, index) => {
+      // Model selection must not be persisted as a per-engine compatibility override.
+      expect(saved.runtimes[agent]!.models.find(m => m.id === id)).not.toHaveProperty('defaultEnabled');
+      const model = provider.models[agent]!.find(m => m.id === id)!;
+      expect(model).toMatchObject({ nativeApi, defaultEnabled: enabled[index] });
+      expect(modelProtocolComparison(provider, { [agent]: model }).forAgent(agent)?.mode)
+        .toBe(enabled[index] ? 'matching' : 'compatibility');
+    });
+  });
+});
+
+it('imports an OpenCode Go Responses model into all three engines', async () => {
+  const preset = structuredClone(BUNDLED_CATALOG.presets!.find(p => p.id === 'opencode-go')!);
+  for (const runtime of Object.values(preset.runtimes)) {
+    for (const model of runtime!.models) model.defaultEnabled = false;
+  }
+  window.electronAPI.maker.listProviderPresets = vi.fn(async () => ({ presets: [preset] }));
+  // Go's shared discovery only returns IDs. Its protocol/capabilities come from the catalog.
+  window.electronAPI.maker.fetchProviderModels = vi.fn(async () => ({ ok: true,
+    models: [{ id: 'gpt-5.6-luna', name: 'Go Luna' }] }));
+  renderWizard('opencode-go');
+  await screen.findByDisplayValue('OpenCode Go');
+  fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'sk-test' } });
+  fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+  fireEvent.click(await screen.findByText('Go Luna'));
+  fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+  await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+  const saved = vi.mocked(createCustomProvider).mock.calls[0][0];
+  expect(saved.runtimes.pi?.models.filter(m => m.defaultEnabled !== false).map(m => m.id)).toEqual(['gpt-5.6-luna']);
+  expect(saved.runtimes['claude-code']?.models.find(m => m.id === 'gpt-5.6-luna')).not.toHaveProperty('api');
+  expect(saved.runtimes.codex?.models.find(m => m.id === 'gpt-5.6-luna')).not.toHaveProperty('api');
+  const model = buildUserProvider(saved, { presets: [preset] }).models.pi?.find(m => m.id === 'gpt-5.6-luna');
+  expect(model).toMatchObject({ piApi: 'openai-responses', supportsImageInput: true });
+  const projected = buildUserProvider(saved, { presets: [preset] });
+  for (const agent of projected.agents) {
+    expect(projected.models[agent]?.find(m => m.id === 'gpt-5.6-luna')).toMatchObject({ api: 'openai-responses', defaultEnabled: agent !== 'claude-code' });
+    expect(saved.runtimes[agent]?.models.find(m => m.id === 'gpt-5.6-luna')).not.toHaveProperty('route');
+  }
+});
+
+
+it.each(['finish', 'back', 'close'] as const)('logs in without a key and handles %s with the owned account', async action => {
+  const preset = { id: 'openrouter', name: 'OpenRouter', runtimes: {
+    pi: { baseUrl: 'https://openrouter.ai/api/v1', wireProtocol: 'openai-chat' as const,
+      models: [{ id: 'test/model', name: 'Test model', api: 'openai-completions' as const }] },
+  } };
+  const maker = window.electronAPI.maker;
+  vi.mocked(maker.listProviderPresets).mockResolvedValue({ presets: [preset] });
+  let created!: Parameters<typeof createCustomProvider>[0];
+  vi.mocked(createCustomProvider).mockImplementation(async config => { created = config; return { ok: true }; });
+  Object.assign(maker, {
+    providerOAuthLogin: vi.fn(async () => ({ ok: true })),
+    providerOAuthCancel: vi.fn(async () => ({ ok: true })),
+    onProviderOAuthProgress: vi.fn(() => () => undefined),
+    listProviders: vi.fn(async () => ({ providers: [{ ...buildUserProvider(created), connected: true }] })),
+  });
+  const view = renderWizard('openrouter');
+  fireEvent.click(await screen.findByRole('button', { name: 'settings.providers.button.authorize' }));
+  await screen.findByText('Test model');
+  expect(screen.getByText('settings.providers.wizard.recommended')).toBeTruthy();
+  expect(created.auth).toMatchObject({ method: 'oauth', oauth: { tokenUrl: 'https://openrouter.ai/api/v1/auth/keys' } });
+  if (action !== 'finish') {
+    if (action === 'back') fireEvent.click(screen.getByRole('button', { name: 'settings.providers.wizard.back' }));
+    else view.unmount();
+    await waitFor(() => expect(deleteCustomProvider).toHaveBeenCalledWith(created.id));
+    expect(updateCustomProvider).not.toHaveBeenCalled();
+    return;
+  }
+  fireEvent.click(screen.getByRole('button', { name: 'settings.providers.wizard.finish' }));
+  await waitFor(() => expect(updateCustomProvider).toHaveBeenCalledWith(expect.objectContaining({ id: created.id, auth: created.auth }), {}));
+  const deletedBefore = vi.mocked(deleteCustomProvider).mock.calls.length;
+  view.unmount();
+  expect(vi.mocked(deleteCustomProvider).mock.calls.length).toBe(deletedBefore);
+});
+
+it('does not discard the OAuth connection if the wizard closes while finish is saving', async () => {
+  const preset = { id: 'openrouter', name: 'OpenRouter', runtimes: {
+    pi: { baseUrl: 'https://openrouter.ai/api/v1', wireProtocol: 'openai-chat' as const,
+      models: [{ id: 'test/model', name: 'Test model', defaultEnabled: true, api: 'openai-completions' as const }] },
+  } };
+  const maker = window.electronAPI.maker;
+  vi.mocked(maker.listProviderPresets).mockResolvedValue({ presets: [preset] });
+  let created!: Parameters<typeof createCustomProvider>[0];
+  vi.mocked(createCustomProvider).mockImplementation(async config => { created = config; return { ok: true }; });
+  let finishSaving!: (value: { ok: true }) => void;
+  vi.mocked(updateCustomProvider).mockImplementation(() => new Promise(resolve => { finishSaving = resolve; }));
+  Object.assign(maker, {
+    providerOAuthLogin: vi.fn(async () => ({ ok: true })),
+    providerOAuthCancel: vi.fn(async () => ({ ok: true })),
+    onProviderOAuthProgress: vi.fn(() => () => undefined),
+    listProviders: vi.fn(async () => ({ providers: [{ ...buildUserProvider(created), connected: true }] })),
+  });
+  const onClose = vi.fn();
+  const onDone = vi.fn();
+  const view = render(
+    React.createElement(AddProviderWizard, {
+      providers: [anthropicProvider],
+      entry: { kind: 'preset' as const, presetId: 'openrouter' },
+      onOpenCustomForm: vi.fn(),
+      onClose,
+      onDone,
+    }),
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'settings.providers.button.authorize' }));
+  await screen.findByText('Test model');
+  fireEvent.click(screen.getByRole('button', { name: 'settings.providers.wizard.finish' }));
+  await waitFor(() => expect(updateCustomProvider).toHaveBeenCalledOnce());
+  fireEvent.keyDown(window, { key: 'Escape' });
+  fireEvent.click(screen.getByRole('button', { name: 'settings.providers.wizard.cancel' }));
+  expect(onClose).not.toHaveBeenCalled();
+  expect(deleteCustomProvider).not.toHaveBeenCalled();
+  view.unmount();
+  expect(deleteCustomProvider).not.toHaveBeenCalled();
+  finishSaving({ ok: true });
+  await waitFor(() => expect(onDone).toHaveBeenCalledWith(created.id));
+  expect(deleteCustomProvider).not.toHaveBeenCalled();
+});
+
+it('preserves OAuth-discovered prices for every engine when finishing model selection', async () => {
+  const preset = structuredClone(BUNDLED_CATALOG.presets!.find(p => p.id === 'openrouter')!);
+  const id = 'new-vendor/oauth-discovered-model';
+  const maker = window.electronAPI.maker;
+  vi.mocked(maker.listProviderPresets).mockResolvedValue({ presets: [preset] });
+  let created!: Parameters<typeof createCustomProvider>[0];
+  vi.mocked(createCustomProvider).mockImplementation(async config => { created = config; return { ok: true }; });
+  const prices = {
+    'claude-code': { input: 0.12, output: 0.34, cacheRead: 0 },
+    codex: { input: 0.23, output: 0.45, cacheWrite: 0.56 },
+    pi: { input: 0.34, output: 0.56 },
+  };
+  Object.assign(maker, {
+    providerOAuthLogin: vi.fn(async () => ({ ok: true })),
+    providerOAuthCancel: vi.fn(async () => ({ ok: true })),
+    onProviderOAuthProgress: vi.fn(() => () => undefined),
+    listProviders: vi.fn(async () => {
+      for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+        created.runtimes[agent]!.models = [{ id, name: 'OAuth discovered model',
+          discoveredMetadata: { contextWindow: 123456 }, discoveredCost: prices[agent] }];
+      }
+      const provider = buildUserProvider(created, { presets: [preset] });
+      for (const agent of provider.agents) expect(provider.models[agent]![0].discoveredCost).toBeUndefined();
+      return { providers: [{ ...provider, connected: true }] };
+    }),
+  });
+  renderWizard('openrouter');
+  fireEvent.click(await screen.findByRole(
+    'button',
+    { name: 'settings.providers.button.authorize' },
+    { timeout: 5000 },
+  ));
+  fireEvent.click(await screen.findByText('OAuth discovered model'));
+  fireEvent.click(screen.getByRole('button', { name: 'settings.providers.wizard.finish' }));
+  await waitFor(() => expect(updateCustomProvider).toHaveBeenCalledOnce());
+  const saved = vi.mocked(updateCustomProvider).mock.calls[0][0];
+  const projected = buildUserProvider(saved, { presets: [preset] });
+  for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+    expect(saved.runtimes[agent]!.models[0].discoveredCost).toEqual(prices[agent]);
+    expect(projected.models[agent]![0].cost).toEqual(prices[agent]);
+    expect(projected.models[agent]![0].defaultEnabled).toBe(agent === 'pi');
+  }
+});
+
+
+it('imports the full Hermes inventory immediately, enables selected Pi models and retains both optional harnesses', async () => {
+  const preset = structuredClone(BUNDLED_CATALOG.presets!.find(p => p.id === 'nous')!);
+  vi.mocked(window.electronAPI.maker.listProviderPresets).mockResolvedValue({ presets: [preset] });
+  vi.mocked(window.electronAPI.maker.fetchProviderModels).mockImplementation(async spec => spec.agent === 'claude-code'
+    ? { ok: false }
+    : { ok: true, models: [{ id: 'google/gemini-test', name: 'Hermes Gemini' }, { id: 'other', name: 'Other Hermes Model' }] });
+  renderWizard('nous');
+  fireEvent.click(await screen.findByText('settings.providers.wizard.useApiKey'));
+  await screen.findByDisplayValue('Nous Research (Hermes)');
+  fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'test-key' } });
+  fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+  fireEvent.click(await screen.findByText('Hermes Gemini'));
+  fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+  await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+  const saved = vi.mocked(createCustomProvider).mock.calls[0][0];
+  const provider = buildUserProvider(saved, { presets: [preset] });
+  expect(provider.agents).toEqual(['claude-code', 'codex', 'pi']);
+  for (const agent of provider.agents) {
+    expect(provider.models[agent]?.map(m => m.id)).toEqual(['google/gemini-test', 'other']);
+    expect(provider.models[agent]?.find(m => m.id === 'google/gemini-test')?.defaultEnabled).toBe(agent === 'pi');
+    expect(provider.models[agent]?.find(m => m.id === 'other')?.defaultEnabled).toBe(false);
+  }
+});
+
+
+it('keeps legacy curated recommendations selected and newly discovered models unchecked', async () => {
+  const preset = { id: 'selection-fixture', name: 'Selection Fixture', runtimes: {
+    pi: { baseUrl: 'https://selection.example/v1', wireProtocol: 'openai-chat' as const, models: [
+      { id: 'recommended', name: 'Recommended' },
+      { id: 'disabled', name: 'Disabled', defaultEnabled: false },
+    ] },
+  } };
+  window.electronAPI.maker.listProviderPresets = vi.fn(async () => ({ presets: [preset] }));
+  window.electronAPI.maker.fetchProviderModels = vi.fn(async () => ({ ok: true, models: [
+    { id: 'recommended', name: 'Recommended' }, { id: 'unspecified', name: 'Unspecified' },
+  ] }));
+  renderWizard(preset.id);
+  await screen.findByDisplayValue('Selection Fixture');
+  fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'fixture-key' } });
+  fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+  await screen.findByText('Unspecified');
+  expect(screen.getAllByText('settings.providers.wizard.recommended')).toHaveLength(1);
+  fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+  await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+  const models = vi.mocked(createCustomProvider).mock.calls[0][0].runtimes.pi!.models;
+  expect(models.filter(model => model.defaultEnabled !== false).map(model => model.id)).toEqual(['recommended']);
+});
+
+it('sets up Sub2API from one site address and retains discovered capabilities in all engines', async () => {
+  const preset = BUNDLED_CATALOG.presets!.find(p => p.id === 'sub2api')!;
+  window.electronAPI.maker.listProviderPresets = vi.fn(async () => ({ presets: [preset] }));
+  const models = parseModelsListResponse({ models: [{ slug: 'private-sol', display_name: 'Private Sol',
+    supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }], default_reasoning_level: 'high',
+    context_window: 272000, max_context_window: 1050000,
+    input_modalities: ['text', 'image'], service_tiers: [{ id: 'priority' }],
+  }] })!;
+  window.electronAPI.maker.fetchProviderModels = vi.fn(async () => ({ ok: true, models }));
+  vi.mocked(createCustomProvider).mockResolvedValue({ ok: true });
+  renderWizard('sub2api');
+  await screen.findByDisplayValue('Sub2API');
+  fireEvent.change(screen.getAllByDisplayValue('https://{endpoint}/v1')[0], { target: { value: 'https://relay.example/team' } });
+  fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'sk-test' } });
+  fireEvent.click(screen.getByText('settings.providers.wizard.next'));
+  fireEvent.click(await screen.findByText('Private Sol'));
+  fireEvent.click(screen.getByText('settings.providers.wizard.finish'));
+  await waitFor(() => expect(createCustomProvider).toHaveBeenCalledOnce());
+  const config = vi.mocked(createCustomProvider).mock.calls[0][0];
+  for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+    const rt = config.runtimes[agent]!;
+    expect(rt.baseUrl).toBe('https://relay.example/team/v1');
+    expect(rt.modelsUrl).toBe('https://relay.example/team/v1/models?client_version=0.147.0');
+    expect(rt.catalogPresetId).toBe('sub2api');
+    expect(rt.models[0].discoveredMetadata).toMatchObject({ efforts: ['low', 'high'],
+      contextWindow: 272000, contextWindowMax: 1050000, supportsFastMode: true, supportsImageInput: true });
+  }
 });

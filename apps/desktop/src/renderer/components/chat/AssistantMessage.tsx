@@ -36,6 +36,7 @@
  *   直到 finally — 那个体验更差, 没有借鉴。
  */
 
+import { CHAT_BODY_CLASS } from './chatChrome';
 import { memo, useCallback, useMemo, useState, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, TriangleAlert } from 'lucide-react';
@@ -262,6 +263,7 @@ export const AssistantMessage = memo(function AssistantMessage({
     currentSessionId ? originDeviceId(sessionFileOrigin) : undefined,
   );
   const isRemote = Boolean(remoteHostId);
+  const sharedGuest = isSharedTaskPeer(originDeviceId(sessionFileOrigin) ?? '');
   const forkSupported = !isRemote && (!agentKind || (capabilities?.fork?.supported ?? true));
   const handleFork = useForkAtMessage({
     sessionId: currentSessionId,
@@ -320,7 +322,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           // 导致代码块溢出消息流右边界。加上 min-w-0 让 w-full 真正生效，
           // <pre> 的 overflow-x-auto 才能正常接管横向滚动。
           'w-full min-w-0',
-          'text-15 font-normal leading-[1.6]',
+          CHAT_BODY_CLASS,
           'text-[var(--msg-assistant-text)]',
         )}
       >
@@ -408,10 +410,10 @@ export const AssistantMessage = memo(function AssistantMessage({
           align="left"
           hovered={hovered}
           simplifiedBotConversation={simplifiedBotConversation}
-          onFork={canFork ? handleFork : undefined}
+          onFork={!sharedGuest && canFork ? handleFork : undefined}
           onAddToChat={messageDeepLink ? handleAddToChat : undefined}
           onShareAsImage={handleShareAsImage}
-          onDelete={currentSessionId && messageClientId ? handleDelete : undefined}
+          onDelete={!sharedGuest && currentSessionId && messageClientId ? handleDelete : undefined}
           turnMoney={turnMoney}
           turnCostUsd={turnCostUsd}
           turnCostIsEstimate={turnCostIsEstimate}
@@ -424,3 +426,4 @@ export const AssistantMessage = memo(function AssistantMessage({
     </div>
   );
 });
+import { isSharedTaskPeer } from '@cindy/device-link';

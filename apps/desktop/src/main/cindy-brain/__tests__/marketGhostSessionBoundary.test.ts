@@ -50,7 +50,24 @@ describe('market Ghost session boundary', () => {
     const afterCommitBody = installBody.slice(afterCommitStart, afterCommitEnd);
     expect(afterCommitBody).toContain('this.withCapturedLedgerMutation(ledger, () => {');
     expect(afterCommitBody).not.toContain('requireSameMarketOwner(');
-    expect(automaticBody).toContain('          true,\n          owner,\n        );');
+    expect(automaticBody).toContain("          { mode: 'automatic' },\n          owner,\n        );");
+  });
+
+  it('releases the custom-source cache lease before waiting for install consent', () => {
+    const installStart = marketServiceSource.indexOf('  private async customInstall(');
+    const installEnd = marketServiceSource.indexOf(
+      '\n  private async installDetail(',
+      installStart,
+    );
+    const installBody = marketServiceSource.slice(installStart, installEnd);
+    const lease = installBody.indexOf('manager.withDiscoveredSource(');
+    const pack = installBody.indexOf('packCustomMarketPlugin(');
+    const consent = installBody.indexOf('obtainGhostInstallConsent(');
+    expect(lease).toBeGreaterThan(-1);
+    expect(pack).toBeGreaterThan(lease);
+    expect(consent).toBeGreaterThan(pack);
+    expect(installBody.slice(lease, consent)).toContain('packCustomMarketPlugin(');
+    expect(installBody.slice(consent)).not.toContain('withDiscoveredSource(');
   });
 
   it('keeps package placement and market ledger commit in the same owner lease', () => {
@@ -188,6 +205,8 @@ describe('market Ghost session boundary', () => {
     // 只有确认旧进程退出，才切断旧市场的自动更新路由；等待失败时保留原路由，
     // 也不会尝试恢复第二份 resident 进程。
     expect(detachIndex).toBeGreaterThan(stopAndWaitIndex);
+    expect(helperBody.indexOf('if (isCurrent?.() === false)')).toBeGreaterThan(-1);
+    expect(helperBody.indexOf('if (isCurrent?.() === false)')).toBeLessThan(stopAndWaitIndex);
     expect(oauthLockIndex).toBeGreaterThan(detachIndex);
     expect(managerUpdateIndex).toBeGreaterThan(oauthLockIndex);
     expect(helperBody).toContain('marketLedger.restoreInstallation(');
@@ -201,7 +220,7 @@ describe('market Ghost session boundary', () => {
     expect(helperBody).not.toContain('GHOST_SOURCE_CONFLICT');
   });
 
-  it('runs the final market callback before both initial install and update placement', () => {
+  it('forwards the first-install check into package placement and guards update entry', () => {
     const installStart = source.indexOf(
       'async function installOrUpdateMarketGhostPackageLocked(',
     );
@@ -215,11 +234,8 @@ describe('market Ghost session boundary', () => {
       body.indexOf('const runtime = getGhostRuntime();'),
     );
 
-    expect(initialBranch.indexOf('expected.beforeCommitInLock?.();')).toBeGreaterThan(-1);
-    expect(initialBranch.indexOf('expected.beforeCommitInLock?.();')).toBeLessThan(
-      initialBranch.indexOf('await installAndDock('),
-    );
-    expect(body.match(/expected\.beforeCommitInLock\?\.\(\);/g)).toHaveLength(2);
+    expect(initialBranch).toContain('beforePackagePlacement: expected.beforeCommitInLock,');
+    expect(body.match(/expected\.beforeCommitInLock\?\.\(\);/g)).toHaveLength(1);
 
     const waitIndex = body.indexOf(
       'await getGhostNodeRuntimeBroker().stopAndWait(expected.ghostId);',

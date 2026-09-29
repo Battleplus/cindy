@@ -7,12 +7,48 @@ import { registerMakerUsageHandlers, toLegacyUsdModelPricing } from '../usageHan
 import { CodexRateLimitResetRejectedError } from '../../usage/codexRateLimitReset';
 import { IpcHarness } from './helpers/ipcHarness';
 import { zeroUsageMoney } from '../../../shared/regionalMoney';
+import * as appSessionState from '../../appSessionState';
 
 function createMakerStub(methods: Partial<Maker>): Maker {
   return methods as Maker;
 }
 
 describe('maker auth IPC handlers', () => {
+  it.each(['logout', 'auth-change'])('does not broadcast an old owner logout after %s yields', async (phase) => {
+    const owner = vi.spyOn(appSessionState, 'activeOwnerScopeKey').mockReturnValue('owner-a:1');
+    try {
+      let finish!: () => void;
+      const gate = new Promise<void>((resolve) => { finish = resolve; });
+      const harness = new IpcHarness();
+      const broadcast = vi.fn();
+      const logoutAgent = vi.fn(() => phase === 'logout' ? gate : Promise.resolve());
+      const onCodexAuthChange = vi.fn(() => phase === 'auth-change' ? gate : Promise.resolve());
+      registerMakerAuthHandlers(harness, createMakerStub({ logoutAgent }), broadcast, () => null, onCodexAuthChange);
+      const result = harness.invoke(MAKER_INVOKE.AUTH_LOGOUT, 'codex');
+      await vi.waitFor(() => expect(phase === 'logout' ? logoutAgent : onCodexAuthChange).toHaveBeenCalledOnce());
+      owner.mockReturnValue('owner-b:2');
+      finish();
+      await result;
+      expect(broadcast).not.toHaveBeenCalled();
+      if (phase === 'logout') expect(onCodexAuthChange).not.toHaveBeenCalled();
+    } finally {
+      owner.mockRestore();
+    }
+  });
+
+  it('rejects a stale owner before disconnecting any account', async () => {
+    const harness = new IpcHarness();
+    const logoutAgent = vi.fn();
+    registerMakerAuthHandlers(harness, createMakerStub({ logoutAgent }), vi.fn(), () => null);
+    await expect(
+      harness.invoke(MAKER_INVOKE.AUTH_LOGOUT, 'codex', {
+        dataOwnerId: 'stale-owner',
+        ownerGeneration: -1,
+      }),
+    ).rejects.toThrow();
+    expect(logoutAgent).not.toHaveBeenCalled();
+  });
+
   it('delegates auth state lookup to Maker', async () => {
     const harness = new IpcHarness();
     const getAgentAuthState = vi.fn().mockResolvedValue({ authenticated: true });
@@ -1201,6 +1237,7 @@ describe('maker usage IPC handlers', () => {
       assertTrustedSender: vi.fn(),
       readUsageHistory: vi.fn().mockResolvedValue(emptyHistory),
       emptyUsageHistory: vi.fn(() => emptyHistory),
+      readUsageDeviceRows: vi.fn(),
       ...over,
     };
   }
@@ -1516,6 +1553,51 @@ describe('maker usage IPC handlers', () => {
 
     await harness.invoke(MAKER_INVOKE.USAGE_HISTORY);
     expect(readUsageHistory).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it('passes the device scope through and drops malformed values', async () => {
+    const harness = new IpcHarness();
+    const readUsageHistory = vi.fn().mockResolvedValue(emptyHistory);
+
+    registerMakerUsageHandlers(harness, makeUsageDeps({ readUsageHistory }));
+
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { days: 'all', device: 'all' });
+    expect(readUsageHistory).toHaveBeenLastCalledWith({ days: 'all', device: 'all' });
+
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { device: 'device-b' });
+    expect(readUsageHistory).toHaveBeenLastCalledWith({ device: 'device-b' });
+
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { device: 42 });
+    expect(readUsageHistory).toHaveBeenLastCalledWith(undefined);
+
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { includeTasks: true });
+    expect(readUsageHistory).toHaveBeenLastCalledWith({ includeTasks: true });
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { includeTasks: 'yes' });
+    expect(readUsageHistory).toHaveBeenLastCalledWith(undefined);
+
+    await harness.invoke(MAKER_INVOKE.USAGE_HISTORY, { device: 'x'.repeat(200) });
+    expect(readUsageHistory).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it('serves raw device rows to device-link peers without a trusted-sender check', async () => {
+    const harness = new IpcHarness();
+    const response = { format: 'usage-device-rows-v1', todayKey: '2026-09-26', sinceDay: null, rowsGz: '' };
+    const readUsageDeviceRows = vi.fn().mockResolvedValue(response);
+    const assertTrustedSender = vi.fn(() => {
+      throw new Error('[PERMISSION_DENIED] untrusted');
+    });
+
+    registerMakerUsageHandlers(harness, makeUsageDeps({ readUsageDeviceRows, assertTrustedSender }));
+
+    await expect(harness.invoke(MAKER_INVOKE.USAGE_DEVICE_ROWS, {})).resolves.toEqual(response);
+    expect(readUsageDeviceRows).toHaveBeenLastCalledWith({ sinceDay: null });
+    await harness.invoke(MAKER_INVOKE.USAGE_DEVICE_ROWS, { sinceDay: '2026-09-25' });
+    expect(readUsageDeviceRows).toHaveBeenLastCalledWith({ sinceDay: '2026-09-25' });
+    await expect(
+      harness.invoke(MAKER_INVOKE.USAGE_DEVICE_ROWS, { sinceDay: '../etc' }),
+    ).rejects.toThrow(/INVALID_PARAMS/);
+    expect(readUsageDeviceRows).toHaveBeenCalledTimes(2);
+    expect(assertTrustedSender).not.toHaveBeenCalled();
   });
 
   it('rejects usage-history reads from an untrusted sender before parsing or querying', async () => {

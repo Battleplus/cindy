@@ -9,15 +9,23 @@ export function buildMobileHistoryRenderItems(options: {
   messages: readonly RemoteMessage[];
   streaming: boolean;
   sessionId: string;
+  sessionSource?: string | null;
   pendingHandoff?: ReadonlySet<string>;
+  localUserClientIds?: ReadonlySet<string>;
   taskUpdates?: ReadonlyMap<string, AgentTaskUpdate>;
 }): MobileMessageRenderItem[] {
   return renderHistoryView<RemoteMessage, MobileMessageRenderItem>({
     view: options.view, snapshot: options.snapshot, liveMessages: options.messages,
     isLive: (row) => row.agentMeta?.isStreaming === true,
     pendingHandoff: options.pendingHandoff,
+    isLocalUser: (row) => options.localUserClientIds?.has(row.clientId) === true,
     streaming: options.streaming,
-    build: (rows, streaming) => buildMobileMessageRenderItems(rows, { isSessionStreaming: streaming, sessionId: options.sessionId }, options.taskUpdates),
+    build: (rows, streaming) => buildMobileMessageRenderItems(rows, {
+      isSessionStreaming: streaming,
+      sessionId: options.sessionId,
+      sessionSource: options.sessionSource,
+      preserveSourceOrder: true,
+    }, options.taskUpdates),
     structure: {
       placeholder: (summary) => ({ id: summary.firstMessageId,
         clientId: summary.anchorClientId ?? summary.key.slice('work-'.length), sessionId: options.sessionId,
@@ -26,12 +34,13 @@ export function buildMobileHistoryRenderItems(options: {
       }),
       children: (item) => item.type === 'work_group' ? item.children
         : item.type === 'subagent_group' ? item.childItems : undefined,
-      sourceIds: (item) => item.type === 'message' || item.type === 'thinking' ? [item.message.source.clientId]
+      sourceIds: (item) => item.type === 'subagent_group' && item.sourceClientId ? [item.sourceClientId]
+        : item.type === 'message' || item.type === 'thinking' ? [item.message.source.clientId]
         : item.type === 'tool_group' || item.type === 'tool_media' ? item.tools.map((tool) => tool.source.clientId)
         : item.type === 'agent_task' && item.toolCall ? [item.toolCall.source.clientId] : [],
       rebuild: (item, children, deferred) => item.type === 'work_group'
         ? { ...item, children: children as MobileWorkChildItem[], deferred }
-        : item.type === 'subagent_group' ? { ...item, childItems: children } : item,
+        : item.type === 'subagent_group' ? { ...item, childItems: children, deferred } : item,
     },
   });
 }

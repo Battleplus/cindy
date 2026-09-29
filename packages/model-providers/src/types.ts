@@ -39,7 +39,7 @@ export const PI_REASONING_EFFORTS = [
 export type PiReasoningEffort = (typeof PI_REASONING_EFFORTS)[number];
 
 /**
- * PI models.json understands these four portable inference protocols. The
+ * PI models.json understands these native inference APIs. The
  * provider-level wireProtocol remains the default for an endpoint; piApi is a
  * sparse per-model override for newly released models or protocol corrections.
  */
@@ -48,12 +48,16 @@ export const PI_MODEL_APIS = [
   "openai-responses",
   "openai-completions",
   "google-generative-ai",
+  "bedrock-converse-stream",
+  "azure-openai-responses",
+  "google-vertex",
+  "mistral-conversations",
 ] as const;
 export type PiModelApi = (typeof PI_MODEL_APIS)[number];
 
 /** Provider runtime 上游实际接受的推理 wire protocol。 */
 export type ProviderWireProtocol =
-  "anthropic-messages" | "openai-responses" | "openai-chat";
+  "anthropic-messages" | "openai-responses" | "openai-chat" | "google-generative-ai";
 
 /** Codex 通过本地 bridge 兼容的两种非原生 Responses wire protocol。 */
 export type CodexCompatibilityWireProtocol = Extract<
@@ -61,8 +65,8 @@ export type CodexCompatibilityWireProtocol = Extract<
   "anthropic-messages" | "openai-chat"
 >;
 
-/** 供应商来源：内置 vs 用户自定义（自定义本轮不实现，类型先留位）。 */
-export type ProviderSource = "builtin" | "user";
+/** 供应商来源：内置 / 用户自定义 / 企业下发。企业连接走自定义路由，但不能当个人连接编辑。 */
+export type ProviderSource = "builtin" | "user" | "organization";
 
 /** 用户连接该供应商的鉴权方式（决定设置页的连接 UI）。
  *  - oauth   : 走 OAuth 登录（Claude.ai 订阅 / Codex 订阅）
@@ -181,6 +185,8 @@ export interface RoutingDescriptor {
    * 缺省按 false 处理；它与模型图片输入能力独立，也不得从模型名推断。
    */
   supportsImageGeneration?: boolean;
+  /** Enterprise BYOK image model binding used by the Codex Images route. */
+  imageModel?: { wireModel: string; litellmModel: string; supportsEdit: boolean };
   /** 真实上游 base URL（direct 时是供应商自家；gateway 时是 XD 网关 base）。 */
   upstream: string;
   /**
@@ -259,6 +265,14 @@ export interface ModelCost {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  /** Pi-compatible rates used when input tokens strictly exceed this threshold. */
+  tiers?: Array<{
+    inputTokensAbove: number;
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  }>;
 }
 
 /**
@@ -273,9 +287,12 @@ export interface ModelCost {
  * 跨 provider(如 gpt-5.5 同时由 openai 与 xd 提供)则必须元数据一致(见 catalog.ts 校验)。
  */
 export interface CatalogModel {
+  supportsToolCalls?: boolean;
+  reasoningRequired?: boolean;
   userModelConfig?: ProviderRuntimeModelConfig;
   catalogPresetId?: string;
   discoveredMetadata?: ModelMetadata;
+  discoveredCost?: ModelCost;
   nameExplicit?: boolean;
   /** Canonical model API from the accepted Registry; null explicitly means unverified. */
   nativeApi?: PiModelApi | null;
@@ -283,7 +300,9 @@ export interface CatalogModel {
   id: string;
   /** Server entitlement state. Paid-locked models remain present for UI but are never routable. */
   availability?: "available" | "requires_payment";
-  /** Sparse PI protocol override; absence means use PI's bundled model catalog. */
+  /** Explicit Pi serializer; missing fields may use the matching native transport fallback. */
+  /** Upstream execution API, shared by Claude Code, Codex and Pi. */
+  api?: PiModelApi;
   piApi?: PiModelApi;
   /** 同一 provider/runtime 内该模型的上游覆盖；缺省使用 provider 级路由。 */
   route?: ProviderModelRouteConfig;
@@ -378,6 +397,10 @@ export interface CatalogModel {
    * 不能读跨 provider 拍平去重后的列表（那只保留首个 provider 的值，会错）。
    */
   supportsFastMode?: boolean;
+  /** Same-provider, same-harness catalog model used for Fast. null explicitly disables mapping.
+   * Unlike a service tier, this changes the upstream model; availability must be checked per account.
+   */
+  fastModelId?: string | null;
   /**
    * 该模型在 Codex 下使用的模型级兼容 bridge 协议。
    *
@@ -470,6 +493,8 @@ export interface ProviderMediaModel extends Pick<
   modalities?: { input: string[]; output: string[] };
   officialDocs?: string;
   disabled?: boolean;
+  /** Follows the chat display axis: omitted/true is shown, false waits for an explicit switch. */
+  defaultEnabled?: boolean;
 }
 
 /** 供应商定义。 */
@@ -478,7 +503,7 @@ export interface Provider {
   id: string;
   /** 展示名。 */
   name: string;
-  /** 内置 vs 用户自定义。 */
+  /** 内置 / 用户自定义 / 企业下发。企业连接走自定义路由，但不能当个人连接编辑。 */
   source: ProviderSource;
   /** ★这家能用在哪些 agent；决定它出现在哪个 agent 的来源列表里 + 路由按哪个 agent 取。 */
   agents: AgentKind[];
@@ -487,7 +512,7 @@ export interface Provider {
    * OAuth Runner（generic-oauth）；不带描述符的 oauth 供应商 = host bespoke 鉴权
    * （anthropic / openai / xai 现状）。
    */
-  auth: { method: AuthMethod; oauth?: OAuthProviderDescriptor };
+  auth: { method: AuthMethod; oauth?: OAuthProviderDescriptor; native?: "codex" | "claude" | "xai" };
   /** 用户使用该供应商时的额度来源；旧目录可缺省，由 source 从 bundled 同 id 条目补齐。 */
   access?: ProviderAccess;
   /**
@@ -565,15 +590,15 @@ export interface Provider {
  * contextWindow 缺省时由 `buildUserProvider` 使用保守默认；预设可显式携带厂商文档确认的值，
  * 并随用户配置持久化，避免已知长上下文模型被错误降级。
  */
-export interface ProviderRuntimeModelConfig extends Pick<
-  ModelMetadata,
-  "mode" | "modalities" | "officialDocs"
-> {
+export interface ProviderRuntimeModelConfig extends ModelMetadata {
   discoveredMetadata?: ModelMetadata;
+  discoveredCost?: ModelCost;
   nameExplicit?: boolean;
   id: string;
   name: string;
   /** Per-model PI protocol override; provider wireProtocol remains the fallback. */
+  /** Upstream execution API, shared by Claude Code, Codex and Pi. */
+  api?: PiModelApi;
   piApi?: PiModelApi;
   /** 同一 runtime 内该模型的上游覆盖；缺省使用 runtime 级路由。 */
   route?: ProviderModelRouteConfig;
@@ -593,6 +618,17 @@ export interface ProviderRuntimeModelConfig extends Pick<
   reasoningDefaultEffort?: PiReasoningEffort;
   /** 思考只有开/关时走开关 UI。 */
   thinkingToggle?: boolean;
+}
+
+/**
+ * 预设推荐模型：三个引擎共用一份清单，数组顺序即推荐顺序（见 `expandPresetModels`）。
+ * 引擎间确有差异时用 `engines` / `engineOverrides` 显式声明，不再为每个引擎各写一份。
+ */
+export interface ProviderPresetModel extends ProviderRuntimeModelConfig {
+  /** 只在这些引擎可用（如协议限制）；缺省 = 预设声明的全部引擎。 */
+  engines?: AgentKind[];
+  /** 引擎专属字段（如 Pi 的推理档位、按模型路由），展开时覆盖共用字段。 */
+  engineOverrides?: Partial<Record<AgentKind, Partial<ProviderRuntimeModelConfig>>>;
 }
 
 /**
@@ -664,6 +700,11 @@ export interface ProviderPreset {
    * 创建后会快照进 CustomProviderConfig，不随预设后续更新。
    */
   authMethod?: "apiKey" | "none";
+  /**
+   * 目录源数据里的共用推荐模型清单。加载时由 `expandPresetModels` 展开进各
+   * `runtimes[agent].models` 并删除本字段；下游始终只读展开后的形状，旧格式照常可用。
+   */
+  models?: ProviderPresetModel[];
   /** per-runtime 预填数据（至少一个）。 */
   runtimes: Partial<Record<AgentKind, ProviderPresetRuntime>>;
 }
@@ -751,9 +792,10 @@ export interface CustomProviderConfig {
    * Bearer；此形态下不再使用 per-runtime API key。
    */
   auth?:
-    | { method: "apiKey"; oauth?: never }
-    | { method: "oauth"; oauth: OAuthProviderDescriptor }
-    | { method: "none"; oauth?: never };
+    | { method: "apiKey"; oauth?: never; native?: never }
+    | { method: "oauth"; oauth: OAuthProviderDescriptor; native?: never }
+    | { method: "oauth"; native: "codex" | "claude" | "xai"; oauth?: never }
+    | { method: "none"; oauth?: never; native?: never };
   /** per-runtime 独立配置（键为 agent，只含已配置的 runtime；至少一个）。 */
   runtimes: Partial<Record<AgentKind, CustomProviderRuntimeConfig>>;
 }

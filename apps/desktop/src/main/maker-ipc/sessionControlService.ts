@@ -57,6 +57,7 @@ export type SessionRuntimeSetResult =
   | {
       ok: true;
       status: 'applied' | 'deferred';
+      effectiveBoundary?: 'next_send';
       generation: number;
       effectiveProfile: SessionRuntimeProfile;
       pendingMutation: PendingSessionRuntimeMutation | null;
@@ -86,9 +87,10 @@ export interface SessionControlServiceDeps {
     targetSessionId: string;
     expectedGeneration?: number;
     patch: {
+      harness?: AgentKind;
       model?: string;
       providerId?: string | null;
-      effort?: Effort;
+      effort?: Effort | null;
       fastMode?: boolean;
     };
   }): Promise<SessionRuntimeSetResult>;
@@ -165,6 +167,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       callerSessionId: string;
       targetSessionId: string;
       message: string;
+      /** Host-owned stable ID; the input coordinator owns acceptance deduplication. */
+      queuedMessageId?: string;
     }): Promise<SessionSteerResult> {
       const missing = await ensureTarget(params.targetSessionId);
       if (missing) return missing;
@@ -196,7 +200,7 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
         };
       }
       const turnGeneration = live.getTurnGeneration();
-      const queuedMessageId = deps.createId();
+      const queuedMessageId = params.queuedMessageId ?? deps.createId();
       const item = await deps.createQueuedMessage({
         ...params,
         queuedMessageId,
@@ -278,9 +282,10 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       targetSessionId: string;
       expectedGeneration?: number;
       patch: {
+        harness?: AgentKind;
         model?: string;
         providerId?: string | null;
-        effort?: Effort;
+        effort?: Effort | null;
         fastMode?: boolean;
       };
     }): Promise<SessionRuntimeSetResult> {
@@ -309,8 +314,10 @@ export function rebuildSessionQueueItem(
     // send_to_session owns raw user text, not a renderer composer envelope.
     // A valid JSON object/array is still literal message content, so editing it
     // must replace the persisted history row wholesale instead of merging a
-    // synthetic `text` property into the old JSON value.
-    updated.persistedContent = message;
+    // synthetic `text` property into the old JSON value. Attachment items are
+    // the exception: their persisted row is the host-built `{text, images, files}`
+    // envelope, which updateQueuedMessageText already rewrote in place.
+    if (!item.files?.length) updated.persistedContent = message;
     updated.origin = { ...updated.origin, displayText: message };
   }
   return updated;
@@ -318,14 +325,23 @@ export function rebuildSessionQueueItem(
 
 export function sessionQueueOriginForDispatcher(params: {
   dispatcherSessionId?: string;
+  /** 来源会话当前标题快照；缺失时接收方 renderer 回退实时查询或通用文案。 */
+  dispatcherSessionTitle?: string | null;
+  /** 来源会话所属伙伴；有则接收方标签显示「由伙伴「X」发送」。 */
+  dispatcherBot?: { id: string; name: string } | null;
   message: string;
   explicitOrigin?: AgentInputQueuedMessage['origin'];
 }): AgentInputQueuedMessage['origin'] | undefined {
   if (params.explicitOrigin) return params.explicitOrigin;
   if (!params.dispatcherSessionId) return undefined;
+  const senderSessionTitle = params.dispatcherSessionTitle?.trim();
   return {
     kind: 'session',
     senderSessionId: params.dispatcherSessionId,
     displayText: params.message,
+    ...(senderSessionTitle ? { senderSessionTitle } : {}),
+    ...(params.dispatcherBot
+      ? { senderBotId: params.dispatcherBot.id, senderBotName: params.dispatcherBot.name }
+      : {}),
   };
 }

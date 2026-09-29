@@ -15,6 +15,8 @@
 export type BotCollaborationRole =
   /** 父任务：启动时写下的任务卡锚点（空正文，只为承载卡片）。 */
   | 'delegation-request'
+  /** Immutable receipt of one completed execution, separate from the original task anchor. */
+  | 'delegation-result'
   /** 历史：父任务里的目标伙伴结果。 */
   | 'guest-result'
   /** 父任务：发起方给进行中任务追加消息的留痕。 */
@@ -40,10 +42,23 @@ export interface BotCollaborationMeta {
   childSessionId: string | null;
   /** 委派目标摘要，用于卡片折叠态文案。 */
   objective: string;
+  result?: {
+    /** Task title at completion; older receipts fall back to the known task title. */
+    title?: string;
+    /** Child task directory on its host; used to resolve remote artifact links. */
+    workingDir?: string;
+    runSequence: number;
+    status: 'completed' | 'failed' | 'cancelled' | 'timed-out';
+    text: string;
+    /** Frozen failure detail, only revealed on demand; never the primary label. */
+    error?: string;
+    artifacts: Array<{ absolutePath: string }>;
+  };
 }
 
 const ROLES = new Set<BotCollaborationRole>([
   'delegation-request',
+  'delegation-result',
   'guest-result',
   'interjection',
   'guest-request',
@@ -73,6 +88,14 @@ export function readBotCollaborationMeta(value: unknown): BotCollaborationMeta |
   const parentSessionId = optionalId(raw.parentSessionId);
   const childSessionId = optionalId(raw.childSessionId);
   if (parentSessionId === undefined || childSessionId === undefined) return null;
+  const receipt = raw as unknown as BotCollaborationMeta;
+  if (receipt.role === 'delegation-result' && (!receipt.result || !Number.isSafeInteger(receipt.result.runSequence)
+    || receipt.result.runSequence < 1 || !['completed', 'failed', 'cancelled', 'timed-out'].includes(receipt.result.status)
+    || (receipt.result.workingDir !== undefined && typeof receipt.result.workingDir !== 'string')
+    || (receipt.result.title !== undefined && typeof receipt.result.title !== 'string')
+    || (receipt.result.error !== undefined && typeof receipt.result.error !== 'string')
+    || typeof receipt.result.text !== 'string' || !Array.isArray(receipt.result.artifacts)
+    || receipt.result.artifacts.some((file) => !file || typeof file.absolutePath !== 'string'))) return null;
   return {
     v: 1,
     role: raw.role as BotCollaborationRole,
@@ -83,12 +106,15 @@ export function readBotCollaborationMeta(value: unknown): BotCollaborationMeta |
     toBotName: raw.toBotName,
     parentSessionId,
     childSessionId,
+    ...(receipt.result ? { result: receipt.result } : {}),
     objective: raw.objective,
   };
 }
 
 /** 委派相关消息的幂等 clientId 前缀，main 与测试共用同一份常量。 */
 export const BOT_DELEGATION_CLIENT_ID = {
+  resultRun: (delegationId: string, runSequence: number) =>
+    `bot-delegation-result:${delegationId}:${runSequence}`,
   /** 父任务里的任务卡锚点。 */
   parentRequest: (delegationId: string) => `bot-delegation-request:${delegationId}`,
   /** 父任务里的结果回传（历史值，不可改）。 */
@@ -115,3 +141,43 @@ export type BotDelegationInterjectResult =
       queued: boolean;
     }
   | { ok: false; errorCode: string; message: string };
+
+/**
+ * Place a task anchor after its initiating explanation, preserving identity and all
+ * other message order. Hidden user triggers are boundaries too: a finished task
+ * must never migrate beneath the later completion reply. Each card follows the
+ * next visible explanation in its own turn; without one, it stays where it was.
+ */
+export function placeBotTaskCardsAfterIntroduction<T>(
+  messages: readonly T[],
+  classify: (message: T) => 'boundary' | 'task' | 'prose' | 'other',
+): T[] {
+  const output: T[] = [];
+  let turn: T[] = [];
+  const flush = () => {
+    // Match anchors to the nearest following prose, rather than the first prose
+    // of the turn: "I'll take a look" before dispatch is not its launch report.
+    let nextProse = -1;
+    const movable = new Set<number>();
+    for (let index = turn.length - 1; index >= 0; index -= 1) {
+      const kind = classify(turn[index]);
+      if (kind === 'prose') nextProse = index;
+      else if (kind === 'task' && nextProse >= 0) movable.add(index);
+    }
+    const pending: T[] = [];
+    for (let index = 0; index < turn.length; index += 1) {
+      if (movable.has(index)) pending.push(turn[index]);
+      else {
+        output.push(turn[index]);
+        if (classify(turn[index]) === 'prose') output.push(...pending.splice(0));
+      }
+    }
+    turn = [];
+  };
+  for (const message of messages) {
+    if (classify(message) === 'boundary') flush();
+    turn.push(message);
+  }
+  flush();
+  return output;
+}

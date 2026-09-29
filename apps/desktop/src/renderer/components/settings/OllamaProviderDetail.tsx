@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Button } from '@/components/ui/button';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Pause, Play, X } from 'lucide-react';
 
 import { toast } from '@/lib/toast';
 import { extractIpcError } from '@/utils/ipcError';
-import { Spinner } from '@/components/ui/spinner';
 import type {
   CuratedOllamaModel,
   LocalInstalledModel,
@@ -14,6 +14,7 @@ import type {
   LocalRuntimeStatus,
 } from '../../../shared/localModelRuntime';
 import {
+  canonicalOllamaModelRef,
   classifyOllamaPullError,
   filterCuratedOllamaModels,
   isHfMlxPullName,
@@ -125,42 +126,64 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pulls, setPulls] = useState<Record<string, LocalModelPullProgress>>({});
 
-  const replaceListedPulls = useCallback((items: readonly LocalModelPullProgress[]) => {
-    setPulls((current) => {
-      const next: Record<string, LocalModelPullProgress> = {};
-      for (const item of items) {
-        if (item.phase === 'cancelled' || item.phase === 'success') continue;
-        next[item.name] = item;
-      }
-      for (const [name, item] of Object.entries(current)) {
-        if (!next[name] && item.phase === 'error') next[name] = item;
-      }
-      return next;
-    });
-  }, []);
+  const refreshGeneration = useRef(0);
+  const progressRevision = useRef(0);
+  const statusRevision = useRef(0);
+  const updatedPulls = useRef(new Map<string, number>());
+  const pendingPulls = useRef(new Set<string>());
+
+  const replaceListedPulls = useCallback(
+    (items: readonly LocalModelPullProgress[], since: number) => {
+      setPulls((current) => {
+        const next: Record<string, LocalModelPullProgress> = {};
+        for (const item of items) {
+          if (item.phase === 'cancelled' || item.phase === 'success') continue;
+          next[canonicalOllamaModelRef(item.name)] = item;
+        }
+        for (const [name, item] of Object.entries(current)) {
+          if (!next[name] && item.phase === 'error') next[name] = item;
+        }
+        // A slow list response must not undo progress, start, pause or completion
+        // events received after that request began. Keep terminal deletions too.
+        for (const [name, revision] of updatedPulls.current) {
+          if (revision <= since && !pendingPulls.current.has(name)) continue;
+          if (current[name]) next[name] = current[name];
+          else delete next[name];
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const upsertPull = useCallback((item: LocalModelPullProgress) => {
+    const name = canonicalOllamaModelRef(item.name);
+    updatedPulls.current.set(name, ++progressRevision.current);
     setPulls((current) => {
       if (item.phase === 'cancelled' || item.phase === 'success') {
-        if (!(item.name in current)) return current;
+        if (!(name in current)) return current;
         const next = { ...current };
-        delete next[item.name];
+        delete next[name];
         return next;
       }
-      return { ...current, [item.name]: item };
+      return { ...current, [name]: item };
     });
   }, []);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
+    const since = progressRevision.current;
+    const statusSince = statusRevision.current;
     const result = await window.electronAPI.maker.localModelList();
-    setStatus(result.status);
+    if (generation !== refreshGeneration.current) return;
+    if (statusSince === statusRevision.current) setStatus(result.status);
     setModels(result.models);
     setCatalog(result.catalog ?? []);
     setFeatured(result.featured ?? []);
     setMemoryGb(result.memoryGb ?? 0);
     setRecommendReason(result.recommendReason ?? 'unknown');
     setAppleSilicon(result.appleSilicon === true);
-    replaceListedPulls(result.pulls ?? []);
+    replaceListedPulls(result.pulls ?? [], since);
     if (result.catalogDirty) onChanged();
   }, [onChanged, replaceListedPulls]);
 
@@ -170,12 +193,14 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
       void refresh().catch(() => undefined);
     });
     const offStatus = window.electronAPI.maker.onLocalModelStatus((next) => {
+      statusRevision.current += 1;
       setStatus(next as LocalRuntimeStatus);
     });
     const offPull = window.electronAPI.maker.onLocalModelPullProgress((next) => {
       upsertPull(next as LocalModelPullProgress);
     });
     return () => {
+      refreshGeneration.current += 1;
       offCatalog();
       offStatus();
       offPull();
@@ -206,15 +231,25 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
       toast.error(t('settings.providers.local.pullError.not-gguf'));
       return;
     }
+    const key = canonicalOllamaModelRef(name);
+    if (pendingPulls.current.has(key)) return;
+    pendingPulls.current.add(key);
     upsertPull({ name, status: 'starting', phase: 'starting', done: false });
     try {
-      const result = await window.electronAPI.maker.localModelPull(name);
+      let result;
+      try {
+        result = await window.electronAPI.maker.localModelPull(name);
+      } finally {
+        // Release only this IPC's guard, before awaiting a refresh that may
+        // outlive a resumed download. Never clear another call's guard later.
+        pendingPulls.current.delete(key);
+      }
       if (result.stopped) {
-        await refresh();
+        await refresh().catch(() => undefined);
         return;
       }
       upsertPull({ name, status: 'success', phase: 'success', percent: 100, done: true });
-      await refresh();
+      await refresh().catch(() => undefined);
       onChanged();
       toast.success(t('settings.providers.local.added'));
     } catch (error) {
@@ -240,7 +275,7 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
 
   const handleAbort = async (reason: 'pause' | 'cancel', name: string) => {
     try {
-      const current = pulls[name];
+      const current = pulls[canonicalOllamaModelRef(name)];
       if (reason === 'cancel' && current?.phase === 'paused') {
         await window.electronAPI.maker.localModelDiscardPaused(name);
       } else {
@@ -284,7 +319,7 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
 
   const renderCatalogCard = (entry: CuratedOllamaModel) => {
     const installed = models.some((model) => ollamaModelRefsEqual(model.name, entry.libraryName));
-    const pull = pulls[entry.libraryName];
+    const pull = pulls[canonicalOllamaModelRef(entry.libraryName)];
     const pulling = Boolean(pull && (!pull.done || pull.phase === 'paused'));
     const failed = pull?.phase === 'error';
     if (!searching && installed && !pulling && !failed) return null;
@@ -367,20 +402,19 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
               onResume={() => void handlePull(entry.libraryName)}
             />
           ) : (
-            <button
+            <Button
+              variant="secondary"
+              size="md"
+              compact
               type="button"
               disabled={!canDownload}
               onClick={() => void handlePull(entry.libraryName)}
-              className="flex h-8 shrink-0 items-center rounded-full px-3.5 text-12 font-medium disabled:opacity-50"
-              style={{
-                backgroundColor: 'var(--surface-chip)',
-                color: 'var(--text-primary)',
-              }}
+              className="shrink-0"
             >
               {failed
                 ? t('settings.providers.local.retryDownload')
                 : t('settings.providers.local.downloadAdd')}
-            </button>
+            </Button>
           )}
         </div>
         {pulling && pull && <PullMeter pull={pull} />}
@@ -390,7 +424,7 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
 
   return (
     <div
-      className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto border-t px-5 py-5"
+      className="flex flex-col gap-6 border-t px-5 py-5"
       style={{ borderColor: 'var(--settings-theme-card-border)' }}
     >
       {statusKind !== 'ready' && statusKind !== 'pulling' && statusKind !== 'absent' && (
@@ -408,16 +442,17 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
         />
       )}
       {statusKind === 'stopped' && (
-        <button
+        <Button
+          variant="cta"
+          size="lg"
+          loading={busy}
           type="button"
           disabled={busy}
           onClick={() => void handleStart()}
-          className="flex h-9 w-fit items-center gap-2 rounded-full px-4 text-13 font-medium"
-          style={{ backgroundColor: 'var(--accent-cta-bg)', color: 'var(--surface-on-card)' }}
+          className="w-fit"
         >
-          {busy && <Spinner size={13} />}
           {t('settings.providers.local.start')}
-        </button>
+        </Button>
       )}
 
       <section className="flex flex-col gap-3">
@@ -497,18 +532,15 @@ export function OllamaProviderDetail({ onChanged }: { onChanged: () => void }) {
               color: 'var(--settings-section-title)',
             }}
           />
-          <button
+          <Button
+            variant="secondary"
+            size="lg"
             type="button"
             disabled={!canDownload || !normalizeOllamaPullName(libraryName)}
             onClick={() => void handlePull(libraryName)}
-            className="flex h-9 items-center rounded-full px-4 text-12 font-medium disabled:opacity-50"
-            style={{
-              backgroundColor: 'var(--surface-chip)',
-              color: 'var(--text-primary)',
-            }}
           >
             {t('settings.providers.local.downloadAdd')}
-          </button>
+          </Button>
         </div>
       </section>
 

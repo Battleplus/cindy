@@ -1,3 +1,4 @@
+import { isModelEnabled, useModelVisibilityVersion } from '@/state/modelVisibilityPrefs';
 /**
  * NewMakerDraftRoute —— "/cc-agent/new" 路由组件:transient draft,无后端 session。
  * ---------------------------------------------------------------------------
@@ -155,6 +156,7 @@ import { crossAgentConvertService } from '@/lib/crossAgentConvertService';
 import {
   consumeNewMakerDialogueTargetRequest,
   consumeNewMakerFolderPickerRequest,
+  isSameNewMakerDevice,
   readNewMakerDialogueTargetRequest,
   readNewMakerFolderPickerRequest,
 } from './lib/newMakerRouteState';
@@ -175,15 +177,16 @@ import { HomeSuggestionList } from './HomeSuggestionList';
 import { type HomeSuggestionId, homeSuggestionPromptKey } from './homeSuggestions';
 import {
   buildHomeTaskCatalog,
+  pluginSuggestionComposerText,
   readPluginRecommendationSnapshot,
   type HomeTaskSuggestion,
 } from './pluginHomeSuggestions';
+import { useInstalledGhosts } from '@/cindy-brain/useInstalledGhosts';
 import {
   startPendingPluginSuggestion,
   takePendingPluginSuggestion,
   type PluginSuggestionRequest,
 } from './pendingPluginSuggestion';
-import { expandGhostCommand } from '@/cindy-brain/ghostCommand';
 import { filterGhostsForWorkdir } from '@/cindy-brain/ghostWorkdirFilter';
 import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 import {
@@ -259,7 +262,6 @@ import {
 import { useDeviceLinkProjects } from '@/hooks/useDeviceLinkProjects';
 import {
   resolveFastSupported,
-  deriveModelsFromProviders,
   filterChatBridgedCodexProviders,
 } from '@/lib/providerModels';
 import {
@@ -267,7 +269,6 @@ import {
   getModel,
   isModelSelectableForNewRoute,
   providerOffersModel,
-  sessionModelSupportsFastMode,
   connectedProvidersForAgent,
   type ProviderView,
 } from '@cindy/model-providers';
@@ -282,6 +283,7 @@ import { makeMirrorAccessors, replaceScope, clearScope } from '@/state/deviceLin
 import type { ModelMemoryAccessors } from '@/components/new-chat/ModelSelector';
 import { resolveNewMakerDraftRightSidebar } from './newMakerDraftRightSidebar';
 import { resolveNewMakerDraftEffort } from './newMakerDraftModelPrefs';
+import { loadSshSessionModelSelection, SshModelSelectionError } from './sshSessionModelSelection';
 import { closeAllTabs as closeRightSidebarTabs } from '@/features/right-sidebar/store';
 import { revealOrcaWorkersTab } from '@/features/right-sidebar/plugins/orca-workers/actions';
 import { normalizeProjectKey } from './lib/projectGrouping';
@@ -683,6 +685,8 @@ export function NewMakerDraftRoute() {
           ? 'ccAgent.draft.remoteProviderUnsupported'
           : code === 'REMOTE_NATIVE_OAUTH_UNAVAILABLE'
             ? 'ccAgent.draft.remoteNativeOauthUnavailable'
+            : code === 'CLAUDE_SUBSCRIPTION_WORKSPACE_OVERRIDE'
+            ? 'ccAgent.draft.claudeSubscriptionWorkspaceOverride'
             : // 轮 40-w4-t3 HIGH:远端 Pi 会话启动时 Cindy AI gateway endpoint
               // 未就绪 —— main 侧已映射同名 IPC code, 这里走已存在 5 语言的
               // logic.errors.remoteError.REMOTE_GATEWAY_ENDPOINT_UNAVAILABLE
@@ -1230,22 +1234,28 @@ export function NewMakerDraftRoute() {
   } = useAgentCapabilities(capabilityAgentKind, effectiveDeviceLinkDeviceId);
   // device-link「以被控端为准」:远程草稿用被控端经隧道带来的 providers(per-provider,含 fast 能力);
   // 本地草稿用本机 providers。fast 判定统一交给 resolveFastSupported(不在控制端另写远程逻辑)。
-  const { providers: localProviders, loading: localProvidersLoading } = useProviders();
+  const {
+    providers: localProviders,
+    loading: localProvidersLoading,
+    loadFailed: localProvidersLoadFailed,
+  } = useProviders();
   const modelEnginePrefsVersion = useModelEnginePrefsVersion();
   const modelPresetVersion = useProviderModelMemoryVersion();
   const hasLegacyDefaultChoice = useMemo(
     () => hasAnyModelEngineOverride() || hasAnyProviderModelOverride(),
     [modelEnginePrefsVersion, modelPresetVersion],
   );
+  const defaultVisibilityVersion = useModelVisibilityVersion();
   const suggestedDefaultTuple = useMemo(
     () =>
       resolveNewMakerDefaultTuple({
+        isModelEnabled,
         providers: localProviders,
         providersLoading: localProvidersLoading,
         availableAgents: availableVendors,
         availableAgentsLoaded,
       }),
-    [localProviders, localProvidersLoading, availableVendors, availableAgentsLoaded],
+    [localProviders, localProvidersLoading, availableVendors, availableAgentsLoaded, defaultVisibilityVersion],
   );
   useEffect(() => {
     // 远程主机 / device-link 的可用 Harness 与来源属于执行端，不能拿控制端本机登录态替它选。
@@ -2020,20 +2030,7 @@ export function NewMakerDraftRoute() {
   const chatInitialPermissionMode = isDeviceLinkDraft
     ? (deviceLinkInitial?.permissionMode ?? chatPrefs.permissionMode)
     : chatPrefs.permissionMode;
-  // 显式来源只在**仍是当前生效来源**时才带进建会话。
-  //
-  // 只比对「模型有没有被校准换掉」不够:存储的来源断开 / 不再提供该模型、而另一个已连接
-  // 来源恰好提供同一个 model id 时,校准会原样保留模型 id(它确实可用),相等条件因此成立,
-  // 却把已经失效的来源一起带了下去 —— 而 effectiveSourceId 早已解析到另一个来源。送出去
-  // 就是一对 model / provider 错配,首条请求会打到不服务该模型的上游(PR #548 review)。
-  //
-  // 但「置 null = 交回默认路由」只在两边会解析到同一个来源时才成立:main 的默认解析吃的是
-  // **未过滤**的目录,被用户隐藏、被 SSH 订阅直连排除、被 chat-bridge 排除掉的来源在那边
-  // 依然是候选。此时 UI 高亮 B、main 却路由到 A,会话就从一个用户看不见的来源发出去。所以
-  // 只在默认路由确实落回 effectiveSourceId 时才省略它,不一致时显式带上(PR #548 review)。
-  // 这里的「默认」还必须覆盖 main 的 spawn-aware 语义:Claude OAuth 会话收到 providerId=null
-  // 且存在 Gateway key 时会按 agent 默认走 XD,即使 XD 的动态目录并不提供当前模型。只比较
-  // effectiveSourceIdForModel 的模型级默认会把这种分叉误判成「可安全省略」(issue #1196)。
+  // 显式连接始终随草稿提交；未指定连接时才按 UI 与 main 的默认来源差异决定是否固化。
   const localProviderIdForDraft = useMemo<string | null>(() => {
     return resolveDraftSessionProviderId({
       providers: localProviders,
@@ -2049,26 +2046,13 @@ export function NewMakerDraftRoute() {
     calibratedDraftModel,
     capabilityAgentKind,
   ]);
-  /**
-   * 传给 ChatInput 的初始来源 / 「新建目标」实际提交的来源。
-   *
-   * 本机分支已经用 effectiveSourceIdForModel 校准过(见 localProviderIdForDraft);**device-link
-   * 分支原来是原样透传** dlSel.providerId —— 那是个漏洞(Codex review P1):被控端把该来源断开 /
-   * 移除、或它不再提供当前模型之后,这个值仍留在草稿里。普通发送不受影响(ChatInput 内部会用
-   * effectiveSourceId 重算,失效即回落),但**「新建目标」是直接拿这个值提交给 maker:create-session**
-   * 的 —— 于是会把一个未认证的来源写进 sessions.provider_id,新目标起不来。
-   *
-   * 所以在**派生处**统一校准,而不是在某个消费点补一次:用与 main 同源、且注释明确要求「新会话 /
-   * 切模型 / worker / schedule 一律用」的 effectiveSourceIdForModel,按**被控端**目录 + 草稿当前
-   * 模型复算。仍有效则原样保留;失效则落到被控端对该模型的原生默认来源 —— 这也正是 ChatInput 高亮
-   * 给用户看的那一个,提交值与界面所见因此一致(比一律置 null 更贴合「所见即所得」)。
-   * 目录尚未加载完时可能解析为 null,无害:发送 / 建目标都被 deviceProvidersLoading 三重 gate 挡着。
-   */
+  // 本机与远程草稿均保留明确选中的连接。显示可用性与提交身份分开，
+  // 防止控制端暂时缺少目录时把账号 A 变成默认账号 B。
   const chatInitialProviderId = useMemo<string | null>(() => {
     if (!isDeviceLinkDraft) return localProviderIdForDraft;
-    return effectiveSourceIdForModel(
+    return deviceLinkInitial?.providerId || effectiveSourceIdForModel(
       deviceProviders,
-      deviceLinkInitial?.providerId ?? null,
+      null,
       draftInitialModel,
       capabilityAgentKind,
     );
@@ -2162,8 +2146,10 @@ export function NewMakerDraftRoute() {
    */
   const applyDraftTarget = useCallback(
     (req: DraftTargetRequest) => {
-      const prevDeviceId = effectiveDeviceLinkDeviceId ?? null;
-      const deviceChanged = req.deviceId !== prevDeviceId;
+      const deviceChanged = !isSameNewMakerDevice(req.deviceId, {
+        deviceLinkDeviceId: effectiveDeviceLinkDeviceId,
+        remoteHostId: effectiveRemoteHostId,
+      });
       const workingDirChanged = req.workingDir !== draft.workingDir;
 
       // chip 绑 workingDir;附件绑设备。两者条件不同,见各自函数的注释。
@@ -2287,6 +2273,7 @@ export function NewMakerDraftRoute() {
     },
     [
       effectiveDeviceLinkDeviceId,
+      effectiveRemoteHostId,
       draft.workingDir,
       capabilityAgentKind,
       stripProjectRelativeMentions,
@@ -2294,7 +2281,7 @@ export function NewMakerDraftRoute() {
     ],
   );
 
-  // “对话”分组可能在 /cc-agent/new 已经打开时再次导航到同一路由，组件不会 remount。
+  // 通用新建继承当前任务电脑；“对话”分组还可能在 /cc-agent/new 已经打开时再次导航。
   // 目标因此随 location.state 交给本页消费，而不是让侧栏直接 patch device 字段；无论首次进入
   // 还是重复导航，local ↔ remote / remote A ↔ B / 项目 → 对话都统一经过 applyDraftTarget，
   // mention、路径型附件、远程运行配置和 worktree 三态才不会绕过集中迁移。
@@ -2309,12 +2296,17 @@ export function NewMakerDraftRoute() {
     // 同路由的对话目标是比在途目录恢复更新的用户选择。先推进同一 sequence owner，
     // 让旧 restore completion 只能释放锁，不能把目录重新写回草稿。
     modePickerSelectionSeqRef.current += 1;
-    patchCollab({ enabled: false });
-    applyDraftTarget({
-      deviceId: dialogueTargetRequest.deviceId,
-      deviceName: dialogueTargetRequest.deviceName,
-      workingDir: null,
-    });
+    if (
+      !dialogueTargetRequest.preserveWorkspaceIfSameDevice ||
+      !isSameNewMakerDevice(dialogueTargetRequest.deviceId, getDraft())
+    ) {
+      patchCollab({ enabled: false });
+      applyDraftTarget({
+        deviceId: dialogueTargetRequest.deviceId,
+        deviceName: dialogueTargetRequest.deviceName,
+        workingDir: null,
+      });
+    }
     navigate(`${location.pathname}${location.search}${location.hash}`, {
       replace: true,
       state: consumeNewMakerDialogueTargetRequest(location.state),
@@ -2390,62 +2382,28 @@ export function NewMakerDraftRoute() {
       // 立即建会话记录并 navigate 过去。建会话约定与本文件其它 createSession 路径一致
       // (createSession + makerChatStore.setSessionRuntime + navigate)。
       //
-      // SSH 始终取本地(controller)的 provider/fast/effort 上下文,不复用 device-link 派生值。
-      // providerId 只保留用户显式选中且仍有效的来源,否则 null(默认路由,不固化默认来源)。
-      // 使用 draftInitialModel(用户在 composer 里看到的模型),而不是 chatPrefs.model
-      // (当 device-link 草稿活跃时 chatPrefs.model 是旧的 controller-local 值)。
-      // bridge 模型(chatgpt/ / xai/)在远程模式不可用(不经本地 compat-proxy),需降级。
-      // 非 bridge 模型也必须在已连接的本地来源中存在,否则 SSH 会话首消息会被阻塞。
-      const sshConnected = connectedProvidersForAgent(localProviders, capabilityAgentKind);
-      // admissionFiltered:SSH 候选是「挑一个可路由模型」的清单,停用条目与能力模型
-      // 不参与(降级兜底也不能落到停用模型上,PR #744 review)。
-      const sshVisibleModels = deriveModelsFromProviders(sshConnected, capabilityAgentKind, {
-        admissionFiltered: true,
-      }).filter((m) => !isSubscriptionDirectModel(m.id));
-      let sshModel = draftInitialModel;
-      if (isSubscriptionDirectModel(sshModel) || !sshVisibleModels.some((m) => m.id === sshModel)) {
-        if (!sshVisibleModels.length) {
-          throw new Error(t('ccAgent.draft.createSessionFailed'));
-        }
-        sshModel = sshVisibleModels[0].id;
-      }
-      // 使用 chatInitialProviderId(显示给用户的来源,device-link 活跃时取镜像值)而非
-      // chatPrefs.providerId(可能是旧的 controller-local 值)。
-      const rawProviderId = chatInitialProviderId ?? null;
-      const sshLocalSourceId = effectiveSourceIdForModel(
-        localProviders,
-        rawProviderId,
-        sshModel,
-        capabilityAgentKind,
-      );
-      // 只有用户显式选中的来源在本地仍可用时才保留;否则 null = 走默认路由。
-      const sshProviderId =
-        rawProviderId && sshLocalSourceId === rawProviderId ? rawProviderId : null;
-      // fast mode:来源不支持就关闭;支持时保留用户在 composer 里看到的 effectiveFastMode
-      // (device-link 草稿活跃时来自 dlSel/deviceLinkInitial,本地草稿来自 per-model 记忆)。
-      const sshSourceSupportsFast = sessionModelSupportsFastMode(
-        localProviders,
-        sshProviderId,
-        sshModel,
-        capabilityAgentKind,
-      );
-      const sshFastMode = sshSourceSupportsFast ? effectiveFastMode : false;
-      // effort: 用 draftInitialEffort(用户在 composer 里看到的值)作 currentEffort,
-      // 再由 resolveNewMakerDraftEffort 按本地 SSH model 支持的 levels 做 clamp。
-      const sshLocalProvider = sshLocalSourceId
-        ? localProviders.find((p) => p.id === sshLocalSourceId)
-        : undefined;
-      const sshLocalModelDesc = sshLocalProvider
-        ? getModel(sshLocalProvider, sshModel, capabilityAgentKind)
-        : undefined;
-      const sshEffort = resolveNewMakerDraftEffort({
-        currentEffort: draftInitialEffort,
-        presetEffort: sshLocalSourceId
-          ? getProviderModelEffort(capabilityAgentKind, sshLocalSourceId, sshModel)
-          : undefined,
-        efforts: sshLocalModelDesc?.efforts ?? [],
-        defaultEffort: sshLocalModelDesc?.defaultEffort ?? null,
+      // Codex reads the selected SSH host; other harnesses retain their existing routing.
+      const sshOwner = getDataOwnerGeneration();
+      const selection = await loadSshSessionModelSelection(target.hostId, {
+        providers: localProviders,
+        loading: localProvidersLoading,
+        loadFailed: localProvidersLoadFailed,
+        agentKind: capabilityAgentKind,
+        preferred: {
+          model: draftInitialModel,
+          providerId: chatInitialProviderId,
+          effort: draftInitialEffort,
+          fastMode: effectiveFastMode,
+        },
+        getPresetEffort: getProviderModelEffort,
       });
+      if (!isDataOwnerGenerationCurrent(sshOwner)) return;
+      if (!selection.ok) {
+        throw new SshModelSelectionError(selection.reason);
+      }
+      const {
+        model: sshModel, providerId: sshProviderId, effort: sshEffort, fastMode: sshFastMode,
+      } = selection;
       try {
         const newSession = await createSession({
           agentKind: draftVendor,
@@ -2542,6 +2500,7 @@ export function NewMakerDraftRoute() {
       effectiveDeviceLinkDeviceId,
       localProviders,
       localProvidersLoading,
+      localProvidersLoadFailed,
       effectiveCollab,
       capabilityAgentKind,
       effectivePlanMode,
@@ -5037,32 +4996,58 @@ export function NewMakerDraftRoute() {
     return proceed;
   }, [vendorAuthGate]);
 
-  const handleHomeSuggestion = useCallback(
-    (id: HomeSuggestionId) => {
-      if (sendInFlightRef.current) return;
-      const prompt = t(homeSuggestionPromptKey(id));
-      void handleSend(
-        prompt,
-        draftInitialModel,
-        (draftInitialEffort ?? 'medium') as Effort,
-        chatInitialPermissionMode,
-        attachmentState.attachments,
-        undefined,
-        {
-          providerId: chatInitialProviderId,
-          recoveryDraftDoc: plainTextToTiptapDoc(prompt),
-        },
-      );
+  // 首页任务建议:悬停只在输入框里预览 prompt,点击把完整 prompt 填进输入框交给用户
+  // 改写后自己发送,不再直接替用户发出。填入走草稿存储的外部写入通道,ChatInput 订阅后
+  // 替换正文并把光标放到末尾;附件等其余草稿内容原样保留。输入框锁定(发送中 / 语音占用)
+  // 时不写入,免得覆盖进行中的语音稿或待发正文。预览与填入共用同一份文字计算。
+  const [suggestionPreview, setSuggestionPreview] = useState<string | null>(null);
+  const composerMutationLockedRef = useRef(false);
+  const handleComposerMutationLockChange = useCallback((locked: boolean) => {
+    composerMutationLockedRef.current = locked;
+  }, []);
+  const fillComposerWithSuggestion = useCallback((prompt: string): boolean => {
+    if (sendInFlightRef.current || composerMutationLockedRef.current) return false;
+    const existing = getComposerDraft(NEW_MAKER_DRAFT_KEY);
+    saveComposerDraft(NEW_MAKER_DRAFT_KEY, {
+      ...existing,
+      text: plainTextToTiptapDoc(prompt),
+      attachments: existing?.attachments ?? [],
+    });
+    return true;
+  }, []);
+  // 一条建议「点击后会填入的文字」的唯一计算:视觉预览与读屏描述都用它,点击填入走同一个
+  // pluginSuggestionComposerText。插件可用时带 $指令(或插件调用说明);需要先安装的插件
+  // 点击后走安装引导、不会立即填入,只显示建议本身。插件清单变化时随之重算。
+  // 可用插件表按插件清单与工作目录缓存:filterGhostsForWorkdir 会同步查询目录禁用表,
+  // 不能在每次渲染 / 每条建议上重复调用。
+  const installedGhosts = useInstalledGhosts();
+  const usableSuggestionGhosts = useMemo(
+    () =>
+      new Map(
+        filterGhostsForWorkdir(installedGhosts, effectiveWorkingDir)
+          .filter((g) => g.enabled)
+          .map((g) => [g.manifest.id, g]),
+      ),
+    [effectiveWorkingDir, installedGhosts],
+  );
+  const suggestionComposerText = useCallback(
+    (suggestion: HomeTaskSuggestion) => {
+      const ghost = suggestion.pluginId
+        ? usableSuggestionGhosts.get(suggestion.pluginId)
+        : undefined;
+      return ghost ? pluginSuggestionComposerText(suggestion.prompt, ghost, t) : suggestion.prompt;
     },
-    [
-      attachmentState.attachments,
-      chatInitialPermissionMode,
-      chatInitialProviderId,
-      draftInitialEffort,
-      draftInitialModel,
-      handleSend,
-      t,
-    ],
+    [t, usableSuggestionGhosts],
+  );
+  const handleSuggestionPreview = useCallback(
+    (suggestion: HomeTaskSuggestion | null) =>
+      setSuggestionPreview(suggestion ? suggestionComposerText(suggestion) : null),
+    [suggestionComposerText],
+  );
+
+  const handleHomeSuggestion = useCallback(
+    (id: HomeSuggestionId) => fillComposerWithSuggestion(t(homeSuggestionPromptKey(id))),
+    [fillComposerWithSuggestion, t],
   );
 
   const pluginSuggestionFlight = useRef(false);
@@ -5151,28 +5136,12 @@ export function NewMakerDraftRoute() {
           navigate(`${route}&recommendation=${encodeURIComponent(nonce)}`);
           return;
         }
-        const recoveryPrompt = ghost.manifest.command
-          ? `$${ghost.manifest.command} ${suggestion.prompt}`
-          : `${suggestion.prompt}\n\n${t('newChat.pluginSuggestions.usePlugin', { name: ghost.manifest.name, id: ghost.manifest.id })}`;
-        // Retry goes through ChatInput, which expands $commands itself.
-        const prompt = ghost.manifest.command
-          ? expandGhostCommand(recoveryPrompt, [ghost])
-          : recoveryPrompt;
-        await handleSend(
-          prompt,
-          request.model,
-          request.effort,
-          request.permissionMode,
-          request.files,
-          undefined,
-          {
-            providerId: request.providerId,
-            recoveryDraftDoc: plainTextToTiptapDoc(recoveryPrompt),
-            onAccepted: () => {
-              void window.electronAPI.ghosts.markUsed(ghost.manifest.id).catch(() => undefined);
-            },
-          },
-        );
+        // 填进输入框而不是直接发送;ChatInput 发送时会自己展开 $command。无指令插件发送时
+        // 识别不出所用插件,所以选中插件建议并成功填入即记一次最近使用(有指令的插件发送时
+        // 还会再记一次,只刷新时间,不影响排序语义)。
+        if (fillComposerWithSuggestion(pluginSuggestionComposerText(suggestion.prompt, ghost, t))) {
+          void window.electronAPI.ghosts.markUsed(ghost.manifest.id).catch(() => undefined);
+        }
       } catch {
         if (pluginSuggestionMounted.current)
           toast.error(t('newChat.pluginSuggestions.unavailable'));
@@ -5181,7 +5150,7 @@ export function NewMakerDraftRoute() {
       }
     },
     [
-      handleSend,
+      fillComposerWithSuggestion,
       i18n.language,
       i18n.resolvedLanguage,
       isDeviceLinkDraft,
@@ -5199,20 +5168,10 @@ export function NewMakerDraftRoute() {
         ownerId: dataOwnerId,
         targetKey: pluginSuggestionTargetKey,
         workingDir: effectiveWorkingDir,
-        model: draftInitialModel,
-        effort: (draftInitialEffort ?? 'medium') as Effort,
-        permissionMode: chatInitialPermissionMode,
-        providerId: chatInitialProviderId,
-        files: attachmentState.attachments,
       });
     },
     [
-      attachmentState.attachments,
-      chatInitialPermissionMode,
-      chatInitialProviderId,
       dataOwnerId,
-      draftInitialEffort,
-      draftInitialModel,
       effectiveWorkingDir,
       pluginSuggestionTargetKey,
       runPluginSuggestion,
@@ -5449,6 +5408,8 @@ export function NewMakerDraftRoute() {
                     visualVariant="create-agent"
                     compactToolbar
                     placeholder={t('newChat.chatInput.createAgentPlaceholder')}
+                    previewPrompt={suggestionPreview}
+                    onMutationLockChange={handleComposerMutationLockChange}
                     sessionId={undefined}
                     initialWorkingDir={effectiveWorkingDir}
                     remoteHostId={draft.remoteHostId ?? null}
@@ -5622,6 +5583,8 @@ export function NewMakerDraftRoute() {
                     onSelect={handleHomeSuggestion}
                     includePlugins={!isRemoteProjectDraft && !isDeviceLinkDraft}
                     onPluginSelect={handlePluginSuggestion}
+                    onPreviewChange={handleSuggestionPreview}
+                    composerTextFor={suggestionComposerText}
                   />
                 )}
                 {/* 首页「新建目标」弹窗:无 sessionId → onCreate 建会话并 setGoal(见 handleCreateGoal)。

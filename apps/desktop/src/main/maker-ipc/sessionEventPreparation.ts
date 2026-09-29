@@ -1,3 +1,5 @@
+import { isQuietScheduledOutput } from '../scheduler-host/silent-output.js';
+import { captureTurnUsageContext, type TurnUsageContext } from './turnUsageContext.js';
 import type { BotCompactRuntimeRefreshCoordinator } from './botCompactRuntimeRefresh.js';
 import type {
   AgentEvent,
@@ -15,12 +17,14 @@ import { noteSubagentObservationTurnStarted } from '../subagentObservationRewind
 import { persistSessionFields } from '../localDb/ipc/sessions.js';
 
 import { createLogger } from '../logger.js';
+import { t } from '../i18n.js';
 import type { GitSnapshotCoordinator } from '../git-snapshot/gitSnapshotCoordinator.js';
 import { markSessionTurnStarted } from '../localDb/sessionActiveTurn.js';
 import {
   backgroundTurnPredatesSessionClear,
   noteAgentMeta,
   noteTurnStarted,
+  onStandaloneTextEvent,
 } from '../messagePersistBroadcaster.js';
 import { isCcMgrUpgradeInFlight } from '../remote-ssh/index.js';
 import { AgentInputCoordinator } from './agent-input-coordinator.js';
@@ -28,7 +32,6 @@ import { clearPromptPredictionSessionStopped } from './promptPredictionStopLedge
 import { MAKER_PUSH } from './channels.js';
 import { finalizeTurnChangeSet } from '../turn-change-set/store.js';
 import { type OrcaTeamService } from './orcaTeamService.js';
-import { getSessionFastMode } from '../maker-host/session-effort-store.js';
 import { noteClaudeSessionTurnState } from '../maker-host/claude-session-background-activity.js';
 import { consumeClaudeOpusPlanMismatch } from '../maker-host/claude-gateway-error-observer.js';
 import {
@@ -44,6 +47,12 @@ import {
   InterruptedTurnAutoResumeGuard,
   isSubstantiveProgressEvent,
 } from './interruptedTurnAutoResume.js';
+import { isBotGroupClientId } from '../../shared/botGroupChat.js';
+
+/** Bot DMs and group-lane turns answer an internal channel, not the user watching this Session. */
+function isBotPrivateInput(clientId: string): boolean {
+  return clientId.startsWith('bot-dm:') || isBotGroupClientId(clientId);
+}
 
 interface DismissedInteraction {
   kind: InteractionRequest['kind'];
@@ -100,7 +109,7 @@ export interface PrepareSessionEventDeps {
   readonly orcaTeamServiceForEvents: Pick<OrcaTeamService, 'handleWorkerTurnStarted'> | null;
   readonly turnModelPromiseBySession: Map<string, Promise<string>>;
   readonly readSessionModelForUsage: (sessionId: string) => Promise<string>;
-  readonly turnPiFastModeBySession: Map<string, boolean>;
+  readonly turnUsageContextBySession: Map<string, TurnUsageContext>;
   readonly silentStopTurnLeaseGate: Pick<SilentStopTurnLeaseGate, 'turnLeaseIdForEvent'>;
   readonly agentInputCoordinatorHolder: Pick<
     AgentInputCoordinator,
@@ -145,6 +154,34 @@ export function prepareSessionEvent(
     });
     return;
   }
+  // Post-terminal Host recovery bypasses the model. Localize before both
+  // persistence and renderer delivery, without mutating the internal receipt.
+  if (event.runtimeRecovery && event.source === 'pi' && event.type === 'text') {
+    event = {
+      ...event,
+      data: {
+        ...(event.data as Record<string, unknown>),
+        text: t('settings.piPackages.failure.runtimeRetirementFailed'),
+      },
+    };
+  }
+  if (event.type === 'text' && event.standaloneText === true) {
+    if (isQuietScheduledOutput(event) && !event.runtimeRecovery) return;
+    // Deliver through the existing persisted-row channel only. Sending a text
+    // event as well would let older renderers adopt the notice as their active
+    // assistant stream and overwrite/misdate the next model reply.
+    const redacted = deps.redactEventForRenderer(event);
+    const text = (redacted.data as { text?: unknown } | null)?.text;
+    const inputId = deps.agentInputCoordinatorHolder?.getActiveInputClientId(session.id, event.sessionTurnGeneration);
+    // Private-message visibility is still owned by the accepted input, even
+    // though the notice is independent of the model's reply/usage state.
+    const privateReply = inputId ? isBotPrivateInput(inputId) : event.agentMeta?.botPrivateReply;
+    if (typeof text === 'string') {
+      onStandaloneTextEvent(session.id, text,
+        typeof privateReply === 'boolean' ? { botPrivateReply: privateReply } : null);
+    }
+    return;
+  }
   // 自动续跑的 pending 不能只靠 status(isRunning=true) 清理：Pi/Claude 的
   // terminal-only 路径可能首个事件就是 error。Session 已把 host-owned token
   // 盖到事件上，首个匹配 token 的事件即视为 provider accepted。
@@ -156,7 +193,16 @@ export function prepareSessionEvent(
   // The host's accepted input owns provenance across all three SDKs. Explicit
   // false restores normal replies when the user steers a private message turn.
   let attributedEvent = activeInputId
-    ? { ...event, agentMeta: { ...event.agentMeta, botPrivateReply: activeInputId.startsWith('bot-dm:') } }
+    ? {
+        ...event,
+        agentMeta: {
+          ...event.agentMeta,
+          botPrivateReply: isBotPrivateInput(activeInputId),
+          // A group-lane turn is delivered into the group chat; its hidden Session never
+          // raises completion/error attention of its own (docs/product-rules/bot-group-chat.md §3).
+          ...(isBotGroupClientId(activeInputId) ? { botGroupLane: true } : {}),
+        },
+      }
     : event;
   if (event.type === 'error' && isTerminalTurnErrorEvent(event)) {
     const reason =
@@ -204,7 +250,7 @@ export function prepareSessionEvent(
     return;
   }
   if (event.type === 'image' && event.source === 'codex') {
-    void deps.broadcastCodexImageAsToolResult(session.id, event);
+    if (!isQuietScheduledOutput(event)) void deps.broadcastCodexImageAsToolResult(session.id, event);
     return;
   }
   if (event.type === 'plan_mode_changed') {
@@ -305,8 +351,9 @@ export function prepareSessionEvent(
       ) {
         deps.turnModelPromiseBySession.set(session.id, deps.readSessionModelForUsage(session.id));
       }
-      if (event.source === 'pi' && !deps.turnPiFastModeBySession.has(session.id)) {
-        deps.turnPiFastModeBySession.set(session.id, getSessionFastMode(session.id));
+      if ((event.source === 'pi' || event.source === 'codex' || event.source === 'claude-code')
+        && (!wasInTurn || !deps.turnUsageContextBySession.has(session.id))) {
+        deps.turnUsageContextBySession.set(session.id, captureTurnUsageContext(session.id));
       }
     } else if (
       data.isRunning === false &&
@@ -420,7 +467,8 @@ export function prepareSessionEvent(
     shouldMarkTurnTerminalIdleAfterBroadcast = true;
     if (event.source === 'claude-code' || event.source === 'codex' || event.source === 'pi') {
       deps.turnModelPromiseBySession.delete(session.id);
-      if (event.source === 'pi') deps.turnPiFastModeBySession.delete(session.id);
+      // A paired done may still carry usage after this error. Retain its billing
+      // identity until done; a new product turn overwrites it using wasInTurn.
     }
     const errData =
       attributedEvent.type === 'error'

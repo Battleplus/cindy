@@ -148,8 +148,8 @@ vi.mock('@/state/modelVisibilityPrefs', () => ({
   useModelVisibilityVersion: () => 0,
 }));
 
-vi.mock('@/components/settings/CustomProviderDialog', () => ({
-  CustomProviderDialog: () => null,
+vi.mock('@/components/settings/ProviderConnectionDialog', () => ({
+  ProviderConnectionDialog: () => null,
 }));
 
 vi.mock('@/components/settings/AddProviderWizard', () => ({
@@ -243,7 +243,7 @@ afterEach(() => {
 });
 
 describe('ProvidersSection — Cindy AI 账户资产模块', () => {
-  it('仅免费个人账号在 Cindy AI 模型数量后显示身份标签', async () => {
+  it('仅免费个人账号在 Cindy AI 名称后显示身份标签', async () => {
     modelAccessState.accountTier = 'free';
     renderSection();
 
@@ -251,7 +251,8 @@ describe('ProvidersSection — Cindy AI 账户资产模块', () => {
     expect(badge.textContent).toBe('settings.providers.xd.accountTier.free');
     const assetModule = screen.getByTestId('cindy-ai-asset-module');
     expect(assetModule.contains(badge)).toBe(false);
-    expect(badge.previousElementSibling?.textContent).toBe('settings.providers.models.modelCount');
+    expect(badge.previousElementSibling?.textContent).toBe('settings.providers.xd.title');
+    expect(screen.getByTestId('provider-detail-metadata').textContent).not.toContain('settings.providers.models.modelCount');
     expect(screen.getByTestId('provider-detail-metadata').contains(badge)).toBe(true);
 
     cleanup();
@@ -287,10 +288,10 @@ describe('ProvidersSection — Cindy AI 账户资产模块', () => {
     );
 
     const buyPlan = screen.getByText('settings.providers.xd.asset.buyPlan').closest('button');
-    expect(buyPlan?.className).toContain('bg-[var(--accent-cta-bg-pure)]');
+    expect(buyPlan?.className).toContain('[--button-face-bg:var(--accent-cta-bg-pure)]');
     expect(buyPlan?.className).toContain('text-[var(--accent-pure-cta-fg)]');
     const usageButton = screen.getByText('settings.providers.xd.asset.viewUsage').closest('button');
-    expect(usageButton?.className).toContain('bg-[var(--surface-elevated)]');
+    expect(usageButton?.className).toContain('[--button-face-bg:var(--surface-elevated)]');
     expect(usageButton?.className).toContain('text-[var(--text-primary)]');
     expect(screen.queryByText('billing.settings.topupCard.action')).toBeNull();
     expect(screen.queryByText('settings.providers.xd.asset.upgradePlan')).toBeNull();
@@ -309,7 +310,7 @@ describe('ProvidersSection — Cindy AI 账户资产模块', () => {
     expect(screen.queryByText('billing.settings.topupCard.action')).toBeNull();
 
     const upgrade = screen.getByText('settings.providers.xd.asset.upgradePlan').closest('button');
-    expect(upgrade?.className).toContain('bg-[var(--accent-cta-bg-pure)]');
+    expect(upgrade?.className).toContain('[--button-face-bg:var(--accent-cta-bg-pure)]');
     expect(upgrade?.className).toContain('text-[var(--accent-pure-cta-fg)]');
 
     fireEvent.click(screen.getByText('settings.providers.xd.asset.upgradePlan'));
@@ -330,7 +331,7 @@ describe('ProvidersSection — Cindy AI 账户资产模块', () => {
     expect(screen.queryByText('settings.providers.xd.asset.upgradePlan')).toBeNull();
 
     const topup = screen.getByText('billing.settings.topupCard.action').closest('button');
-    expect(topup?.className).toContain('bg-[var(--accent-cta-bg-pure)]');
+    expect(topup?.className).toContain('[--button-face-bg:var(--accent-cta-bg-pure)]');
     expect(topup?.className).toContain('text-[var(--accent-pure-cta-fg)]');
 
     fireEvent.click(screen.getByText('billing.settings.topupCard.action'));

@@ -41,6 +41,7 @@ export interface RemoteScheduleWriteInput {
   targetSessionId?: string;
   persistentSession?: boolean;
   silentWhenIdle?: boolean;
+  preRunHook?: { command: string; timeoutMs?: number } | null;
   notify: RemoteScheduleNotifyConfig;
 }
 
@@ -112,6 +113,7 @@ export interface RemoteSchedule {
   targetSessionId?: string;
   persistentSession?: boolean;
   silentWhenIdle?: boolean;
+  preRunHook?: { command: string; timeoutMs?: number } | null;
   notify?: RemoteScheduleNotifyConfig;
   status: RemoteScheduleStatus;
   createdAt?: RemoteTimestamp;
@@ -130,6 +132,10 @@ export interface RemoteScheduleRun {
   finishedAt?: RemoteTimestamp;
   status: RemoteScheduleRunStatus;
   errorMsg?: string;
+  /** Optional lightweight host projection; history and read receipts stay unchanged. */
+  failureKind?: 'precheck' | 'rate-limit' | 'execution';
+  failureRecovered?: boolean;
+  preRunHookResult?: { decision?: string; checkSucceeded?: boolean; stderr?: string };
   resultText?: string;
   costUsd?: number;
   estimatedValueUsd?: number;

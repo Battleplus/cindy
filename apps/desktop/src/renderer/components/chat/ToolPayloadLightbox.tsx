@@ -1,3 +1,4 @@
+import { Button } from '@/components/ui/button';
 /**
  * ToolPayloadLightbox
  * ---------------------------------------------------------------------------
@@ -20,6 +21,12 @@
  *     about.
  */
 
+import {
+  CHAT_LIGHTBOX_ICON_BUTTON_CLASS,
+  CHAT_FOCUS_CLASS,
+  CHAT_COMPACT_CODE_CLASS,
+  CHAT_CODE_SURFACE_CLASS,
+} from './chatChrome';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, FileText, Folder, X } from 'lucide-react';
@@ -28,6 +35,7 @@ import { useTranslation } from 'react-i18next';
 import { cn, basename } from '@/lib/utils';
 import { toast } from '@/lib/toast';
 import { Tooltip } from '@/components/ui/tooltip';
+import { FileTypeIcon } from '@/components/ui/file-type-icon';
 
 import { DiffView } from './DiffView';
 import { MarkdownDiffBlock } from './MarkdownDiffBlock';
@@ -298,7 +306,7 @@ export function ToolPayloadLightbox({
       <div
         data-tool-payload-lightbox-card
         className={cn(
-          'cursor-auto flex flex-col overflow-hidden rounded-[12px]',
+          'cursor-auto flex flex-col overflow-hidden rounded-xl',
           'border border-[var(--msg-tool-card-border)]',
           'bg-[var(--msg-tool-card-bg)]',
         )}
@@ -326,12 +334,17 @@ export function ToolPayloadLightbox({
                 onClick={copyTitle}
                 className={cn(
                   'flex items-center gap-2 min-w-0',
-                  'rounded-[6px] px-1 -mx-1 py-0.5',
+                  'rounded-full px-1 -mx-1 py-0.5',
+                  CHAT_FOCUS_CLASS,
                   'hover:bg-[var(--msg-code-inline-bg)] transition-colors',
                   'text-left cursor-pointer',
                 )}
               >
-                <FileText size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                {singleDiffFile ? (
+                  <FileTypeIcon name={singleDiffFile.filePath} size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                ) : (
+                  <FileText size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
+                )}
                 <span
                   className={cn(
                     'font-semibold text-14',
@@ -357,10 +370,7 @@ export function ToolPayloadLightbox({
                   <button
                     type="button"
                     onClick={showInFolder}
-                    className={cn(
-                      'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                      'hover:bg-[var(--msg-code-inline-bg)] transition-colors cursor-pointer',
-                    )}
+                    className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                     aria-label={t('chat.lightbox.openInExplorer')}
                   >
                     <Folder size={18} className="text-[var(--msg-tool-card-chevron)]" />
@@ -374,10 +384,7 @@ export function ToolPayloadLightbox({
                 <button
                   type="button"
                   onClick={copyContent}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                    'hover:bg-[var(--msg-code-inline-bg)] transition-colors cursor-pointer',
-                  )}
+                  className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                   aria-label={t('chat.lightbox.copyContent')}
                 >
                   <Copy size={18} className="text-[var(--msg-tool-card-chevron)]" />
@@ -390,10 +397,7 @@ export function ToolPayloadLightbox({
                 <button
                   type="button"
                   onClick={handleClose}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-[6px]',
-                    'hover:bg-[var(--msg-code-inline-bg)] transition-colors cursor-pointer',
-                  )}
+                  className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                   aria-label={t('chat.lightbox.close')}
                 >
                   <X size={20} className="text-[var(--msg-tool-card-chevron)]" />
@@ -486,7 +490,8 @@ export function ToolPayloadLightbox({
               className={cn(
                 'h-full min-h-0 w-full resize-none rounded-lg border',
                 'border-[var(--msg-code-block-border)] bg-[var(--msg-code-block-bg)]',
-                'p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
+                'p-3',
+                CHAT_COMPACT_CODE_CLASS,
                 'text-[var(--msg-tool-card-text)] outline-none',
               )}
             />
@@ -500,8 +505,9 @@ export function ToolPayloadLightbox({
                 </div>
                 <pre
                   className={cn(
-                    'overflow-x-auto rounded-[12px] border border-[var(--msg-code-block-border)]',
-                    'bg-[var(--msg-code-block-bg)] p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
+                    CHAT_CODE_SURFACE_CLASS,
+                    CHAT_COMPACT_CODE_CLASS,
+                    'overflow-x-auto p-3',
                     'text-[var(--msg-tool-card-text)] select-text whitespace-pre-wrap break-words',
                   )}
                 >
@@ -515,8 +521,9 @@ export function ToolPayloadLightbox({
                   </div>
                   <pre
                     className={cn(
-                      'overflow-x-auto rounded-[12px] border border-[var(--msg-code-block-border)]',
-                      'bg-[var(--msg-code-block-bg)] p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
+                      CHAT_CODE_SURFACE_CLASS,
+                      CHAT_COMPACT_CODE_CLASS,
+                      'overflow-x-auto p-3',
                       'text-[var(--msg-tool-card-text)] select-text whitespace-pre-wrap break-words',
                     )}
                   >
@@ -535,30 +542,12 @@ export function ToolPayloadLightbox({
               'border-t border-[var(--msg-tool-card-border)]',
             )}
           >
-            <button
-              type="button"
-              onClick={handleClose}
-              className={cn(
-                'h-8 rounded-full border px-4 text-12 font-medium',
-                'border-[var(--border-default)] bg-[var(--surface-elevated)]',
-                'text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] transition-colors',
-                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
-              )}
-            >
+            <Button variant="secondary" size="md" compact type="button" onClick={handleClose}>
               {textEdit.cancelLabel}
-            </button>
-            <button
-              type="button"
-              onClick={handleSaveText}
-              className={cn(
-                'h-8 rounded-full px-4 text-12 font-medium',
-                'bg-[var(--accent-cta-bg)] text-[var(--accent-pure-cta-fg)]',
-                'hover:opacity-90 transition-opacity',
-                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
-              )}
-            >
+            </Button>
+            <Button variant="cta" size="md" compact type="button" onClick={handleSaveText}>
               {textEdit.saveLabel}
-            </button>
+            </Button>
           </div>
         )}
       </div>

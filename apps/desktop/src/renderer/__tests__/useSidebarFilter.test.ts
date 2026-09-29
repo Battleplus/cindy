@@ -16,6 +16,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   STATUS_KEY,
+  VENDOR_KEY,
+  loadVendor,
+  persistVendor,
   PROJECTS_KEY,
   GROUP_BY_KEY,
   LAST_ACTIVITY_KEY,
@@ -293,7 +296,7 @@ describe('loadProjectOrder', () => {
     expect(loadProjectOrder()).toBe('activity');
   });
 
-  it("maps leftover sortBy=manual to custom when projectOrder is unset", () => {
+  it('maps leftover sortBy=manual to custom when projectOrder is unset', () => {
     localStorage.setItem(SORT_BY_KEY, 'manual');
     expect(loadProjectOrder()).toBe('custom');
     expect(loadSortBy()).toBe('recency');
@@ -378,10 +381,23 @@ describe('taskInfoFields（任务行右侧信息复选）', () => {
     expect(loadTaskInfoFields()).toEqual(['time', 'cost']);
   });
 
+  it('标签不再是任务信息项：旧存储里的 tags 静默丢弃，其余选择与顺序保留', () => {
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify(['cost', 'time', 'pr']));
+    expect(loadTaskInfoFields()).toEqual(['cost', 'time', 'pr']);
+    localStorage.setItem(TASK_INFO_KEY, '[]');
+    expect(loadTaskInfoFields()).toEqual([]);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify(['time', 'tags']));
+    expect(loadTaskInfoFields()).toEqual(['time']);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ version: 1, fields: ['tags', 'time'] }));
+    expect(loadTaskInfoFields()).toEqual(['time']);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ version: 1, fields: ['tags'] }));
+    expect(loadTaskInfoFields()).toEqual([]);
+  });
+
   it('falls back to default on broken JSON or shape mismatch', () => {
     localStorage.setItem(TASK_INFO_KEY, '{not-json');
     expect(loadTaskInfoFields()).toEqual(['time']);
-    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ fields: ['time'] }));
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ fields: ['cost'] }));
     expect(loadTaskInfoFields()).toEqual(['time']);
   });
 
@@ -563,15 +579,15 @@ describe('nextProjectsAfterToggle', () => {
     ).toBe('all');
   });
 
-  it("toggles the dialogue sentinel without treating it as a project path", () => {
+  it('toggles the dialogue sentinel without treating it as a project path', () => {
     expect(nextProjectsAfterToggle('all', DIALOGUE_FILTER_KEY)).toEqual([DIALOGUE_FILTER_KEY]);
     expect(nextProjectsAfterToggle([DIALOGUE_FILTER_KEY], 'local:/proj-a')).toEqual([
       DIALOGUE_FILTER_KEY,
       'local:/proj-a',
     ]);
-    expect(nextProjectsAfterToggle([DIALOGUE_FILTER_KEY, 'local:/proj-a'], DIALOGUE_FILTER_KEY)).toEqual([
-      'local:/proj-a',
-    ]);
+    expect(
+      nextProjectsAfterToggle([DIALOGUE_FILTER_KEY, 'local:/proj-a'], DIALOGUE_FILTER_KEY),
+    ).toEqual(['local:/proj-a']);
   });
 });
 
@@ -828,5 +844,25 @@ describe('项目拖拽(机器过滤态):mergeVisibleReorder + normalizeManualPro
     expect(merged).toEqual([p2, h1, p1, h2]);
     // setManualProjectOrder 内部会再归一化一次 → 必须幂等(不追加、不打乱)。
     expect(normalizeManualProjectOrder(merged, all)).toEqual([p2, h1, p1, h2]);
+  });
+});
+
+describe('Harness filter persistence', () => {
+  beforeEach(() => installMemoryLocalStorage());
+  afterEach(() => uninstallLocalStorage());
+
+  it.each(['all', 'cc', 'codex', 'pi'] as const)(
+    'restores %s from the existing preference key',
+    (vendor) => {
+      persistVendor(vendor);
+      expect(localStorage.getItem(VENDOR_KEY)).toBe(vendor);
+      expect(loadVendor()).toBe(vendor);
+    },
+  );
+
+  it('keeps the all default for absent or unknown harness values', () => {
+    expect(loadVendor()).toBe('all');
+    localStorage.setItem(VENDOR_KEY, 'unknown');
+    expect(loadVendor()).toBe('all');
   });
 });

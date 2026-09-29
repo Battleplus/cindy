@@ -1,4 +1,5 @@
 import { Modal, Pressable, StyleSheet } from 'react-native';
+import { ModalContentArea } from '@/platform/ModalContentArea';
 import { useTranslation } from 'react-i18next';
 import { Text, TextInput } from '@/components/AppText';
 import { MainWindowActionGroup } from '@/components/MobilePrimitives';
@@ -35,6 +36,7 @@ export function RenameDeviceModal({
   const canSave = draft.trim().length > 0 && !saving;
   return (
     <Modal
+      supportedOrientations={['portrait', 'portrait-upside-down', 'landscape-left', 'landscape-right']}
       animationType="fade"
       transparent
       visible={visible}
@@ -45,6 +47,7 @@ export function RenameDeviceModal({
         onPress={onCancel}
         testID="home.renameDevice.backdrop"
       >
+        <ModalContentArea>
         <Pressable
           style={styles.renameDeviceCard}
           onPress={() => undefined}
@@ -62,7 +65,7 @@ export function RenameDeviceModal({
               if (canSave) onConfirm();
             }}
             placeholder={t('devices.list.renameDevice.placeholder')}
-            placeholderTextColor={colors.textTertiary}
+            placeholderTextColor={colors.textPlaceholder}
             returnKeyType="done"
             selectTextOnFocus
             style={styles.renameDeviceInput}
@@ -101,6 +104,7 @@ export function RenameDeviceModal({
             testID="home.renameDevice.actions"
           />
         </Pressable>
+        </ModalContentArea>
       </Pressable>
     </Modal>
   );
@@ -108,7 +112,7 @@ export function RenameDeviceModal({
 
 const makeStyles = (colors: ThemeColors) =>
   StyleSheet.create({
-    error: { color: colors.destructive, fontSize: typeScale.body },
+    error: { color: colors.destructive, fontSize: typeScale.body, lineHeight: lineHeight.body },
     renameDeviceBackdrop: {
       alignItems: 'center',
       backgroundColor: colors.overlay,
@@ -129,8 +133,8 @@ const makeStyles = (colors: ThemeColors) =>
     renameDeviceTitle: {
       color: colors.textPrimary,
       fontSize: typeScale.title,
-      fontWeight: fontWeight.medium,
-      lineHeight: lineHeight.subtitle,
+      fontWeight: fontWeight.semibold,
+      lineHeight: lineHeight.title,
     },
     renameDeviceInput: {
       backgroundColor: colors.surface,

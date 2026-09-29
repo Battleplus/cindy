@@ -1,9 +1,11 @@
+import { Button } from '@/components/ui/button';
 import { useModelPickerAgents } from '@/hooks/useAvailableAgents';
 import * as React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ExternalLink, Folder, MessageCircle, Timer, SlidersHorizontal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
+import { Select } from '@/components/ui/select';
 import { Tip } from '@/components/ui/tooltip';
 import {
   addRecentFolder,
@@ -16,10 +18,8 @@ import { useProviders } from '@/hooks/useProviders';
 import { ModelIconMark, ModelSelectorContent } from '@/components/new-chat/ModelSelector';
 import { useModelDiscoveryPending } from '@/components/new-chat/useModelDiscoveryPending';
 import {
-  connectedProvidersForAgent,
   effectiveSourceIdForModel,
   getModel,
-  nativeDefaultSourceId,
 } from '@cindy/model-providers';
 import * as sessionService from '@/lib/sessionService';
 import type { Session } from '@/lib/ccAgent.types';
@@ -38,6 +38,9 @@ import {
   switchScheduleTimingMode,
   WEEKDAY_LABELS,
   DEFAULT_CONFIG,
+  isSupportedIntervalMinutes,
+  resolveIntervalMinutesPresetValue,
+  SUPPORTED_INTERVAL_MINUTES,
   type CodexScheduleConfig,
 } from '../lib/cronCodexPreset';
 import { getScheduleDefaultModel, type EffortValue } from '../hooks/useScheduleForm';
@@ -385,10 +388,15 @@ export function ScheduleChip({
   };
 
   const setMode = (mode: EditableScheduleMenuMode) => {
+    // Re-selecting the visible mode is not an instruction to replace a legacy value.
+    // An exact interval has its own activeMode and can still enter a supported preset.
+    if (mode === 'intervalMinutes' && mode === activeMode) return;
+    // Exact intervals have no preset config; their compatibility Cron is not authoritative.
+    const presetConfig = activeMode === 'exactInterval' ? DEFAULT_CONFIG : config;
     const patch: Partial<CodexScheduleConfig> = { mode };
-    if (mode === 'interval') patch.intervalHours = config.mode === 'interval' ? config.intervalHours : 1;
+    if (mode === 'interval') patch.intervalHours = presetConfig.mode === 'interval' ? presetConfig.intervalHours : 1;
     if (mode === 'intervalMinutes') {
-      patch.intervalMinutes = config.mode === 'intervalMinutes' ? config.intervalMinutes : 5;
+      patch.intervalMinutes = resolveIntervalMinutesPresetValue(presetConfig);
     }
     update(patch);
   };
@@ -522,11 +530,20 @@ function ScheduleConfigPanel({
             <div className="flex min-h-[34px] w-full items-center gap-1.5">
               <IntervalMinutesInput
                 value={panelConfig.intervalMinutes}
+                label={t('scheduler.chips.scheduleField.intervalMinutesAria')}
                 onFocus={commit}
                 onChange={(intervalMinutes) => onUpdate({ mode: 'intervalMinutes', intervalMinutes })}
               />
               <span className="text-13 text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">{t('scheduler.chips.scheduleField.minutesSuffix')}</span>
             </div>
+            <p className="text-11 leading-4 text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+              {t('scheduler.chips.scheduleField.minuteIntervalHint')}
+            </p>
+            {!isSupportedIntervalMinutes(panelConfig.intervalMinutes) && (
+              <p className="text-11 leading-4 text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                {t('scheduler.chips.scheduleField.unsupportedMinuteInterval', { count: panelConfig.intervalMinutes })}
+              </p>
+            )}
             <PreviewPill
               text={
                 panelConfig.intervalMinutes === 1
@@ -611,35 +628,38 @@ function IntervalHoursInput({
 
 function IntervalMinutesInput({
   value,
+  label,
   onFocus,
   onChange,
 }: {
   value: number;
+  label: string;
   onFocus: () => void;
   onChange: (value: number) => void;
 }) {
-  const [draft, setDraft] = useState(String(value));
-
-  useEffect(() => {
-    setDraft(String(value));
-  }, [value]);
-
+  const valueString = String(value);
+  const isSupported = SUPPORTED_INTERVAL_MINUTES.includes(
+    value as (typeof SUPPORTED_INTERVAL_MINUTES)[number],
+  );
+  const options = [
+    ...(!isSupported
+      ? [{ value: valueString, label: String(value) + '*', disabled: true }]
+      : []),
+    ...SUPPORTED_INTERVAL_MINUTES.map((minutes) => ({
+      value: String(minutes),
+      label: String(minutes),
+    })),
+  ];
   return (
-    <input
-      type="text"
-      inputMode="numeric"
-      pattern="[0-9]*"
-      maxLength={2}
-      value={draft}
-      onFocus={onFocus}
-      onBlur={() => setDraft(String(value))}
-      onChange={(e) => {
-        const digits = e.target.value.replace(/\D/g, '').slice(0, 2);
-        setDraft(digits);
-        if (!digits) return;
-        onChange(clamp(Number(digits), 1, 59));
+    <Select
+      label={label}
+      value={valueString}
+      options={options}
+      onOpenChange={(open) => {
+        if (open) onFocus();
       }}
-      className={inputPillClass('w-[68px] text-center')}
+      onValueChange={(next) => onChange(Number(next))}
+      className="w-[88px] px-2 text-center text-13"
     />
   );
 }
@@ -1133,18 +1153,7 @@ export function ModelEffortChip({
     : [agentLabel, modelLabel, effectiveEffort ? effortLabel(effectiveEffort as EffortValue) : null,
       fastMode ? '⚡' : null].filter(Boolean).join(' · ');
 
-  // railSources 仅用于 nativeDefault 归一化(下拉宽度由 ModelSelectorContent 内容自适应,见 w-auto)。
   const vendorKey = agentKind === 'claude-code' ? 'cc' : agentKind;
-  const railSources = useMemo(
-    () => connectedProvidersForAgent(providers, agentKind),
-    [providers, agentKind],
-  );
-  // 归一化:选中的来源 == 原生默认 → 存 ''(= 跟随默认,与老数据/未升级字节级一致),
-  // 否则存显式 id。这样只有「钉到非原生来源」才在 schedule 上落非空 providerId。
-  const nativeDefault = useMemo(
-    () => nativeDefaultSourceId(railSources, agentKind),
-    [railSources, agentKind],
-  );
   // 当前生效来源 —— 与聊天 trigger 同口径(effectiveSourceIdForModel):按「已连接且**确实
   // 提供当前模型**」收窄后再应用显式选择 / 原生默认。只查「已连接」会在显式来源不提供
   // effectiveId 时渲染错误来源的标识(如 providerId=openai 而默认模型只有 xd 提供);
@@ -1212,7 +1221,7 @@ export function ModelEffortChip({
           onDismiss={() => setOpenWithoutAutoRefresh(false)}
           currentProviderId={providerId || null}
           onProviderChange={(pid, reconciledModelId, reconciledEffort, reconciledFast) => {
-            onChangeProviderId(pid && pid !== nativeDefault ? pid : '');
+            onChangeProviderId(pid ?? '');
             if (reconciledFast !== undefined) onChangeFast?.(reconciledFast);
             if (reconciledModelId) onChangeModel(reconciledModelId);
             if (reconciledEffort !== undefined) {
@@ -1220,9 +1229,7 @@ export function ModelEffortChip({
             }
           }}
           onNavigateToProviders={onNavigateToProviders}
-          // A stale explicit provider is rendered as the effective fallback row.
-          // Re-selecting that highlighted row must repair the stored provider
-          // before the effort configuration card opens.
+          // An explicit selection always pins the connection, including the native default.
           reselectEmitsChange
           selectedRowClickOpensConfiguration
           overlayContentClassName="z-[10020]"
@@ -1328,19 +1335,18 @@ export function ThreadPickerInline({ value, onSelect, onOpen, reference }: {
             ))}
           </select>
           {onOpen && hasRealValue && !referenceUnavailable && (
-            <button
+            <Button
+              variant="secondary"
+              size="md"
+              compact
+              tone="quiet"
               type="button"
               onClick={() => onOpen(value)}
               title={t('scheduler.editor.runSession.card.open')}
-              className={cn(
-                'inline-flex h-[34px] shrink-0 items-center gap-1 rounded-full px-2.5 text-xs font-medium',
-                'text-[var(--settings-btn-secondary-text)] hover:bg-[var(--surface-hover)]',
-                'transition-colors focus:outline-none',
-              )}
             >
               <ExternalLink size={12} strokeWidth={1.75} aria-hidden />
               {t('scheduler.editor.runSession.card.open')}
-            </button>
+            </Button>
           )}
         </>
       )}

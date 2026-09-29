@@ -16,6 +16,7 @@
  * dispose: 由 bootstrap-electron.ts 的 onQuit 注册器在退出阶段调用。
  */
 
+import { createAttachmentRecovery } from './oversized-attachment-recovery.js';
 import {
   createAnthropicCompatProxy,
   createActiveStripTransform,
@@ -28,7 +29,7 @@ import {
   createToolUseProviderSpecificFieldsRecoveryRule,
   createXaiModelInputRecoveryRule,
   createXaiModelInputSanitizeTransform,
-  compactOversizedImageHistory,
+  createAnthropicEffortCompatibilityRule,
   dedupeDuplicateToolUseIds,
   repairToolExchangeAdjacency,
   sanitizeXaiModelInputFromBody,
@@ -45,8 +46,14 @@ import {
 } from '@cindy/anthropic-compat-proxy';
 import { buildVisionBridgeProxyTransform } from '../vision-bridge/vision-bridge-controller.js';
 
-import { ANTHROPIC_DIRECT_UPSTREAM, CLAUDE_PROVIDER_AUTH_PLACEHOLDER_KEY, anthropicCatalogModelIds, isAnthropicWireModel } from './claude-gateway-config.js';
+import { CLAUDE_PROVIDER_AUTH_PLACEHOLDER_KEY, anthropicCatalogModelIds, isAnthropicWireModel } from './claude-gateway-config.js';
 import { getActiveCatalog } from './active-catalog.js';
+import { providerModelRecord } from '@cindy/model-providers';
+import { outboundFetch } from './outbound-fetch.js';
+import { invocationModelRecord, requiresNativeProviderAuth } from './pi-provider-transport.js';
+import { createClaudeProviderBridge } from './claude-provider-bridge.js';
+import { isOpenAiSubscriptionProviderId } from './codex-account-auth.js';
+import { isClaudeSubscriptionProviderId, isXaiSubscriptionProviderId } from './subscription-account-auth.js';
 import {
   getPiNativeSubscriptionHandler,
   getResponsesBridgeHandler,
@@ -76,6 +83,7 @@ import { shouldApplyExclusiveProviderReroute } from './model-route-guard.js';
 import { getSessionProvider } from './session-provider-store.js';
 import {
   buildRouteDecision,
+  providerRoutingForModel,
   gatewayDefaultRouteDecision,
   getUserProviderIdForSession,
   resolveImplicitLocalBridgeRouteResolution,
@@ -129,14 +137,52 @@ let _initialized = false;
 // auth-adapters(重模块)。oauth-spawn 下走网关的请求(默认 / 选 XD)要把鉴权头换成它。
 // 复刻 codex-proxy-host.ts 的 setCodexProxyGatewayKeyReader 套路。
 let _readGatewayKey: () => string | null = () => null;
+
+function attachClaudeProviderBridge(route: RoutingDecision, providerId: string, wireModel: string, sessionId?: string): RoutingDecision {
+  if (route.localHandler) return route;
+  const provider = getActiveCatalog().providers.find(p => p.id === providerId);
+  const model = provider?.models['claude-code']?.find(m => m.id === wireModel);
+  const routing = provider ? providerRoutingForModel(provider, 'claude-code', wireModel) : null;
+  // Adapter identity belongs to the declared route. An OAuth account can select
+  // another host without becoming a different provider (e.g. Copilot Business).
+  const nativeRow = model && routing && model.api ? invocationModelRecord(model, routing.upstream) : undefined;
+  const requiresNativeAuth = requiresNativeProviderAuth(nativeRow);
+  if (provider?.source === 'user' && model && routing &&
+      (requiresNativeAuth || routing.wireProtocol === 'openai-chat' || routing.wireProtocol === 'openai-responses' || (model.api && model.api !== 'anthropic-messages'))) {
+    const base = route.upstreamOverride ?? routing.upstream;
+    const protocol = routing.wireProtocol === 'openai-responses' ? 'openai-responses' : 'openai-chat';
+    const requestPath = routing.requestPath ?? (protocol === 'openai-chat' ? '/chat/completions' : '/responses');
+    const row = nativeRow ?? providerModelRecord(model.id, base, protocol);
+    const thinkingFormat = row?.execution.pi.compat?.thinkingFormat;
+    const handler = createClaudeProviderBridge({
+      url: `${base.replace(/\/+$/, '')}/${requestPath.replace(/^\/+/, '')}`,
+      protocol, headers: route.headerOverride ?? {}, efforts: model.efforts,
+      supportsFastMode: model.supportsFastMode === true,
+      providerId: provider.id,
+      ...(row && (protocol === 'openai-chat' || model.api) ? { model: row, nativeUpstream: base } : {}),
+      capabilities: {
+        ...(model.supportsImageInput ? { imageInput: 'image_url' as const } : {}),
+        reasoningField: thinkingFormat === 'qwen' ? 'enable_thinking'
+          : thinkingFormat === 'zai' ? 'thinking.type' : 'reasoning_effort',
+      },
+      fetchImpl: outboundFetch,
+    });
+    return { ...route, localHandler: args => handler.handle({ ...args,
+      prefs: { reasoningEffort: (sessionId ? getSessionEffort(sessionId) : null) ?? model.defaultEffort ?? undefined,
+        fast: sessionId ? getSessionFastMode(sessionId) : false },
+    }) };
+  }
+  return route;
+}
+
 export function setClaudeProxyGatewayKeyReader(fn: () => string | null): void {
   _readGatewayKey = fn;
 }
 
-// cc 是否处于 oauth-spawn —— 由 host 注入(hasClaudeAiOAuth)。退役全局 authMode 后,cc 的 spawn
-// 凭证形态完全由「是否连了 Claude.ai 订阅」决定(见 auth-adapters.getAuthEnv):连了 = oauth-spawn
-// (带 OAuth bearer,默认须换网关 key),否则 = gateway-spawn(自带网关 key,默认 passthrough)。
-// 默认 false:未注入时按 gateway-spawn 处理(passthrough),与未连订阅用户字节级一致。
+// cc 是否处于 oauth-spawn(带订阅 OAuth bearer 经过本 proxy)。Claude 订阅会话现由内置 CLI
+// 用它自己的登录直连 Anthropic、不经本 proxy(见 claude-native-cli),desktop 不再注入 checker:
+// 经 proxy 的 cc 进程一律带网关 key / 占位 key,恒按 gateway-spawn 处理(passthrough)。
+// 保留注入口只为兼容单测与其它 host。
 let _isOAuthSpawn: () => boolean = () => false;
 export function setClaudeProxyOAuthSpawnChecker(fn: () => boolean): void {
   _isOAuthSpawn = fn;
@@ -206,6 +252,31 @@ function refuseExclusiveXaiDefaultGateway(wireModel: string): RoutingDecision {
         },
       });
       res.writeHead(400, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(payload);
+    },
+  };
+}
+
+/**
+ * Claude 订阅只由 CLI 用自己的登录直连 Anthropic(env-builder nativeCliAuth),从不经本 proxy。
+ * 请求走到需要订阅凭证的分支说明子进程 env 不对:本地拒绝,绝不把请求(可能带着 CLI 的
+ * 订阅凭证)转发到 Anthropic。
+ */
+function refuseClaudeSubscriptionViaProxy(): RoutingDecision {
+  return {
+    localHandler: async ({ res }) => {
+      const payload = JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'permission_error',
+          code: 'anthropic_subscription_cli_only',
+          message: 'The Claude subscription is only used by Claude Code with its own login.',
+        },
+      });
+      res.writeHead(403, {
         'content-type': 'application/json; charset=utf-8',
         'cache-control': 'no-store',
       });
@@ -460,7 +531,7 @@ function unavailablePiProviderRoute(providerId: string): RoutingDecision {
  *      - 带 x-api-key(= gateway-spawn,cc 自带网关 key)→ passthrough,字节级不变。
  *      - 不带 x-api-key(= oauth-spawn,cc 带订阅 OAuth bearer)→ 默认全量换网关 key
  *        (覆盖 bearer + 删 anthropic-beta,防订阅 token 泄漏到网关);要走订阅须 per-session 选 Anthropic。
- *   **为什么看请求头而非 hasClaudeAiOAuth() live 读**:cc 进程的凭证在 spawn 时冻结,而 OAuth 连接态
+ *   **为什么看请求头而非连接态 live 读**:cc 进程的凭证在 spawn 时冻结,而 OAuth 连接态
  *   可能在会话中途变化(用户在供应商页连/断);live 读(还会每请求 shell-out 读 keychain,慢且与并发的
  *   keychain 写竞争)会与 cc 实际持有的凭证发散,导致 OAuth bearer 被误判 passthrough 泄漏到网关 → 401。
  *   请求头反映的就是 cc 此刻真正握着的凭证,稳健且零 syscall(规则 10 热路径)。
@@ -522,7 +593,7 @@ export function createModelRoutingTransform(): RoutingTransform {
           && piProviderId !== selectedPiProviderId
         ))
         || (!subagentRoute && (
-          (selectedPiProviderId === 'openai' || selectedPiProviderId === 'xai')
+          (isOpenAiSubscriptionProviderId(selectedPiProviderId) || isXaiSubscriptionProviderId(selectedPiProviderId))
           && piProviderId !== selectedPiProviderId
         ))
       )
@@ -549,7 +620,7 @@ export function createModelRoutingTransform(): RoutingTransform {
         },
       };
     }
-    if (piSessionId && (piProviderId === 'openai' || piProviderId === 'xai')) {
+    if (piSessionId && piProviderId && (isOpenAiSubscriptionProviderId(piProviderId) || isXaiSubscriptionProviderId(piProviderId))) {
       return {
         // PI has already built the provider-native request. The local handler
         // authenticates and forwards it; the xAI forwarder also restores its
@@ -626,9 +697,9 @@ export function createModelRoutingTransform(): RoutingTransform {
     if (
       !piSessionId
       && isSubscriptionDirectRoute(wireModel)
-      && !(explicitCustomProvider && isExclusiveXaiModelId(wireModel) && !wireModel.startsWith(XAI_MODEL_PREFIX))
+      && !(explicitCustomProvider && !isXaiSubscriptionProviderId(selectedProviderId) && isExclusiveXaiModelId(wireModel) && !wireModel.startsWith(XAI_MODEL_PREFIX))
     ) {
-      const bridgeHandler = getResponsesBridgeHandler();
+      const bridgeHandler = getResponsesBridgeHandler((isOpenAiSubscriptionProviderId(selectedProviderId) || isXaiSubscriptionProviderId(selectedProviderId)) ? selectedProviderId! : undefined);
       if (!bridgeHandler) {
         if (isExclusiveXaiModelId(wireModel)) {
           log.warn('exclusive xAI model but responses handler unavailable; refusing default gateway', {
@@ -691,6 +762,9 @@ export function createModelRoutingTransform(): RoutingTransform {
     // ① 该会话显式选了供应商 → 据 catalog 统一路由。
     //    x-claude-code-session-id = cc sdkSessionId,经注入的 resolver 反解成 xdt sessionId。
     if (sessionId) {
+      if (requestAgent === 'claude-code' && selectedProviderId && isClaudeSubscriptionProviderId(selectedProviderId)) {
+        return refuseClaudeSubscriptionViaProxy();
+      }
       // wireModel 传给 scope 门:cc 内部辅助调用(权限 auto 分类器等 claude-* 小模型请求)
       // 不在订阅直连供应商(xai / openai-cc)声明的 modelPrefixes 范围内 → 返回 null,
       // 落到下方 ② 段 spawn 默认路由,分类器照常走网关/直连(issue #886)。
@@ -699,7 +773,7 @@ export function createModelRoutingTransform(): RoutingTransform {
         // A missing descriptor is not permission to use the default upstream.
         // Keep builtin subscription scope fallbacks, but pin explicit custom
         // requests even while their catalog/runtime is temporarily unavailable.
-        if (!route && requestAgent === 'claude-code' && explicitCustomProvider) {
+        if (!route && ((requestAgent === 'claude-code' && explicitCustomProvider) || (requestAgent === 'pi' && piProviderId && piProviderId !== 'xd'))) {
           return retryableLocalRoute(
             'provider_route_unavailable',
             'The selected provider route is unavailable; check its configuration and retry.',
@@ -716,10 +790,13 @@ export function createModelRoutingTransform(): RoutingTransform {
             selectedProviderId === 'xd' ? 'gateway' : 'subscription',
           );
         }
+        if (route && requestAgent === 'claude-code' && explicitCustomProvider && selectedProviderId) {
+          return attachClaudeProviderBridge(route, selectedProviderId, wireModel, sessionId);
+        }
         return isPiGatewayRequest ? sanitizePiGatewayDecision(route, ctx.url) : route;
       };
       if (perSession instanceof Promise) return perSession.then(recordSelectedRoute);
-      if (perSession || (requestAgent === 'claude-code' && explicitCustomProvider)) {
+      if (perSession || (requestAgent === 'claude-code' && explicitCustomProvider) || (requestAgent === 'pi' && piProviderId && piProviderId !== 'xd')) {
         return recordSelectedRoute(perSession);
       }
       if (isPiGatewayRequest && selectedProviderId === 'xd') {
@@ -756,7 +833,7 @@ export function createModelRoutingTransform(): RoutingTransform {
         // wire 缺省推断与 provider-route 的 implicitBridgeWire 同口径:claude-code 的
         // 用户 Anthropic 兼容上游在目录里省略 wireProtocol(buildUserProvider 约定)。
         const bridgeWire = bridgeRoute?.routing.wireProtocol ?? 'anthropic-messages';
-        if (bridgeRoute && bridgeRoute.providerId !== 'xd' && bridgeWire === 'anthropic-messages') {
+        if (bridgeRoute && bridgeRoute.providerId !== 'xd' && ['anthropic-messages', 'openai-chat', 'openai-responses', 'google-generative-ai'].includes(bridgeWire)) {
           const bridged = buildRouteDecision(
             bridgeRoute.routing,
             gatewayKey,
@@ -768,7 +845,7 @@ export function createModelRoutingTransform(): RoutingTransform {
             bridged && bridgeRoute.routing.requestPath
               ? { ...bridged, pathOverride: bridgeRoute.routing.requestPath }
               : bridged;
-          if (withRequestPath) return withRequestPath;
+          if (withRequestPath) return attachClaudeProviderBridge(withRequestPath, bridgeRoute.providerId, wireModel, sessionId ?? undefined);
         }
         const implicitOAuth = resolveImplicitProviderOAuthRouteDecision(
           wireModel,
@@ -835,15 +912,15 @@ export function createModelRoutingTransform(): RoutingTransform {
         log.warn('provider-oauth cc spawn 占位 key 且无网关 key; passthrough (预期 401)', { wireModel });
         return null;
       }
-      // 没网关 key:Anthropic 模型只能直连(唯一出路),其余 passthrough + 记一条诊断。
-      // 判据 = 前缀地板 ∪ 目录 anthropic 供应商模型集合(新家族改 OSS 目录即可,无需发版)。
+      // 没有任何 Cindy 注入的凭证:Anthropic 模型只剩「带着 CLI 自己的订阅凭证直连」一条路,
+      // 而订阅会话从不经本 proxy —— 本地拒绝,不中转。判据 = 前缀地板 ∪ 目录 anthropic 模型集合。
       if (isAnthropicWireModel(wireModel, anthropicCatalogModelIds(getActiveCatalog()))) {
-        recordResolvedDefaultRoute('subscription');
-        return { upstreamOverride: ANTHROPIC_DIRECT_UPSTREAM };
+        log.warn('claude request without Cindy credentials refused (subscription is CLI-only)', { wireModel });
+        return refuseClaudeSubscriptionViaProxy();
       }
       if (wireModel) {
         // 无 key 的非 Anthropic 模型 passthrough 大概率 401 —— 路由归属不明确, 不记录。
-        log.warn('claude oauth-spawn but no gateway key; non-anthropic passthrough (可能 401)', { wireModel });
+        log.warn('claude request without key or gateway key; non-anthropic passthrough (可能 401)', { wireModel });
       }
       return null;
     }
@@ -913,14 +990,15 @@ export async function ensureAnthropicCompatProxyReady(): Promise<void> {
       // 函数形态:model-access 凭据同步可能在 proxy 启动(splash)后才把 endpoint
       // 换成下发值;每请求现取才能保证与当前 key 同租户(proxy 内部按值 memoize)。
       upstream: () => claudeUpstreamEndpoint(),
-      // Claude/PI 历史会把图片 base64 累积进下一次请求。仅当请求超过
-      // 32 MiB 时才打开有界 ingress，并优先压缩旧的 tool_result 图片；
-      // 原始媒体仍保留在媒体库，当前用户消息中的图片不被删除。
-      oversizedRequestCompactor: (body, _ctx, targetBytes) =>
-        typeof body === 'object' && body !== null && !Array.isArray(body)
-          ? compactOversizedImageHistory(body as Record<string, unknown>, targetBytes)
-          : null,
-      oversizedRequestIngressBytes: 64 * 1024 * 1024,
+      oversizedRequestRecovery: createAttachmentRecovery(headers => {
+        const piSessionId = headerValue(headers, 'x-cindy-pi-session-id');
+        if (piSessionId) {
+          return authenticatePiProxySession(piSessionId, headerValue(headers, 'x-cindy-pi-session-token'))
+            ? piSessionId : null;
+        }
+        const sdkSessionId = headerValue(headers, 'x-claude-code-session-id');
+        return sdkSessionId ? _resolveCcSessionId?.(sdkSessionId) : null;
+      }),
       // 'oauth' 模式按 model 分流(claude-* → api.anthropic.com 走订阅;其余 → gateway 换 key)。
       // 'gateway' 模式恒返 null,字节级行为与扩展前一致。
       routingTransform: createModelRoutingTransform(),
@@ -1065,6 +1143,10 @@ export async function ensureAnthropicCompatProxyReady(): Promise<void> {
         createXaiModelInputRecoveryRule({
           onRetry: (threadId, model) => xaiModelInputStripController.markActive(threadId, model),
         }),
+        // 自定义 Anthropic 兼容网关不认 Claude Code 默认档位的精确 400(#5032)→ 省略
+        // output_config.effort 重发一次。只在该文本命中时生效,官方 Claude / 订阅直连
+        // 不会返回它;能力未声明的模型本就不该收到客户端偏好(#4860 出站不变量)。
+        createAnthropicEffortCompatibilityRule(),
       ],
       logger: log,
       // 请求体 dump 默认关(dev trace 级别 + agent 高并发会刷爆 main event loop

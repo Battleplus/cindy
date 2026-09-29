@@ -195,8 +195,16 @@ vi.mock('@/state/modelVisibilityPrefs', () => ({
 vi.mock('@/state/deviceLinkModelMirror', () => ({
   useDeviceLinkModelMirrorVersion: () => 0,
 }));
+// Remote directories read account usage from device mirrors; this suite has no device link.
+vi.mock('@/hooks/useRemoteDeviceUsage', () => ({
+  useRemoteCodexAccountUsage: () => null,
+  useRemoteXaiSubscriptionUsage: () => null,
+}));
+vi.mock('@/hooks/useRemoteClaudeSubscriptionUsage', () => ({
+  useRemoteClaudeSubscriptionUsage: () => null,
+}));
 
-import { ModelSelectorContent } from '@/components/new-chat/ModelSelector';
+import { ModelSelector, ModelSelectorContent } from '@/components/new-chat/ModelSelector';
 import {
   __resetForTest as resetEnginePrefs,
   getModelEngineOverride,
@@ -208,7 +216,6 @@ import {
   updateModelFavorite,
 } from '@/state/modelFavorites';
 import { setModelEngineOverride } from '@/state/modelEnginePrefs';
-import { PRICE_TIER_COLORS } from '@/themes/effortTierColors';
 
 const onProviderChange = vi.fn();
 
@@ -894,13 +901,41 @@ describe('统一面板 · 会话内形态', () => {
       providerId: 'xd',
       modelId: 'gpt-5.5',
       targetAgent: 'claude-code',
-      effort: 'medium',
+      // 当前行实际为 high，切 Harness 不恢复成 Claude 的默认 medium。
+      effort: 'high',
       // 浮层展示的目标配置里的 Fast(cc 那条无 Fast 能力 → false)。
       fast: false,
       // 改的是**模型行**的引擎,与收藏无关 → 显式清锚点(2026-08-17 review K3:三类调用点
       // 的传值语义各不相同,一律显式给,不靠调用方的缺省)。
       favoriteUid: null,
     });
+    expect(getModelEngineOverride('xd', 'gpt-5.5')).toBeUndefined();
+  });
+
+  it.each(['low', 'high'])('切换同模型 Harness 保留当前 %s 档，不改成目标默认中档', async (effort) => {
+    renderPanel({ sessionEngineFilter, currentProviderId: 'xd', modelId: 'gpt-5.5', effort });
+    const flyout = await openRowFlyout('GPT-5.5');
+    await act(async () => {
+      fireEvent.click(flyout.querySelector('[data-engine-capsule="cc"]') as HTMLElement);
+    });
+    expect(onCrossEngineSelect).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'xd', modelId: 'gpt-5.5', targetAgent: 'claude-code', effort,
+    }));
+    expect(getModelEngineOverride('xd', 'gpt-5.5')).toBeUndefined();
+  });
+
+  it('切换 Harness 时只因目标能力限制适配当前档位', async () => {
+    renderPanel({
+      sessionEngineFilter: { ...sessionEngineFilter, currentAgent: 'claude-code', runtimeAgent: 'claude-code' },
+      currentProviderId: 'xd', modelId: 'gpt-5.5', effort: 'medium',
+    });
+    const flyout = await openRowFlyout('GPT-5.5');
+    await act(async () => {
+      fireEvent.click(flyout.querySelector('[data-engine-capsule="codex"]') as HTMLElement);
+    });
+    expect(onCrossEngineSelect).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: 'xd', modelId: 'gpt-5.5', targetAgent: 'codex', effort: 'low',
+    }));
     expect(getModelEngineOverride('xd', 'gpt-5.5')).toBeUndefined();
   });
 
@@ -3311,17 +3346,60 @@ describe('统一面板 · 合并行与 wire id', () => {
     expect(getEffort.mock.calls).not.toContainEqual(['claude-code', 'openai', 'gpt-5.6']);
   });
 
-  it('本地简介单行截断并挂 title，不透出上游英文描述，模型名同理', () => {
+  it('全部模型优先显示来源，Cindy AI 保留单行本地简介', () => {
     renderPanel();
     const row = rowFor('GPT-5.6');
     expect(row.textContent).not.toContain('A very long English');
-    const desc = within(row).getByText('用于编写代码、排查错误与改进程序。');
+    expect(row.querySelector('[data-model-source-details]')?.textContent).toBe('OpenAI');
+    expect(within(row).queryByText('用于编写代码、排查错误与改进程序。')).toBeNull();
+    const desc = within(rowFor('GPT-5.5')).getByText('用于编写代码、排查错误与改进程序。');
     expect(desc.getAttribute('title')).toBe('用于编写代码、排查错误与改进程序。');
     expect(desc).toBeTruthy();
     expect(desc.className).toContain('truncate');
     const name = within(row).getByText('GPT-5.6');
     expect(name.getAttribute('title')).toBe('GPT-5.6');
     expect(name.className).toContain('truncate');
+  });
+
+  it.each([
+    { providerId: 'openai', modelName: 'GPT-5.6', accountField: 'openAiAccount', named: false },
+    { providerId: 'openai', modelName: 'GPT-5.6', accountField: 'openAiAccount', named: true },
+    { providerId: 'anthropic', modelName: 'Opus 5', accountField: 'subscriptionAccount', named: false },
+    { providerId: 'anthropic', modelName: 'Opus 5', accountField: 'subscriptionAccount', named: true },
+  ])('全部和收藏显示识别出的账号，不重复已有账号名：$providerId / $named', ({ providerId, modelName, accountField, named }) => {
+    const original = providersRef.providers;
+    const identity = 'recognized@example.test';
+    providersRef.providers = original.map((value) => {
+      const provider = value as Record<string, unknown>;
+      return provider.id === providerId ? {
+        ...provider,
+        name: named ? `工作账号 · ${identity}` : '工作账号',
+        [accountField]: { source: 'oauth', identity },
+      } : provider;
+    });
+    try {
+      renderPanel();
+      expect(rowFor(modelName).querySelector('[data-model-source-details]')?.textContent).toBe(`工作账号 · ${identity}`);
+      fireEvent.click(within(rowFor(modelName)).getByRole('button', { name: '存为收藏' }));
+      fireEvent.click(document.querySelector('[data-rail-item="favorites"]')!);
+      expect(rowFor(modelName).querySelector('[data-model-source-details]')?.textContent).toBe(`工作账号 · ${identity}`);
+    } finally {
+      providersRef.providers = original;
+    }
+  });
+
+  it('收藏保持来源第二行，切到单供应商分栏恢复简介', () => {
+    renderPanel();
+    fireEvent.click(within(rowFor('GPT-5.6')).getByRole('button', { name: '存为收藏' }));
+    fireEvent.click(document.querySelector('[data-rail-item="favorites"]')!);
+    expect(rowFor('GPT-5.6').querySelector('[data-model-source-details]')?.textContent).toBe('OpenAI');
+    fireEvent.click(document.querySelector('[data-rail-item="provider:openai"]')!);
+    const providerRows = within(screen.getByRole('listbox')).getAllByText('GPT-5.6');
+    for (const name of providerRows) {
+      const row = name.closest('[data-unified-anchor]') as HTMLElement;
+      expect(row.querySelector('[data-model-source-details]')).toBeNull();
+      expect(within(row).getByText('用于编写代码、排查错误与改进程序。')).toBeTruthy();
+    }
   });
 
   it('没有折扣的行不渲染折扣徽标', () => {
@@ -3410,11 +3488,7 @@ describe('统一面板 · 行内折扣徽标', () => {
     expect(tierNode.innerHTML).toContain('inset(0 50% 0 0)');
     withBadge.unmount();
 
-    // 颜色只由点亮格数决定:亮 1 格绿 / 2 格黄 / 3 格红,与模型档位无关。
-    // jsdom 把 hex 序列化成 rgb —— 按常量换算后断言,不写死魔法数字。
-    const hexToRgb = (hex: string) =>
-      `rgb(${parseInt(hex.slice(1, 3), 16)}, ${parseInt(hex.slice(3, 5), 16)}, ${parseInt(hex.slice(5, 7), 16)})`;
-    // $$$ 六折(实付 60%)→ round(1.8)=2 格亮 → 黄(t2),裁掉右侧 1/3。
+    // 折扣档串也保持中性色。
     const solLike = render(
       React.createElement(UnifiedModelRow, {
         ...common,
@@ -3428,11 +3502,10 @@ describe('统一面板 · 行内折扣徽标', () => {
       }),
     );
     const solNode = solLike.container.querySelector('[data-price-tier]') as HTMLElement;
-    expect(solNode.innerHTML).toContain(hexToRgb(PRICE_TIER_COLORS.t2));
-    expect(solNode.innerHTML).not.toContain(hexToRgb(PRICE_TIER_COLORS.t3));
+    expect(solNode.innerHTML).toContain('color: var(--text-secondary)');
     solLike.unmount();
 
-    // $$$ 一折(实付 10%)→ 至少 1 格亮 → 绿(t1)。
+    // $$$ 一折(实付 10%)→ 至少 1 格亮，仍用中性色。
     const deepDiscount = render(
       React.createElement(UnifiedModelRow, {
         ...common,
@@ -3447,11 +3520,10 @@ describe('统一面板 · 行内折扣徽标', () => {
     );
     const deepNode = deepDiscount.container.querySelector('[data-price-tier]') as HTMLElement;
     expect(deepNode.textContent).toContain('$$$');
-    expect(deepNode.innerHTML).toContain(hexToRgb(PRICE_TIER_COLORS.t1));
-    expect(deepNode.innerHTML).not.toContain(hexToRgb(PRICE_TIER_COLORS.t3));
+    expect(deepNode.innerHTML).toContain('color: var(--text-secondary)');
     deepDiscount.unmount();
 
-    // 无折扣付费行:$ 串按档位色渲染,无 ↓ 徽标。
+    // 无折扣付费行:$ 串用中性色渲染,无 ↓ 徽标。
     const plain = render(
       React.createElement(UnifiedModelRow, {
         ...common,
@@ -3805,7 +3877,7 @@ describe('统一面板 · 重选与草稿失败恢复', () => {
       await act(async () => {
         finish(true);
       });
-      expect(onDismiss).toHaveBeenCalledTimes(1);
+      expect(onDismiss).toHaveBeenCalledTimes(operation === 'select' ? 1 : 0);
       if (operation === 'reset') expect(getModelEngineOverride('xd', 'gpt-5.5')).toBeUndefined();
       if (uid) expect(listModelFavorites()).toHaveLength(0);
     },
@@ -3954,5 +4026,119 @@ describe('settings configuration without shared memory', () => {
     await act(async () => { fireEvent.click(fast); });
     expect(change).toHaveBeenLastCalledWith('xd', 'gpt-5.5', 'high', true);
     expect(dismiss).not.toHaveBeenCalled();
+  });
+});
+
+// Teammate settings must use this real picker, including the portaled config.
+vi.mock('@/hooks/useAvailableAgents', () => ({ useAvailableAgents: () => ({
+  availableVendors: new Set(['cc', 'codex', 'pi']), loaded: true,
+}) }));
+vi.mock('@/features/bots/botStore', () => ({ getEffectiveBotModelSettings: () => ({
+  model: 'claude-opus-5', providerId: 'anthropic', effort: 'medium', fastMode: false,
+}) }));
+vi.mock('@/features/bots/botPronounContext', () => ({ useBotTranslation: () => ({ t: (key: string) => key }) }));
+import { BotModelChainEditor } from '@/features/bots/BotModelChainEditor';
+
+describe('Teammate settings with the real model picker', () => {
+  it('opens the real config and saves the selected source, harness, effort and Fast as one route', async () => {
+    const change = vi.fn();
+    function Editor() {
+      const [routes, setRoutes] = React.useState<React.ComponentProps<typeof BotModelChainEditor>['value']>([{
+        harness: 'claude', providerId: 'anthropic', model: 'claude-opus-5', effort: 'medium', fastMode: false,
+      }]);
+      return <BotModelChainEditor value={routes} onChange={(next) => { change(next); setRoutes(next); }} />;
+    }
+    const view = render(<Editor />);
+    fireEvent.click(view.container.querySelector('button[aria-haspopup="listbox"]')!);
+    await screen.findByRole('listbox');
+    const flyout = await openRowFlyout('GPT-5.5');
+    const fast = await within(flyout).findByRole('button', { name: 'newChat.modelSelector.unified.fastTip' });
+    await act(async () => { fireEvent.click(fast); });
+    await act(async () => { fireEvent.keyDown(within(flyout).getByRole('slider'), { key: 'ArrowLeft' }); });
+    await act(async () => { fireEvent.click(within(rowFor('GPT-5.5')).getByText('GPT-5.5')); });
+    await waitFor(() => expect(change).toHaveBeenCalled());
+    expect(change).toHaveBeenLastCalledWith([expect.objectContaining({
+      harness: 'codex', providerId: 'xd', model: 'gpt-5.5', effort: 'low', fastMode: true,
+    })]);
+  });
+});
+
+it('teammate fallback exposes supported Harness choices and preserves the primary route', async () => {
+  const primary = { harness: 'claude' as const, providerId: 'anthropic', model: 'claude-opus-5', effort: 'medium', fastMode: false };
+  const change = vi.fn();
+  function Editor() {
+    const [routes, setRoutes] = React.useState<React.ComponentProps<typeof BotModelChainEditor>['value']>([primary, { ...primary, harness: 'codex', providerId: 'xd', model: 'gpt-5.5' }]);
+    return <BotModelChainEditor value={routes} onChange={(next) => { change(next); setRoutes(next); }} />;
+  }
+  const view = render(<Editor />);
+  const details = view.container.querySelector('details')!;
+  details.open = true;
+  fireEvent(details, new Event('toggle'));
+  fireEvent.click(details.querySelector('button[aria-haspopup="listbox"]')!);
+  await screen.findByRole('listbox');
+  const flyout = await openRowFlyout('GPT-5.6');
+  const cc = flyout.querySelector('[data-engine-capsule="cc"]') as HTMLElement;
+  const codex = flyout.querySelector('[data-engine-capsule="codex"]');
+  expect(cc).toBeTruthy(); expect(codex).toBeTruthy();
+  await act(async () => { fireEvent.click(cc); });
+  await act(async () => { fireEvent.click(within(rowFor('GPT-5.6')).getByText('GPT-5.6')); });
+  expect(change).toHaveBeenLastCalledWith([primary, expect.objectContaining({ harness: 'claude', providerId: 'openai', model: 'chatgpt/gpt-5.6' })]);
+});
+
+
+describe('harness configuration keeps the model menu open', () => {
+  it.each(['success', 'cancel', 'error'] as const)('%s keeps both menus available', async (outcome) => {
+    let finish!: (value: boolean) => void;
+    let fail!: (error: Error) => void;
+    const change = vi.fn(() => new Promise<boolean>((resolve, reject) => {
+      finish = resolve;
+      fail = reject;
+    }));
+    function Picker() {
+      const [pendingTarget, setPendingTarget] = React.useState<'claude-code' | undefined>();
+      return <ModelSelector
+        modelId="gpt-5.5" effort="high" vendorKey="codex"
+        currentProviderId="xd" onModelChange={vi.fn()} onEffortChange={vi.fn()}
+        sessionEngineFilter={{
+          currentAgent: 'codex',
+          runtimeAgent: 'codex',
+          pendingTarget,
+          onCrossEngineSelect: async ({ targetAgent }) => {
+            const applied = await change();
+            if (applied) setPendingTarget(targetAgent === 'claude-code' ? targetAgent : undefined);
+            return applied;
+          },
+        }}
+      />;
+    }
+    render(<Picker />);
+    await act(async () => { fireEvent.click(screen.getByRole('button')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '全部' })); });
+    const flyout = await openRowFlyout('GPT-5.5');
+    await act(async () => {
+      fireEvent.click(flyout.querySelector('[data-engine-capsule="cc"]') as HTMLElement);
+    });
+    expect(change).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('listbox')).toBeTruthy();
+    await act(async () => {
+      if (outcome === 'error') fail(new Error('switch failed'));
+      else finish(outcome === 'success');
+    });
+    expect(screen.getByRole('listbox')).toBeTruthy();
+    expect(screen.getByTestId('unified-model-config-flyout')).toBeTruthy();
+    if (outcome === 'success') {
+      expect(screen.getByTestId('unified-model-config-flyout')
+        .querySelector('[data-engine-capsule="cc"]')?.getAttribute('aria-pressed')).toBe('true');
+      // Switching back must clear the pending intent through the same transaction.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('unified-model-config-flyout')
+          .querySelector('[data-engine-capsule="codex"]') as HTMLElement);
+      });
+      expect(change).toHaveBeenCalledTimes(2);
+      await act(async () => { finish(true); });
+    }
+    expect(screen.getByRole('listbox')).toBeTruthy();
+    expect(screen.getByTestId('unified-model-config-flyout')
+      .querySelector('[data-engine-capsule="codex"]')?.getAttribute('aria-pressed')).toBe('true');
   });
 });

@@ -3,6 +3,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BotCapabilities, BotModelRoute, BotProfile } from '../botStore';
+import { MainViewHistoryContext, type MainViewHistory } from '@/contexts/MainViewHistoryContext';
 import type { CustomMcpListContext, CustomMcpListResult } from '../../../../shared/customMcp';
 import { beginProvidersRefresh, commitProvidersSnapshot } from '@/lib/providersSnapshotStore';
 
@@ -17,6 +18,7 @@ vi.mock('@/components/onboarding/ConnectProviderCard', () => ({
 
 const translate = (key: string, opts?: Record<string, unknown>) =>
   opts ? `${key}:${JSON.stringify(opts)}` : key;
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ dataOwnerId: 'fixture-owner' }) }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: translate }) }));
 
 const mocks = vi.hoisted(() => {
@@ -33,6 +35,7 @@ const mocks = vi.hoisted(() => {
   listAgentSkills: vi.fn(),
   listToolsets: vi.fn(),
   profiles: [] as BotProfile[],
+  profilesLoaded: true,
   params: {} as { botId?: string },
   availableVendors: new Set(['cc', 'codex', 'pi']),
   defaultModelChain: [] as BotModelRoute[],
@@ -80,6 +83,7 @@ vi.mock('../botStore', () => ({
   chooseBotAvatar: mocks.chooseBotAvatar,
   setCanonicalBotSession: vi.fn(),
   useBotProfiles: () => mocks.profiles,
+  hasLoadedBotProfiles: () => mocks.profilesLoaded,
   canonicalBotSessionId: (bot: BotProfile) => bot.canonicalSessionId,
   getEffectiveBotModelChain: () => mocks.defaultModelChain,
   subscribeBotGlobalModel: (listener: () => void) => {
@@ -125,6 +129,9 @@ vi.mock('@/state/newMakerDraft', () => ({
 }));
 
 vi.mock('../../feature-context', () => ({ useRegisterContentHeader: () => undefined }));
+vi.mock('@/components/chat/MarkdownRenderer', () => ({
+  MarkdownRenderer: ({ content }: { content: string }) => <div>{content}</div>,
+}));
 
 import { BotsHomeView, BotSettings } from '../BotsHomeView';
 
@@ -206,6 +213,7 @@ beforeEach(() => {
   mocks.openPath.mockResolvedValue({ success: true });
   mocks.initialSearch = '';
   mocks.profiles = [];
+  mocks.profilesLoaded = true;
   mocks.params = {};
   mocks.availableVendors = new Set(['cc', 'codex', 'pi']);
   mocks.defaultModelChain = [];
@@ -243,6 +251,49 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+});
+
+describe('Bot entry after deletion', () => {
+  it('opens an ordinary teammate when Cindy is absent without flashing creation', () => {
+    mocks.profiles = [bot()];
+    render(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+    expect(screen.queryByRole('textbox')).toBeNull();
+  });
+
+  it('prefers the last viewed ID over Cindy, independent of renamed profiles', () => {
+    mocks.profiles = [bot({ id: 'cindy', name: 'Renamed', templateId: 'cindy' }), bot()];
+    const history = { current: { lastMatchedKey: 'bots', paths: {}, lastBotId: 'bot-1' } as MainViewHistory };
+    render(<MainViewHistoryContext.Provider value={history}><BotsHomeView /></MainViewHistoryContext.Provider>);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+  });
+
+  it('waits for hydration before recovering a stale deep link', () => {
+    mocks.profilesLoaded = false;
+    mocks.params = { botId: 'deleted' };
+    const view = render(<BotsHomeView />);
+    expect(mocks.navigate).not.toHaveBeenCalled();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    mocks.profiles = [bot()];
+    mocks.profilesLoaded = true;
+    view.rerender(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1', { replace: true });
+  });
+
+  it('skips a deleting current profile and opens recovery settings for the remaining paused one', () => {
+    mocks.params = { botId: 'deleted' };
+    mocks.profiles = [bot({ id: 'deleted', status: 'deleting' }), bot({ status: 'paused' })];
+    render(<BotsHomeView />);
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots/bot-1?settings=1', { replace: true });
+    expect(mocks.readSession).not.toHaveBeenCalled();
+  });
+
+  it('only shows creation once the loaded roster is empty', () => {
+    mocks.params = { botId: 'deleted' };
+    render(<BotsHomeView />);
+    expect(screen.getByRole('textbox')).toBeTruthy();
+    expect(mocks.navigate).toHaveBeenCalledWith('/bots', { replace: true });
+  });
 });
 
 describe('Bot settings profile consolidation', () => {
@@ -385,6 +436,7 @@ describe('Bot settings profile consolidation', () => {
     expect(screen.getByText('bots.homeFolder.title')).toBeTruthy();
     expect(screen.getByTestId('model-selector')).toBeTruthy();
     expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
+    expect(screen.getByTestId('bot-lifecycle-settings').closest('details')).toBeNull();
     expect(screen.queryByText('bots.settingsTabs.growth')).toBeNull();
     expect(screen.queryByText('bots.persona.adjustButton')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -400,6 +452,7 @@ describe('Bot settings profile consolidation', () => {
 
   it('opens the managed advanced folder without exposing a second editor', async () => {
     renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
     fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.open' }));
     await waitFor(() => expect(mocks.openPath).toHaveBeenCalledWith('/managed/bots/bot-1'));
   });
@@ -407,16 +460,39 @@ describe('Bot settings profile consolidation', () => {
   it('shows the open-folder failure in place', async () => {
     mocks.openPath.mockResolvedValue({ success: false, error: 'missing' });
     renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
     fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.open' }));
     expect((await screen.findByRole('alert')).textContent).toContain('missing');
   });
 
-  it('ignores retired tab deep links and keeps every setting on the same page', () => {
+  it('starts at grouped settings and opens real inner pages without exposing hidden inputs', async () => {
     renderSettings({}, 'settings=1&tab=growth');
-    expect(screen.queryByRole('tab')).toBeNull();
-    expect(screen.getByLabelText('bots.nameLabel')).toBeTruthy();
-    expect(screen.getByTestId('model-selector')).toBeTruthy();
-    expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.getByRole('button', { name: 'routines.title' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    expect(screen.getByRole('textbox', { name: 'bots.nameLabel' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'bots.profile.changeAvatar' })).toBeTruthy();
+    fireEvent.change(screen.getByRole('textbox', { name: 'bots.nameLabel' }), { target: { value: 'New name' } });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'bots.settingsTabs.model' })).toBeTruthy());
+    expect(mocks.updateBotProfile).toHaveBeenCalledWith('bot-1', { name: 'New name' });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsTabs.model' }));
+    expect(screen.getByRole('region', { name: 'bots.settingsTabs.model' })).toBeTruthy();
+    expect(screen.queryByRole('textbox', { name: 'bots.nameLabel' })).toBeNull();
+  });
+
+  it('keeps the current inner page and its draft when saving before navigation fails', async () => {
+    mocks.updateBotProfile.mockRejectedValue(new Error('offline'));
+    const beforeCloseRef = { current: null as (() => Promise<boolean>) | null };
+    render(<BotSettings bot={bot()} onBack={vi.fn()} onOpenSession={vi.fn()} beforeCloseRef={beforeCloseRef} />);
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'bots.nameLabel' }), { target: { value: 'Keep this draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    await screen.findByRole('button', { name: 'bots.autosave.retry' });
+    expect((screen.getByRole('textbox', { name: 'bots.nameLabel' }) as HTMLInputElement).value).toBe('Keep this draft');
+    let allowed = true;
+    await act(async () => { allowed = await beforeCloseRef.current!(); });
+    expect(allowed).toBe(false);
   });
 
   it('does not duplicate the chat action inside the settings panel', () => {
@@ -527,10 +603,31 @@ describe('Bot settings unified autosave', () => {
     });
   });
 
-  it('changes the avatar through the host-owned image picker', async () => {
+  it('saves Cindy from the settings gallery without changing the name or persona', async () => {
+    vi.stubGlobal('Image', class { src = ''; width = 256; height = 256; decode = async () => {}; });
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+    const output = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG9ydHJhaXQ=');
+    try {
+      renderSettings();
+      fireEvent.click(screen.getByRole('button', { name: 'bots.profile.changeAvatar' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Cindy' }));
+      await waitFor(() => expect(mocks.chooseBotAvatar).toHaveBeenCalledWith('bot-1', 'cG9ydHJhaXQ='));
+      expect(mocks.updateBotProfile).not.toHaveBeenCalled();
+      expect((screen.getByLabelText('bots.nameLabel') as HTMLInputElement).value).toBe('PR steward');
+    } finally {
+      context.mockRestore();
+      output.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the current avatar until uploading through the shared gallery', async () => {
     vi.useFakeTimers();
     renderSettings();
     fireEvent.click(screen.getByRole('button', { name: 'bots.profile.changeAvatar' }));
+    expect(screen.getByRole('button', { name: 'Cindy' })).toBeTruthy();
+    expect(mocks.chooseBotAvatar).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.guided.upload' }));
     await act(async () => {
       await vi.runAllTimersAsync();
     });
@@ -540,13 +637,23 @@ describe('Bot settings unified autosave', () => {
     );
   });
 
-  it('offers one recovery action only for a legacy profile with memory disabled', async () => {
+  it('turns memory on and off from the memory page', async () => {
     vi.useFakeTimers();
+    const listMemory = vi.fn(async () => []);
+    Object.assign(window.electronAPI, {
+      localDb: { ...window.electronAPI.localDb, bots: { memory: { list: listMemory } } },
+    });
     renderSettings({ capabilities: capabilities({ memory: false }) });
-    fireEvent.click(screen.getByRole('button', { name: 'bots.memoryRecovery.action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'bots.homeFolder.title' }));
+    expect(screen.queryByRole('switch')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    fireEvent.click(screen.getByRole('button', { name: 'bots.memory.title' }));
+    expect(screen.getByText('bots.memory.disabledHint')).toBeTruthy();
+    fireEvent.click(screen.getByRole('switch', { name: 'bots.memory.enabled' }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
+    expect(listMemory).toHaveBeenCalledWith('bot-1', undefined);
     expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toMatchObject({
       capabilities: expect.objectContaining({ memory: true }),
     });
@@ -554,12 +661,79 @@ describe('Bot settings unified autosave', () => {
 });
 
 
+describe('settings text fields', () => {
+  it('never saves unconfirmed IME text on any save path and saves it once committed', async () => {
+    vi.useFakeTimers();
+    renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    const name = screen.getByRole('textbox', { name: 'bots.nameLabel' });
+    const summary = screen.getByLabelText('bots.profile.summary');
+    // A save already scheduled before the composition still fires, without the pinyin.
+    fireEvent.change(summary, { target: { value: 'Own releases' } });
+    fireEvent.compositionStart(name);
+    fireEvent.change(name, { target: { value: 'PR stewardni' } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    // An explicit flush in the middle of the composition is held to the same snapshot.
+    fireEvent.blur(summary);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mocks.updateBotProfile).toHaveBeenCalledTimes(1);
+    expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toEqual({ description: 'Own releases' });
+    fireEvent.change(name, { target: { value: 'PR steward你' } });
+    fireEvent.compositionEnd(name);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1600);
+    });
+    expect(mocks.updateBotProfile).toHaveBeenCalledTimes(2);
+    expect(mocks.updateBotProfile.mock.calls[1]?.[1]).toEqual({ name: 'PR steward你' });
+  });
+
+  it('keeps showing the saved name for a cleared field and tidies the field on blur', async () => {
+    renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.title' }));
+    const name = screen.getByRole('textbox', { name: 'bots.nameLabel' }) as HTMLInputElement;
+    fireEvent.change(name, { target: { value: '   ' } });
+    fireEvent.blur(name);
+    expect(name.value).toBe('PR steward');
+    fireEvent.change(name, { target: { value: '  Release buddy ' } });
+    fireEvent.blur(name);
+    expect(name.value).toBe('Release buddy');
+    await waitFor(() =>
+      expect(mocks.updateBotProfile).toHaveBeenCalledWith('bot-1', { name: 'Release buddy' }),
+    );
+    const summary = screen.getByLabelText('bots.profile.summary') as HTMLTextAreaElement;
+    fireEvent.change(summary, { target: { value: 'Own releases \n' } });
+    fireEvent.blur(summary);
+    expect(summary.value).toBe('Own releases');
+    fireEvent.change(name, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    expect(await screen.findByRole('heading', { level: 1, name: 'Release buddy' })).toBeTruthy();
+  });
+
+  it('moves focus to the opened page and back to the row that opened it', async () => {
+    renderSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.personality' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' }));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole('button', { name: 'bots.profile.personality' }),
+      ),
+    );
+  });
+});
+
 describe('same-Bot capability updates while editing settings', () => {
   beforeEach(() => {
     mocks.defaultModelChain = capabilities().modelChain;
   });
   async function openCapabilities() {
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
+    const entry = screen.queryByRole('button', { name: 'bots.capabilities.title' });
+    if (entry) await act(async () => { fireEvent.click(entry); });
+    const details = screen.getByTestId('bot-capability-editor') as HTMLDetailsElement;
     await act(async () => {
       details.open = true;
       fireEvent(details, new Event('toggle'));
@@ -684,8 +858,8 @@ describe('same-Bot capability updates while editing settings', () => {
     await waitFor(() => expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { capabilities: { mcpServers: [] }, capabilityBaseline: { mcpServers: ['events'] } }));
     if (change === 'unavailable') expect(checkbox.disabled).toBe(true);
     else expect(screen.queryByRole('checkbox', { name: /events/ })).toBeNull();
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
-    await act(async () => { details.open = false; fireEvent(details, new Event('toggle')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' })); });
+    expect(screen.queryByTestId('bot-capability-editor')).toBeNull();
     expect(off).toHaveBeenCalledOnce();
   });
 
@@ -701,8 +875,8 @@ describe('same-Bot capability updates while editing settings', () => {
     renderSettings();
     await openCapabilities();
     expect(screen.getByRole('checkbox', { name: 'old-skill' })).toBeTruthy();
-    const details = screen.getByText('bots.capabilities.title').parentElement as HTMLDetailsElement;
-    await act(async () => { details.open = false; fireEvent(details, new Event('toggle')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'bots.settingsBack' })); });
+    expect(screen.queryByTestId('bot-capability-editor')).toBeNull();
     disk = ['new-skill'];
     await openCapabilities();
     expect(screen.queryByRole('checkbox', { name: 'old-skill' })).toBeNull();
@@ -825,6 +999,30 @@ describe('same-Bot capability updates while editing settings', () => {
     expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { name: 'Local name', capabilities: { toolsets: ['docs', 'scheduler'] }, capabilityBaseline: { toolsets: ['docs'] } });
   });
 
+  it('explains a rename that collides with another teammate instead of a generic save failure', async () => {
+    mocks.profiles = [bot(), bot({ id: 'bot-2', name: 'Ｒｅｌｅａｓｅ Buddy' })];
+    renderSettings();
+    fireEvent.change(screen.getByLabelText('bots.nameLabel'), { target: { value: ' release buddy ' } });
+    expect(screen.getByRole('alert').textContent).toBe('bots.guided.duplicateName');
+    expect(screen.queryByText('bots.autosave.retry')).toBeNull();
+    fireEvent.change(screen.getByLabelText('bots.nameLabel'), { target: { value: 'Release buddy 2' } });
+    expect(screen.queryByText('bots.guided.duplicateName')).toBeNull();
+  });
+
+  it('keeps a trailing line break typed before the debounced save lands', async () => {
+    vi.useFakeTimers();
+    const view = renderSettings();
+    fireEvent.change(screen.getByLabelText('bots.profile.summary'), { target: { value: 'Own releases\n' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+    expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { description: 'Own releases' });
+    // The host stores the trimmed text; the field must not snap the caret back a line.
+    view.rerender(<BotSettings bot={bot({ description: 'Own releases' })} onBack={view.onBack} onOpenSession={view.onOpenSession} />);
+    await act(async () => {});
+    expect((screen.getByLabelText('bots.profile.summary') as HTMLTextAreaElement).value).toBe('Own releases\n');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+    expect(mocks.updateBotProfile).toHaveBeenCalledOnce();
+  });
+
   it('keeps edits made during a successful save and adopts concurrent capability updates', async () => {
     vi.useFakeTimers();
     let finishSave!: (value: { id: string; currentVersion: number; name: string }) => void;
@@ -839,6 +1037,7 @@ describe('same-Bot capability updates while editing settings', () => {
     expect((screen.getByLabelText('bots.nameLabel') as HTMLInputElement).value).toBe('Second name');
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(mocks.updateBotProfile).toHaveBeenLastCalledWith('bot-1', { name: 'Second name' });
+    await openCapabilities();
     expect((screen.getByRole('checkbox', { name: /release-check/ }) as HTMLInputElement).checked).toBe(true);
   });
 

@@ -1,3 +1,4 @@
+import { deferRecycle, recycleFailureReason, recyclePolicy } from './recyclePolicy';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -7,7 +8,6 @@ import { gitExec } from './gitExec';
 import { hasLiveSessionReference, loadLiveSessionPathKeys } from './liveSessionRefs';
 import {
   newRecycleRecord, readRecycleRecord, writeRecycleRecord, worktreeGeneration,
-  type WorktreeRecycleRecord,
 } from './recycleJournal';
 import { createRecoveryArchive, inventoryWorktree, sameWorktreeFiles, verifyRecoveryArchive } from './recoveryArchive';
 import { physicalWorktreeKey, withWorktreeResourceLock } from './resourceLock';
@@ -27,11 +27,16 @@ export interface ManagedRecycleOptions {
 /** Pool reset is destructive too: preserve the old generation before clean/reset. */
 export async function checkpointWorktreeForReuse(meta: WorktreeMeta): Promise<void> {
   const current = store.get(meta.sessionId);
-  if (!current || worktreeGeneration(current) !== worktreeGeneration(meta) || await hasOtherGeneration(meta)) throw new Error('pooled generation changed');
+  if (!current || current.pendingSessionTransfer || worktreeGeneration(current) !== worktreeGeneration(meta) || await hasOtherGeneration(meta)) throw new Error('pooled generation changed');
   await assertManagedResourcePath(meta, store.getAllPaths());
   await assertWorktreeGitIdentity(meta);
   if (hasLiveSessionReference(meta, await loadLiveSessionPathKeys({ contextPath: meta.path }))) {
     throw new Error('pooled worktree is referenced');
+  }
+  const previous = await readRecycleRecord(meta.path);
+  if (previous?.generation === worktreeGeneration(meta)
+    && ['paused', 'kept'].includes(recyclePolicy(previous).state)) {
+    throw new Error('pooled worktree recycling is paused');
   }
   const record = await newRecycleRecord(meta);
   record.directoryIdentity = (await directoryIdentity(meta.path)) ?? undefined;
@@ -91,6 +96,7 @@ export async function recycleManagedWorktree(meta: WorktreeMeta, options: Manage
 async function recycleManagedWorktreeInSlot(meta: WorktreeMeta, options: ManagedRecycleOptions): Promise<boolean> {
   return withWorktreeResourceLock(meta.path, () => withLegacyWorktreeRuntimeGuard(async (legacyGuardHeld) => {
     const registered = store.get(meta.sessionId);
+    if (registered?.pendingSessionTransfer) return false;
     if (registered && worktreeGeneration(registered) !== worktreeGeneration(meta)) return false;
     if (await hasOtherGeneration(meta)) return false;
     let record = await readRecycleRecord(meta.path);
@@ -99,10 +105,11 @@ async function recycleManagedWorktreeInSlot(meta: WorktreeMeta, options: Managed
       record.directoryIdentity = (await directoryIdentity(meta.path)) ?? undefined;
       await writeRecycleRecord(record);
     }
+    const policy = recyclePolicy(record);
+    if (policy.state === 'paused' || policy.state === 'kept') return false;
+    const startedAt = performance.now();
     const defer = async (reason: string): Promise<false> => {
-      record.reason = reason;
-      record.attempts += 1;
-      record.nextAttemptAt = Date.now() + Math.min(30 * 60_000, 5_000 * 2 ** Math.min(record.attempts, 9));
+      deferRecycle(record, reason, performance.now() - startedAt);
       await writeRecycleRecord(record);
       return false;
     };
@@ -226,7 +233,7 @@ async function recycleManagedWorktreeInSlot(meta: WorktreeMeta, options: Managed
       await unregisterResource(meta);
       return true;
     } catch (error) {
-      return defer((error as NodeJS.ErrnoException).code ?? 'recycle-failed');
+      return defer(recycleFailureReason(error));
     }
   }));
 }

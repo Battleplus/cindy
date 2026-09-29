@@ -1,3 +1,4 @@
+import { isOpenAiSubscriptionProvider, providerCatalogId } from '@cindy/model-providers';
 import { randomUUID } from 'node:crypto';
 
 import { type AgentKind, type Maker } from '@cindy/maker-core';
@@ -12,7 +13,6 @@ import { getAppCapabilities } from '../appCapabilities.js';
 import { activeOwnerScopeKey, isAppSessionBoundaryPending } from '../appSessionState.js';
 import { readClaudeApiKey } from '../maker-host/auth-adapters.js';
 import { getChatgptBridgeAuth } from '../maker-host/anthropic-responses-bridge-host.js';
-import { getValidClaudeAiOAuth } from '../maker-host/claude-oauth-refresh.js';
 import { getGrokAccessToken } from '../maker-host/grok-oauth-login.js';
 import { readCachedGenericOAuthAccessToken } from '../maker-host/generic-oauth.js';
 // undici 的 fetch,但 per-request 现取系统代理(裸 undici 不吃代理设置)。
@@ -25,6 +25,7 @@ import {
 import { readModelDisableOverrides } from '../maker-host/model-disable-store.js';
 import { isModelDisabled, isProviderDisabled } from '@cindy/model-providers';
 import { isProviderRouteMutationInProgress } from '../maker-host/provider-route.js';
+import { withOpenCodeGoSessionHeader } from '../maker-host/opencode-go-session.js';
 import { effectiveXdGatewayBaseUrl } from '../model-access/effectiveEndpoint.js';
 import { readCustomProviderKey } from '../secrets/providerSecretStore.js';
 import { MANAGED_OLLAMA_PROVIDER_ID } from '../../shared/localModelRuntime.js';
@@ -372,8 +373,9 @@ const DEDICATED_AUTO_REVIEW_MAX_TOKENS = 384;
 
 /**
  * Auto-review 的封闭候选表。它刻意不接受调用方传 provider/model：待审内容只能
- * 发往 Cindy 托管网关或用户已连接的 OpenAI/Anthropic 订阅，不能跟随主会话
- * 落到 xAI、DeepSeek、Kimi 或自定义 BYOM。
+ * 发往 Cindy 托管网关或用户已连接的 OpenAI 订阅，不能跟随主会话落到 xAI、DeepSeek、
+ * Kimi 或自定义 BYOM。Claude 订阅不在表内:它只供内置 Claude Code CLI 自己使用,
+ * Cindy 的直连请求不得借用。
  */
 export const DEDICATED_AUTO_REVIEW_CANDIDATES = Object.freeze([
   {
@@ -400,17 +402,9 @@ export const DEDICATED_AUTO_REVIEW_CANDIDATES = Object.freeze([
     transport: 'codex-responses',
     reasoningEffort: 'low',
   },
-  {
-    id: 'claude-haiku',
-    providerId: 'anthropic',
-    agentKind: 'claude-code',
-    model: 'claude-haiku-4-5',
-    transport: 'litellm-chat-completions',
-    reasoningEffort: undefined,
-  },
 ] as const satisfies ReadonlyArray<{
   id: string;
-  providerId: 'xd' | 'openai' | 'anthropic';
+  providerId: 'xd' | 'openai';
   agentKind: AgentKind;
   model: string;
   transport: UtilityModelTransport;
@@ -767,6 +761,9 @@ async function requestExplicitProviderText(
   // which would silently turn a Claude request into a Codex request.
   const model = requestedModel || configuredModels.find((item) =>
     isModelSelectableForNewRoute(item, { userProvider: provider?.source === 'user' }))?.id || '';
+  // 预设身份随模型投影带出：从 OpenCode Go 预设创建后再改地址/复制连接时，运行时 id 与
+  // URL 都可能对不上，补会话头仍要认得出来（见 opencode-go-session.ts 的三路识别）。
+  const catalogPresetId = configuredModels.find((item) => item.id === model)?.catalogPresetId;
   const selectedRouting = agentKind ? provider?.routing[agentKind] : undefined;
   const transport: UtilityModelTransport =
     agentKind === 'codex' && selectedRouting?.wireProtocol !== 'openai-chat'
@@ -858,7 +855,7 @@ async function requestExplicitProviderText(
     opts = { ...opts, maxTokens: Math.min(opts.maxTokens, catalogModel.maxOutput) };
   }
 
-  if (provider.id === 'xd' || provider.id === 'anthropic' || provider.id === 'openai' || provider.id === 'xai') {
+  if (provider.id === 'xd' || providerCatalogId(provider) === 'anthropic' || isOpenAiSubscriptionProvider(provider) || providerCatalogId(provider) === 'xai') {
     return requestBuiltinProviderText(prompt, {
       provider,
       agentKind,
@@ -903,7 +900,7 @@ async function requestExplicitProviderText(
     };
   }
   const authStrategy: 'api-key-header' | 'oauth-token' | 'none' = routing.authStrategy;
-  if (!routing?.upstream) {
+  if (!routing?.upstream || routing.wireProtocol === 'google-generative-ai') {
     return {
       ok: false,
       reason: 'no_candidate',
@@ -911,6 +908,7 @@ async function requestExplicitProviderText(
     };
   }
   const isOAuth = authStrategy === 'oauth-token';
+  const wireProtocol = routing.wireProtocol;
   const noAuth = authStrategy === 'none';
   const credential = isOAuth
     ? readCachedGenericOAuthAccessToken(storedCustomProviderId(provider.id), provider.auth.oauth)
@@ -959,9 +957,13 @@ async function requestExplicitProviderText(
       agentKind,
       baseUrl: routing.upstream,
       requestPath: routing.requestPath,
-      wireProtocol: routing.wireProtocol,
+      wireProtocol,
       isOllama,
-      headers: routing.headerOverride,
+      headers: withOpenCodeGoSessionHeader(routing.headerOverride, {
+        providerId: provider.id,
+        catalogPresetId,
+        upstream: routing.upstream,
+      }),
       credential: credential ?? '',
       authStrategy,
       model,
@@ -1122,57 +1124,16 @@ async function requestBuiltinProviderText(
     }], prompt, [], input);
   }
 
-  if (input.provider.id === 'anthropic') {
-    const oauth = await getValidClaudeAiOAuth();
-    if (input.signal?.aborted) return cancelledUtilityTextResult(profile);
-    if (!oauth?.accessToken) {
-      return { ok: false, reason: 'no_candidate', attempts: [skippedAttempt(profile, 'not_authenticated')] };
-    }
-    return executeCandidates([{
-      providerId: input.provider.id,
-      model: input.model,
-      transport: 'litellm-chat-completions',
-      profile,
-      execute: (text, requestOpts) => requestProviderHttpText({
-        wire: 'anthropic-messages',
-        endpoint: joinAnthropicMessagesPath(routing.upstream),
-        headers: {
-          Authorization: `Bearer ${oauth.accessToken}`,
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'oauth-2025-04-20',
-        },
-        // 直连 Anthropic API 用目录裸 id;不要复用 toSdkModelString——它会给 1M
-        // 目录模型追加 SDK 专用的 [1m] 后缀,/v1/messages 对该串返回 404(#2429)。
-        model: toAnthropicApiModelId(input.model),
-        prompt: text,
-        // Anthropic API 协议必填 max_tokens:缺省时以模型目录声明的 maxOutput
-        // (模型自身输出能力)兜底,没有目录条目才回退 81920——宿主不设政策上限。
-        maxTokens: requestOpts?.maxTokens ?? input.maxTokens ?? catalogModel?.maxOutput ?? 81_920,
-        timeoutMs: requestOpts?.timeoutMs ?? input.timeoutMs,
-        reasoningEffort: requestOpts?.reasoningEffort ?? input.reasoningEffort,
-        disableReasoning: requestOpts?.disableReasoning ?? input.disableReasoning,
-        signal: requestOpts?.signal ?? input.signal,
-        systemPrompt: requestOpts?.systemPrompt,
-        responseInstructions: requestOpts?.responseInstructions,
-        beforeDispatch: requestOpts?.beforeDispatch
-          ? () => requestOpts.beforeDispatch!({
-              providerId: input.provider.id,
-              agentKind: input.agentKind,
-              model: input.model,
-            })
-          : undefined,
-        credentialStillCurrent: requestOpts?.beforeDispatch
-          ? async () => (await getValidClaudeAiOAuth())?.accessToken === oauth.accessToken
-          : undefined,
-        routeStillCurrent: requestOpts?.beforeDispatch ? input.routeStillCurrent : undefined,
-      }),
-    }], prompt, [], input);
+  if (providerCatalogId(input.provider) === 'anthropic') {
+    // Claude 订阅只供内置 Claude Code CLI 用它自己的登录发起请求;Cindy 进程不持有也不借用
+    // 这份凭证,辅助模型 / 标题等直连调用不走它(调用方按候选链回落到其它来源)。
+    return { ok: false, reason: 'no_candidate', attempts: [skippedAttempt(profile, 'not_authenticated')] };
   }
 
-  if (input.provider.id === 'openai') {
+  if (isOpenAiSubscriptionProvider(input.provider)) {
     let creds: Awaited<ReturnType<typeof getChatgptBridgeAuth>>;
     try {
-      creds = await getChatgptBridgeAuth();
+      creds = await (input.provider.id === 'openai' ? getChatgptBridgeAuth() : getChatgptBridgeAuth(input.provider.id));
     } catch {
       return { ok: false, reason: 'no_candidate', attempts: [skippedAttempt(profile, 'not_authenticated')] };
     }
@@ -1220,7 +1181,7 @@ async function requestBuiltinProviderText(
         credentialStillCurrent: requestOpts?.beforeDispatch
           ? async () => {
               try {
-                const current = await getChatgptBridgeAuth();
+                const current = await (input.provider.id === 'openai' ? getChatgptBridgeAuth() : getChatgptBridgeAuth(input.provider.id));
                 return current.accountId === accountId && current.accessToken === creds.accessToken;
               } catch {
                 return false;
@@ -1232,10 +1193,10 @@ async function requestBuiltinProviderText(
     }], prompt, [], input);
   }
 
-  if (input.provider.id === 'xai') {
+  if (providerCatalogId(input.provider) === 'xai') {
     let accessToken: string;
     try {
-      accessToken = await getGrokAccessToken();
+      accessToken = await (input.provider.id === 'xai' ? getGrokAccessToken() : getGrokAccessToken(input.provider.id));
     } catch {
       return { ok: false, reason: 'no_candidate', attempts: [skippedAttempt(profile, 'not_authenticated')] };
     }
@@ -1269,7 +1230,7 @@ async function requestBuiltinProviderText(
         credentialStillCurrent: requestOpts?.beforeDispatch
           ? async () => {
               try {
-                return (await getGrokAccessToken()) === accessToken;
+                return (await (input.provider.id === 'xai' ? getGrokAccessToken() : getGrokAccessToken(input.provider.id))) === accessToken;
               } catch {
                 return false;
               }

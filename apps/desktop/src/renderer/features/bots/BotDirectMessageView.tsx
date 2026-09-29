@@ -1,3 +1,4 @@
+import { Button } from '@/components/ui/button';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeftRight, CircleAlert, LockKeyhole } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -29,7 +30,6 @@ export function BotDirectMessageView() {
   const { botId, threadId } = useParams();
   const deviceId = new URLSearchParams(location.search).get('deviceId');
   const allProfiles = useBotProfiles();
-  const profiles = deviceId ? [] : allProfiles;
   const [state, setState] = useState<DirectMessageState>({ kind: 'loading' });
 
   useEffect(() => {
@@ -79,14 +79,16 @@ export function BotDirectMessageView() {
   const thread = state.kind === 'ready' ? state.thread : null;
   const profileFor = useCallback(
     (id: string, fallbackName: string) => {
-      const profile = profiles.find((item) => item.id === id);
+      // Keep the callback stable when a remote thread registers its header.
+      // A fresh empty profiles array here would feed each slot update back into render.
+      const profile = deviceId ? undefined : allProfiles.find((item) => item.id === id);
       return {
         name: profile?.name || fallbackName || id,
         avatar: profile?.avatar ?? null,
         avatarColor: profile?.avatarColor ?? null,
       };
     },
-    [profiles],
+    [allProfiles, deviceId],
   );
   const [leftBot, rightBot] = useMemo(() => {
     if (!thread || !botId) return [null, null] as const;
@@ -141,13 +143,9 @@ export function BotDirectMessageView() {
           <p className="mt-3 text-13 text-[var(--text-secondary)]">
             {t('bots.directMessage.unavailable')}
           </p>
-          <button
-            type="button"
-            onClick={close}
-            className="mt-4 h-9 rounded-full border border-[var(--border-default)] px-4 text-12 text-[var(--text-primary)] hover:bg-[var(--surface-hover)]"
-          >
+          <Button variant="secondary" size="lg" type="button" onClick={close} className="mt-4">
             {t('bots.directMessage.close')}
-          </button>
+          </Button>
         </section>
       </main>
     );
@@ -206,13 +204,9 @@ export function BotDirectMessageView() {
             <LockKeyhole size={12} aria-hidden />
             {t('bots.directMessage.readOnly')}
           </span>
-          <button
-            type="button"
-            onClick={close}
-            className="h-8 rounded-full border border-[var(--border-default)] px-3 text-11 text-[var(--text-primary)] hover:bg-[var(--surface-hover)]"
-          >
+          <Button variant="secondary" size="md" compact type="button" onClick={close}>
             {t('bots.directMessage.close')}
-          </button>
+          </Button>
         </div>
       </footer>
     </main>

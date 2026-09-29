@@ -13,6 +13,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { PluginRegistry } from '../../maker-host/plugins/plugin-registry';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getLiziMcpSessionContext } from '@cindy/mcps';
 import { createOrcaWorkerBridgeMcpProvider } from '@cindy/orca-workflow';
@@ -28,6 +29,7 @@ import {
   CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY,
   CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY,
 } from '../codexBuiltinToolPolicy.js';
+import { CINDY_MAKE_VENDOR_OPTION_KEY } from '../../../shared/cindyMakeSession.js';
 import {
   getPiExtraSpawnConfig,
   invalidatePiEnvironment,
@@ -346,6 +348,32 @@ describe('piEnvironment per-session identity', () => {
     config?.disposeSessionCtx?.();
   });
 
+  it('exposes cindy_make only to a Session carrying the Cindy Make marker', async () => {
+    const providers = [makeProvider('cindy_make'), makeProvider('custom_probe')];
+    const ordinary = await getPiExtraSpawnConfig(providers, noopLogger(), {
+      sessionId: 'pi-ordinary',
+      workingDir: '/repo',
+      vendorOptions: {},
+    });
+    expect(ordinary?.mcpBridge?.servers.map((server) => server.name)).toEqual(['custom_probe']);
+    ordinary?.disposeSessionCtx?.();
+
+    const anonymous = await getPiExtraSpawnConfig(providers, noopLogger());
+    expect(anonymous?.mcpBridge?.servers.map((server) => server.name)).toEqual(['custom_probe']);
+    anonymous?.disposeSessionCtx?.();
+
+    const make = await getPiExtraSpawnConfig(providers, noopLogger(), {
+      sessionId: 'pi-make',
+      workingDir: '/cindy-make/source',
+      vendorOptions: { [CINDY_MAKE_VENDOR_OPTION_KEY]: true },
+    });
+    expect(make?.mcpBridge?.servers.map((server) => server.name)).toEqual([
+      'cindy_make',
+      'custom_probe',
+    ]);
+    make?.disposeSessionCtx?.();
+  });
+
   it('omits a stable built-in server when the frozen Bot Toolset disables it', async () => {
     const config = await getPiExtraSpawnConfig([makeProvider()], noopLogger(), {
       sessionId: 'pi-bot-no-collab',
@@ -356,6 +384,73 @@ describe('piEnvironment per-session identity', () => {
     });
     expect(config?.mcpBridge?.servers).toEqual([]);
     config?.disposeSessionCtx?.();
+  });
+
+  it('keeps collab servers for a session already inside an active Team when the global toggle is off (issue 4734)', async () => {
+    const isEnabled = vi
+      .spyOn(PluginRegistry.prototype, 'isEnabled')
+      .mockImplementation((pluginId) => pluginId !== 'collab');
+    const collabNames = (config: Awaited<ReturnType<typeof getPiExtraSpawnConfig>>) =>
+      (config?.mcpBridge?.servers ?? [])
+        .map((server) => server.name)
+        .filter((name) => name === 'cindy_orca' || name === 'orca_worker_bridge');
+    // 真实的 Worker 通信 server(issue #4734 报的就是它丢了 → send_to_lead UNKNOWN_SERVER)
+    const logger = noopLogger();
+    const providers = [
+      makeProvider(),
+      createOrcaWorkerBridgeMcpProvider({
+        logger,
+        getMaker: () => {
+          throw new Error('not called while registering the MCP server');
+        },
+        persistUserMessage: async () => {},
+        wireSession: () => undefined,
+      }),
+    ];
+    try {
+      // 普通会话: 全局关闭后不再拿到协同 server(后续新建任务不协同)
+      const plain = await getPiExtraSpawnConfig(providers, logger, {
+        sessionId: 'pi-4734-plain',
+        workingDir: '/repo',
+        vendorOptions: {},
+      });
+      expect(collabNames(plain)).toEqual([]);
+      plain?.disposeSessionCtx?.();
+
+      // 已属于 active Team 的 Worker: 下一轮重建描述时仍保留 cindy_orca 与 orca_worker_bridge
+      const worker = await getPiExtraSpawnConfig(providers, logger, {
+        sessionId: 'pi-4734-worker',
+        workingDir: '/repo',
+        vendorOptions: {
+          orcaRole: 'worker',
+          orcaWorkflowId: 'team-1',
+          orcaLeadSessionId: 'lead-1',
+          orcaWorkerId: 'worker-1',
+          orcaWorkerSessionId: 'pi-4734-worker',
+        },
+      });
+      expect(collabNames(worker)).toEqual(['cindy_orca', 'orca_worker_bridge']);
+      worker?.disposeSessionCtx?.();
+
+      const lead = await getPiExtraSpawnConfig(providers, logger, {
+        sessionId: 'pi-4734-lead',
+        workingDir: '/repo',
+        vendorOptions: { orcaRole: 'lead', orcaWorkflowId: 'team-1', orcaLeadSessionId: 'pi-4734-lead' },
+      });
+      expect(collabNames(lead)).toEqual(['cindy_orca', 'orca_worker_bridge']);
+      lead?.disposeSessionCtx?.();
+
+      // 项目级 / 冻结伙伴的显式停用仍优先于 active Team 豁免
+      const frozen = await getPiExtraSpawnConfig(providers, logger, {
+        sessionId: 'pi-4734-frozen',
+        workingDir: '/repo',
+        vendorOptions: { orcaRole: 'worker', [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['collab'] },
+      });
+      expect(collabNames(frozen)).toEqual([]);
+      frozen?.disposeSessionCtx?.();
+    } finally {
+      isEnabled.mockRestore();
+    }
   });
 
   it('keeps the registered Pi MCP vendorOptions live for start_team Lead activation', async () => {

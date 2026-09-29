@@ -18,14 +18,42 @@ import {
   type RemoteResourceRef,
   type RemoteResourceStatus,
   type RemoteText,
+  type RemoteActionDescriptor,
+  type RemoteResourceBlock,
 } from '@cindy/device-link';
+import { BOT_GROUP_CHAT_PRIMITIVE } from '@cindy/maker-shared/botGroupChat';
 
+import { normalizeRemoteActions, normalizeRemoteBlocks } from './remoteResourceContent';
 import type { RemoteInvoke } from './mobileMakerTransport';
 
 export const MOBILE_REMOTE_RESOURCE_PRIMITIVES = [
   'status',
   'session-link',
+  'session-controls',
 ] as const;
+
+/**
+ * Primitives whose whole block data is kept for a dedicated screen that asked for them
+ * (`getRemoteResource(..., supportedPrimitives)`); ordinary resource views never get it.
+ * The screen still validates that data before using it.
+ */
+const RICH_REMOTE_RESOURCE_PRIMITIVES: readonly string[] = [
+  'form',
+  'routine-list',
+  'routine-detail',
+  BOT_GROUP_CHAT_PRIMITIVE,
+];
+
+/** Routines remain a desktop feature; other portable collections stay available. */
+export function isMobileRemoteCollectionSupported(collectionId: string): boolean {
+  return collectionId !== 'routines';
+}
+
+function assertMobileRemoteCollectionSupported(collectionId: string): void {
+  if (!isMobileRemoteCollectionSupported(collectionId)) {
+    throw new Error('Unsupported mobile resource collection');
+  }
+}
 
 export interface RemoteResourceHostTarget {
   deviceId: string;
@@ -141,10 +169,14 @@ function normalizeRemoteDisplay(value: unknown): RemoteResourceDisplay | null {
   const timestamp = normalizeRemoteTimestamp(record.timestamp);
   const avatar = normalizeRemoteAvatar(record.avatar);
   const status = normalizeRemoteStatus(record.status);
+  const generation = recordOf(record.generation);
+  const generationPhase = boundedString(generation?.phase, 80);
+  const generationStartedAt = normalizeRemoteTimestamp(generation?.startedAt);
   return {
     title,
     ...(subtitle ? { subtitle } : {}),
     ...(preview ? { preview } : {}),
+    ...(generationPhase ? { generation: { phase: generationPhase, startedAt: generationStartedAt ?? null } } : {}),
     ...(timestamp !== undefined ? { timestamp } : {}),
     ...(normalizeRemoteTimestamp(record.lastReplyAt) !== undefined ? { lastReplyAt: record.lastReplyAt as number } : {}),
     ...(avatar ? { avatar } : {}),
@@ -197,7 +229,7 @@ function normalizeManifest(value: unknown): RemoteResourceManifestResponse | nul
   if (!record || !Array.isArray(record.collections)) return null;
   const collections = record.collections.flatMap((item) => {
     const descriptor = validDescriptor(item);
-    return descriptor ? [descriptor] : [];
+    return descriptor && isMobileRemoteCollectionSupported(descriptor.id) ? [descriptor] : [];
   });
   const protocolVersion = typeof record.protocolVersion === 'number'
     ? record.protocolVersion
@@ -237,7 +269,7 @@ export async function loadRemoteResourceManifest(
 
 /**
  * Merge the same host-advertised collection across computers. The mobile shell
- * only understands placement and portable display primitives, not module ids.
+ * uses placement and portable display primitives after applying mobile availability.
  */
 export async function discoverRemoteHomeCollections(
   invoke: RemoteInvoke,
@@ -280,7 +312,7 @@ export async function discoverRemoteHomeCollections(
   const byId = new Map<string, RemoteHomeCollection>();
   for (const { target, manifest } of discovered) {
     for (const collection of manifest?.collections ?? []) {
-      if (collection.placement !== 'home-scope') continue;
+      if (collection.placement !== 'home-scope' || !isMobileRemoteCollectionSupported(collection.id)) continue;
       const existing = byId.get(collection.id);
       if (existing && existing.resourceKind === collection.resourceKind) {
         existing.targets.push(target);
@@ -311,6 +343,8 @@ export async function invokeRemoteResourceAction(
   },
   locale?: string,
 ): Promise<RemoteActionInvokeResponse> {
+  assertMobileRemoteCollectionSupported(request.collectionId);
+  if (request.resourceRef) assertMobileRemoteCollectionSupported(request.resourceRef.collectionId);
   return invoke<RemoteActionInvokeResponse>(target.deviceId, REMOTE_RESOURCE_INVOKE_CHANNEL, [{
     client: clientDescriptor(locale),
     ...request,
@@ -322,16 +356,61 @@ export async function getRemoteResource(
   target: RemoteResourceHostTarget,
   ref: RemoteResourceRef,
   locale?: string,
+  supportedPrimitives: readonly string[] = [],
 ): Promise<RemoteResource> {
+  assertMobileRemoteCollectionSupported(ref.collectionId);
   const raw = await invoke<unknown>(target.deviceId, REMOTE_RESOURCE_GET_CHANNEL, [{
-    client: clientDescriptor(locale),
+    client: { ...clientDescriptor(locale), primitives: [...MOBILE_REMOTE_RESOURCE_PRIMITIVES, ...supportedPrimitives] },
     ref,
   }]);
   const normalized = normalizeRemoteCollectionItem(raw, ref.collectionId);
   if (!normalized || normalized.ref.kind !== ref.kind || normalized.ref.id !== ref.id) {
     throw new Error('invalid remote resource response');
   }
-  return normalized;
+  const source = recordOf(raw);
+  // Rich forms are consumed only by the dedicated editor, never ordinary resource views.
+  if (supportedPrimitives.some(primitive => RICH_REMOTE_RESOURCE_PRIMITIVES.includes(primitive))) return {
+    ...normalized, actions: normalizeRemoteActions(source?.actions), blocks: normalizeRemoteBlocks(source?.blocks),
+  };
+  const actions: RemoteActionDescriptor[] = Array.isArray(source?.actions)
+    ? source.actions.slice(0, 16).flatMap((value) => {
+        const entry = recordOf(value);
+        const id = boundedString(entry?.id, MAX_REMOTE_ID_CHARS);
+        const label = normalizeRemoteText(entry?.label, 512);
+        // Forms remain unsupported; a malformed confirmation must never become an unconfirmed action.
+        if (!entry || !id || !label || entry.fields) return [];
+        let confirmation: RemoteActionDescriptor['confirmation'];
+        if (entry.confirmation !== undefined) {
+          const raw = recordOf(entry.confirmation);
+          const title = normalizeRemoteText(raw?.title, 512);
+          const body = raw?.body === undefined ? undefined : normalizeRemoteText(raw.body, 8192);
+          const confirmLabel = raw?.confirmLabel === undefined ? undefined : normalizeRemoteText(raw.confirmLabel, 512);
+          if (!title || body === null || confirmLabel === null) return [];
+          confirmation = { title, ...(body ? { body } : {}), ...(confirmLabel ? { confirmLabel } : {}) };
+        }
+        return [{ id, label, disabled: entry.disabled !== undefined && entry.disabled !== false,
+          ...(entry.tone === 'destructive' ? { tone: 'destructive' } : {}),
+          ...(confirmation ? { confirmation } : {}),
+        }];
+      }) : [];
+  const blocks: RemoteResourceBlock[] | undefined = Array.isArray(source?.blocks) ? source.blocks.slice(0, 256).flatMap<RemoteResourceBlock>((rawBlock) => {
+    const block = recordOf(rawBlock);
+    const id = boundedString(block?.id, 256);
+    const primitive = boundedString(block?.primitive, 64);
+    const fallbackMarkdown = typeof block?.fallbackMarkdown === 'string' ? block.fallbackMarkdown : null;
+    if (!id || !primitive || fallbackMarkdown === null || fallbackMarkdown.length > 131072) return [];
+    // Only the inert media URL primitive is needed here. Never copy arbitrary host data.
+    const data = recordOf(block?.data);
+    if (ref.kind === 'bot' && id === 'invitation' && primitive === 'status'
+      && typeof data?.stage === 'string' && ['profile', 'skills', 'avatar', 'welcome', 'ready', 'failed'].includes(data.stage))
+      return [{ id, primitive, fallbackMarkdown, data: { stage: data.stage } }];
+    if (primitive === 'session-controls') return [{ id, primitive, fallbackMarkdown,
+      data: { input: data?.input === 'available' ? 'available' : 'blocked', busy: data?.busy === true } }];
+    const inlineIcon = ref.collectionId === 'plugin-identities' && id === 'icon' && primitive === 'image';
+    const url = boundedString(data?.url, inlineIcon ? 256_000 : 4096);
+    return [{ id, primitive, fallbackMarkdown, ...(url ? { data: { url } } : {}) }];
+  }) : undefined;
+  return { ...normalized, ...(actions.length ? { actions } : {}), ...(blocks ? { blocks } : {}) };
 }
 
 function normalizeRemoteCollectionItem(
@@ -356,6 +435,7 @@ export function normalizeRemoteCollectionItems(
   value: unknown,
   collectionId: string,
 ): RemoteCollectionItem[] {
+  if (!isMobileRemoteCollectionSupported(collectionId)) return [];
   const record = recordOf(value);
   if (!record || !Array.isArray(record.items)) return [];
   return record.items.slice(0, 200).flatMap((candidate) => {
@@ -388,6 +468,7 @@ export async function listRemoteCollection(
   collectionId: string,
   locale?: string,
 ): Promise<RemoteCollectionListResponse> {
+  assertMobileRemoteCollectionSupported(collectionId);
   return invoke<RemoteCollectionListResponse>(target.deviceId, REMOTE_RESOURCE_LIST_CHANNEL, [{
     client: clientDescriptor(locale),
     collectionId,

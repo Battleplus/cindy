@@ -38,6 +38,8 @@ import { randomUUID } from 'node:crypto';
 
 import {
   makeInteractionCancel,
+  makeMessageOp,
+  HOOK_FEATURE_MESSAGE_OPS,
   makeInteractionRequest,
   makeTaskAck,
   type MessageOpResultPayload,
@@ -63,6 +65,7 @@ import {
 import { createTelegramMessageLifecycle, type TelegramMessageLifecycle } from '@cindy/im';
 
 import { HOOK_CHAT_WORKSPACE_ALIAS } from '../../shared/hookControlIpc.js';
+import { captureImContext, type ImContextSnapshot } from '../../shared/imMessageSource.js';
 import type { GroupHistoryAccessScope } from '../im/shared/groupHistoryAccess.js';
 import { groupHistoryAccessForExternalKey } from './groupHistoryScope.js';
 import { isPathWithin } from './paths.js';
@@ -70,6 +73,7 @@ import { createAckReactions, type AckReactionTask } from './ackReactions.js';
 import type { HookConnectionConfig } from './store.js';
 import type { HookBindingStore } from './bindings.js';
 import { terminalDeliveryExpired } from './requestLedger.js';
+import { composeXPrompt } from './xPrompt.js';
 import type { HookRequestLedger, HookTerminalRecord } from './requestLedger.js';
 
 /** 会话执行器抽象 —— 生产实现 session-runner.ts(包 maker), 测试注入假的。 */
@@ -145,6 +149,8 @@ export interface HookContinuationWatchRequest {
 }
 
 export interface HookRunRequest {
+  /** Local display snapshot; not part of the server wire protocol. */
+  contextSnapshot?: ImContextSnapshot;
   sessionId: string;
   /**
    * IM lane 形态(externalKey 派生): 'group' = 群/topic, 'dm' = 私聊。
@@ -210,6 +216,8 @@ export interface HookRunRequest {
    * 连接不在线时直接丢弃, 不缓存不重发(与 turn.end 的离线补发相反)。
    */
   onProgress?: (text: string) => void;
+  /** Independent, acknowledged channel notice after runtime retirement fails. */
+  onRuntimeRecovery?: (text: string) => Promise<boolean>;
   /**
    * 执行中交互卡回调(interaction.request 链路)。runner 把 maker 的
    * InteractionRequest 合成渠道无关卡片后经此发出; 连接不在线时丢弃
@@ -269,6 +277,7 @@ export interface HookDispatcherDeps {
    */
   buildContextPrefix?: (payload: TaskDispatchPayload) => Promise<{
     prefix: string;
+    messageCount?: number;
     commit: (
       guard?: () => boolean | Promise<boolean>,
     ) =>
@@ -282,7 +291,7 @@ export interface HookDispatcherDeps {
    * 分配独立子目录。
    * 未注入时 chat 别名按 unknown_workspace 拒绝(纯逻辑测试 / 旧行为默认)。
    */
-  dialogue?: { rootDir: () => string; allocateDir: (sessionId: string) => Promise<string> };
+  dialogue?: { rootDir: () => string; rootDirs?: () => string[]; allocateDir: (sessionId: string) => Promise<string> };
   /**
    * 可选: 中断某 session 正在跑的 turn(task.cancel 用; 生产为
    * maker.getSession(id)?.abort())。未注入时 cancel 只能收口排队中的任务。
@@ -437,27 +446,6 @@ const TURN_DELIVERY_ACK_MAX_DELAY_MS = 60_000;
 const REOPEN_TTL_MS = 24 * 60 * 60_000;
 /** 续跑记账条数上限(FIFO 淘汰最老), 同 ackHistory 语义: 防长驻进程无界增长。 */
 const MAX_PENDING_REOPENS = 200;
-/**
- * 原对话不再落在工作目录映射内时(被移到映射外的项目, 或映射本身被改/删),
- * 回给渠道的一次性说明(Slack / Telegram 侧文案不进 locale, 与 interactions.ts
- * 的卡片按钮同规硬编码中文)。
- *
- * 必须如实: 旧绑定被丢弃后同一个 externalKey 立刻指向新对话, 光把目录加进映射
- * **不会**自动接回原对话(那条 thread 已经绑到新的了), 只有先让目录进映射、再用
- * 对话选择重新指定原对话才接得回来 —— 两步缺一不可。
- */
-const NOTICE_SESSION_RECREATED =
-  'ℹ️ 原任务已不在可用的工作目录里，这条消息起换用了新任务，原任务的上下文不会带过来。' +
-  '想接回原任务：先到 Cindy 的 设置 → 远程连接 → 工作目录映射 把它所在的目录加进来，' +
-  '再在这里选择任务重新指定它。';
-/**
- * 查不到原对话时的说明。措辞刻意留了余地: inspect 返回 null 是多义的 ——
- * 会话真的没了是 null, meta / DB 读取瞬时失败也被吞成 null(session-runner
- * 两路都 catch)。一口咬定"已被归档或删除"会在读库抖动时误导用户
- * (PR #733 review 指出)。
- */
-const NOTICE_SESSION_GONE = 'ℹ️ 原任务现在读不到（可能已被归档或删除），这条消息起换用了新任务。';
-
 /** 标题里消息摘要的最大长度(字符), 超出截断加省略号。 */
 const TITLE_SNIPPET_MAX = 24;
 /** Server-controlled source metadata is persisted and rendered, so keep it bounded locally too. */
@@ -487,7 +475,16 @@ export function normalizeTaskSource(source: TaskSource): TaskSource {
   const channelName = boundedNullable(source.channelName, SOURCE_CHANNEL_NAME_MAX);
   const teamId = boundedNullable(source.teamId, SOURCE_TEAM_ID_MAX);
   const teamName = boundedNullable(source.teamName, SOURCE_TEAM_NAME_MAX);
-  const threadContext = source.threadContext?.slice(0, SOURCE_THREAD_CONTEXT_MAX).map((entry) => ({
+  // The X wire chain includes the trigger for prompt assembly. Display it only
+  // as userText, not again among referenced messages. Match the original ID
+  // before bounding the snapshot; legacy entries without IDs stay untouched.
+  const displayContext = source.im === 'x' && source.triggerMessageId && source.userText?.trim()
+    ? source.threadContext?.filter((entry) => entry.messageId !== source.triggerMessageId)
+    : source.threadContext;
+  const threadContext = displayContext?.slice(0, SOURCE_THREAD_CONTEXT_MAX).map((entry) => ({
+    ...(entry.messageId !== undefined ? { messageId: entry.messageId.slice(0, SOURCE_TRIGGER_MESSAGE_ID_MAX) } : {}),
+    ...(entry.authorId !== undefined ? { authorId: entry.authorId.slice(0, SOURCE_THREAD_AUTHOR_MAX) } : {}),
+    ...(entry.replyToMessageId !== undefined ? { replyToMessageId: entry.replyToMessageId?.slice(0, SOURCE_TRIGGER_MESSAGE_ID_MAX) ?? null } : {}),
     author: entry.author.slice(0, SOURCE_THREAD_AUTHOR_MAX),
     text: entry.text.slice(0, SOURCE_THREAD_TEXT_MAX),
     ...(entry.isBot === true ? { isBot: true } : {}),
@@ -495,6 +492,11 @@ export function normalizeTaskSource(source: TaskSource): TaskSource {
 
   return {
     im: source.im,
+    ...(source.xContext ? { xContext: {
+      requesterId: source.xContext.requesterId.slice(0, SOURCE_THREAD_AUTHOR_MAX),
+      ...(source.xContext.requesterName !== undefined ? { requesterName: source.xContext.requesterName.slice(0, SOURCE_THREAD_AUTHOR_MAX) } : {}),
+      truncated: source.xContext.truncated,
+    } } : {}),
     ...(channelName !== undefined ? { channelName } : {}),
     ...(teamId !== undefined ? { teamId } : {}),
     ...(teamName !== undefined ? { teamName } : {}),
@@ -567,8 +569,6 @@ interface PendingTask {
   accountGeneration: number;
   /** 群上下文游标提交回调；仅在 provider 实际受理后调用。 */
   commitContextCursor?: ContextCursorCommit;
-  /** 会话定位阶段产生的一次性说明, 前置到本次 turn.end 的 finalText。 */
-  notice?: string;
   /**
    * 派活被接下那一刻, 这条连接宣告过 turn.reopen 吗。
    *
@@ -739,6 +739,10 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
   }
   /** 每连接当前发送函数(transport 重建后由 onConnected / handleDispatch 刷新)。 */
   const sendFns = new Map<string, (m: HookMessage) => boolean>();
+  const recoveryDeliveries = new Map<string, (delivered: boolean) => void>();
+  const clearRecoveryDeliveries = (): void => {
+    for (const settle of recoveryDeliveries.values()) settle(false);
+  };
   /** 离线积压的 turn.end, 按连接缓存; durable terminal 先记 pending, 发送成功后标 sent。 */
   const pendingTurnEnds = new Map<string, PendingTurnEnd[]>();
   /** 双向 ACK 已协商时，等待 server durable accepted 的完整 turn.end 副本。 */
@@ -1557,6 +1561,36 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         outcome = await runner.run({
           ...task.run,
           onProgress,
+          ...(task.run.source?.im === 'telegram' ? {
+            onRuntimeRecovery: (text: string): Promise<boolean> => {
+              // This is not another turn.end: the original result remains final.
+              // Only the negotiated Telegram executor can send outside that turn.
+              if (!isCurrentGeneration(task.accountGeneration)
+                || !dirStillAllowed(task.connectionId, task.run.workingDir)
+                || !serverFeatures.get(task.connectionId)?.includes(HOOK_FEATURE_MESSAGE_OPS)) {
+                return Promise.resolve(false);
+              }
+              const send = sendFns.get(task.connectionId);
+              if (!send) return Promise.resolve(false);
+              const opId = randomUUID();
+              return new Promise<boolean>((resolve) => {
+                const settle = (delivered: boolean): void => {
+                  clearTimeout(timer);
+                  recoveryDeliveries.delete(opId);
+                  resolve(delivered);
+                };
+                const timer = setTimeout(() => settle(false), 10_000);
+                timer.unref?.();
+                recoveryDeliveries.set(opId, settle);
+                try {
+                  if (!send(makeMessageOp({ opId,
+                    scope: { externalKey: task.run.origin.externalKey },
+                    action: { kind: 'send', text, tier: 'plain' },
+                  }))) settle(false);
+                } catch { settle(false); }
+              });
+            },
+          } : {}),
           onInteraction,
           onInteractionCancel,
           ...(task.commitContextCursor
@@ -1594,19 +1628,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     const status: 'ok' | 'error' | 'cancelled' = wasCancelled ? 'cancelled' : outcome.status;
     // 协议约束: error 必须带非空 errorMessage, ok / cancelled 必须为 null
     const isError = status === 'error';
-    // 会话定位说明前置到正文: 协议没有系统消息通道, 而"为什么换了个会话 /
-    // 目录变了"必须让渠道里的人看见, 否则只能观察到会话莫名重开。
-    const finalText = task.notice
-      ? outcome.finalText
-        ? `${task.notice}\n\n${outcome.finalText}`
-        : task.notice
-      : outcome.finalText;
     const turnEnd: TurnEndPayload = {
       requestId: task.requestId,
       externalKey: task.externalKey,
       sessionId,
       status,
-      finalText,
+      finalText: outcome.finalText,
       errorMessage: isError ? outcome.errorMessage || 'unknown error' : null,
       usage: { durationMs: outcome.durationMs },
       ...(outcome.attachments !== undefined && outcome.attachments.length > 0
@@ -1690,7 +1717,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     // 排队中的任务同样不能因为"目录还在映射里"就照跑(PR #733 review 指出)。
     if (!config || !config.enabled) return false;
     if (Object.values(config.workspaces).some((root) => isPathWithin(root, dir))) return true;
-    return dialogue !== undefined && isPathWithin(dialogue.rootDir(), dir);
+    return dialogue !== undefined && (dialogue.rootDirs?.() ?? [dialogue.rootDir()])
+      .some((root) => isPathWithin(root, dir));
   }
 
   function startExecution(task: PendingTask): void {
@@ -1750,8 +1778,6 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
 
   /**
    * 会话定位(接管 / 绑定复用 / 新建), 返回 run 参数或拒绝原因。
-   * notice: 需要随本次 turn.end 一并告知渠道用户的一次性说明(会话被移动 /
-   * 旧绑定失效换了新会话) —— 协议没有系统消息通道, 由 execute 前置到 finalText。
    */
   async function resolveTarget(
     connectionId: string,
@@ -1759,7 +1785,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     payload: TaskDispatchPayload,
     generation: number,
   ): Promise<
-    | { run: HookRunRequest; notice?: string; cleanupWorktree?: () => Promise<void> }
+    | { run: HookRunRequest; cleanupWorktree?: () => Promise<void> }
     | { reject: TaskRejectReason }
   > {
     // options 四元组原样透传给 runner —— 空值由 runner 按桌面端草稿默认落值
@@ -1788,7 +1814,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       );
     /** app 托管对话目录(dialogues 根)内的路径 —— chat 伪目录会话的白名单等价物。 */
     const inDialogueRoot = (dir: string | null): boolean =>
-      dir !== null && dialogue !== undefined && isPathWithin(dialogue.rootDir(), dir);
+      dir !== null && dialogue !== undefined && (dialogue.rootDirs?.() ?? [dialogue.rootDir()])
+        .some((root) => isPathWithin(root, dir));
     // 显式接管的目标失效时会从旧目录 / 本次别名提示里挑一个安全落点, 然后
     // 复用下方的新建路径。普通派发仍原样使用 payload.workspace。
     let effectiveWorkspace = payload.workspace;
@@ -1796,8 +1823,6 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     let forceNew = false;
     let replacementOfSessionId: string | null = null;
     let replacementPrompt: string | null = null;
-    /** 旧绑定作废、本次不得不新建会话时, 随 turn.end 回给渠道的说明。 */
-    let recreatedNotice: string | null = null;
 
     const laneKind = deriveLaneKind(payload.externalKey);
     const laneKey = bindingKey(connectionId, payload.externalKey);
@@ -2029,7 +2054,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
        * 而例外必须跨「绑定文件」与「会话库」两次无事务的写保持一致, 中间还夹着
        * 随时可能到达的 IM 消息 —— PR #653 / #669 为此叠了在途标记、TTL、回滚、
        * CAS、补偿五层状态, 十轮 review 仍在出新的组合边界。现在的语义是: 移出
-       * 映射 = 断开绑定, 并向渠道说明怎么恢复(见 NOTICE_SESSION_RECREATED)。
+       * 映射 = 断开绑定, 静默换新对话。
        * 在映射**内**换目录仍然无感跟随, 因为那本就在边界内。
        */
       if (usable && inAllowedRoot) {
@@ -2054,10 +2079,8 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       }
       bindings.remove(connectionId, payload.externalKey);
       if (legacyNamespace) bindings.remove(legacyNamespace, payload.externalKey);
-      // 旧绑定作废后下面会新建会话 —— 渠道侧只会看到"换了个会话"却无从得知
-      // 原因, 因此带一条说明随本次 turn.end 回去(见 execute)。
+      // 旧绑定作废后下面静默新建会话, 不在 IM 回复里追加说明。
       if (!forceNew) {
-        recreatedNotice = info?.usable ? NOTICE_SESSION_RECREATED : NOTICE_SESSION_GONE;
         // 当前 lane 自己的失效绑定可以作为交接来源。legacy namespace 可能来自
         // 另一账号，只允许迁移可用且仍在映射内的任务，绝不从失效 legacy 读历史。
         if (!info?.usable && bound === namespacedBound) {
@@ -2172,7 +2195,6 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
         attachments: payload.attachments,
         origin,
       },
-      ...(recreatedNotice ? { notice: recreatedNotice } : {}),
       ...(cleanupWorktree ? { cleanupWorktree } : {}),
     };
   }
@@ -2185,7 +2207,11 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     if (!accountActive) return;
     const admittedGeneration = accountGeneration;
     const source = payload.source === undefined ? undefined : normalizeTaskSource(payload.source);
-    const dispatchPayload = source === undefined ? payload : { ...payload, source };
+    const dispatchPayload = {
+      ...payload,
+      ...(source === undefined ? {} : { source }),
+      prompt: composeXPrompt(payload.source, payload.prompt),
+    };
     sendFns.set(connectionId, send);
 
     // Durable terminal replay comes first: an auto-update restarts the process
@@ -2273,11 +2299,13 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
     serializeByKey(`${connectionId} ${payload.externalKey}`, async () => {
       try {
         let contextPrefix = '';
+        let groupMessageCount: number | undefined;
         let commitContextCursor: ContextCursorCommit | undefined;
         if (buildContextPrefix) {
           try {
             const assembly = await buildContextPrefix(dispatchPayload);
             contextPrefix = assembly.prefix;
+            groupMessageCount = assembly.messageCount;
             commitContextCursor = assembly.commit;
           } catch (error) {
             log.warn(`group context prefix failed, dispatching without it: ${String(error)}`);
@@ -2307,6 +2335,12 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
           run: {
             ...resolved.run,
             ...(contextPrefix ? { prompt: `${contextPrefix}${resolved.run.prompt}` } : {}),
+            contextSnapshot: captureImContext({
+              // Only the host-produced prefix is context; user text may contain
+              // identical tags without becoming an attached background group.
+              groupPrefix: contextPrefix,
+              groupMessageCount,
+            }),
             ...(source ? { source } : {}),
             ...(groupHistoryAccess ? { groupHistoryAccess } : {}),
           },
@@ -2317,7 +2351,6 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
           commitContextCursor
             ? { commitContextCursor }
             : {}),
-          ...(resolved.notice ? { notice: resolved.notice } : {}),
           ...(resolved.cleanupWorktree ? { cleanupWorktree: resolved.cleanupWorktree } : {}),
         };
         const sessionId = resolved.run.sessionId;
@@ -2425,6 +2458,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       const wasActive = accountActive;
       accountActive = false;
       accountGeneration += 1;
+      clearRecoveryDeliveries();
       if (accountDeactivation !== null) {
         await accountDeactivation;
         return;
@@ -2757,6 +2791,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       serverFeatures.delete(connectionId);
     },
     dispose() {
+      clearRecoveryDeliveries();
       unsubscribeUiContinuation?.();
       unsubscribeUiIntervention?.();
       unsubscribeUiTurnDispatching?.();
@@ -2774,6 +2809,7 @@ export function createHookDispatcher(deps: HookDispatcherDeps): HookDispatcher {
       for (const key of [...pendingDeliveryTurnEnds.keys()]) clearPendingDelivery(key);
     },
     onMessageOpResult(payload: MessageOpResultPayload) {
+      recoveryDeliveries.get(payload.opId)?.(payload.ok);
       // 带上按连接取发送函数的钩子: 群限制了可用表情时要用基础款回落一次,
       // 而该发到哪条连接由 ackReactions 自己记的 task 决定。
       ackReactions.onResult(payload, (connectionId) => sendFns.get(connectionId));

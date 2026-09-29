@@ -11,6 +11,7 @@ import { composeAtomicModelSelection } from '@cindy/model-providers';
 import {
   assessModelSwitchContext,
   MODEL_WINDOW_SWITCH_FORCE_REBUILD_PCT,
+  shouldHandoffAfterContextAssessment,
 } from './modelSwitchAssessment.js';
 
 export type RuntimeModelSwitchGate = {
@@ -97,6 +98,44 @@ export function assessRuntimeModelSwitchGate(
   return { skipRebuild: false, defer: false };
 }
 
+/**
+ * 冷 Pi 的窗口核实要**冷启动一个完整运行时**(实测 2~3s:asset-prep → `pi list` →
+ * Pi boot)，是「点一次切模型等一次」的卡顿来源。但核实读到的**当前窗口 / 占用**
+ * 只服务于一个判定：缩窗交接（见 `assessRuntimeModelSwitchGate`：`skipRebuild=false`
+ * 要求 `target < current` 且占用已到 danger/overflow）。因此当**已知占用**相对
+ * **目标窗口**还没到 danger/overflow 时，核实结果不可能改变结论 —— 矩阵里压根不会
+ * 走换窗重建，冷启动是纯等待。
+ *
+ * `contextTokens` 必须来自 **live runtime 的最后一次读数**（关闭时固化，见
+ * `maker-ipc/sessionLastLiveUsage.ts`），不能直接用 `sessions.context_tokens`：
+ * 后者只在 turn 正常收尾时落库，中断 / 崩溃后可能低报真实占用，拿它证明「目标还有
+ * 余量」会绕过缩窗交接（Greptile P1，2026-09-21）。
+ *
+ * 缺占用（null / 非法）或缺目标窗口时返回 false（保守）：没有可信占用就证明不了目标
+ * 有余量，维持原核实路径，不省这次冷启动。
+ */
+export function shouldSkipColdPiWindowRehydration(input: {
+  contextTokens: number | null | undefined;
+  targetContextWindow: number | null | undefined;
+}): boolean {
+  const { contextTokens, targetContextWindow } = input;
+  if (
+    typeof contextTokens !== 'number' ||
+    !Number.isFinite(contextTokens) ||
+    contextTokens < 0
+  ) {
+    return false;
+  }
+  if (!isPositiveWindow(targetContextWindow)) return false;
+  return !shouldHandoffAfterContextAssessment(
+    assessModelSwitchContext({
+      contextTokens,
+      targetContextWindow,
+      autoCompactThresholdPct: MODEL_WINDOW_SWITCH_FORCE_REBUILD_PCT,
+    }),
+  );
+}
+
 /** 回合中登记 pending 时写入的运行时快照:必须带上点选时的 effort / Fast,不能等结算再猜。 */
 export function buildDeferredRuntimeSelectionProfile<
   TAgent extends string,
@@ -124,9 +163,7 @@ export function buildDeferredRuntimeSelectionProfile<
 }
 
 export type DeferredModelWindowRetry =
-  | { action: 'done' }
-  | { action: 'retry'; confirmedContextWindow: number }
-  | { action: 'cancel' };
+  { action: 'done' } | { action: 'retry'; confirmedContextWindow: number } | { action: 'cancel' };
 
 /** 延期选择在空闲结算时若仍要换窗确认:带着核实窗口再 apply,缺窗口才取消。 */
 export function nextDeferredModelWindowRetry(
@@ -134,7 +171,11 @@ export function nextDeferredModelWindowRetry(
   confirmedWindow: number | undefined,
 ): DeferredModelWindowRetry {
   if (!confirmationRequired) return { action: 'done' };
-  if (typeof confirmedWindow === 'number' && Number.isFinite(confirmedWindow) && confirmedWindow > 0) {
+  if (
+    typeof confirmedWindow === 'number' &&
+    Number.isFinite(confirmedWindow) &&
+    confirmedWindow > 0
+  ) {
     return { action: 'retry', confirmedContextWindow: confirmedWindow };
   }
   return { action: 'cancel' };
@@ -203,4 +244,27 @@ export function planUserRuntimeModelSwitch(input: {
     return { outcome: 'defer', skipRebuild: gate.skipRebuild, selection, pendingProfile };
   }
   return { outcome: 'hot-apply', skipRebuild: gate.skipRebuild, selection, pendingProfile };
+}
+
+/** Complete an already-selected route using the host-verified handoff window. */
+export async function applyWithVerifiedModelWindow<
+  T extends {
+    contextWindowConfirmationRequired?: number;
+    contextTokensForConfirmation?: number;
+  },
+>(apply: (confirmedContextWindow?: number) => Promise<T>): Promise<T> {
+  const requiresConfirmation = (result: T) =>
+    result.contextWindowConfirmationRequired !== undefined ||
+    result.contextTokensForConfirmation !== undefined;
+  let result = await apply();
+  const next = nextDeferredModelWindowRetry(
+    requiresConfirmation(result),
+    result.contextWindowConfirmationRequired,
+  );
+  if (next.action === 'cancel') throw new Error('Model window could not be verified for recovery');
+  if (next.action === 'retry') {
+    result = await apply(next.confirmedContextWindow);
+    if (requiresConfirmation(result)) throw new Error('Model window changed during recovery');
+  }
+  return result;
 }

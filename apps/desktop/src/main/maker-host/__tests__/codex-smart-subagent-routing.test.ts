@@ -71,6 +71,37 @@ const baseCatalog = {
 };
 
 describe('Codex smart Subagent catalog', () => {
+  it('does not borrow reasoning capabilities from existing records or GPT templates', () => {
+    const raw = { models: baseCatalog.models.map(entry => ({
+      ...entry, default_reasoning_level: 'medium',
+    })) };
+    const built = buildCodexSmartModelCatalog(raw, [
+      { providerId: 'custom', model: { ...model('gpt-5.6-luna'), efforts: [], defaultEffort: null } },
+      { providerId: 'custom', model: { ...model('unknown-model'), efforts: [], defaultEffort: null } },
+      { providerId: 'custom', model: { ...model('declared-model'), defaultEffort: null } },
+    ]);
+    for (const slug of ['gpt-5.6-luna', 'unknown-model']) {
+      expect(built?.models.find(entry => entry.slug === slug)).toMatchObject({
+        supported_reasoning_levels: [], default_reasoning_level: null,
+      });
+    }
+    expect(built?.models.find(entry => entry.slug === 'declared-model')).toMatchObject({
+      supported_reasoning_levels: [expect.objectContaining({ effort: 'low' }), expect.objectContaining({ effort: 'medium' })],
+      default_reasoning_level: null,
+    });
+    expect(raw.models[1].supported_reasoning_levels).toEqual([{ effort: 'medium', description: 'medium' }]);
+  });
+
+  it('only selects subscription routes belonging to the current account host', () => {
+    const providers = [
+      provider('openai', [model('gpt-account-default')], { authStrategy: 'oauth-passthrough' }),
+      provider('account-a', [model('gpt-account-a')], { authStrategy: 'oauth-passthrough' }),
+      provider('account-b', [model('gpt-account-b')], { authStrategy: 'oauth-passthrough' }),
+      provider('xd', [model('api-model')]),
+    ];
+    expect(selectCodexSmartSubagentCandidates(providers, { allowChatGptOAuth: true, oauthProviderId: 'account-b' })
+      .map((candidate) => candidate.providerId).sort()).toEqual(['account-b', 'xd']);
+  });
   it('preserves a newly discovered native v2 model including its larger maximum window', () => {
     const astra = {
       slug: 'gpt-6-astra',

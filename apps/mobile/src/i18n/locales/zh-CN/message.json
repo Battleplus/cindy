@@ -1,4 +1,13 @@
 {
+  "pluginInvocation": {
+    "listSeparator": "、",
+    "status": {
+      "running": "调用中…",
+      "called": "已调用",
+      "done": "已完成",
+      "selected": "已选择"
+    }
+  },
   "renderer": {
     "moreActions": "更多消息操作",
     "previousQuestionJump": "跳到上一条提问：{{preview}}",
@@ -23,6 +32,10 @@
     "expand": "展开",
     "automationOriginNamed": "由自动化「{{name}}」发送",
     "automationOrigin": "由自动化发送",
+    "sessionOriginNamed": "由任务「{{name}}」发送",
+    "botOriginNamed": "由伙伴「{{name}}」发送",
+    "sessionOrigin": "由其他任务发送",
+    "openSessionOrigin": "打开来源任务",
     "modelMismatch": "本轮由 {{actual}} 响应，而非所选的 {{selected}}(服务端临时降级)",
     "copyStateCopying": "复制中",
     "copyStateCopied": "已复制",
@@ -146,13 +159,20 @@
     "loadFailed": "图片加载失败",
     "retryLoadImage": "重试加载图片",
     "retry": "重试",
-    "closeImage": "关闭图片"
+    "closeImage": "关闭图片",
+    "discardAnnotationTitle": "放弃标注？",
+    "discardAnnotationBody": "未保存的笔迹将会丢失。",
+    "continueAnnotating": "继续标注",
+    "discardAnnotation": "放弃标注",
+    "annotateUnavailableTitle": "暂时无法标注",
+    "annotateImageUnavailable": "标注图片（暂不可用）"
   },
   "queue": {
     "continueSystemInstruction": "继续未完成的任务(系统指令)",
     "systemInstruction": "系统指令",
     "retrySend": "重试发送",
     "clearError": "清除错误",
+    "noRetryContent": "没有可重发的内容，请清除错误后重新输入。",
     "piImageInputUnsupported": "当前 Pi 模型未启用图片输入。请切换到支持图片的模型；如果这是自定义模型，请在供应商设置中开启“支持图片输入”，然后新建 Pi 任务。",
     "codexResumeNotReady": "Codex 暂时无法恢复这个任务，请稍后重试",
     "credentialSwitchWait": "正在等待其它 Codex 任务结束，结束后自动发送",
@@ -239,12 +259,13 @@
     },
     "row": {
       "syntheticEditDisabled": "系统指令消息不支持编辑或插话发送。",
+      "autoSentEditDisabled": "自动发送的消息不支持编辑或插话发送。",
       "first": "已经是队列第一条。",
       "last": "已经是队列最后一条。",
       "steering": "插话发送中",
       "orcaTitle": "协同队列 {{index}}",
       "title": "队列 {{index}}",
-      "orcaReadOnly": "协同消息由桌面端编排，手机端只读显示。",
+      "orcaEditDisabled": "协同消息不支持编辑或插话发送。",
       "busy": "队列操作同步中，完成后再继续操作。",
       "steeringDisabled": "插话正在发送到当前 turn，等待桌面端回流后再操作。",
       "editLocked": "这条队列消息正在编辑中，完成后再操作。",

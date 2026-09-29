@@ -1,18 +1,26 @@
+import { RemoteDesktopActionButton } from "./RemoteDesktopActionButton";
 import type { ReactNode } from "react";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 import {
   Keyboard,
   SlidersHorizontal,
-  X,
   type LucideIcon,
 } from "lucide-react-native";
-import { AllWindowsIcon, ShowDesktopIcon } from "./RemoteDesktopIcons";
+import {
+  AllWindowsIcon,
+  ShowDesktopIcon,
+  WorkspaceLeftIcon,
+  WorkspaceRightIcon,
+  OmarchyMenuIcon,
+} from "./RemoteDesktopIcons";
+import { RemoteDesktopPanelButton } from "./RemoteDesktopPanelButton";
 import { useTranslation } from "react-i18next";
 import { Text } from "@/components/AppText";
 import {
   iconSize,
   iconStroke,
   fontWeight,
+  lineHeight,
   radius,
   spacing,
   typeScale,
@@ -30,6 +38,9 @@ export function RemoteDesktopToolbar({
   onDesktop,
   onKeyboard,
   onOperations,
+  onWorkspaceLeft,
+  onWorkspaceRight,
+  onOmarchyMenu,
 }: {
   landscape: boolean;
   canControl: boolean;
@@ -39,6 +50,9 @@ export function RemoteDesktopToolbar({
   onDesktop(): void;
   onKeyboard(): void;
   onOperations(): void;
+  onWorkspaceLeft?: () => void;
+  onWorkspaceRight?: () => void;
+  onOmarchyMenu?: () => void;
 }) {
   const { t } = useTranslation();
   const { colors } = useTheme();
@@ -51,17 +65,27 @@ export function RemoteDesktopToolbar({
     disabled?: boolean;
   }> = [
     {
-      key: "allWindows",
-      icon: AllWindowsIcon,
-      press: onWindows,
+      key: onWorkspaceLeft ? "workspaceLeft" : "allWindows",
+      icon: onWorkspaceLeft ? WorkspaceLeftIcon : AllWindowsIcon,
+      press: onWorkspaceLeft ?? onWindows,
       disabled: !canControl,
     },
     {
-      key: "showDesktop",
-      icon: ShowDesktopIcon,
-      press: onDesktop,
+      key: onWorkspaceRight ? "workspaceRight" : "showDesktop",
+      icon: onWorkspaceRight ? WorkspaceRightIcon : ShowDesktopIcon,
+      press: onWorkspaceRight ?? onDesktop,
       disabled: !canControl,
     },
+    ...(onOmarchyMenu
+      ? [
+          {
+            key: "omarchyMenu",
+            icon: OmarchyMenuIcon,
+            press: onOmarchyMenu,
+            disabled: !canControl,
+          },
+        ]
+      : []),
     {
       key: "keyboard",
       icon: Keyboard,
@@ -83,7 +107,7 @@ export function RemoteDesktopToolbar({
     >
       {(landscape ? [...actions].reverse() : actions).map(
         ({ key, icon: Icon, press, selected, disabled }) => (
-          <Pressable
+          <RemoteDesktopActionButton
             key={key}
             testID={`remoteDesktop.${key}`}
             accessibilityRole="button"
@@ -106,7 +130,7 @@ export function RemoteDesktopToolbar({
             <Text numberOfLines={2} style={styles.label}>
               {t(`remoteDesktop.${key}`)}
             </Text>
-          </Pressable>
+          </RemoteDesktopActionButton>
         ),
       )}
     </View>
@@ -121,20 +145,30 @@ export function RemoteDesktopPanel({
   title,
   caption,
   onClose,
+  onBack,
+  page,
   children,
   footer,
+  visible = true,
 }: {
   landscape: boolean;
   topInset: number;
+  toolbarOnLeft?: boolean;
+  toolbarActionCount?: number;
+  railAnchor?: { top: number; right: number };
   title: string;
   caption: string;
   onClose(): void;
+  onBack?(): void;
+  page?: string;
   children: ReactNode;
   footer?: ReactNode;
+  visible?: boolean;
 }) {
   const { t } = useTranslation();
   const { colors } = useTheme();
   const styles = useThemedStyles(makeStyles);
+  if (!visible) return null;
   return (
     <View
       style={StyleSheet.absoluteFill}
@@ -148,6 +182,7 @@ export function RemoteDesktopPanel({
       />
       <View
         accessibilityViewIsModal
+        testID="remoteDesktop.panelSurface"
         style={[
           styles.panel,
           landscape ? styles.sidePanel : styles.bottomPanel,
@@ -155,6 +190,15 @@ export function RemoteDesktopPanel({
         ]}
       >
         <View style={styles.panelHeader}>
+          <View style={styles.close}>
+            {onBack && (
+              <RemoteDesktopPanelButton
+                back
+                label={t("remoteDesktop.back")}
+                onPress={onBack}
+              />
+            )}
+          </View>
           <View style={styles.heading}>
             <Text numberOfLines={1} style={styles.title}>
               {title}
@@ -163,27 +207,19 @@ export function RemoteDesktopPanel({
               {caption}
             </Text>
           </View>
-          <Pressable
-            onPress={onClose}
-            accessibilityRole="button"
-            accessibilityLabel={t("remoteDesktop.close")}
-            style={styles.close}
-          >
-            <X
-              size={iconSize.action}
-              strokeWidth={iconStroke.regular}
-              color={colors.textPrimary}
-            />
-          </Pressable>
+          <View style={styles.close} />
         </View>
         <ScrollView
+          key={page}
+          testID="remoteDesktop.panelScroll"
+          style={styles.panelScroll}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.panelContent}
         >
           {children}
+          {footer && <View style={styles.panelFooter}>{footer}</View>}
         </ScrollView>
-        {footer && <View style={styles.panelFooter}>{footer}</View>}
       </View>
     </View>
   );
@@ -212,6 +248,7 @@ const makeStyles = (colors: ThemeColors) =>
     label: {
       color: colors.textPrimary,
       fontSize: typeScale.caption,
+      lineHeight: lineHeight.caption,
       textAlign: "center",
     },
     selected: { backgroundColor: colors.surfaceChip },
@@ -229,7 +266,7 @@ const makeStyles = (colors: ThemeColors) =>
     },
     bottomPanel: {
       left: 0,
-      maxHeight: "72%",
+      height: "50%",
       borderTopRightRadius: radius.container,
     },
     sidePanel: { width: "48%", minWidth: 280, maxWidth: 360 },
@@ -240,20 +277,22 @@ const makeStyles = (colors: ThemeColors) =>
       paddingVertical: spacing.sm,
       gap: spacing.sm,
     },
-    heading: { flex: 1, gap: spacing.xs },
+    heading: { flex: 1, gap: spacing.xs, alignItems: "center" },
     title: {
       color: colors.textPrimary,
       fontSize: typeScale.body,
+      lineHeight: lineHeight.body,
       fontWeight: fontWeight.semibold,
     },
-    caption: { color: colors.textTertiary, fontSize: typeScale.caption },
+    caption: { color: colors.textTertiary, fontSize: typeScale.caption, lineHeight: lineHeight.caption },
     close: {
       width: 44,
       height: 44,
       alignItems: "center",
       justifyContent: "center",
     },
-    panelContent: { padding: spacing.md, paddingTop: 0, gap: spacing.md },
+    panelScroll: { flex: 1, minHeight: 0 },
+    panelContent: { padding: spacing.md, gap: spacing.md },
     panelFooter: {
       paddingHorizontal: spacing.md,
       paddingVertical: spacing.xs,

@@ -8,7 +8,9 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { ScriptTarget, transpileModule } from 'typescript';
+import type { AgentEvent } from '@cindy/maker-core';
 
 const sourcePath = resolve(__dirname, '..', 'maker-ipc', 'register.ts');
 const source = readFileSync(sourcePath, 'utf8').replace(/\r\n?/g, '\n');
@@ -23,6 +25,66 @@ const goalStorageSourcePath = resolve(__dirname, '..', 'goal-host', 'storage.ts'
 const goalStorageSource = readFileSync(goalStorageSourcePath, 'utf8').replace(/\r\n?/g, '\n');
 
 describe('maker:event hot path ordering', () => {
+  it('finishes mandatory runtime cleanup when optional remote refresh throws at an owner boundary', () => {
+    const start = source.indexOf('function cleanupClosedSessionRuntime(');
+    const code = source.slice(start, source.indexOf('\n// Keep holder reads', start));
+    const js = transpileModule(code, { compilerOptions: { target: ScriptTarget.ES2022 } }).outputText;
+    const cleared = vi.fn();
+    const deps = {
+      pendingCredentialSwitchHolder: null, deferredCodexRestartHolder: null,
+      agentInputCoordinatorHolder: null,
+      refreshRemoteCodexMcpOnTurnSettledHolder: () => { throw new Error('App session is switching'); },
+      gitSnapshotCoordinator: { onSessionClosed: vi.fn() },
+      clearOrcaMcpHydrated: vi.fn(), knownNonOrcaSessionIds: new Set(),
+      lastReportedCostUsdBySession: new Map(), lastReportedModelUsageBySession: new Map(),
+      turnModelPromiseBySession: new Map(), turnUsageContextBySession: new Map(),
+      productTurnWallClockTracker: { clear: cleared }, productTurnUsageTargetTracker: { clear: vi.fn() },
+      claudeOutputLagTimingGuard: { clear: vi.fn() }, clearClaudeSessionBackgroundActivity: vi.fn(),
+      clearSessionPersistState: vi.fn(), clearSubagentObservationRewindState: () => true,
+      handleAgentIslandSessionClosedAfterCleanup: vi.fn(), log: { warn: vi.fn() },
+    };
+    const cleanup = new Function(...Object.keys(deps), `${js}; return cleanupClosedSessionRuntime;`)(...Object.values(deps));
+    expect(() => cleanup({ id: 'departing-task' })).not.toThrow();
+    expect(cleared).toHaveBeenCalledWith('departing-task');
+    expect(deps.clearSessionPersistState).toHaveBeenCalledWith('departing-task');
+    expect(deps.handleAgentIslandSessionClosedAfterCleanup).toHaveBeenCalledWith('departing-task', 'process-closed');
+  });
+
+  it('does not read the guarded Maker during account-boundary remote refresh', () => {
+    const start = source.indexOf('refreshRemoteCodexMcpOnTurnSettledHolder = (sessionId: string): void => {');
+    const prefix = source.slice(start, source.indexOf('    const remoteHostId', start));
+    const js = transpileModule(`let refreshRemoteCodexMcpOnTurnSettledHolder; ${prefix}\n};`, {
+      compilerOptions: { target: ScriptTarget.ES2022 },
+    }).outputText;
+    const getSession = vi.fn(() => { throw new Error('App session is switching'); });
+    const refresh = new Function('isAppSessionBoundaryPending', 'maker', `${js}; return refreshRemoteCodexMcpOnTurnSettledHolder;`)(() => true, { getSession });
+    expect(() => refresh('departing-task')).not.toThrow();
+    expect(getSession).not.toHaveBeenCalled();
+  });
+  it.each([undefined, null, { text: 'Restart Cindy before using Pi again.', isFinal: true }])(
+    'strips Host recovery metadata from the boundary copy with data %j',
+    (data) => {
+      // Execute the actual boundary function without booting Desktop/register side effects.
+      const start = source.indexOf('function redactEventForRenderer');
+      const code = source.slice(start, source.indexOf('\nfunction ', start + 1));
+      const js = transpileModule(code, {
+        compilerOptions: { target: ScriptTarget.ES2022 },
+      }).outputText;
+      const redact = new Function(`${js}; return redactEventForRenderer;`)() as
+        (event: AgentEvent) => AgentEvent;
+      const original: AgentEvent = {
+        type: 'text', source: 'pi', data, runtimeRecovery: true,
+        sessionInstanceId: 'runtime', sessionTurnGeneration: 7,
+      };
+      const boundary = redact(original);
+      expect(boundary).toEqual({ type: 'text', source: 'pi', data });
+      expect(original.runtimeRecovery).toBe(true);
+      expect(original.sessionInstanceId).toBe('runtime');
+      expect(original.sessionTurnGeneration).toBe(7);
+      expect(boundary).not.toBe(original);
+    },
+  );
+
   it('keeps complete PI Subagent returns on the host side of the event boundary', () => {
     const redactor = source.slice(
       source.indexOf('function redactEventForRenderer'),
@@ -52,6 +114,7 @@ describe('maker:event hot path ordering', () => {
     expect(wireSessionSource).toMatch(
       /registration\.disposers\.push\(\s*session\.onEvent\(\(event: AgentEvent\) => \{/,
     );
+    expect(wireSessionSource).toContain('session.onRuntimeRecovery(emitWiredSessionEvent)');
     expectOrder(
       wireSessionSource,
       'sessionBindings.attachStatusListener(registration);',
@@ -90,7 +153,7 @@ describe('maker:event hot path ordering', () => {
       'lastReportedCostUsdBySession.delete(',
       'lastReportedModelUsageBySession.delete(',
       'turnModelPromiseBySession.delete(',
-      'turnPiFastModeBySession.delete(',
+      'turnUsageContextBySession.delete(',
       'productTurnWallClockTracker.clear(',
       'productTurnUsageTargetTracker.clear(',
       'claudeOutputLagTimingGuard.clear(',
@@ -117,7 +180,7 @@ describe('maker:event hot path ordering', () => {
     expectOrder(
       continuation,
       'productTurnWallClockTracker.preserveForContinuation(session.id);',
-      'const sendResult = await session.send(',
+      'const sendResult = await session.sendHostTurnContinuation(',
     );
   });
 
@@ -383,7 +446,7 @@ describe('maker:event hot path ordering', () => {
     );
     expect(source).toContain('out.push({ request: entry.request, persistId: entry.persistId });');
     expect(source).toContain(
-      'taken.push({ requestId, request: entry.request, resolve: entry.resolve });',
+      'taken.push({ requestId, request: entry.request, resolve:',
     );
   });
 
@@ -418,30 +481,37 @@ describe('maker:event hot path ordering', () => {
     );
   });
 
-  it('preserves only a waiting Codex reconnect-stall retry across its exact provider rebuild', () => {
+  it('preserves continuation-only retry across its exact unexpected provider rebuild', () => {
     const closedBlock = extractSessionCloseAdaptersSource();
 
     expect(source).toContain(
-      'const pendingCodexReconnectStalledRebuilds = new WeakMap<Session, number>();',
+      'const pendingContinuationOnlyAutoResumeRebuilds = new WeakMap<Session, number>();',
     );
-    expect(source).toContain("if (signals.reason === 'codex_reconnect_stalled') {");
+    expect(source).toContain('if (isAcceptedTurnContinuationOnlyReason(signals.reason)) {');
     expect(source).toContain(
-      'pendingCodexReconnectStalledRebuilds.set(runtimeSession, decision.attemptToken);',
+      'pendingContinuationOnlyAutoResumeRebuilds.set(runtimeSession, decision.attemptToken);',
     );
-    expect(source).toContain("if (closeReason !== 'unexpected') return false;");
+    expect(source).toContain('shouldPreserveWaitingContinuationOnlyAutoResume({');
+    expect(source).toContain('leasedAttemptToken,');
     expect(source).toContain(
       'interruptedTurnAutoResumeGuard.isCurrentAttempt(session.id, attemptToken)',
     );
-    expect(source).toContain('coordinator.getAutoResumeAttemptToken(session.id) !== attemptToken');
-    expect(source).toContain('autoResumeBookkeeping.hasWaitingSchedule(session.id, attemptToken)');
+    expect(source).toContain('autoResumeBookkeeping.hasLiveSchedule(session.id, attemptToken)');
+    expect(source).toContain('coordinator?.hasQueuedAutoResume(session.id)');
+    expect(source).toContain('isContinuationOnly:');
+    expect(source).toContain('coordinator?.isContinuationOnlyAutoResume(session.id) === true');
+    expect(source).toContain('coordinator?.isContinuationOnlyAutoResume(session.id) !== true');
     expect(closedBlock).toContain(
-      'shouldPreserveCodexReconnectStalledAutoResume(session, closeReason)',
+      'shouldPreserveContinuationOnlyAutoResume(session, closeReason)',
     );
     expect(closedBlock).toContain(
       'shouldPreserveSessionRuntimeFallbackAutoResume(session, closeReason)',
     );
     expect(closedBlock).toContain('runSessionCloseCleanup(context.preserveAutoResumeIntent, {');
     expect(closedBlock).toContain('autoResumeBookkeeping.teardown(session.id);');
+    expect(source).toMatch(/onBind: \(session: WiredSession\) => \{\s*advanceSessionTurnBoundaryGeneration\(session.id\);\s*bindContinuationOnlyAutoResumeLease\(session\);/);
+    expect(source).toContain('onUnconfirmedAutoResumeTurn:');
+    expect(source).toContain('autoResumeBookkeeping.abandonUnconfirmedPersistedResume(');
   });
 
   it('clears Agent Island after mandatory closed-session cleanup', () => {
@@ -608,7 +678,7 @@ describe('maker:event hot path ordering', () => {
       'const goalPause = pauseGoalBeforeExplicitStop(sid);',
       'inputCoordinator.stop(',
     );
-    expectOrder(inputStopSource, 'inputCoordinator.stop(', 'await goalPause;');
+    expectOrder(inputStopSource, 'inputCoordinator.stop(', 'await Promise.all([goalPause, makeInterrupted]);');
     expect(goalPauseStart).toBeGreaterThanOrEqual(0);
     expect(goalPauseSource).toContain('catch (err)');
     expect(goalPauseSource).toContain('await Promise.resolve(observer(sessionId));');
@@ -796,7 +866,7 @@ describe('maker:event hot path ordering', () => {
     expect(codexDoneIndex).toBeGreaterThanOrEqual(0);
 
     const codexDoneSource = wireSessionSource.slice(codexDoneIndex);
-    expect(codexDoneSource).toContain('const sessionProvider = getSessionProvider(session.id);');
+    expect(codexDoneSource).toContain('const sessionProvider = turnContext.providerId;');
     expect(codexDoneSource).toContain(
       'const isRemoteCodexSession = Boolean(session.remoteHostId);',
     );
@@ -819,7 +889,7 @@ describe('maker:event hot path ordering', () => {
       'promptTokens + completionTokens + reasoningTokens + cachedTokens',
     );
     expect(codexDoneSource).toContain('const isCustomProviderRoute =');
-    expect(codexDoneSource).toContain('isUserProviderSession(session.id)');
+    expect(codexDoneSource).toContain('turnContext.isUserProviderRoute');
     expect(codexDoneSource).toMatch(/&&\s*pricingModel\.startsWith\('codex\/'\);/);
     expect(codexDoneSource).toMatch(/&&\s*isExclusiveXaiModelId\(pricingModel\);/);
     expect(codexDoneSource).toContain('const hasGatewayKey = Boolean(readClaudeApiKey());');
@@ -869,10 +939,10 @@ describe('maker:event hot path ordering', () => {
     expect(codexDoneSource).toContain('void recordTurnSpend(money);');
     expect(codexDoneSource).toContain('void recordSessionTurnSpend(session.id, money);');
     expect(codexDoneSource).toMatch(
-      /await recordModelTurnUsage\(\{\s*agentKind: 'codex',\s*model: modelUsageKey,\s*money: isSubscriptionValue \? unpricedSubscriptionValueMarker\(\) : undefined,\s*inputTokensDelta: promptTokens,\s*outputTokensDelta: completionTokens,\s*cacheReadTokensDelta: cachedTokens,\s*cacheCreateTokensDelta: 0,\s*\}\)\.finally\(\(\) => rebroadcastCodexTodayUsage\(\)\);[\s\S]*?const pricing = isSubscriptionValue/,
+      /await recordModelTurnUsage\(\{\s*sessionId: session\.id,\s*agentKind: 'codex',\s*model: modelUsageKey,\s*money: isSubscriptionValue \? unpricedSubscriptionValueMarker\(\) : undefined,\s*inputTokensDelta: promptTokens,\s*outputTokensDelta: completionTokens,\s*cacheReadTokensDelta: cachedTokens,\s*cacheCreateTokensDelta: cacheCreationTokens,\s*\}\)\.finally\(\(\) => rebroadcastCodexTodayUsage\(\)\);[\s\S]*?const pricing = isSubscriptionValue/,
     );
     expect(codexDoneSource).toMatch(
-      /await recordModelTurnUsage\(\{\s*agentKind: 'codex',\s*model: modelUsageKey,\s*money,\s*inputTokensDelta: 0,\s*outputTokensDelta: 0,\s*cacheReadTokensDelta: 0,\s*cacheCreateTokensDelta: 0,\s*\}\);/,
+      /await recordModelTurnUsage\(\{\s*sessionId: session\.id,\s*agentKind: 'codex',\s*model: modelUsageKey,\s*money,\s*inputTokensDelta: 0,\s*outputTokensDelta: 0,\s*cacheReadTokensDelta: 0,\s*cacheCreateTokensDelta: 0,\s*\}\);/,
     );
     const costRecordIndex = codexDoneSource.indexOf('void recordTurnSpend(money);');
     const modelCostRecordIndex = codexDoneSource.indexOf(
@@ -922,23 +992,20 @@ describe('maker:event hot path ordering', () => {
     expect(claudeDoneSource).toContain('recordSessionTurnSpend(session.id, turnMoney);');
     expect(claudeDoneSource).toContain('subscriptionEstimate ?? unpricedSubscriptionValueMarker()');
     expect(claudeDoneSource).toContain('money: modelRowMoney,');
-    // 订阅轮 (Claude Anthropic 订阅或 bridge 订阅直连) 打 #billing=subscription 标记,
+    // 订阅轮复用计费解析结果打 #billing=subscription 标记,
     // 仪表盘按订阅估算价折算; 其余轮仍写归一化裸 id。
     expect(claudeDoneSource).toMatch(
-      /model:\s*isClaudeSubscriptionValueRow \|\| isBridgeSubscriptionRow\s*\?\s*claudeSubscriptionUsageModelKey\(m\.model\)\s*:\s*m\.model,/,
+      /model:\s*isSubscriptionValueRow\s*\?\s*claudeSubscriptionUsageModelKey\(m\.model\)\s*:\s*m\.model,/,
     );
     expect(claudeDoneSource).toContain(
-      'isClaudeSubscriptionSession && !m.money && isAnthropicModel(m.model)',
-    );
-    expect(claudeDoneSource).toContain(
-      "m.source === 'subscription' && isSubscriptionDirectRoute(m.model)",
+      "const isSubscriptionValueRow = m.source === 'subscription'",
     );
     expect(claudeDoneSource).toContain('const subscriptionTurnEstimates: RegionalMoney[] = [];');
     expect(claudeDoneSource).toMatch(
-      /computePriceQuoteTurnMoney\(\s*m\.deltas,\s*getSubscriptionValuePriceFor\('claude-code', m\.model, pricing\),\s*currentLedgerCurrency\(\),\s*m\.segments,\s*\)/,
+      /computePriceQuoteTurnMoney\(\s*m\.deltas,\s*\(sessionProviderForBilling\s*\? getCodexProviderSubscriptionValuePrice\(sessionProviderForBilling, m\.model, pricing, undefined, undefined, 'claude-code'\)\s*: undefined\) \?\? getSubscriptionValuePriceFor\('claude-code', m\.model, pricing\),\s*currentLedgerCurrency\(\),\s*m\.segments,\s*\)/,
     );
     // 订阅判定对齐 proxy 路由: 显式选 Anthropic, 或默认路由优先按 observed route, 未观察再回落无网关 key 启发式
-    expect(claudeDoneSource).toContain("sessionProviderForBilling === 'anthropic'");
+    expect(claudeDoneSource).toContain("turnContext.subscriptionKind === 'claude'");
     expect(claudeDoneSource).toContain('const observedClaudeRoute =');
     expect(claudeDoneSource).toContain('readClaudeSessionRoute(session.id)');
     expect(claudeDoneSource).toContain("observedClaudeRoute === 'subscription'");
@@ -959,7 +1026,9 @@ describe('maker:event hot path ordering', () => {
     expect(claudeCostFallback).toMatch(
       /buildClaudeTurnUsageDetails\(\s*undefined,\s*undefined,\s*resolvedModel,/,
     );
-    expect(claudeCostFallback).toContain("if (route !== 'provider-api')");
+    expect(claudeCostFallback).toContain(
+      "if (route !== 'provider-api' || turnContext.accessKind === 'managed')",
+    );
   });
 
   it('pi subscription turns estimate value from the shared reference-price helper', () => {
@@ -968,9 +1037,9 @@ describe('maker:event hot path ordering', () => {
     expect(piDoneIndex).toBeGreaterThanOrEqual(0);
     const piDoneSource = wireSessionSource.slice(piDoneIndex);
     expect(piDoneSource).toContain(
-      '(turnPiFastModeBySession.get(session.id) ?? getSessionFastMode(session.id))',
+      'turnContext.piFastMode',
     );
-    expect(piDoneSource).toContain('turnPiFastModeBySession.delete(session.id);');
+    expect(piDoneSource).toContain('turnUsageContextBySession.delete(session.id);');
     expect(piDoneSource).toContain(
       "segment.priceVariant ?? (segment.id?.startsWith('pi:') ? piPriceVariant : 'standard'),",
     );
@@ -989,24 +1058,28 @@ describe('maker:event hot path ordering', () => {
     expect(piDoneSource).toContain('money: modelRowMoney,');
     expect(piDoneSource).toContain('if (actualMoney)');
     expect(piDoneSource).toContain('await recordSchedulerTurnCost({');
+    // 消息 / 调度落库失败同样落进 catch:兜底只补写正常分支尚未发起的模型组,
+    // 不重放已写过的用量(否则任务与模型用量翻倍)。
+    expectOrder(piDoneSource, 'recordedModels.add(model);', 'modelWrites.push(');
+    expect(piDoneSource).toMatch(
+      /\[\.\.\.groupedSegments\]\s*\.filter\(\(\[model\]\) => !recordedModels\.has\(model\)\)\s*\.map\(/,
+    );
   });
 
-  it('refreshes Claude credential cache before dropping mismatched header snapshots', () => {
+  it('records Claude subscription quota events only while the native login is connected', () => {
     const listenerSource = usageSource.match(
-      /setClaudeRateLimitHeadersListener\(\(snapshot, requestBearerToken\) => \{[\s\S]*?\n {2}\}\);/,
+      /setClaudeRateLimitInfoListener\(\(info\) => \{[\s\S]*?\n {2}\}\);/,
     )?.[0];
     expect(listenerSource).toBeTruthy();
     if (!listenerSource) return;
 
-    expect(listenerSource).toContain('let currentToken = _currentClaudeToken;');
-    expect(listenerSource).toContain(
-      'currentToken = readClaudeCredentialsInfo()?.accessToken ?? null;',
-    );
+    // 登出 / 断开后晚到的事件必须丢弃,不能复活刚清掉的快照。
     expectOrder(
       listenerSource,
-      'currentToken = readClaudeCredentialsInfo()?.accessToken ?? null;',
-      'if (requestBearerToken !== currentToken) return false;',
+      'if (!hasClaudeNativeLogin()) return;',
+      'void recordClaudeSubscriptionUsageSnapshot(',
     );
+    expect(usageSource).not.toContain('setClaudeRateLimitHeadersListener');
   });
 });
 

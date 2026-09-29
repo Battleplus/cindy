@@ -1,6 +1,7 @@
 import {
   validModelMetadata,
   expandedRegistryEntries,
+  type ModelMetadata,
 } from "./modelMetadataLayers.js";
 import { parseLocalModelCatalog } from "./localModelCatalog.js";
 import {
@@ -19,6 +20,7 @@ import {
   MODEL_REGISTRY_SCHEMA_VERSION,
   MODEL_REGISTRY_V3_SCHEMA_VERSION,
   MODEL_REGISTRY_V4_SCHEMA_VERSION,
+  MODEL_REGISTRY_V5_SCHEMA_VERSION,
   MODEL_NATIVE_APIS,
   MODEL_REGISTRY_STATUSES,
   type ListModelsResponse,
@@ -957,6 +959,52 @@ function referencePriceError(value: unknown, path: string): string | null {
   return null;
 }
 
+function referencePricesError(value: unknown, path: string): string | null {
+  if (!Array.isArray(value)) return `${path} must be an array`;
+  for (const [index, price] of value.entries()) {
+    const error = referencePriceError(price, `${path}[${index}]`);
+    if (error) return error;
+    for (let previousIndex = 0; previousIndex < index; previousIndex++) {
+      const previous = value[previousIndex];
+      if (
+        isPlainObject(price) &&
+        isPlainObject(previous) &&
+        referencePriceRangesOverlap(previous, price)
+      )
+        return `${path}[${index}] overlaps referencePrices[${previousIndex}] for the same currency and variant`;
+    }
+  }
+  return null;
+}
+
+function referencePriceGroupsError(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length > 32)
+    return "baseModel.referencePriceGroups must be an array of at most 32 groups";
+  const ids = new Set<string>();
+  for (const group of value) {
+    if (
+      !isPlainObject(group) ||
+      unknownFieldError(group, ["id", "prices"], "referencePriceGroup") ||
+      !isSafeSlug(group.id)
+    )
+      return "baseModel.referencePriceGroups contains an invalid group";
+    if (ids.has(group.id))
+      return "baseModel.referencePriceGroups ids must be unique";
+    ids.add(group.id);
+    const error = referencePricesError(
+      group.prices,
+      `baseModel.referencePriceGroups.${group.id}.prices`,
+    );
+    if (error) return error;
+  }
+  return null;
+}
+
+// Capacity is connection-local metadata, never a public Registry default.
+function validRegistryMetadata(value: unknown): value is ModelMetadata {
+  return validModelMetadata(value) && !("contextWindowMax" in value);
+}
+
 function registryRouteError(
   value: unknown,
   path: string,
@@ -969,6 +1017,7 @@ function registryRouteError(
     schemaVersion >= 4
       ? [
           ...MODEL_REGISTRY_ROUTE_FIELDS,
+          ...(schemaVersion >= 5 ? ["referencePriceGroup"] : []),
           "defaults",
           "forceOverrides",
           "overrideReason",
@@ -979,7 +1028,7 @@ function registryRouteError(
   );
   if (error) return error;
   for (const field of ["defaults", "forceOverrides"] as const) {
-    if (value[field] !== undefined && !validModelMetadata(value[field]))
+    if (value[field] !== undefined && !validRegistryMetadata(value[field]))
       return `${path}.${field} is invalid`;
   }
   if (
@@ -1027,25 +1076,16 @@ function registryRouteError(
   if (media && Array.isArray(value.agents) && value.agents.length !== 0) {
     return `${path}.agents must be empty for a media model`;
   }
-  if (value.referencePrices !== undefined) {
-    if (!Array.isArray(value.referencePrices)) {
-      return `${path}.referencePrices must be an array when present`;
-    }
-    for (const [index, price] of value.referencePrices.entries()) {
-      error = referencePriceError(price, `${path}.referencePrices[${index}]`);
-      if (error) return error;
-      for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
-        const previous = value.referencePrices[previousIndex];
-        if (
-          isPlainObject(price) &&
-          isPlainObject(previous) &&
-          referencePriceRangesOverlap(previous, price)
-        ) {
-          return `${path}.referencePrices[${index}] overlaps referencePrices[${previousIndex}] for the same currency and variant`;
-        }
-      }
-    }
-  }
+  if (
+    value.referencePriceGroup !== undefined &&
+    !isSafeSlug(value.referencePriceGroup)
+  )
+    return `${path}.referencePriceGroup must be a non-empty slug`;
+  if (value.referencePrices !== undefined)
+    return referencePricesError(
+      value.referencePrices,
+      `${path}.referencePrices`,
+    );
   return null;
 }
 
@@ -1234,7 +1274,8 @@ export function parseModelRegistry(
   if (!isPlainObject(value)) return fail("modelRegistry must be an object");
   const unknownField = unknownFieldError(
     value,
-    value.schemaVersion === MODEL_REGISTRY_V4_SCHEMA_VERSION
+    value.schemaVersion === MODEL_REGISTRY_V4_SCHEMA_VERSION ||
+      value.schemaVersion === MODEL_REGISTRY_V5_SCHEMA_VERSION
       ? [
           ...MODEL_REGISTRY_FIELDS,
           "nativeApiRules",
@@ -1251,9 +1292,10 @@ export function parseModelRegistry(
     value.schemaVersion !== MODEL_REGISTRY_LEGACY_SCHEMA_VERSION &&
     value.schemaVersion !== MODEL_REGISTRY_SCHEMA_VERSION &&
     value.schemaVersion !== MODEL_REGISTRY_V3_SCHEMA_VERSION &&
-    value.schemaVersion !== MODEL_REGISTRY_V4_SCHEMA_VERSION
+    value.schemaVersion !== MODEL_REGISTRY_V4_SCHEMA_VERSION &&
+    value.schemaVersion !== MODEL_REGISTRY_V5_SCHEMA_VERSION
   ) {
-    return fail("modelRegistry.schemaVersion must be 1, 2, 3 or 4");
+    return fail("modelRegistry.schemaVersion must be 1, 2, 3, 4 or 5");
   }
   if (!isIsoTimestamp(value.updatedAt)) {
     return fail("modelRegistry.updatedAt must be an ISO timestamp");
@@ -1307,7 +1349,16 @@ export function parseModelRegistry(
     for (const base of value.baseModels) {
       if (
         !isPlainObject(base) ||
-        unknownFieldError(base, ["id", "aliases", "defaults"], "baseModel") ||
+        unknownFieldError(
+          base,
+          [
+            "id",
+            "aliases",
+            "defaults",
+            ...(value.schemaVersion >= 5 ? ["referencePriceGroups"] : []),
+          ],
+          "baseModel",
+        ) ||
         typeof base.id !== "string" ||
         !base.id ||
         base.id.length > 256 ||
@@ -1316,9 +1367,13 @@ export function parseModelRegistry(
         !base.aliases.every(
           (a) => typeof a === "string" && a.length > 0 && a.length <= 256,
         ) ||
-        !validModelMetadata(base.defaults)
+        !validRegistryMetadata(base.defaults)
       )
         return fail("modelRegistry.baseModels contains invalid data");
+      if (base.referencePriceGroups !== undefined) {
+        const error = referencePriceGroupsError(base.referencePriceGroups);
+        if (error) return fail(error);
+      }
       baseIds.add(base.id);
       if (
         base.defaults.efforts !== undefined &&
@@ -1377,6 +1432,21 @@ export function parseModelRegistry(
       value.schemaVersion < 4,
     );
     if (error) return fail(error);
+    const referenceEntry = model as ModelRegistryEntry;
+    for (const route of referenceEntry.routes) {
+      if (route.referencePriceGroup !== undefined) {
+        const base = (
+          value.baseModels as
+            import("./modelMetadataLayers.js").BaseModel[] | undefined
+        )?.find((base) => base.id === referenceEntry.modelRef);
+        if (
+          !base?.referencePriceGroups?.some(
+            (group) => group.id === route.referencePriceGroup,
+          )
+        )
+          return fail("modelRegistry.route.referencePriceGroup is unresolved");
+      }
+    }
     const typed = model as ModelRegistryEntry;
     for (const effective of expandedRegistryEntries({
       ...(value as unknown as ModelRegistry),

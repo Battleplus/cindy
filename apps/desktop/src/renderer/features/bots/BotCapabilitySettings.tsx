@@ -1,3 +1,7 @@
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
+import { ChevronDown, Search } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useBotTranslation } from './botPronounContext';
 import {
@@ -25,15 +29,21 @@ export function BotCapabilitySettings({
   capabilities,
   skills,
   onChange,
+  expanded,
 }: {
+  expanded?: boolean;
   bot: BotProfile;
   capabilities: BotCapabilities;
   skills: string[];
   onChange: (kind: Kind, values: string[]) => void;
 }) {
   const { t } = useBotTranslation();
-  const [catalog, setCatalog] = useState<{ key: string; entries: Partial<Record<Kind, Entry[]>> }>({ key: '', entries: {} });
-  const [open, setOpen] = useState(false);
+  const [catalog, setCatalog] = useState<{ key: string; entries: Partial<Record<Kind, Entry[]>> }>({
+    key: '',
+    entries: {},
+  });
+  const [localOpen, setOpen] = useState(false);
+  const open = expanded ?? localOpen;
   const [revision, setRevision] = useState(0);
   const requestRef = useRef(0);
   const [busy, setBusy] = useState(false);
@@ -43,11 +53,18 @@ export function BotCapabilitySettings({
   // Followed defaults can change when providers / available harnesses change, even
   // if the local profile still holds the previous modelChain snapshot.
   useSyncExternalStore(subscribeBotGlobalModel, () => JSON.stringify(getEffectiveBotModelChain()));
-  const modelChain = capabilities.modelChainOverride === null
-    ? getEffectiveBotModelChain()
-    : capabilities.modelChain;
+  const modelChain =
+    capabilities.modelChainOverride === null
+      ? getEffectiveBotModelChain()
+      : capabilities.modelChain;
   const modelChainKey = JSON.stringify(modelChain);
-  const catalogKey = JSON.stringify([bot.id, bot.canonicalSessionId, modelChainKey, revision, open]);
+  const catalogKey = JSON.stringify([
+    bot.id,
+    bot.canonicalSessionId,
+    modelChainKey,
+    revision,
+    open,
+  ]);
   // Invalidate during render as well as effect cleanup: stale checkboxes must never stay selectable.
   const entries = catalog.key === catalogKey ? catalog.entries : {};
   const refresh = useCallback(() => {
@@ -59,15 +76,34 @@ export function BotCapabilitySettings({
     if (!open) return;
     const changed = (sessionId: string, patch: Partial<Session>) => {
       if (sessionId !== bot.canonicalSessionId) return;
-      if (['agentKind', 'model', 'providerId', 'effort', 'fastMode', 'runtimeGeneration',
-        'runtimeEffective', 'runtimePending', 'workingDir', 'remoteHostId'].some((key) => key in patch)) refresh();
+      if (
+        [
+          'agentKind',
+          'model',
+          'providerId',
+          'effort',
+          'fastMode',
+          'runtimeGeneration',
+          'runtimeEffective',
+          'runtimePending',
+          'workingDir',
+          'remoteHostId',
+        ].some((key) => key in patch)
+      )
+        refresh();
     };
     const offLocal = onPatch(changed);
-    const offPush = window.electronAPI.localDb?.sessionsPush?.onPatched(({ sessionId, patch }, stamp) => {
-      if (isDataOwnerPushCurrent(stamp)) changed(sessionId, patch);
-    });
+    const offPush = window.electronAPI.localDb?.sessionsPush?.onPatched(
+      ({ sessionId, patch }, stamp) => {
+        if (isDataOwnerPushCurrent(stamp)) changed(sessionId, patch);
+      },
+    );
     const offMcp = window.electronAPI.maker.onMcpChanged(refresh);
-    return () => { offLocal(); offPush?.(); offMcp(); };
+    return () => {
+      offLocal();
+      offPush?.();
+      offMcp();
+    };
   }, [open, bot.canonicalSessionId, refresh]);
 
   useEffect(() => {
@@ -84,8 +120,12 @@ export function BotCapabilitySettings({
         if (!isCurrent()) return;
         const api = window.electronAPI.maker;
         const mcpResult = await api.listCustomMcpServers({
-          agentKind: session.runtimePending?.profile.agentKind ?? session.runtimeEffective?.agentKind
-            ?? (session.agentKind === 'codex' || session.agentKind === 'pi' ? session.agentKind : 'claude-code'),
+          agentKind:
+            session.runtimePending?.profile.agentKind ??
+            session.runtimeEffective?.agentKind ??
+            (session.agentKind === 'codex' || session.agentKind === 'pi'
+              ? session.agentKind
+              : 'claude-code'),
           botSessionId: bot.canonicalSessionId,
           modelChain: JSON.parse(modelChainKey),
         });
@@ -99,7 +139,9 @@ export function BotCapabilitySettings({
             remoteHostId: session.remoteHostId ?? undefined,
           }),
           api.plugins.list(session.workingDir ?? undefined, true, {
-            botId: bot.id, agentKind, remoteHostId: session.remoteHostId,
+            botId: bot.id,
+            agentKind,
+            remoteHostId: session.remoteHostId,
           }),
         ]);
         if (!isCurrent()) return;
@@ -133,44 +175,67 @@ export function BotCapabilitySettings({
       }
     };
     void load();
-    return () => { requestRef.current += 1; };
+    return () => {
+      requestRef.current += 1;
+    };
   }, [open, catalogKey, bot.id, bot.canonicalSessionId, modelChainKey]);
   return (
     <details
-      className="rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)]"
+      data-testid="bot-capability-editor"
+      open={open}
+      className={cn('group', expanded === undefined && 'border-t border-[var(--border-default)] pt-3')}
       onToggle={(event) => {
-        setOpen(event.currentTarget.open);
+        if (expanded === undefined) setOpen(event.currentTarget.open);
       }}
     >
-      <summary className="cursor-pointer px-4 py-3 text-12 font-medium text-[var(--text-secondary)]">
+      {/* A page-owned editor has its own title; `hidden` alone loses to `flex`. */}
+      <summary
+        hidden={expanded !== undefined}
+        className={cn(
+          'flex min-h-9 cursor-pointer list-none items-center justify-between gap-3 rounded-full px-3 py-2 text-13 text-[var(--text-secondary)] outline-none hover:bg-[var(--surface-hover)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] [&::-webkit-details-marker]:hidden',
+          expanded !== undefined && 'hidden',
+        )}
+      >
         {t('bots.capabilities.title')}
+        <ChevronDown size={15} aria-hidden className="shrink-0 group-open:rotate-180" />
       </summary>
-      <div className="space-y-4 border-t border-[var(--border-default)] p-4">
-        <input
-          aria-label={t('bots.capabilities.search')}
-          placeholder={t('bots.capabilities.search')}
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          className="h-9 w-full rounded-full border border-[var(--border-default)] bg-[var(--surface)] px-3 text-12 text-[var(--text-primary)]"
-        />
+      <div className={cn('space-y-4', expanded === undefined ? 'px-3 pt-4' : 'pt-3')}>
+        <div className="relative">
+          <Search
+            size={14}
+            aria-hidden="true"
+            className="pointer-events-none absolute left-3 top-1/2 z-10 -translate-y-1/2 text-[var(--text-tertiary)]"
+          />
+          <Input
+            size="md"
+            ariaLabel={t('bots.capabilities.search')}
+            placeholder={t('bots.capabilities.search')}
+            value={query}
+            onChange={setQuery}
+            inputClassName="pl-8"
+          />
+        </div>
         {busy ? (
           <p className="text-12 text-[var(--text-secondary)]">{t('bots.capabilities.loading')}</p>
         ) : null}
         {error ? (
-          <button
+          <Button
+            variant="secondary"
+            size="md"
+            tone="danger"
+            compact
             type="button"
             onClick={refresh}
-            className="rounded-full px-4 py-2 text-12 text-[var(--text-danger)]"
           >
             {t('bots.retry')}
-          </button>
+          </Button>
         ) : null}
         {kinds.map((kind) => {
           const rows = [...(entries[kind] ?? [])];
           for (const id of selected[kind])
             if (!rows.some((item) => item.id === id)) rows.push({ id, name: id, available: false });
           const matching = rows.filter((item) =>
-            `${item.id} ${item.name}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+            `${item.id} ${item.name}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
           );
           return (
             <fieldset key={kind} className="min-w-0">
