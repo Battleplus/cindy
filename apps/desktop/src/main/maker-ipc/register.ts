@@ -114,7 +114,7 @@ import { isRetainableProjectSession } from '../../shared/sessionSource.js';
 import { initializePluginOauthCards } from '../plugin-oauth/cards.js';
 import { currentOauthIdentityScope, loadOauthSigningKey } from '../plugin-oauth/desktopIdentity.js';
 import { readDeviceLinkSettings } from '../device-link/settings-store.js';
-import { getDeviceLinkStatus } from '../device-link/index.js';
+import { getDeviceLinkStatus, getMobileNotifyGeneration, sendMobileBotGroupNotify } from '../device-link/index.js';
 import type { AgentMeta, Session as RendererSession } from '../../renderer/lib/ccAgent.types';
 import {
   deriveAutoTitleSeed,
@@ -459,7 +459,11 @@ import {
 } from './botDirectMessageService.js';
 import { createBotGroupChatService, type BotGroupChatService } from './botGroupChatService.js';
 import { createBotGroupPlanDecider } from './botGroupPlanDecider.js';
+import { botGroupMembersVisibleRemotely, registerBotGroupRemoteResourceProvider } from './botGroupRemoteResourceProvider.js';
+import { broadcastBotGroupRemoteResourceChanged } from './botGroupRemoteResourceInvalidation.js';
+import { getBotGroupStepNotificationBody } from '../sessionNotificationCopy.js';
 import { createBotGroupWorkDir } from './botGroupWorkDir.js';
+import { createBotGroupAttachmentStore } from './botGroupAttachments.js';
 import { requestUtilityText } from '../utility-model/oneShotCandidates.js';
 import { validateExistingLocalProjectDirectory } from '../mcp-integrations/createProject.js';
 import { gitExec } from '../worktree/gitExec.js';
@@ -471,6 +475,7 @@ import { isSessionPermissionMode, persistPermissionModeWithoutRuntime } from './
 import { updateBotRoutineLifecycle } from '../routines/service.js';
 import {
   createBotCompactRuntimeRefreshCoordinator,
+  prepareBotCapabilityEpochBeforeSend,
   refreshBotRuntimeAfterModelSelection,
   replaceBotRuntimeAfterPreflight,
   type BotCompactBoundary,
@@ -7302,80 +7307,64 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   async function refreshBotCapabilityEpochBeforeSend(
     live: WiredSession,
   ): Promise<void> {
-    if (botCompactRuntimeRefreshCoordinator.hasPending(live.id)) {
-      await botCompactRuntimeRefreshCoordinator.attempt(live);
-      if (botCompactRuntimeRefreshCoordinator.hasPending(live.id)) {
-        throwIpcError(
-          'PRECONDITION_FAILED',
-          '伙伴能力正在刷新，请稍后再发送',
+    const outcome = await prepareBotCapabilityEpochBeforeSend(live, {
+      coordinator: botCompactRuntimeRefreshCoordinator,
+      readSession: async () => {
+        const db = getDbClient().drizzle;
+        const [row] = await db
+          .select({
+            role: botSessionLinks.role,
+            source: sessions.source,
+            status: sessions.status,
+            title: sessions.title,
+            workingDir: sessions.workingDir,
+            workspaceKind: sessions.workspaceKind,
+            agentKind: sessions.agentKind,
+            model: sessions.model,
+            providerId: sessions.providerId,
+            effort: sessions.effort,
+            fastMode: sessions.fastMode,
+            permissionMode: sessions.permissionMode,
+            planModeEnabled: sessions.planModeEnabled,
+            sdkSessionId: sessions.sdkSessionId,
+            remoteHostId: sessions.remoteHostId,
+            orcaRole: sessions.orcaRole,
+            codexHistoryHasProductPrompt: sessions.codexHistoryHasProductPrompt,
+          })
+          .from(sessions)
+          .innerJoin(botSessionLinks, eq(botSessionLinks.sessionId, sessions.id))
+          .where(eq(sessions.id, live.id))
+          .limit(1);
+        return row;
+      },
+      preflight: async (row) => {
+        const createOpts = buildCreateOptsWithStderr({
+          id: live.id,
+          agentKind: dbToMakerAgentKind(row.agentKind),
+          workingDir: row.workingDir,
+          workspaceKind: row.workspaceKind,
+          model: row.model ?? undefined,
+          providerId: row.providerId,
+          effort: (row.effort ?? undefined) as CreateOpts['effort'],
+          fastMode: !!row.fastMode,
+          permissionMode: permissionModeOrAsk(row.permissionMode),
+          planMode: !!row.planModeEnabled,
+          title: row.title ?? undefined,
+          resumeSessionId: row.sdkSessionId ?? undefined,
+          remoteHostId: row.remoteHostId ?? undefined,
+          orcaRole: row.orcaRole as CreateOpts['orcaRole'],
+          codexHistoryHasProductPrompt: row.codexHistoryHasProductPrompt ?? undefined,
+        });
+        await synthesizeOrcaVendorOptionsFromDb(live.id, createOpts);
+        const extraDirs = await readSessionExtraDirsFromDb(live.id).catch(() => []);
+        if (extraDirs.length > 0) createOpts.extraDirs = extraDirs;
+        const snapshot = await preflightBotRuntimeResources(
+          createOpts as MakerSessionCreateOpts,
         );
-      }
-      return;
-    }
-
-    const db = getDbClient().drizzle;
-    const [row] = await db
-      .select({
-        role: botSessionLinks.role,
-        source: sessions.source,
-        status: sessions.status,
-        title: sessions.title,
-        workingDir: sessions.workingDir,
-        workspaceKind: sessions.workspaceKind,
-        agentKind: sessions.agentKind,
-        model: sessions.model,
-        providerId: sessions.providerId,
-        effort: sessions.effort,
-        fastMode: sessions.fastMode,
-        permissionMode: sessions.permissionMode,
-        planModeEnabled: sessions.planModeEnabled,
-        sdkSessionId: sessions.sdkSessionId,
-        remoteHostId: sessions.remoteHostId,
-        orcaRole: sessions.orcaRole,
-        codexHistoryHasProductPrompt: sessions.codexHistoryHasProductPrompt,
-      })
-      .from(sessions)
-      .innerJoin(botSessionLinks, eq(botSessionLinks.sessionId, sessions.id))
-      .where(eq(sessions.id, live.id))
-      .limit(1);
-    if (
-      !row
-      || (row.role !== 'canonical' && row.role !== 'group')
-      || row.source !== 'bot'
-      || row.status !== 'active'
-      || !row.workingDir
-    ) {
-      return;
-    }
-
-    const createOpts = buildCreateOptsWithStderr({
-      id: live.id,
-      agentKind: dbToMakerAgentKind(row.agentKind),
-      workingDir: row.workingDir,
-      workspaceKind: row.workspaceKind,
-      model: row.model ?? undefined,
-      providerId: row.providerId,
-      effort: (row.effort ?? undefined) as CreateOpts['effort'],
-      fastMode: !!row.fastMode,
-      permissionMode: permissionModeOrAsk(row.permissionMode),
-      planMode: !!row.planModeEnabled,
-      title: row.title ?? undefined,
-      resumeSessionId: row.sdkSessionId ?? undefined,
-      remoteHostId: row.remoteHostId ?? undefined,
-      orcaRole: row.orcaRole as CreateOpts['orcaRole'],
-      codexHistoryHasProductPrompt: row.codexHistoryHasProductPrompt ?? undefined,
+        return !!snapshot?.runtimeEpochChanged;
+      },
     });
-    await synthesizeOrcaVendorOptionsFromDb(live.id, createOpts);
-    const extraDirs = await readSessionExtraDirsFromDb(live.id).catch(() => []);
-    if (extraDirs.length > 0) createOpts.extraDirs = extraDirs;
-    const snapshot = await preflightBotRuntimeResources(
-      createOpts as MakerSessionCreateOpts,
-    );
-    if (!snapshot?.runtimeEpochChanged) return;
-
-    botCompactRuntimeRefreshCoordinator.noteBoundary(live);
-    await botCompactRuntimeRefreshCoordinator.attempt(live);
-    if (botCompactRuntimeRefreshCoordinator.hasPending(live.id)) {
+    if (outcome === 'deferred') {
       throwIpcError(
         'PRECONDITION_FAILED',
         '伙伴能力正在刷新，请稍后再发送',
@@ -9893,6 +9882,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   setBotRemoteMessageService(botDirectMessageServiceHolder);
   botGroupChatServiceHolder?.dispose();
   // 分工 steps run in the group's folder, the 项目文件夹, or one worktree per plan (bot-group-chat.md §7.5).
+  const botGroupAttachments = createBotGroupAttachmentStore({ ownerRoot: () => ownerScopedUserDataPath() });
   const botGroupWorkDir = createBotGroupWorkDir({
     ownerRoot: () => ownerScopedUserDataPath(),
     detectRepo: async (dir) => {
@@ -9922,8 +9912,32 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         return { ok: false as const, errorCode: 'LANE_UNAVAILABLE', message: error instanceof Error ? error.message : String(error) };
       }
     },
-    dispatch: ({ targetSessionId, message, persistedContent, clientId, onAccepted }) =>
-      dispatchBotSessionMessage({ targetSessionId, message, persistedContent, clientId, onAccepted }),
+    dispatch: ({ targetSessionId, message, persistedContent, clientId, attachments, onAccepted }) =>
+      dispatchBotSessionMessage({
+        targetSessionId,
+        message,
+        persistedContent,
+        clientId,
+        // Same attachment shape as a task message: images by their media address, files by path.
+        ...(attachments && attachments.length > 0
+          ? {
+            files: attachments.map((attachment) => ({
+              id: attachment.id,
+              name: attachment.name,
+              originalName: attachment.name,
+              path: attachment.path ?? attachment.url ?? '',
+              ...(attachment.url ? { url: attachment.url } : {}),
+              ext: path.extname(attachment.name).toLowerCase(),
+              size: attachment.size,
+              category: attachment.category,
+              mimeType: attachment.mimeType,
+              ...(attachment.annotated ? { annotated: true } : {}),
+            })),
+          }
+          : {}),
+        onAccepted,
+      }),
+    prepareAttachments: botGroupAttachments.prepare,
     abortLane: async (sessionId) => {
       await inputCoordinator.ensureQueueRestored(sessionId);
       resetAutomaticRecoveryForExplicitStop(sessionId);
@@ -9975,9 +9989,31 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       const ownerScope = scope as ReturnType<typeof captureDataOwnerBroadcastScope> | undefined;
       if (ownerScope && !isDataOwnerBroadcastScopeCurrent(ownerScope)) return;
       broadcastToAllWindows(MAKER_PUSH.BOT_GROUP_CHANGED, payload, ownerScope);
+      // Phones read groups as remote resources; any change re-reads the row and the chat.
+      broadcastBotGroupRemoteResourceChanged(payload.groupId);
+    },
+    onStepSettled: (event, scope) => {
+      const ownerScope = scope as ReturnType<typeof captureDataOwnerBroadcastScope> | undefined;
+      if (ownerScope && !isDataOwnerBroadcastScopeCurrent(ownerScope)) return;
+      const generation = getMobileNotifyGeneration();
+      // Same boundary as the phone's group list: a group with a hidden member never reaches it.
+      void botGroupMembersVisibleRemotely(event.memberBotIds).then((visible) => {
+        if (!visible || (ownerScope && !isDataOwnerBroadcastScopeCurrent(ownerScope))) return;
+        sendMobileBotGroupNotify({
+          groupId: event.groupId,
+          title: event.groupName,
+          body: getBotGroupStepNotificationBody(event),
+          eventId: `${event.planId}:${event.position}:${event.outcome}:${Date.now()}`,
+          generation,
+        });
+      }).catch((error: unknown) => {
+        log.warn('bot group step push skipped', { error: error instanceof Error ? error.message : String(error) });
+      });
     },
     log,
   });
+  // Phones reach groups through the Remote Resource protocol (bot-group-chat.md §8).
+  registerBotGroupRemoteResourceProvider(() => botGroupChatServiceHolder);
   botDelegationServiceHolder?.dispose();
   botDelegationServiceHolder = createBotDelegationService({
     readSessionExecution: id => {

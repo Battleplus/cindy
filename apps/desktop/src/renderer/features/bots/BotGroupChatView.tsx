@@ -8,13 +8,21 @@
  *
  * 分工（§7）：安排卡、交接文件与「下一步 · 继续」「没做完 · 重试」见 BotGroupPlan.tsx；
  * 这里只负责把安排快照接到对应消息上，并调用 main 的安排操作。
+ *
+ * 附件（§3.1）：托盘状态（`useAttachments`）由页面持有，文件拖到页面任意位置都进托盘，
+ * 与普通任务的整区拖入一致；用户消息上的图片与文件复用普通聊天用户气泡的图片视图与
+ * 附件 chip。
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import { ArrowLeft, CircleAlert, RefreshCcw, Settings2, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 
+import { attachGhostMediaToSession, getGhostMediaUriFromDataTransfer } from '@/cindy-brain/ghostMediaHandover';
+import { ChatImageView } from '@/components/chat/ChatImageView';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
+import { TextLightbox } from '@/components/chat/TextLightbox';
+import { UserAttachmentChip } from '@/components/chat/UserAttachmentChip';
 import { CHAT_BODY_CLASS } from '@/components/chat/chatChrome';
 import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
 import { Button } from '@/components/ui/button';
@@ -24,9 +32,19 @@ import {
   isDataOwnerGenerationCurrent,
   isDataOwnerPushCurrent,
 } from '@/contexts/dataOwnerGeneration';
+import { useAttachments } from '@/hooks/useAttachments';
+import { discardDraft } from '@/lib/composerDraftStore';
+import {
+  classifyUnclassifiedDroppedItems,
+  getDroppedFileItems,
+  type DroppedFileItems,
+} from '@/lib/fileDrop';
+import { isGlobalDropIntercepted } from '@/lib/globalDropIntercept';
 import { toast } from '@/lib/toast';
+import { ControlledBanner, useControlledBy, useComposerCollapsed } from '@/features/remote-device/ControlledBanner';
 import { useAgentIslandActivity } from '@/state/agentIslandActivity';
 import type {
+  BotGroupAttachment,
   BotGroupDetail,
   BotGroupMemberView,
   BotGroupMessageView,
@@ -39,6 +57,7 @@ import { useRegisterContentHeader } from '../feature-context';
 import { BotAvatar } from './BotAvatar';
 import { BotGenerationLabel } from './BotGenerationLabel';
 import { BotGroupAvatarStack } from './BotGroupAvatars';
+import { botGroupAttachmentScope, splitBotGroupMessageAttachments } from './botGroupAttachments';
 import { BotGroupComposer } from './BotGroupComposer';
 import { BotGroupPendingInteraction } from './BotGroupPendingInteraction';
 import {
@@ -64,6 +83,7 @@ import {
   openBotGroupPlan,
 } from './botGroupPresentation';
 import { botGroupApi, editBotGroupPlanStep, runBotGroupPlanAction } from './botGroupStore';
+import { botGroupReadKey, markBotRead } from './botReadState';
 import { collectBotMessageTimeGroups, formatBotMessageGroupTime } from './botConversationTimeline';
 
 type GroupViewState =
@@ -95,6 +115,15 @@ function memberKey(members: readonly BotGroupMemberView[]): string {
   return JSON.stringify(members.map((member) => [member.botId, member.name, member.avatar, member.avatarColor]));
 }
 
+/**
+ * Files from the system or media dragged out of a Plugin panel. Plain text keeps its
+ * native drop into the input.
+ */
+function isAttachmentDrag(event: DragEvent): boolean {
+  const types = Array.from(event.dataTransfer.types);
+  return types.includes('Files') || types.includes('text/uri-list');
+}
+
 export function BotGroupChatView() {
   const { groupId } = useParams();
   return <BotGroupChatContent key={groupId ?? ''} groupId={groupId ?? ''} />;
@@ -102,6 +131,11 @@ export function BotGroupChatView() {
 
 function BotGroupChatContent({ groupId }: { groupId: string }) {
   const { t, i18n } = useTranslation();
+  const controlledBy = useControlledBy();
+  const hasControlledBanner = controlledBy.length > 0;
+  // Groups have no single task session; namespace their existing composer UI state.
+  const controlledBannerKey = `bot-group:${groupId}`;
+  const controlledBannerCollapsed = useComposerCollapsed(controlledBannerKey);
   const navigate = useNavigate();
   const location = useLocation();
   const [state, setState] = useState<GroupViewState>({ kind: 'loading' });
@@ -114,7 +148,12 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const readOwner = useRef(getDataOwnerGeneration());
   const prependAnchorRef = useRef<{ height: number; top: number } | null>(null);
+  const attachmentScope = botGroupAttachmentScope(groupId);
+  const attachmentState = useAttachments(attachmentScope, attachmentScope);
+  const [dragOver, setDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -133,6 +172,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         const result = await api.getBotGroup(groupId);
         if (!isCurrent()) return;
         if (result.ok) {
+          readOwner.current = owner;
           setState((previous) =>
             previous.kind === 'ready'
               ? { ...previous, group: result.group }
@@ -161,6 +201,8 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         if (!isDataOwnerPushCurrent(ownerStamp) || payload.groupId !== groupId) return;
         if (payload.change === 'deleted') {
           requestVersion += 1;
+          // Unsent attachments go with the group (staged copies included).
+          discardDraft(botGroupAttachmentScope(groupId));
           setState({ kind: 'missing' });
           return;
         }
@@ -179,6 +221,18 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     () => (state.kind === 'ready' ? mergeBotGroupMessages(state.older, state.group.messages) : []),
     [state],
   );
+  const acknowledge = useCallback(() => {
+    if (!isDataOwnerGenerationCurrent(readOwner.current) || !stickToBottomRef.current || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    const at = messages.reduce((latest, message) => message.kind === 'message' && message.authorKind === 'bot'
+      ? Math.max(latest, message.createdAt) : latest, 0);
+    if (at > 0) markBotRead(botGroupReadKey(groupId), at);
+  }, [groupId, messages]);
+  useEffect(() => {
+    const frame = requestAnimationFrame(acknowledge);
+    window.addEventListener('focus', acknowledge);
+    document.addEventListener('visibilitychange', acknowledge);
+    return () => { cancelAnimationFrame(frame); window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
+  }, [acknowledge]);
   const plans = useMemo(
     () => (state.kind === 'ready' ? mergeBotGroupPlans(state.olderPlans, state.group.plans) : []),
     [state],
@@ -231,7 +285,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
   }, [group?.name, headerMembers, openSettings, separator, settingsLabel]);
   useRegisterContentHeader(header);
 
-  // Follow new messages only while the reader is already at the bottom.
+  // Follow new messages and banner viewport changes only while the reader is at the bottom.
   const lastSequence = messages[messages.length - 1]?.sequence ?? 0;
   // Several Bots think at once in a broadcast round's first circle; the key follows the set.
   const speakingKey =
@@ -246,7 +300,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
       return;
     }
     if (stickToBottomRef.current) element.scrollTop = element.scrollHeight;
-  }, [lastSequence, speakingKey, messages.length]);
+  }, [lastSequence, speakingKey, messages.length, hasControlledBanner, controlledBannerCollapsed]);
 
   // Markdown, code blocks and avatars finish layout after the first paint; keep a reader
   // who is at the bottom pinned there while the content grows.
@@ -358,6 +412,34 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     }
   };
 
+  const resetDrag = () => {
+    dragCounterRef.current = 0;
+    setDragOver(false);
+  };
+
+  /** Same drop routing as a task's chat area, minus folder references a group does not have. */
+  const dropAttachments = (event: DragEvent) => {
+    // .cindy / .cshare drops belong to the window-level import; only clear the hint.
+    if (isGlobalDropIntercepted(event.nativeEvent)) return;
+    const ghostMediaUri = getGhostMediaUriFromDataTransfer(event.dataTransfer);
+    if (ghostMediaUri) {
+      void attachGhostMediaToSession(ghostMediaUri, attachmentScope, t);
+      return;
+    }
+    const attach = (items: Pick<DroppedFileItems, 'files' | 'directories'>) => {
+      if (items.directories.length > 0) toast.warning(t('bots.groupChat.composer.folderNotSupported'));
+      if (items.files.length > 0) void attachmentState.addFiles(items.files);
+    };
+    const dropped = getDroppedFileItems(event.dataTransfer);
+    attach(dropped);
+    if (dropped.unclassified.length > 0) {
+      void classifyUnclassifiedDroppedItems(dropped.unclassified, {
+        getFilePath: (file) => window.electronAPI.getFilePath(file),
+        classifyPath: (path) => window.electronAPI.localDb.sessionShare.classifyPath({ path }),
+      }).then(attach);
+    }
+  };
+
   if (state.kind === 'loading') {
     // Local reads are fast; an empty surface avoids a spinner flash.
     return <main className="h-full bg-[var(--surface)]" />;
@@ -420,12 +502,38 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     planId && planPending?.planId === planId ? planPending.action : null;
 
   return (
-    <main className="flex h-full min-w-0 flex-col overflow-hidden bg-[var(--surface)]">
+    <main
+      className="relative flex h-full min-w-0 flex-col overflow-hidden bg-[var(--surface)]"
+      onDragEnter={(event) => {
+        if (!isAttachmentDrag(event)) return;
+        event.preventDefault();
+        dragCounterRef.current += 1;
+        if (dragCounterRef.current === 1) setDragOver(true);
+      }}
+      onDragOver={(event) => {
+        if (!isAttachmentDrag(event)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'copy';
+      }}
+      onDragLeave={(event) => {
+        if (!isAttachmentDrag(event)) return;
+        event.preventDefault();
+        dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+        if (dragCounterRef.current === 0) setDragOver(false);
+      }}
+      onDrop={(event) => {
+        if (!isAttachmentDrag(event)) return;
+        event.preventDefault();
+        resetDrag();
+        dropAttachments(event);
+      }}
+    >
       <div
         ref={scrollRef}
         onScroll={(event) => {
           const element = event.currentTarget;
           stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+          acknowledge();
         }}
         className="min-h-0 flex-1 overflow-y-auto px-5 pb-4 pt-6"
       >
@@ -515,16 +623,38 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
           ))}
         </div>
       </div>
+      {hasControlledBanner && (
+        // Like teammate chats, keep the collapsed breathing light above the composer.
+        <div className="shrink-0 px-5 pt-2">
+          <div className="mx-auto flex w-full max-w-[760px] justify-center px-2">
+            <ControlledBanner placement="composer" sessionId={controlledBannerKey} />
+          </div>
+        </div>
+      )}
       <BotGroupComposer
         groupId={group.id}
         members={group.members}
         running={running}
         planState={botGroupComposerPlanState(openPlan)}
+        attachments={attachmentState}
+        attachmentScope={attachmentScope}
+        dragOver={dragOver}
         onSent={() => {
           stickToBottomRef.current = true;
           loadRef.current();
         }}
       />
+      {/* Whole-page drop hint, as over a task's chat area; the card repeats it. */}
+      {dragOver ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-50"
+          style={{
+            backgroundColor: 'var(--drop-overlay-bg)',
+            border: '2px dashed var(--drop-overlay-border)',
+          }}
+        />
+      ) : null}
     </main>
   );
 }
@@ -593,23 +723,30 @@ function BotGroupTimelineItem({
     return <p className="text-center text-12 text-[var(--text-tertiary)]">{text}</p>;
   }
   if (message.authorKind === 'user') {
+    // An attachment-only message shows just its attachments, without an empty bubble.
+    const hasText = message.content.trim().length > 0;
     return (
       <article className="flex justify-end">
-        <div
-          className={`max-w-[72%] whitespace-pre-wrap break-words rounded-xl border border-[var(--msg-user-border)] bg-[var(--msg-user-bg)] px-3.5 py-2.5 text-[var(--msg-user-text)] ${CHAT_BODY_CLASS}`}
-        >
-          {splitBotGroupMentionSegments(message.content, mentionLabels).map((segment, index) =>
-            segment.mention ? (
-              <span
-                key={index}
-                className="rounded-full bg-[var(--surface-chip)] px-1.5 font-medium"
-              >
-                {segment.text}
-              </span>
-            ) : (
-              <span key={index}>{segment.text}</span>
-            ),
-          )}
+        <div className="flex min-w-0 max-w-[72%] flex-col items-end gap-2">
+          <BotGroupUserAttachments attachments={message.attachments} />
+          {hasText ? (
+            <div
+              className={`max-w-full whitespace-pre-wrap break-words rounded-xl border border-[var(--msg-user-border)] bg-[var(--msg-user-bg)] px-3.5 py-2.5 text-[var(--msg-user-text)] ${CHAT_BODY_CLASS}`}
+            >
+              {splitBotGroupMentionSegments(message.content, mentionLabels).map((segment, index) =>
+                segment.mention ? (
+                  <span
+                    key={index}
+                    className="rounded-full bg-[var(--surface-chip)] px-1.5 font-medium"
+                  >
+                    {segment.text}
+                  </span>
+                ) : (
+                  <span key={index}>{segment.text}</span>
+                ),
+              )}
+            </div>
+          ) : null}
         </div>
       </article>
     );
@@ -655,6 +792,47 @@ function BotGroupTimelineItem({
         )}
       </div>
     </article>
+  );
+}
+
+/**
+ * A user message's images and files, drawn like a task's user bubble: each image as the
+ * same attached-image view (click for the lightbox, right-click to copy or reveal), files
+ * as the same chips (text preview or the system app, right-click menu).
+ */
+function BotGroupUserAttachments({ attachments }: { attachments: readonly BotGroupAttachment[] }) {
+  const [textPreview, setTextPreview] = useState<{ path: string; name: string } | null>(null);
+  const chipRef = useRef<HTMLElement | null>(null);
+  const { images, files } = splitBotGroupMessageAttachments(attachments);
+  if (images.length === 0 && files.length === 0) return null;
+  return (
+    <>
+      {images.map((image) => (
+        <ChatImageView key={image.id} src={image.url} filename={image.name} variant="user-attached" />
+      ))}
+      {files.length > 0 ? (
+        <div className="flex flex-wrap items-end justify-end gap-1.5">
+          {files.map((file) => (
+            <UserAttachmentChip
+              key={file.id}
+              file={{ name: file.name, path: file.path }}
+              onOpenTextPreview={(chip) => {
+                chipRef.current = chip;
+                setTextPreview({ path: file.path, name: file.name });
+              }}
+            />
+          ))}
+        </div>
+      ) : null}
+      {textPreview ? (
+        <TextLightbox
+          filePath={textPreview.path}
+          fileName={textPreview.name}
+          triggerRef={chipRef}
+          onClose={() => setTextPreview(null)}
+        />
+      ) : null}
+    </>
   );
 }
 

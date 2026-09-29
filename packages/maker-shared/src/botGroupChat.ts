@@ -13,6 +13,8 @@ export const BOT_GROUP_PLAN_MAX_STEPS = 6;
 export const BOT_GROUP_PLAN_TASK_MAX_CHARS = 80;
 /** Files listed under one step's hand-off message. */
 export const BOT_GROUP_STEP_FILES_MAX = 20;
+/** Attachments on one user message (bot-group-chat.md §3.1); each one goes to every member. */
+export const BOT_GROUP_ATTACHMENTS_MAX = 20;
 
 /** A Bot whose final reply is exactly this sentinel (after trim) stays silent. */
 export const BOT_GROUP_NO_REPLY_SENTINEL = 'NO_REPLY';
@@ -64,7 +66,45 @@ export interface BotGroupMessageView {
   planId: string | null;
   /** Step hand-off files, relative to the plan's work directory (POSIX separators). */
   files: string[];
+  /** What the user attached to this message (images, files, videos). */
+  attachments: BotGroupAttachment[];
   createdAt: number;
+}
+
+export type BotGroupAttachmentCategory = 'image' | 'pdf' | 'text' | 'office' | 'file';
+
+/**
+ * An attachment as a composer hands it over, in the same serialized shape as a task
+ * message attachment. On this computer `path` is the local file (a pasted image has a
+ * placeholder) and an image carries its `cindy-media://` `url`; a phone sends its upload
+ * reference in `path` (and `url` for an image).
+ */
+export interface BotGroupAttachmentInput {
+  id: string;
+  name: string;
+  path: string;
+  ext?: string;
+  size?: number;
+  category: BotGroupAttachmentCategory;
+  mimeType: string;
+  url?: string;
+  originalName?: string;
+  /** The image carries the user's drawn annotations (same meaning as in task messages). */
+  annotated?: boolean;
+}
+
+/** An attachment kept with a group message. */
+export interface BotGroupAttachment {
+  id: string;
+  name: string;
+  category: BotGroupAttachmentCategory;
+  mimeType: string;
+  size: number;
+  /** Images: the `cindy-media://` address; controllers read it through remote media. */
+  url: string | null;
+  /** The file on this computer; always null in a controller's copy. */
+  path: string | null;
+  annotated?: boolean;
 }
 
 /**
@@ -155,6 +195,8 @@ export interface BotGroupSummary {
   /** 项目文件夹; null means the group's own folder. */
   projectDir: string | null;
   lastMessage: BotGroupLastMessage | null;
+  /** Latest visible Bot reply, independent of user messages and runtime activity. Older hosts omit it. */
+  lastReplyAt?: number;
   speakingBotIds: string[];
   /** The organizer while it works out a plan (sidebar 「正在安排」). */
   planningBotId: string | null;
@@ -227,6 +269,8 @@ export interface BotGroupSendInput {
   clientId: string;
   /** 「+」→ 安排分工: always ask the organizer for a plan instead of deciding. */
   division?: boolean;
+  /** At most `BOT_GROUP_ATTACHMENTS_MAX`; with attachments the text may be empty. */
+  attachments?: BotGroupAttachmentInput[];
 }
 
 export interface BotGroupPlanActionInput {
@@ -265,6 +309,54 @@ export function isBotGroupNoReplyText(text: string): boolean {
 export function isBotGroupNoReplyPrefix(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length === 0 || BOT_GROUP_NO_REPLY_SENTINEL.startsWith(trimmed);
+}
+
+// ---- Controllers (phones) — docs/product-rules/bot-group-chat.md §8 -------------
+
+/**
+ * Groups reach controllers through the Remote Resource protocol (collection below), not
+ * dedicated channels. The host keeps every rule; controllers only render and invoke actions.
+ */
+export const BOT_GROUP_REMOTE_COLLECTION_ID = 'bot-groups';
+export const BOT_GROUP_REMOTE_RESOURCE_KIND = 'bot-group';
+/** Block primitive whose `data` is `BotGroupRemoteChatData`; only sent to controllers declaring it. */
+export const BOT_GROUP_CHAT_PRIMITIVE = 'bot-group-chat';
+/** Collection item link to each member (`teammates` resource), in member order. */
+export const BOT_GROUP_MEMBER_LINK_REL = 'member';
+
+/**
+ * Remote actions. `create` is collection-level ({ name, botIds }); the others target a group:
+ * `send` ({ text, mentions, clientId, division? }), `continue`, `stop`, `update`
+ * ({ name?, replyMode?, speakingMode?, organizerBotId? } — never a host path),
+ * `set-members` ({ botIds }), `delete`, `plan-start` / `plan-dismiss` / `plan-continue` /
+ * `plan-retry` ({ planId }) and `plan-edit` ({ planId, position, action, botId? }).
+ * A refused action fails with the `BotGroupErrorCode` as its message.
+ */
+export type BotGroupRemoteActionId =
+  | 'create'
+  | 'send'
+  | 'continue'
+  | 'stop'
+  | 'update'
+  | 'set-members'
+  | 'delete'
+  | 'plan-start'
+  | 'plan-dismiss'
+  | 'plan-continue'
+  | 'plan-retry'
+  | 'plan-edit';
+
+/**
+ * The group as a controller sees it. Host paths never leave the computer: `projectDir`
+ * and every plan `workDir` are null, and `projectDirName` names the folder.
+ */
+export interface BotGroupRemoteChatData extends BotGroupDetail {
+  projectDirName: string | null;
+  /**
+   * The computer accepts attachments on `send` (absent on older computers, which would
+   * drop them). Attachment `path`s are always null here.
+   */
+  supportsAttachments?: boolean;
 }
 
 export const BOT_GROUP_CLIENT_ID_PREFIX = 'bot-group:';
