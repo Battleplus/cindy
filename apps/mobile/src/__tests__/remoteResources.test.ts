@@ -57,10 +57,24 @@ describe('remote resource discovery', () => {
       { deviceId: 'mac-2', name: 'Laptop', canOpen: false, state: 'access_revoked' },
       { deviceId: 'mac-3', name: 'Disabled', canOpen: false, state: 'remote_disabled' },
     ], previous);
-    expect(selected).toEqual([targets[0]]);
+    expect(selected).toEqual([{ ...targets[0], offline: true }]);
     const invoke = vi.fn(async () => { throw new Error('offline'); }) as RemoteInvoke;
     const collections = await discoverRemoteHomeCollections(invoke, selected, 'en', previous);
     expect(collections[0]?.targets).toEqual([targets[0]]);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('refreshes an offline cached host when it comes online and removes an empty manifest', async () => {
+    const previous = [{ id: 'teammates', title: 'Teammates', resourceKind: 'bot', placement: 'home-scope', targets }];
+    const selected = remoteResourceDiscoveryTargets([
+      { deviceId: 'mac-1', name: 'Studio', canOpen: true, state: 'online' },
+      { deviceId: 'mac-2', name: 'Laptop', canOpen: false, state: 'offline' },
+    ], previous);
+    const invoke = vi.fn(async () => ({ protocolVersion: 1, collections: [] })) as RemoteInvoke;
+    const collections = await discoverRemoteHomeCollections(invoke, selected, 'en', previous);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('mac-1', 'maker:remote-resources:manifest', expect.any(Array));
+    expect(collections).toEqual([{ ...previous[0], iconName: undefined, targets: [targets[1]] }]);
   });
 
   it('advertises only primitives implemented by the current mobile shell', () => {
@@ -266,4 +280,26 @@ it('preserves additive public generation state without interpreting unknown futu
     .toEqual({ phase: 'replying', startedAt: 123 });
   expect(normalizeRemoteCollectionItems(input(), 'teammates')[0].display.generation).toBeUndefined();
   expect(normalizeRemoteCollectionItems(input({ phase: {}, startedAt: Infinity }), 'teammates')[0].display.generation).toBeUndefined();
+});
+
+describe('bot group chat block', () => {
+  const ref = { collectionId: 'bot-groups', kind: 'bot-group', id: 'g1' };
+  const response = {
+    ref, revision: '1', display: { title: '官网介绍页' }, links: [],
+    blocks: [{ id: 'chat', primitive: 'bot-group-chat', fallbackMarkdown: '**阿布**: 写好了', data: { id: 'g1', messages: [{ id: 'm1' }] } }],
+  };
+
+  it('keeps the structured group data only for the screen that declared the primitive', async () => {
+    const invoke = vi.fn(async () => response) as RemoteInvoke;
+    const resource = await getRemoteResource(invoke, targets[0], ref, 'zh-CN', ['bot-group-chat']);
+    expect(resource.blocks?.[0]).toEqual(response.blocks[0]);
+    const request = (invoke as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]![2] as [{ client: { primitives: string[] } }];
+    expect(request[0].client.primitives).toEqual([...MOBILE_REMOTE_RESOURCE_PRIMITIVES, 'bot-group-chat']);
+  });
+
+  it('never hands the group data to an ordinary resource view', async () => {
+    const invoke = vi.fn(async () => response) as RemoteInvoke;
+    const resource = await getRemoteResource(invoke, targets[0], ref);
+    expect(resource.blocks?.[0]).toEqual({ id: 'chat', primitive: 'bot-group-chat', fallbackMarkdown: '**阿布**: 写好了' });
+  });
 });

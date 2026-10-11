@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import { BotAvatar } from '@/features/bots/BotAvatar';
 import type { BotChatIdentity } from '@/features/bots/BotSessionContentHeader';
 
+import { shouldCardShortcutYield } from '@/lib/editableKeyboardTarget';
 import { cn } from '@/lib/utils';
 import { Tip } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
@@ -102,6 +103,7 @@ const allowActionClass = cn(
 
 export function PermissionPrompt({ permission, onRespond, companion }: PermissionPromptProps) {
   const { t } = useTranslation();
+  const cardRef = useRef<HTMLDivElement>(null);
   const { toolName, input, title, displayName, description, suggestions, autoReviewUnavailable,
     submitting, submissionFailed } = permission;
   const isMediaDownload = toolName === 'cindy.media.download';
@@ -188,12 +190,18 @@ export function PermissionPrompt({ permission, onRespond, companion }: Permissio
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // 仅处理授权快捷键 Enter/Esc;其余按键不干预。
+      if (e.key !== 'Enter' && e.key !== 'Escape') return;
       // IME 组合期间的 Enter(确认候选词)不算快捷键;焦点在可编辑元素上时
       // (侧栏重命名/查找栏等)也不劫持按键,避免把输入操作误判成授权决定。
       if (e.isComposing) return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      // main: 按键已被卡片自身快捷方式认领时让位(输入法/菜单/按钮焦点等)
+      const shortcutKind =
+        e.key === 'Escape' ? 'dismiss' : e.ctrlKey || e.metaKey ? 'modifiedActivate' : 'activate';
+      if (shouldCardShortcutYield(e, shortcutKind, cardRef.current)) return;
       if (e.repeat) {
         // Suppress Chromium's native button click activation on held Enter.
         // Without preventDefault(), the browser fires click events on the
@@ -222,6 +230,7 @@ export function PermissionPrompt({ permission, onRespond, companion }: Permissio
 
   return (
     <div
+      ref={cardRef}
       className={cn(
         'w-full max-w-[914px] rounded-xl border p-4',
         'border-[var(--chat-input-border)] bg-[var(--chat-input-bg)]',
@@ -241,8 +250,13 @@ export function PermissionPrompt({ permission, onRespond, companion }: Permissio
       </div>
 
       {/* Description */}
+      {autoReviewUnavailable && permission.sourceDescription && (
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-13 font-normal text-[var(--status-bar-meta)]">
+          {permission.sourceDescription}
+        </p>
+      )}
       {promptDescription && (
-        <p className="mt-1.5 text-13 font-normal leading-tight text-[var(--status-bar-meta)]">
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-13 font-normal leading-tight text-[var(--status-bar-meta)]">
           {promptDescription}
         </p>
       )}
