@@ -3,7 +3,7 @@
  *
  * 输入 `@` 在输入框上方弹出点名候选，第一项固定是「所有人」。发送时以正文重新解析点名
  * （与桌面同一套规则，见 @cindy/maker-shared/botGroupMentions），clientId 作为幂等键：同一段
- * 文字、同一个「分工」标签、同一批附件重发沿用同一个 clientId。一轮进行中输入框为空且没有
+ * 文字、同一批点名目标、同一个「分工」标签、同一批附件重发沿用同一个 clientId。一轮进行中输入框为空且没有
  * 附件时，发送按钮变成停止；否则照常发送（插话本身就会作废当前一轮）。
  *
  * 附件与一对一聊天同一套（照片、拍照、文件、iOS 最近照片、粘贴图片，见
@@ -26,6 +26,7 @@ import {
   findBotGroupMentionQuery,
   insertBotGroupMention,
   resolveBotGroupMentions,
+  retainBotGroupTrackedMentions,
   type BotGroupTrackedMention,
 } from '@cindy/maker-shared/botGroupMentions';
 import {
@@ -36,7 +37,7 @@ import {
 import { Text } from '@/components/AppText';
 import { PaperPlaneIcon } from '@/components/PaperPlaneIcon';
 import { mobileInteractionStyles } from '@/components/mobileInteractionStyles';
-import { iconStroke, useTheme, useThemedStyles, type ThemeColors } from '@/theme';
+import { iconStroke, motionDuration, useTheme, useThemedStyles, type ThemeColors } from '@/theme';
 import { fontWeight, iconSize, lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
 import { BOT_GROUP_STEP_AVATAR_SIZE, BotGroupAvatar } from './BotGroupAvatars';
 import { BotGroupMenu } from './BotGroupMenu';
@@ -46,6 +47,7 @@ import { ContextSheet, ContextSheetGroup, ContextSheetRow } from './ContextSheet
 import { RecentPhotosStrip } from './ContextSheetMediaViews';
 import { ImageLightbox } from './ImageLightbox';
 import { ComposerToolbarLeftGroup, ComposerToolbarSpacer, MobileComposerInputRow } from './MobileComposerInputRow';
+import { CompanionFadeIn } from './CompanionEntering';
 import { nextBotGroupSendAttempt, type BotGroupSendAttempt } from './botGroupRemote';
 import { canBrowsePhotoLibraryDirectly } from './photoLibraryPolicy';
 import type { RemoteSerializedAttachment } from './types';
@@ -71,7 +73,7 @@ type MentionOption =
   | { kind: 'member'; label: string; member: BotGroupMemberView };
 
 export function BotGroupComposer({
-  members, identityFor, deviceId, online, running, planState, attachmentsSupported, onSend, onStop,
+  members, identityFor, deviceId, online, running, planState, attachmentsSupported, divisionSupported = true, onSend, onStop,
 }: {
   members: readonly BotGroupMemberView[];
   identityFor: BotGroupIdentityLookup;
@@ -81,6 +83,7 @@ export function BotGroupComposer({
   planState: BotGroupComposerPlanState | null;
   /** The computer takes attachments on `send` (`BotGroupRemoteChatData.supportsAttachments`). */
   attachmentsSupported: boolean;
+  divisionSupported?: boolean;
   /** Rejects with the host's error; the draft (and its tag) come back and the attachments stay. */
   onSend(input: BotGroupSendInput): Promise<void>;
   onStop(): Promise<void>;
@@ -98,6 +101,7 @@ export function BotGroupComposer({
   const [stopping, setStopping] = useState(false);
   const inputRef = useRef<NativeTextInput>(null);
   const textRef = useRef(text); textRef.current = text;
+  const selectionRef = useRef({ start: 0, end: 0 });
   const sendingRef = useRef(false);
   const stoppingRef = useRef(false);
   const attemptRef = useRef<BotGroupSendAttempt | null>(null);
@@ -116,17 +120,19 @@ export function BotGroupComposer({
   const mediaLibraryEnabled = canBrowsePhotoLibraryDirectly(Platform.OS);
 
   const activeMembers = useMemo(() => members.filter(isActiveBotGroupMember), [members]);
+  const mentionMembers = useMemo(() => members.filter(member => member.isSelf !== true), [members]);
+  const mentionCandidates = useMemo(() => mentionMembers.filter(isActiveBotGroupMember), [mentionMembers]);
   const allLabel = t('groupChat.mention.all');
   const query = focused ? findBotGroupMentionQuery(text, caret) : null;
   const options = useMemo<MentionOption[]>(() => {
-    if (!query || activeMembers.length === 0) return [];
+    if (!query || mentionCandidates.length === 0) return [];
     const everyone: MentionOption[] = filterBotGroupMentionCandidates(query.query, [{ name: allLabel }]).length > 0
       ? [{ kind: 'all', label: allLabel }]
       : [];
-    const people = filterBotGroupMentionCandidates(query.query, activeMembers)
+    const people = filterBotGroupMentionCandidates(query.query, mentionCandidates)
       .map((member): MentionOption => ({ kind: 'member', label: member.name, member }));
     return [...everyone, ...people];
-  }, [activeMembers, allLabel, query]);
+  }, [mentionCandidates, allLabel, query]);
   const pickerOpen = query !== null && options.length > 0;
 
   const trimmed = text.trim();
@@ -145,14 +151,16 @@ export function BotGroupComposer({
     if (!query) return;
     const next = insertBotGroupMention(text, { start: query.start, end: caret }, option.label);
     setText(next.text);
+    selectionRef.current = { start: next.caret, end: next.caret };
     setCaret(next.caret);
     setForcedSelection({ start: next.caret, end: next.caret });
-    if (option.kind === 'member') {
-      setTracked((current) => [
-        ...current.filter((mention) => mention.botId !== option.member.botId),
-        { botId: option.member.botId, label: option.label },
-      ]);
-    }
+    setTracked(current => {
+      const remaining = retainBotGroupTrackedMentions(text, next.text, {
+        members: members.map(member => ({ botId: member.botId, name: member.name })),
+        allLabels: [allLabel], tracked: current, editStart: query.start, editEnd: caret,
+      });
+      return option.kind === 'member' ? [...remaining, { botId: option.member.botId, label: option.label, start: query.start }] : remaining;
+    });
     inputRef.current?.focus();
   };
 
@@ -187,14 +195,14 @@ export function BotGroupComposer({
         return;
       }
       const attachmentIds = attachments.map((attachment) => attachment.id);
-      // The tag and the attachments change what the host does, so they are part of the idempotency key.
-      const attempt = nextBotGroupSendAttempt(attemptRef.current, draftText, draftDivision, randomUUID, attachmentIds);
-      attemptRef.current = attempt;
-      const mentions = resolveBotGroupMentions(draftText, {
-        members: members.map((member) => ({ botId: member.botId, name: member.name })),
+      const mentions = resolveBotGroupMentions(draft, {
+        members: mentionMembers.map((member) => ({ botId: member.botId, name: member.name })),
         allLabels: [allLabel],
         tracked: draftTracked,
       });
+      // Targets, tag and attachments are part of the same send intent.
+      const attempt = nextBotGroupSendAttempt(attemptRef.current, draftText, draftDivision, randomUUID, attachmentIds, mentions);
+      attemptRef.current = attempt;
       release = tray.holdForSend(attachmentIds);
       await onSend({ text: attempt.text, mentions, clientId: attempt.clientId, division: attempt.division, attachments });
       attemptRef.current = null;
@@ -240,7 +248,7 @@ export function BotGroupComposer({
     testID="botGroup.composer.more">
     <Plus size={iconSize.sm} color={colors.textSecondary} strokeWidth={iconStroke.regular} />
   </Pressable>;
-  const plus = attachmentsEnabled
+  const plus = !divisionSupported && !attachmentsSupported ? null : attachmentsEnabled
     // The same panel as a 1:1 chat's 「+」: attachments, then the group's own 安排分工.
     ? plusButton(() => { tray.armMediaTap(); setSheetOpen(true); })
     : divisionBlocked
@@ -275,7 +283,10 @@ export function BotGroupComposer({
   return <View style={styles.wrap} testID="botGroup.composer">
     {pickerOpen && query ? <View style={styles.picker} accessibilityLabel={t('groupChat.mention.label')} testID="botGroup.mentionPicker">
       <ScrollView keyboardShouldPersistTaps="always" style={styles.pickerScroll}>
-        {options.map((option) => <Pressable key={option.kind === 'all' ? 'all' : option.member.botId} accessibilityRole="button"
+        {/* M9: candidates ease in one after another, 30ms apart, fast 150ms from 4pt below. */}
+        {options.map((option, index) => <CompanionFadeIn key={option.kind === 'all' ? 'all' : option.member.botId} play distance={4}
+          duration={motionDuration.fast} delay={index * 30}>
+          <Pressable accessibilityRole="button"
           accessibilityLabel={option.label} onPress={() => choose(option)}
           style={({ pressed }) => [styles.pickerRow, pressed && mobileInteractionStyles.pressed]}
           testID={`botGroup.mention.${option.kind === 'all' ? 'all' : option.member.botId}`}>
@@ -284,7 +295,8 @@ export function BotGroupComposer({
             : <BotGroupAvatar deviceId={deviceId} identity={identityFor(option.member.botId, option.member.name)} size={BOT_GROUP_STEP_AVATAR_SIZE} online={online} />}
           <Text numberOfLines={1} style={styles.pickerName}>{option.label}</Text>
           {option.kind === 'all' ? <Text numberOfLines={1} style={styles.pickerHint}>{t('groupChat.mention.allHint')}</Text> : null}
-        </Pressable>)}
+          </Pressable>
+        </CompanionFadeIn>)}
       </ScrollView>
     </View> : null}
     {hint ? <Text accessibilityLiveRegion="polite" style={styles.hint}>{hint}</Text> : null}
@@ -309,8 +321,19 @@ export function BotGroupComposer({
       cursorColor={colors.inputCaret}
       selectionColor={colors.inputCaret}
       selection={forcedSelection}
-      onChangeText={setText}
+      onChangeText={(value) => {
+        const { start: editStart, end: editEnd } = selectionRef.current;
+        setText(value);
+        setTracked(current => retainBotGroupTrackedMentions(text, value, {
+          members: members.map(member => ({ botId: member.botId, name: member.name })),
+          allLabels: [allLabel],
+          tracked: current,
+          editStart,
+          editEnd,
+        }));
+      }}
       onSelectionChange={(event) => {
+        selectionRef.current = event.nativeEvent.selection;
         setForcedSelection(undefined);
         setCaret(event.nativeEvent.selection.end);
       }}

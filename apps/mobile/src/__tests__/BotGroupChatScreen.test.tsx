@@ -2,7 +2,7 @@
 import { act, createElement as el, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BotGroupRemoteChatData } from '@cindy/maker-shared/botGroupChat';
+import { BOT_GROUP_RUNTIME_FAILURE_CODES, type BotGroupRemoteChatData } from '@cindy/maker-shared/botGroupChat';
 
 const h = vi.hoisted(() => ({
   chat: null as any,
@@ -20,8 +20,11 @@ const h = vi.hoisted(() => ({
   local: null as any,
   discarded: [] as any[],
   deleted: [] as string[],
+  keyboardAvoidingView: null as any,
+  platform: { OS: 'ios' },
 }));
 
+vi.mock('expo-web-browser', () => ({ openBrowserAsync: vi.fn(async () => ({})) }));
 vi.mock('react-native', () => {
   const box = (tag: string) => ({ children, testID, accessibilityLabel }: any) =>
     el(tag, { 'data-testid': testID, 'aria-label': accessibilityLabel }, children);
@@ -30,16 +33,23 @@ vi.mock('react-native', () => {
       h.scroll = props;
       useImperativeHandle(ref, () => ({ scrollToEnd: h.scrollToEnd }));
       return el('div', { 'data-testid': props.testID }, children);
-    }, KeyboardAvoidingView: box('div'),
+    }, KeyboardAvoidingView: ({ children, ...props }: any) => {
+      h.keyboardAvoidingView = props;
+      return el('div', null, children);
+    },
     Pressable: ({ children, onPress, disabled, testID, accessibilityLabel }: any) => el('button',
       { 'data-testid': testID, 'aria-label': accessibilityLabel, disabled, onClick: onPress },
       typeof children === 'function' ? children({ pressed: false }) : children),
     ActivityIndicator: () => el('i', { 'data-testid': 'spinner' }),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 },
-    Platform: { OS: 'ios', select: (value: any) => value.ios },
+    Platform: { get OS() { return h.platform.OS; }, select: (value: any) => value[h.platform.OS] },
     Alert: { alert: h.alert },
     useWindowDimensions: () => ({ width: 390, height: 844 }),
     AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) },
+    Keyboard: { dismiss: () => {} },
+    Animated: { View: box('div'), Value: class { setValue() {} interpolate() { return this; } }, timing: () => ({ start() {}, stop() {} }),
+      loop: () => ({ start() {}, stop() {} }), sequence: () => ({}) },
+    Easing: { inOut: () => undefined, ease: undefined, bezier: () => undefined },
   };
 });
 vi.mock('expo-router', () => ({
@@ -60,11 +70,12 @@ vi.mock('react-i18next', async (importOriginal) => ({
 }));
 vi.mock('expo-crypto', () => ({ randomUUID: () => `uuid-${++h.uuid}` }));
 vi.mock('lucide-react-native', () => Object.fromEntries(
-  ['ChevronLeft', 'Settings2', 'Plus', 'Square', 'Users', 'X', 'Check', 'CircleAlert', 'CircleCheck', 'CircleDashed', 'FileText', 'Sparkles', 'Folder', 'Camera', 'Image']
+  ['ChevronLeft', 'Settings2', 'Plus', 'Square', 'Users', 'X', 'Check', 'CircleAlert', 'CircleCheck', 'CircleDashed', 'FileText', 'Sparkles', 'Folder', 'Camera', 'Image',
+    'Layers', 'ListChecks', 'Ellipsis', 'ChevronRight', 'ChevronDown']
     .map((name) => [name, () => null]),
 ));
-vi.mock('@/theme', () => ({
-  useThemedStyles: () => ({}), useTheme: () => ({ colors: {} }), fontWeight: {}, iconStroke: {}, monoFont: 'mono',
+vi.mock('@/theme', async () => ({
+  ...await import('@/theme/tokens'), useThemedStyles: () => ({}), useTheme: () => ({ colors: {} }), monoFont: 'mono',
 }));
 vi.mock('@/auth/AuthContext', () => ({ useAuth: () => ({
   user: { id: 'owner' }, accountGeneration: 1, getAccessToken: async () => 'token', apiFetch: async () => ({}),
@@ -110,7 +121,7 @@ vi.mock('@/session/CompanionSheet', () => ({
 }));
 vi.mock('@/session/BotGroupAvatars', () => ({
   BOT_GROUP_MESSAGE_AVATAR_SIZE: 28, BOT_GROUP_STEP_AVATAR_SIZE: 24, BOT_GROUP_INLINE_AVATAR_SIZE: 20, BOT_GROUP_ROW_AVATAR_SIZE: 32,
-  BotGroupAvatar: () => null, BotGroupAvatarStack: () => null,
+  BotGroupAvatar: () => null, BotGroupDuoAvatar: () => null,
   useBotGroupIdentities: () => (botId: string, fallbackName = '', member?: { name: string }) => ({ botId, name: fallbackName || member?.name || botId }),
 }));
 vi.mock('@/session/BotGroupSpeakerRow', () => ({
@@ -180,6 +191,9 @@ vi.mock('@/session/useBotGroupRemoteMedia', () => ({ useBotGroupRemoteMedia: () 
 vi.mock('@/session/useHostTeammates', () => ({ useHostTeammates: () => h.teammates }));
 vi.mock('@/session/useBotGroupChat', () => ({ useBotGroupChat: () => h.chat }));
 
+vi.mock('@/hooks/useReduceMotion', () => ({ useReduceMotionEnabled: () => true }));
+vi.mock('@/session/CompanionPresenceRing', () => ({ CompanionPresenceRing: () => null }));
+vi.mock('@/session/ThinkingDots', () => ({ ThinkingDots: () => null }));
 import { BotGroupChatScreen } from '@/session/BotGroupChatScreen';
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -245,6 +259,7 @@ async function render(data: BotGroupRemoteChatData | null = group(), kind: 'read
 beforeEach(() => {
   vi.clearAllMocks();
   h.uuid = 0; h.inputs = {}; h.teammates = { rows: [], loading: false, failed: false };
+  h.platform.OS = 'ios'; h.keyboardAvoidingView = null;
   h.chat = { reload: vi.fn(), act: vi.fn(async () => ({ effects: [] })), online: true };
   h.discarded = []; h.deleted = [];
   h.local = {
@@ -259,6 +274,12 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); vi.useRealTimers(); });
 
 describe('group timeline', () => {
+  it('uses the shared Android keyboard avoidance behavior for the group composer', async () => {
+    h.platform.OS = 'android';
+    await render();
+    expect(h.keyboardAvoidingView).toMatchObject({ enabled: true, behavior: 'height' });
+  });
+
   it('waits for measured tail positioning before acknowledging replies, including new snapshots', async () => {
     vi.useFakeTimers();
     await render();
@@ -304,6 +325,23 @@ describe('group timeline', () => {
     expect(h.markRead).toHaveBeenLastCalledWith('owner', 'mac', 'g1', 7000);
   });
 
+  it('renders the joined member as a localized system line without a chat bubble', async () => {
+    await render(group({ messages: [message('join', 1, { kind: 'notice', authorKind: 'system',
+      authorName: 'Taylor', authorBotId: null, noticeCode: 'member-joined', content: 'Fallback text' })] }));
+    expect(all('botGroup.notice').map(entry => entry.textContent)).toEqual(['groupChat.notice.memberJoined(name=Taylor)']);
+    expect(all('botGroup.message.user')).toHaveLength(0);
+    expect(all('botGroup.message.bot')).toHaveLength(0);
+  });
+
+  it.each(BOT_GROUP_RUNTIME_FAILURE_CODES)('renders the runtime reason and recovery advice on mobile: %s', async runtimeFailureCode => {
+    await render(group({ messages: [message('failure', 1, { kind: 'notice', authorKind: 'system',
+      authorName: 'Bot', noticeCode: 'member-failed', runtimeFailureCode })] }));
+    const text = all('botGroup.notice')[0]?.textContent;
+    expect(text).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}(name=Bot)`);
+    expect(text).toContain('groupChat.notice.runtimeFailureSetupHint');
+    expect(text).not.toContain('groupChat.notice.memberFailed');
+  });
+
   it('renders messages, notices, round ends and plan ends like the desktop timeline', async () => {
     await render();
     expect(byId('botGroup.message.user')?.textContent).toBe('@咪咪 帮我做官网');
@@ -347,6 +385,39 @@ describe('group timeline', () => {
     expect(h.chat.act).toHaveBeenLastCalledWith('plan-edit', { planId: 'p1', position: 0, action: 'remove' });
   });
 
+  it('renders human-signed plans as organizer cards with working actions and read-only old plans', async () => {
+    const data = group();
+    data.messages = data.messages.map(message => message.kind === 'plan'
+      ? { ...message, authorKind: 'user', authorBotId: null, authorName: 'Human creator' } : message);
+    await render(data);
+    expect(byId('botGroup.message.plan')?.textContent).toContain('咪咪');
+    expect(byId('botGroup.message.plan')?.textContent).not.toContain('Human creator');
+    await click('botGroup.plan.start');
+    expect(h.chat.act).toHaveBeenLastCalledWith('plan-start', { planId: 'p1' });
+    await click('botGroup.plan.dismiss');
+    expect(h.chat.act).toHaveBeenLastCalledWith('plan-dismiss', { planId: 'p1' });
+    data.plans[0]!.status = 'superseded';
+    data.openPlan = null;
+    await render(data);
+    expect(byId('botGroup.plan.finalNote')?.textContent).toBe('groupChat.plan.superseded');
+    expect(byId('botGroup.plan.start')).toBeNull();
+  });
+
+  it('removes a server human by actor identity without offering them as organizer', async () => {
+    const data = group({ serverBacked: true, supportsMemberRemoval: true });
+    data.members.push({ botId: 'person', actorId: 'actor-person', actorKind: 'human', name: 'Person', avatar: '', avatarColor: '', status: 'active' });
+    await render(data);
+    expect(byId('botGroup.plan.stepMenu.0.action.member:person')).toBeNull();
+    await click('botGroup.settingsButton');
+    expect(byId('botGroup.settings.memberMenu.person.action.organizer:person')).toBeNull();
+    await click('botGroup.settings.memberMenu.person.action.remove:person');
+    expect(h.chat.act).toHaveBeenLastCalledWith('remove-member', { actorId: 'actor-person' });
+    h.chat.act.mockRejectedValueOnce(new Error('PERMISSION_DENIED'));
+    await click('botGroup.settings.memberMenu.person.action.remove:person');
+    expect(node.textContent).toContain('groupChat.errors.permissionDenied');
+    expect(byId('botGroup.settings.member.person')).not.toBeNull();
+  });
+
   it('keeps at least one step and names the host’s reason when an action is refused', async () => {
     const data = group();
     data.plans[0]!.steps = [data.plans[0]!.steps[0]!];
@@ -381,7 +452,7 @@ describe('group timeline', () => {
       steps: [{ ...data.plans[0]!.steps[0]!, status: 'done' }, { ...data.plans[0]!.steps[1]!, status: 'failed' }] };
     await render(data);
     expect(byId('botGroup.followUp.retry')?.textContent).toContain('groupChat.timeline.retryStep');
-    expect(node.textContent).toContain('groupChat.timeline.stepFailed(name=阿布)');
+    expect(node.textContent).toContain('groupChat.followUp.failedStep(step=2)');
     await click('botGroup.followUp.retry');
     expect(h.chat.act).toHaveBeenLastCalledWith('plan-retry', { planId: 'p1' });
   });
@@ -440,6 +511,73 @@ describe('group composer', () => {
       text: '请 @阿布 写代码', mentions: { all: false, botIds: ['abu'] }, clientId: 'uuid-1',
     });
     expect(h.row.value).toBe('');
+  });
+
+  it.each(['[INVALID_PARAMS] MENTION_UNAVAILABLE', 'MENTION_UNAVAILABLE'])('keeps a stale selected target through a refused send (%s) and lets a new pick replace it', async message => {
+    const data = group({ openPlan: null });
+    const namesakes = [{ ...data.members[0]!, name: 'Ann' }, { ...data.members[1]!, name: 'Ann' }];
+    await render(group({ openPlan: null, members: namesakes }));
+    await type('@');
+    await click('botGroup.mention.mimi');
+    await render(group({ openPlan: null, members: namesakes.slice(1) }));
+    h.chat.act.mockRejectedValue(new Error(message));
+    for (let retry = 0; retry < 2; retry++) {
+      await click('botGroup.composer.send');
+      expect(h.chat.act).toHaveBeenLastCalledWith('send', expect.objectContaining({ mentions: { all: false, botIds: ['mimi'] } }));
+      expect(h.row.value).toBe('@Ann ');
+    }
+    expect(h.alert).toHaveBeenCalledWith('groupChat.errors.mentionUnavailable');
+    const originalClientId = h.chat.act.mock.calls[0][1].clientId;
+    expect(h.chat.act.mock.calls[1][1].clientId).toBe(originalClientId);
+    await type('@');
+    await click('botGroup.mention.abu');
+    h.chat.act.mockResolvedValue({ effects: [] });
+    await click('botGroup.composer.send');
+    expect(h.chat.act).toHaveBeenLastCalledWith('send', expect.objectContaining({ mentions: { all: false, botIds: ['abu'] } }));
+    expect(h.chat.act.mock.calls.at(-1)[1].clientId).not.toBe(originalClientId);
+    expect(h.row.value).toBe('');
+  });
+
+  it('drops a deleted selected mention before a namesake is manually mentioned again', async () => {
+    const data = group({ openPlan: null });
+    const namesakes = [{ ...data.members[0]!, name: 'Ann' }, { ...data.members[1]!, name: 'Ann' }];
+    await render(group({ openPlan: null, members: namesakes }));
+    await type('@');
+    await click('botGroup.mention.mimi');
+    await render(group({ openPlan: null, members: namesakes.slice(1) }));
+    await type('hello');
+    await type('@Ann hello');
+    await click('botGroup.composer.send');
+    expect(h.chat.act).toHaveBeenLastCalledWith('send', expect.objectContaining({ mentions: { all: false, botIds: ['abu'] } }));
+  });
+
+  it('keeps the current human in the group but excludes it from mention choices and typed mentions', async () => {
+    h.chat.server = true;
+    const data = group({ openPlan: null });
+    data.members.unshift({ ...data.members[0]!, botId: 'self', name: 'Me', actorKind: 'human', isSelf: true });
+    await render(data);
+    await type('@');
+    expect(byId('botGroup.mention.self')).toBeNull();
+    expect(byId('botGroup.mention.mimi')).not.toBeNull();
+    await type('@Me @阿布 hello');
+    await click('botGroup.composer.send');
+    expect(h.chat.act).toHaveBeenLastCalledWith('send', expect.objectContaining({ mentions: { all: false, botIds: ['abu'] } }));
+  });
+
+  it.each(['picked', 'manual'])('removes only the %s token identity when same-name mentions coexist', async removed => {
+    const data = group({ openPlan: null });
+    const namesakes = [{ ...data.members[0]!, name: 'Ann' }, { ...data.members[1]!, name: 'Ann' }];
+    await render(group({ openPlan: null, members: namesakes }));
+    await type('  @');
+    await click('botGroup.mention.mimi');
+    await type('  @Ann @Ann');
+    await render(group({ openPlan: null, members: namesakes.slice(1) }));
+    await act(async () => h.row.onSelectionChange({ nativeEvent: { selection: {
+      start: removed === 'picked' ? 2 : 6, end: removed === 'picked' ? 7 : 11,
+    } } }));
+    await type('  @Ann');
+    await click('botGroup.composer.send');
+    expect(h.chat.act).toHaveBeenLastCalledWith('send', expect.objectContaining({ mentions: { all: false, botIds: [removed === 'picked' ? 'abu' : 'mimi'] } }));
   });
 
   it('sends a 分工 message and keeps the clientId and tag for a retry', async () => {
@@ -665,10 +803,11 @@ describe('group settings', () => {
     await act(async () => { h.inputs['botGroup.settings.name'].onChangeText('新名字'); });
     await act(async () => { h.inputs['botGroup.settings.name'].onBlur(); });
     expect(h.chat.act).toHaveBeenLastCalledWith('update', { name: '新名字' });
-    expect(byId('botGroup.settings.organizer.mimi')).toBeNull();
-    await click('botGroup.settings.organizer.abu');
+    // The organizer is not offered again; each member row opens its own menu.
+    expect(byId('botGroup.settings.memberMenu.mimi.action.organizer:mimi')).toBeNull();
+    await click('botGroup.settings.memberMenu.abu.action.organizer:abu');
     expect(h.chat.act).toHaveBeenLastCalledWith('update', { organizerBotId: 'abu' });
-    await click('botGroup.settings.remove.xiaoman');
+    await click('botGroup.settings.memberMenu.xiaoman.action.remove:xiaoman');
     expect(h.chat.act).toHaveBeenLastCalledWith('set-members', { botIds: ['mimi', 'abu'] });
     await click('botGroup.settings.add');
     // Current members are not offered again.
@@ -695,7 +834,7 @@ describe('group settings', () => {
     const data = group();
     data.members = data.members.slice(0, 2);
     await openSettings(data);
-    expect(byId('botGroup.settings.remove.abu')?.disabled).toBe(true);
+    expect(byId('botGroup.settings.memberMenu.abu.action.remove:abu')?.disabled).toBe(true);
   });
 
   it('deletes after the system confirmation, then leaves once the sheet has closed', async () => {
@@ -739,4 +878,59 @@ describe('offline computer', () => {
     expect(byId('botGroup.continue')?.disabled).toBe(true);
     expect(h.row.editable).toBe(false);
   });
+});
+
+
+describe('direct server group presentation', () => {
+  it.each([true, false])('aligns attachments with their message author (server=%s)', async (server) => {
+    h.chat = { ...h.chat, server, ...(server ? { media: vi.fn() } : {}) };
+    const attachment = { id: 'media', name: 'brief.pdf', mimeType: 'application/pdf', size: 10, category: 'pdf' as const, url: null, path: null };
+    await render(group({ messages: [
+      message('mine', 1, { authorKind: 'user', isSelf: true, attachments: [attachment] }),
+      message('other', 2, { authorKind: 'user', isSelf: false, authorName: 'Other member', attachments: [attachment] }),
+      message('bot', 3, { authorBotId: 'mimi', authorName: '咪咪', attachments: [attachment] }),
+    ], plans: [], openPlan: null }));
+    expect(all('botGroup.message.user')).toHaveLength(1);
+    expect(all('botGroup.message.bot')).toHaveLength(2);
+    expect(all('attachmentStrip').map(strip => strip.getAttribute('data-align'))).toEqual(['right', 'left', 'left']);
+  });
+  it('uses server failure copy, keeps other humans incoming and loads older history', async () => {
+    h.chat = { ...h.chat, server: true, online: false, loadOlder: vi.fn(async () => {}) };
+    await render(null, 'error');
+    expect(byId('botGroup.loadFailed')?.textContent).toContain('groupChat.server.loadFailed');
+    expect(node.textContent).not.toContain('devices.resources.hostOffline');
+    h.chat.online = true;
+    await render(group({ messages: [message('other', 1, { authorKind: 'user', authorName: 'Other member', isSelf: false, content: 'hello' })], plans: [], openPlan: null, hasMoreBefore: true }));
+    expect(all('botGroup.message.user')).toHaveLength(0);
+    expect(node.textContent).toContain('Other member');
+    expect(h.scroll.maintainVisibleContentPosition).toEqual({ minIndexForVisible: 1 });
+    await click('botGroup.loadOlder'); expect(h.chat.loadOlder).toHaveBeenCalledOnce();
+    await click('botGroup.settingsButton');
+    expect(byId('botGroup.settings.delete')?.disabled).toBe(true);
+    expect(byId('botGroup.settings.replyMode.mentioned')?.disabled).toBe(true);
+  });
+  it('reauthorizes a server attachment on tap and opens the existing image viewer', async () => {
+    const attachment = { id: 'media', name: 'picture.png', mimeType: 'image/png', size: 10, category: 'image' as const, url: 'https://media.example.invalid/one-use', path: null };
+    h.chat = { ...h.chat, server: true, media: vi.fn(async () => attachment) };
+    await render(group({ messages: [message('picture', 1, { authorKind: 'user', isSelf: false, attachments: [{ ...attachment, url: null, category: 'file' }] })], plans: [], openPlan: null }));
+    expect(h.chat.media).not.toHaveBeenCalled();
+    await click('attachment.file'); expect(h.chat.media).toHaveBeenCalledExactlyOnceWith('media');
+    expect(byId('lightbox')?.getAttribute('data-url')).toBe(attachment.url);
+  });
+});
+
+
+it('acknowledges other humans only once their messages reach the measured visible tail', async () => {
+  h.chat.server = true;
+  h.chat.markRead = vi.fn(async () => {});
+  await render(group({ messages: [message('incoming-human', 12, { authorKind: 'user', isSelf: false, content: 'hello' }),
+    message('mine', 13, { authorKind: 'user', isSelf: true, content: 'reply' })], plans: [], openPlan: null }));
+  expect(h.markRead).not.toHaveBeenCalled();
+  expect(h.chat.markRead).not.toHaveBeenCalled();
+  await act(async () => {
+    h.scroll.onLayout({ nativeEvent: { layout: { height: 500 } } });
+    h.scroll.onContentSizeChange(400, 400);
+  });
+  expect(h.chat.markRead).toHaveBeenLastCalledWith(['incoming-human']);
+  expect(h.markRead).not.toHaveBeenCalled();
 });
