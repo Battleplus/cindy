@@ -333,9 +333,10 @@ function toCatalogModel(
     // 手填模型保持历史默认可见；刷新发现的模型可显式声明默认隐藏。
     defaultEnabled: m.defaultEnabled ?? true,
     // 图片能力必须由用户/预设明确声明；缺省不猜（防止 Pi 静默把截图降级成占位文本）。
-    // 显式 `false` 同样要透传：发图的本地拦截、原生请求体与徽标都按它判定，
-    // 丢成 undefined 会让用户在设置里声明的「不支持」失效（#6243 诉求 1）。
-    ...(m.supportsImageInput !== undefined ? { supportsImageInput: m.supportsImageInput } : {}),
+    // 只需在此保证 `true` 不被丢掉：显式 `false` 由下面的 `runtimeUserModelMetadata`
+    // 复制进 user 层，再经 `applyModelMetadata` 落到目录层，因此这里重复展开 `false`
+    // 不会改变任何输出（已实测三种输入形态输出完全一致），保留单一来源避免两处漂移。
+    ...(m.supportsImageInput === true ? { supportsImageInput: true } : {}),
     ...(m.thinkingToggle === true ? { thinkingToggle: true } : {}),
     ...(supportsFastMode ? { supportsFastMode: true } : {}),
   };

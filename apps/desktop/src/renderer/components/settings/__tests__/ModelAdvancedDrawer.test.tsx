@@ -796,3 +796,43 @@ it('keeps built-in providers\' image input read-only', () => {
   expect(screen.queryByRole('button', { name: 'settings.providers.custom.fields.modelSupportsImageInput' })).toBeNull();
   expect(screen.getByText('settings.providers.models.advanced.imageInput')).toBeTruthy();
 });
+
+// #6243 回归：协议、图片/视频能力、图片输入三态三处都是「复制整份 config → 整份写回」，
+// 而 provider 快照异步刷新。快照回来前连改两项时，第二次请求必须从第一次写回的结果继续，
+// 否则会带着旧值把上一项撤销（主进程只串行、不合并请求体）。
+it('accumulates consecutive drawer saves instead of overwriting the earlier one', async () => {
+  const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+  const previous = window.electronAPI;
+  Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
+  try {
+    const built = buildUserProvider({ id: 'relay', name: 'Relay', auth: { method: 'apiKey' },
+      runtimes: { pi: { baseUrl: 'https://chat.example.invalid/v1',
+        models: [{ id: 'glm-5.3', name: 'GLM-5.3' }] } } });
+    // 让 pi 走 openai-images，抽屉才会渲染「图片能力」下拉（另一个整份写回的入口）。
+    const builtRouting = (built as unknown as { routing?: Record<string, Record<string, unknown> | undefined> }).routing;
+    const source = { ...built, connected: true,
+      routing: { ...builtRouting, pi: { ...builtRouting?.pi, imageApi: 'openai-images' } } } as unknown as ProviderView;
+    // provider 快照在整个用例里保持同一个对象：模拟「刷新还没回来」的窗口。
+    render(<ModelAdvancedDrawer provider={source} row={{ id: 'glm-5.3', name: 'GLM-5.3', avail: ['pi'],
+      byAgent: { pi: source.models.pi![0] } }} open onOpenChange={vi.fn()} pricePresentationOf={() => null}
+      onDisable={vi.fn()} disabled={false} paymentRequired={false} />);
+
+    // 第一次：改「图片能力」→ generate（写 mode / modalities）。
+    const capability = screen.getByRole('button', { name: 'settings.providers.models.advanced.imageCapability.label' });
+    fireEvent.keyDown(capability, { key: 'ArrowDown' });
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: 'settings.providers.models.advanced.imageCapability.generate' }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const first = update.mock.calls[0]![0] as Parameters<typeof buildUserProvider>[0];
+    expect(first.runtimes.pi!.models[0]!.mode).toBe('image_generation');
+
+    // 第二次：快照未刷新就改「支持图片输入」→ 不支持。必须带着第一次的 mode 一起落盘。
+    const trigger = screen.getByRole('button', { name: 'settings.providers.custom.fields.modelSupportsImageInput' });
+    fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: 'settings.providers.models.advanced.unsupported' }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    const second = update.mock.calls[1]![0] as Parameters<typeof buildUserProvider>[0];
+    expect(second.runtimes.pi!.models[0]!.supportsImageInput).toBe(false);
+    // 关键断言：第一次改动没有被第二次的整份写回撤销。
+    expect(second.runtimes.pi!.models[0]!.mode).toBe('image_generation');
+  } finally { cleanup(); Object.defineProperty(window, 'electronAPI', { configurable: true, value: previous }); }
+});
