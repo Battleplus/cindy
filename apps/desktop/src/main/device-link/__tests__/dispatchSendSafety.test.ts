@@ -87,6 +87,25 @@ beforeEach(() => {
   __testing.reset();
 });
 
+// Test value: public push dispatch must deliver the new metadata invalidation to both controllers.
+// Existing forwarding cases did not cover alias topics or the bot-authorization queue's empty payload.
+// Minimal input: one {} invalidation and two sessions subscribers; unit tier, no network.
+it('forwards project alias invalidations through the production bot authorization queue to every subscriber', async () => {
+  const client = mkClient();
+  __testing.setActiveClient(client as never);
+  subscriptions.subscribe('mobile', ['sessions'], 'mobile', []);
+  subscriptions.subscribe('desktop', ['sessions'], 'desktop', []);
+  setRemoteBotSessionLookup(async () => 'ordinary');
+  try {
+    __testing.forwardPush('local-db:project-aliases:changed', {});
+    await vi.waitFor(() => expect(client.sendPush).toHaveBeenCalledTimes(2));
+    expect(client.sendPush).toHaveBeenCalledWith('mobile', 'local-db:project-aliases:changed', {});
+    expect(client.sendPush).toHaveBeenCalledWith('desktop', 'local-db:project-aliases:changed', {});
+  } finally {
+    setRemoteBotSessionLookup(null);
+  }
+});
+
 it('strips Desktop credential links from authorization history and live metadata pushes', () => {
   const card = { v: 1, sessionId: 's1', createdAt: 1, target: { kind: 'plugin', id: 'p' },
     snapshot: { kind: 'plugin_setup', requestId: 'r', revision: 1, ghost: { id: 'p', name: 'Plugin' },
@@ -426,6 +445,18 @@ describe('[14] sendInvokeResultSafe — 结果超限兜底', () => {
     });
     expect(second[2].result[0].content).toContain('[remote content truncated: payload too large]');
     expect(second[2].result[0].content.length).toBeLessThan(bigContent.length);
+  });
+
+  it('keeps a long HTML draft card reference in the compact phone history response', () => {
+    const sendInvokeResult = vi.fn().mockImplementationOnce(() => { throw tooLarge(); });
+    const client = mkClient({ sendInvokeResult });
+    const content = JSON.stringify({ ok: true, result: { bodyHtml: '你好'.repeat(16000) }, xdt_card_id: 'draft-card' });
+    __testing.sendInvokeResultSafe(client as never, 'ctrl', 'req', {
+      ok: true, result: [{ id: 'card-result', role: 'tool_result', content }],
+    }, 'local-db:messages:list');
+    const stored = sendInvokeResult.mock.calls[1][2].result[0].content;
+    expect(JSON.parse(stored)).toMatchObject({ xdt_card_id: 'draft-card' });
+    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(8192);
   });
 
   it('消息页非字符串 content 超限 → 用占位文本替代,不返回半截 JSON', () => {

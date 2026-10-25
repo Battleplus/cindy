@@ -34,7 +34,7 @@ import {
 } from '@cindy/maker-shared/internal-citation';
 
 import { UsageTokenSpeedMeter } from '../shared/token-speed.js';
-import type { AgentEvent, AgentTaskStatus, AgentTaskUpdateEventData } from '../../types/events.js';
+import type { AgentEvent, AgentTaskStatus, AgentTaskUpdateEventData, GeneratedImageEventData } from '../../types/events.js';
 import { normalizeAccountRateLimitSnapshot } from '../../types/account-rate-limits.js';
 import type { AsyncQueue } from '../shared/async-queue.js';
 import { stripTerminalControlSequences } from '../shared/terminal-output.js';
@@ -93,6 +93,8 @@ export interface CodexRuntimeState {
   generationDurationMs: number;
   /** Model time sampled with the latest accepted output usage. */
   generationOutputDurationMs: number;
+  /** Native-turn output for speed, independent of the billing ledger lifecycle. */
+  generationOutputTokens: number;
   generationTurnId: string | null;
   /** False when a tool boundary is incomplete/out of order; unreliable TPS is omitted. */
   generationTimingReliable: boolean;
@@ -142,6 +144,7 @@ export function newCodexRuntimeState(): CodexRuntimeState {
     generationPendingToolIds: new Set(),
     generationDurationMs: 0,
     generationOutputDurationMs: 0,
+    generationOutputTokens: 0,
     generationTurnId: null,
     generationTimingReliable: true,
     generationHeartbeatAt: null,
@@ -190,13 +193,15 @@ function startCodexGenerationHeartbeat(rt: CodexRuntimeState): void {
 }
 
 /** Reset per-turn model-generation timing; turn wall-clock is tracked separately by the host. */
-export function resetCodexGenerationTiming(rt: CodexRuntimeState): void {
+export function resetCodexGenerationTiming(rt: CodexRuntimeState, preserveSpeed = false): void {
   stopCodexGenerationHeartbeat(rt);
-  rt.tokenSpeed.reset();
+  if (preserveSpeed) rt.tokenSpeed.startSegment();
+  else rt.tokenSpeed.reset();
   rt.generationStartedAt = null;
   rt.generationPendingToolIds.clear();
   rt.generationDurationMs = 0;
   rt.generationOutputDurationMs = 0;
+  rt.generationOutputTokens = 0;
   rt.generationTurnId = null;
   rt.generationTimingReliable = true;
 }
@@ -221,7 +226,7 @@ export function beginCodexGenerationTurn(
   startedAt = Date.now(),
 ): void {
   if (rt.generationTurnId !== turnId) {
-    resetCodexGenerationTiming(rt);
+    resetCodexGenerationTiming(rt, true);
     rt.generationTurnId = turnId;
   }
   if (rt.generationStartedAt === null && rt.generationPendingToolIds.size === 0) {
@@ -498,7 +503,7 @@ export function translateItemNotification(
       handleImageView(phase, item as unknown as ImageViewItem, queue);
       return;
     case 'imageGeneration':
-      handleImageGeneration(phase, item as unknown as ImageGenerationItem, queue);
+      handleImageGeneration(phase, item as unknown as ImageGenerationItem, queue, notification);
       return;
     case 'contextCompaction':
       handleContextCompaction(phase, item as unknown as ContextCompactionItem, queue, ctx);
@@ -1006,7 +1011,7 @@ interface ImageViewItem {
   path: string;
 }
 
-// v2.rs ThreadItem::ImageGeneration — 模型生成图; result 是 url/data URL, savedPath 落盘后才有。
+// result may contain bare Base64 even when savedPath is also present (Codex 0.159.2).
 interface ImageGenerationItem {
   type: 'imageGeneration';
   id: string;
@@ -2235,9 +2240,8 @@ function handleImageView(
 }
 
 // ── imageGeneration → image event (kind='generation') ────────────────────────
-// 模型生成图。result 优先识别为 url (http/data 协议头) — 否则当 path 兜底 (codex 偶尔直接给本地路径
-// 不走 savedPath 字段)。savedPath 优先 path; 同时给 revisedPrompt / status 让 UI 显示生成参数。
-// started 阶段 result/savedPath 通常没填, 只发 completed。
+// Preserve bytes independently of savedPath: that path may belong to another computer.
+// Decode/validate/store in the Host, outside the synchronous translator hot path.
 
 function isUrlLike(s: string): boolean {
   return /^(https?:|data:)/i.test(s);
@@ -2247,26 +2251,24 @@ function handleImageGeneration(
   phase: ItemPhase,
   item: ImageGenerationItem,
   queue: AsyncQueue<AgentEvent>,
+  identity: { threadId: string; turnId: string },
 ): void {
   if (phase !== 'completed') return;
-  const data: {
-    kind: 'generation';
-    blockId: string;
-    path?: string;
-    url?: string;
-    revisedPrompt?: string;
-    status?: string;
-  } = {
+  const data: GeneratedImageEventData = {
     kind: 'generation',
     blockId: item.id,
+    threadId: identity.threadId,
+    turnId: identity.turnId,
     status: item.status,
   };
   if (item.revisedPrompt) data.revisedPrompt = item.revisedPrompt;
-  if (item.savedPath) {
-    data.path = item.savedPath;
-  } else if (item.result) {
+  if (item.savedPath) data.path = item.savedPath;
+  if (item.result) {
     if (isUrlLike(item.result)) data.url = item.result;
-    else data.path = item.result;
+    // Keep the historical path-only result shape, but never interpret Base64 as a path.
+    else if (/^(?:[A-Za-z]:[\\/]|\.\.?[\\/])/.test(item.result)
+      || /\.(?:png|jpe?g|gif|webp)$/i.test(item.result)) data.path ??= item.result;
+    else data.data = item.result;
   }
   queue.push({ type: 'image', data, source: 'codex' });
 }

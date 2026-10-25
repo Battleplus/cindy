@@ -62,6 +62,7 @@ import {
 } from '../../../shared/claudeGatewayError';
 import { isPiImageInputUnsupportedError } from '../../../shared/inputError';
 import type { ToolLoopErrorDetails } from '@cindy/maker-core';
+import type { ErrorDiagnosisSource } from '@/lib/errorDiagnosisPrompt';
 
 interface ErrorBannerProps {
   error: string;
@@ -118,6 +119,8 @@ interface ErrorBannerProps {
   silentEncryptedRetryEnabled?: boolean;
   onForkStripEncrypted?: () => void | Promise<void>;
   forkStripEncryptedRunning?: boolean;
+  /** 展开详情后的「诊断」：上层带着错误与出错任务去新任务里排查。 */
+  onDiagnose?: (error: ErrorDiagnosisSource) => void;
   /** 当前 error 是非终止的 recoverableError(turn 还在跑,agent/daemon 在自动
    *  重试,如 codex 网络 retry-loop 透出)。网络类分支据此区分文案:「正在自动
    *  重试…」vs「服务暂时不可达,可点击重试」。历史尾部行恒为 false。 */
@@ -152,6 +155,7 @@ export function ErrorBanner({
   silentEncryptedRetryEnabled = false,
   onForkStripEncrypted,
   forkStripEncryptedRunning = false,
+  onDiagnose,
   isRecoverable = false,
   sessionSource,
   style,
@@ -355,11 +359,15 @@ export function ErrorBanner({
         ? t(errorReasonI18nKey)
         : undefined;
   const remoteErrorCode = parseAgentErrorCode(error)?.code;
+  const isAttachmentAccessDenied = remoteErrorCode === 'DEVICE_LINK_MEDIA_ACCESS_DENIED';
   const remoteErrorKey = remoteAgentLimitErrorKey(error) ?? chatRemoteErrorGuidanceKey(remoteErrorCode, sessionSource);
   const remoteGuidance = remoteErrorKey && i18n.exists(remoteErrorKey) ? t(remoteErrorKey) : undefined;
   const terminalRateLimitRetryProgress = parseTerminalRateLimitRetryProgress(error, errorReason);
   const isCodexUsageLimitError =
-    agentKind === 'codex' && usageLimitRecovery?.isAccountUsageLimit === true;
+    agentKind === 'codex' && usageLimitRecovery?.isAccountUsageLimit === true
+    // Group selection may fail before the new route is saved. A reset card for the
+    // previous local account cannot restore the account chosen by that group.
+    && remoteErrorCode !== 'REMOTE_AGENT_GROUP_USAGE_LIMIT';
   const { snapshot: resetSnapshot, refresh: refreshResets } = useCodexRateLimits(
     isCodexUsageLimitError && isCodexOpenAiSource && !isAnyRemoteSession && !agentDeviceId,
     normalizedProviderId ?? 'openai',
@@ -668,13 +676,20 @@ export function ErrorBanner({
       ref={bannerRef}
       className={cn('mx-auto', className)}
       style={style}
-      message={displayError}
+      message={isAttachmentAccessDenied ? t('chat.errorBanner.attachmentAccessDeniedTitle') : displayError}
       description={
-        (showHistoryRecovery || showInvalidEncryptedContentRecovery) && onForkStripEncrypted
-          ? t('chat.errorBanner.readableHistoryRecoveryDescription')
-          : undefined
+        isAttachmentAccessDenied
+          ? t('chat.errorBanner.attachmentAccessDeniedRecovery')
+          : (showHistoryRecovery || showInvalidEncryptedContentRecovery) && onForkStripEncrypted
+            ? t('chat.errorBanner.readableHistoryRecoveryDescription')
+            : undefined
       }
       details={canShowErrorDetails ? error : undefined}
+      onDiagnose={
+        onDiagnose
+          ? () => onDiagnose({ message: displayError, details: error, reason: errorReason })
+          : undefined
+      }
       onDismiss={onCancel}
       icon={
         openAiConnectionRecoveredSinceError ? (

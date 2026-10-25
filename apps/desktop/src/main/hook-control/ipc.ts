@@ -10,6 +10,9 @@
  * 即连即断。没有密钥概念, 旧 safeStorage secret 文件由 store 迁移时清理。
  */
 
+import { requireXCompanion, resolveXCompanionTarget } from './xCompanion.js';
+import { captureChannelAccount } from '../im/shared/openChannelSession.js';
+
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -96,6 +99,7 @@ import { createHookTransport } from './transport.js';
 import { registerSlackToolBridge, unregisterSlackToolBridge } from './slackToolBridge.js';
 import { createHookBindingStore } from './bindings.js';
 import { createHookRequestLedger } from './requestLedger.js';
+import { createHookMediaStore } from '../cindy-media/hookOutbox.js';
 import {
   buildGroupContextPrefix,
   listTelegramKnownGroupsForStableBinding,
@@ -485,6 +489,7 @@ function ensureInstances(): { store: SlackHookStore; manager: HookControlManager
     });
   }
   if (!manager) {
+    const mediaStore = createHookMediaStore();
     const dispatcher = createHookDispatcher({
       // 两个 provider 复用 dispatcher，但连接身份和服务地址彼此隔离。
       getConnection: (connectionId) => {
@@ -522,6 +527,7 @@ function ensureInstances(): { store: SlackHookStore; manager: HookControlManager
           name: meta.name,
           url: meta.url,
           enabled: meta.enabled,
+          ...(provider === 'x' ? { companionBotId: config.xCompanionBotId ?? null } : {}),
           workspaces: config.workspaces,
           createdAt: 0,
         };
@@ -532,9 +538,12 @@ function ensureInstances(): { store: SlackHookStore; manager: HookControlManager
       }),
       terminalLedger: createHookRequestLedger({
         filePath: ownerScopedUserDataPath('hook-request-ledger.json'),
+        releaseMedia: mediaStore.release,
         log,
       }),
+      mediaStore,
       runner: createMakerHookSessionRunner({ log }),
+      resolveCompanionTarget: resolveXCompanionTarget,
       buildContextPrefix: buildGroupContextPrefix,
       // 新建 hook 会话默认预建独立 worktree(并发隔离); deps 组装与
       // maker-ipc/register.ts 的 use_worktree 分支同款。失败由 dispatcher
@@ -764,6 +773,35 @@ function registerTrustedHookControlHandler(channel: string, handler: HookControl
   });
 }
 
+/** Compare-and-set of the official X account's teammate (IPC and the teammate settings host share it). */
+export async function changeXCompanionBinding(botId: string | null, expectedBotId: string | null) {
+  requireHookControl();
+  const assertAccount = captureChannelAccount();
+  const { store: s, manager: m } = ensureInstances();
+  if (botId !== null) await requireXCompanion(botId);
+  assertAccount();
+  if ((s.get().xCompanionBotId ?? null) !== expectedBotId) {
+    throwIpcError('PRECONDITION_FAILED', 'X companion assignment changed');
+  }
+  translateValidation(() => s.setXCompanionBotId(botId));
+  const hook = m.snapshot();
+  broadcastStatus(hook);
+  return hook;
+}
+
+/** What a teammate's settings page may show of the official X account: no URLs, accounts or tokens. */
+export function readXCompanionSummary(): { available: boolean; visible: boolean; enabled: boolean; connected: boolean; companionBotId: string | null } {
+  const x = hookControlAvailable() ? ensureInstances().manager.snapshot().x : disabledHookView().x;
+  return {
+    available: x.available,
+    // The same rule that decides whether this computer's own settings list the X card.
+    visible: x.url.length > 0 || x.capabilityPending || x.available || x.enabled,
+    enabled: x.enabled,
+    connected: x.binding?.state === 'confirmed',
+    companionBotId: x.companionBotId ?? null,
+  };
+}
+
 /** 注册 IPC 并按配置 + 登录态拉起连接。bootstrap 里调用一次。 */
 export function registerHookControlIpc(): void {
   registerTrustedHookControlHandler(HOOK_CONTROL_INVOKE.GET, () => ({
@@ -924,6 +962,16 @@ export function registerHookControlIpc(): void {
       return { hook: m.snapshot() };
     },
   );
+
+  registerTrustedHookControlHandler(HOOK_CONTROL_INVOKE.SET_X_COMPANION, async (_e, payload) => {
+    const p = requireObject(payload);
+    return {
+      hook: await changeXCompanionBinding(
+        requireNullableString(p.botId, 'botId'),
+        requireNullableString(p.expectedBotId, 'expectedBotId'),
+      ),
+    };
+  });
 
   // 发起 Slack 账号绑定(SIWS OIDC): 经已连接的 WS 发 bind.start(无参); server
   // 回 bind.update(pending, authorizeUrl), main 打开系统浏览器并广播状态。
@@ -1245,6 +1293,12 @@ export function registerHookControlIpc(): void {
   });
 
   log.info('hook-control ipc registered');
+}
+
+/** Read the current owner's already-loaded assignment without starting a transport. */
+export function readXCompanionAssignment(): { botId: string; enabled: boolean } | null {
+  const config = store?.get();
+  return config?.xCompanionBotId ? { botId: config.xCompanionBotId, enabled: config.xEnabled } : null;
 }
 
 /** Called after the current account DB is ready; app:ready-for-bot may retry it. */
