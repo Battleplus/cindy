@@ -387,6 +387,23 @@ describe('virtual workspace', () => {
     expect(workspace.mapOutputForAgent(Buffer.from(pathExpected))).toEqual(Buffer.from(pathValue));
   });
 
+  // 测试价值：mapExecServerParams 的程序名必须是原生路径；2026-10-22 含空格别名被
+  // Shell 引用后在 Windows 启动报 os error 123。旧用例未映射 argv[0]；unit 最小输入为一个程序路径。
+  it.each(['/home/agent/bin', 'C:\\Agent\\bin'])('maps executable aliases without shell quoting from %s', (virtual) => {
+    const programs = path.join(root, "Program Files 100% O'Brien");
+    const workspace = new ExecutorWorkspace({ workingDir: root, aliases: [{ from: virtual, to: programs }] });
+    const native = virtual.startsWith('C:') ? path.win32 : path.posix;
+    const params = mapExecServerParams({ argv: [native.join(virtual, 'tool.exe'), '--version'], cwd: pathToFileURL(root).href }, workspace, 'process/start');
+    expect(params).toEqual({ argv: [path.join(programs, 'tool.exe'), '--version'], cwd: pathToFileURL(root).href });
+  });
+
+  it('preserves native executable paths, PATH names, relative names and literal quote characters', () => {
+    const workspace = new ExecutorWorkspace({ workingDir: root, aliases: [{ from: '/agent/bin', to: path.join(root, 'Program Files') }] });
+    for (const executable of ['pwsh', path.join(root, 'Program Files', 'pwsh.exe'), './tool', '"/agent/bin/pwsh.exe"']) {
+      expect(mapExecServerParams({ argv: [executable] }, workspace, 'process/start')).toEqual({ argv: [executable] });
+    }
+  });
+
   it('maps Codex request paths and commands before permission checks and projects text file bytes', async () => {
     const { workspace, project, executor } = setup('/Users/agent/workspace');
     const params = mapExecServerParams({ path: 'file:///Users/agent/workspace/a.txt', dataBase64: Buffer.from(project).toString('base64') }, workspace);

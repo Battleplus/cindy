@@ -13,6 +13,67 @@ const REPO = path.resolve(__dirname, '../../../../../..');
 const CODEX = path.join(REPO, 'apps', 'codex-package-bin', process.platform + '-' + process.arch, 'bin', process.platform === 'win32' ? 'codex.exe' : 'codex');
 
 describe.skipIf(!fs.existsSync(CODEX))('native exec-server workspace projection', () => {
+  // 测试价值：经 ExecServerRelay → 原生 exec-server 启动含空格目录中的程序并验证 cwd/参数/退出码。
+  // 2026-10-22 argv[0] 被 Shell 引用导致 Windows os error 123；旧用例仅使用未映射的 process.execPath。
+  // 最小失败输入：虚拟程序目录别名指向 Program Files；e2e tier，真实子进程，不依赖用户账号。
+  it('starts an executable in a spaced directory through an alias, native path and PATH lookup', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-exec-argv-')));
+    const programs = path.join(root, 'Program Files');
+    const executableName = process.platform === 'win32' ? 'node.exe' : 'node';
+    const executable = path.join(programs, executableName);
+    fs.mkdirSync(programs);
+    fs.copyFileSync(process.execPath, executable);
+    fs.chmodSync(executable, 0o755);
+    const virtual = '/agent/programs';
+    const workspace = new ExecutorWorkspace({ workingDir: root, aliases: [{ from: virtual, to: programs }] });
+    const messages: Array<Record<string, any>> = [];
+    const actions: ExecutorAction[] = [];
+    let parts = '';
+    const relay = new ExecServerRelay({
+      codexPath: CODEX, cwd: root, workspace,
+      authorize: (action) => { actions.push(action); return { ok: true }; },
+      push: async (frames) => {
+        for (const frame of frames) {
+          if (frame.kind !== 'message') continue;
+          parts += frame.data;
+          if (!frame.more) { messages.push(JSON.parse(parts)); parts = ''; }
+        }
+      },
+    });
+    const send = (message: unknown) => relay.handle({ t: 'ws', connId: 'argv', kind: 'message', data: JSON.stringify(message) });
+    try {
+      relay.handle({ t: 'ws', connId: 'argv', kind: 'open', path: '/ws/exec-server' });
+      send({ id: 1, method: 'initialize', params: { clientName: 'cindy-test', clientVersion: '1' } });
+      await expect.poll(() => messages.find((item) => item.id === 1), { timeout: 5000 }).toBeDefined();
+      expect(messages.find((item) => item.id === 1)?.error).toBeUndefined();
+      send({ method: 'initialized', params: {} });
+      const args = ['space in argument', 'literal "double" and \'single\' quotes'];
+      for (const [index, program] of [`${virtual}/${executableName}`, executable, executableName].entries()) {
+        const id = index + 2;
+        const processId = `argv-${index}`;
+        send({ id, method: 'process/start', params: {
+          processId,
+          argv: [program, '-e', 'console.log(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(1) }))', ...args],
+          cwd: pathToFileURL(root).href,
+          env: { PATH: programs, ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, TEMP: os.tmpdir() } : {}) },
+          tty: false,
+        } });
+        await expect.poll(() => messages.find((item) => item.id === id), { timeout: 5000 }).toBeDefined();
+        expect(messages.find((item) => item.id === id)?.error).toBeUndefined();
+        await expect.poll(() => messages.find((item) => item.method === 'process/exited' && item.params.processId === processId), { timeout: 5000 }).toBeDefined();
+        expect(messages.find((item) => item.method === 'process/exited' && item.params.processId === processId)?.params.exitCode).toBe(0);
+        await expect.poll(() => messages.some((item) => item.method === 'process/closed' && item.params.processId === processId), { timeout: 5000 }).toBe(true);
+        const output = messages.filter((item) => item.method === 'process/output' && item.params.processId === processId)
+          .map((item) => Buffer.from(item.params.chunk, 'base64').toString()).join('');
+        expect(JSON.parse(output)).toEqual({ cwd: root, args });
+      }
+      expect(actions).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({ kind: 'exec', cwd: root })));
+    } finally {
+      relay.close();
+      await fsp.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
   it('initializes and executes with virtual paths while the file and authorization stay on this computer', async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-exec-projection-')));
     const project = path.join(root, 'project');
