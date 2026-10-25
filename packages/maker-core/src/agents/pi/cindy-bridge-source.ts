@@ -3342,6 +3342,20 @@ class CindyMcpGateway {
         reason: unavailableReason,
         availableServers: this.availableServers(),
       };
+    } else if (serverName && tools.length === 0) {
+      // 「这个 server 在网关里没有登记任何工具」必须先于工具匹配判定。未注册的
+      // server 若同时带了 tool，旧顺序会落进下面的 UNKNOWN_TOOL 分支，而此时
+      // tools 已按 server 过滤成空数组 —— availableTools 恒为 []，把「server
+      // 不存在」说成「工具名不对」，模型只会继续猜工具名而不会回头质疑 server
+      // （#6926）。前移到此处后，未知 server 无论是否带 tool 都统一回
+      // UNKNOWN_SERVER 并附上 availableServers / unavailableServers。
+      payload = {
+        ok: false,
+        errorCode: 'UNKNOWN_SERVER',
+        requested: serverName,
+        availableServers: this.availableServers(),
+        unavailableServers,
+      };
     } else if (serverName && toolName) {
       const selected = this.botMemoryFacadeEnabled && serverName === 'cindy_memory'
         ? undefined
@@ -3365,14 +3379,6 @@ class CindyMcpGateway {
           }],
         };
       }
-    } else if (serverName && tools.length === 0) {
-      payload = {
-        ok: false,
-        errorCode: 'UNKNOWN_SERVER',
-        requested: serverName,
-        availableServers: this.availableServers(),
-        unavailableServers,
-      };
     } else {
       payload = {
         ok: true,

@@ -2755,3 +2755,50 @@ it('removes cache fields only for an exact learned Chat Completions route and pr
   rules = '{bad-json';
   expect(adapt(original, model)).toBe(original);
 });
+
+// #6926 回归：未注册的 server 带上 tool 时，判定必须先看「server 存不存在」。
+// 旧顺序下 tools 已按 server 过滤成空数组，请求会落进 UNKNOWN_TOOL 分支，
+// 而 availableTools 恒为 [] —— 把「server 不存在」说成「工具名不对」，模型
+// 只会继续猜工具名。三个形态都要覆盖：未知 server、工具名写错、连接失败。
+it('reports an unknown MCP server as UNKNOWN_SERVER even when a tool name is supplied', () => {
+  const source = CINDY_BRIDGE_EXTENSION_SOURCE;
+  const compiled = ts.transpileModule(
+    source.slice(source.indexOf('const CINDY_MCP_LIST_TOOLS'), source.indexOf('async function connectServer'))
+      + '\n(globalThis as any).Gateway = CindyMcpGateway;',
+    { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const context: Record<string, any> = {
+    // 沙箱没有模块系统：bridge 顶部的 node:crypto import 在切片后丢失，
+    // 指纹计算用的 createHash 必须由宿主注入。
+    createHash,
+    recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
+    mcpContentToPi: (content: unknown) => content,
+  };
+  runInNewContext(compiled, context);
+  const client = { request: async () => ({ content: [] }) };
+  const gateway = new context.Gateway();
+  gateway.add('demo', client, [{ name: 'alpha' }, { name: 'beta' }]);
+  gateway.markUnavailable('down', 'connect refused');
+  const list = (params: unknown) => gateway.listResult(params).details as Record<string, any>;
+
+  // 未知 server + 任意 tool：报「server 不存在」，并附上可用 server 列表。
+  const unknown = list({ server: 'ghost', tool: 'whatever' });
+  expect(unknown).toMatchObject({ ok: false, errorCode: 'UNKNOWN_SERVER', requested: 'ghost' });
+  expect(unknown.availableServers).toContain('demo');
+  // 关键证据：不能再出现空的 availableTools（那正是「说成工具名不对」的载体）。
+  expect(unknown).not.toHaveProperty('availableTools');
+
+  // server 存在但工具名写错：仍是 UNKNOWN_TOOL，且带该 server 的真实工具名（非空）。
+  const wrongTool = list({ server: 'demo', tool: 'missing' });
+  expect(wrongTool).toMatchObject({ ok: false, errorCode: 'UNKNOWN_TOOL' });
+  expect(wrongTool.availableTools).toEqual(['alpha', 'beta']);
+
+  // 连接失败的 server + 任意 tool：仍是 SERVER_UNAVAILABLE 并带失败原因。
+  const unavailable = list({ server: 'down', tool: 'whatever' });
+  expect(unavailable).toMatchObject({ ok: false, errorCode: 'SERVER_UNAVAILABLE', reason: 'connect refused' });
+
+  // 正常路径不受影响：server 存在、工具名也对，仍照旧回工具 schema。
+  const ok = list({ server: 'demo', tool: 'alpha' });
+  expect(ok).toMatchObject({ ok: true });
+  expect(ok.tools).toHaveLength(1);
+});
