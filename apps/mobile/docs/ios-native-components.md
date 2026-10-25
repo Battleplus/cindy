@@ -7,7 +7,7 @@
 
 | 用户看到的位置 | 实际实现 | 边界与源码 |
 | --- | --- | --- |
-| 普通页面返回、任务顶栏及工具栏 | 原生导航栈、UINavigationBar、系统 toolbar item | 标题内容可嵌入 RN；首页 / 伙伴首页的顶栏布局仍是 RN。[入口](../src/platform/chrome/SimpleStackHeader.tsx)、[任务顶栏](../src/session/SessionHeaderNativeControls.ios.tsx) |
+| 普通页面返回、任务顶栏及工具栏 | 原生导航栈、UINavigationBar、系统 toolbar item | 标题内容可嵌入 RN；首页顶栏布局仍是 RN。[入口](../src/platform/chrome/SimpleStackHeader.tsx)、[任务顶栏](../src/session/SessionHeaderNativeControls.ios.tsx) |
 | 设备范围、任务显示等下拉菜单 | UIMenu | 菜单是系统的；触发按钮可由调用方提供。旧包缺原生模块时有自绘回退。[入口](../src/platform/chrome/NativePullDownMenu.tsx) |
 | 普通确认弹窗 | UIAlertController，经 React Native Alert 调用 | 自定义多步骤编辑不能一概算系统弹窗。[入口](../src/platform/chrome/showActionMenu.ts) |
 | 设置里的开关 | SwiftUI 系统开关，经 @expo/ui 使用 | 设置分组和说明布局仍是 RN，不代表整页 Settings 原生化。[实现](../src/platform/chrome/NativeSwitch.tsx) |
@@ -26,7 +26,7 @@
 | 位置 | 已原生的部分 | 仍然定制的部分 |
 | --- | --- | --- |
 | 任务详情面板 | 系统 BottomSheet、展开档位和拖拽关闭 | RN 内容、间距和业务信息布局；不能称整页系统 Form。[实现](../src/session/SessionDetailsNative.ios.tsx) |
-| 附件、伙伴等面板 | 原生 sheet；部分页面用 Form / Section / 原生按钮 | 某些资源块通过 RNHostView 嵌入 RN 内容。[公共外壳](../src/session/ComposerSheet.ios.tsx)、[伙伴内容桥](../src/session/CompanionNativeContent.ios.tsx) |
+| 附件、伙伴等面板 | 原生 sheet；部分页面用 Form / Section / 原生按钮 | 普通 RN 内容由原生 ScrollView 滚动，按内容高度桥接，footer 位于滚动区之外；自带 RN ScrollView 的导入、待办保留原有 RN 滚动路径及待办的位置保持。[公共外壳](../src/session/ComposerSheet.ios.tsx)、[伙伴内容桥](../src/session/CompanionNativeContent.ios.tsx) |
 | 消息输入器 | UITextView 编辑核心与选择/撤销，原生展开控制器 | Cindy 编写的原生引用/文档逻辑、业务工具栏；外框在可用系统上用原生 GlassView。[编辑器](../src/session/ComposerNativeInput.ios.tsx)、[外框](../src/session/ComposerFrame.ios.tsx) |
 | 底部动作菜单 | 自定义原生 UIViewController / UITableView + 系统 UISheetPresentationController；旧包回退系统 ActionSheetIOS | 不是每一种动作菜单都直接使用系统 UIAlertController；背景仅在 Liquid Glass 可用时透明，否则用系统分组底色。[模块](../modules/xdt-ios-action-sheet/ios/XdtIosActionSheetModule.swift) |
 

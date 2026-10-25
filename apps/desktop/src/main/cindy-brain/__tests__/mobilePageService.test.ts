@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { MobilePluginPages } from '../mobilePageService.js';
 import type { InstalledGhost } from '../../../shared/ghost.js';
 import { toGhostPluginDetail } from '../../../renderer/features/plugin/lib/ghostPluginViewModel.js';
-
+import { installedGhostStoragePart } from '../../../shared/pluginIdentity.js';
+import { parseRemoteResourceGetRequest, type PluginPageDocument } from '@cindy/device-link';
 function setup(
   projection: Pick<
     ConstructorParameters<typeof MobilePluginPages>[0],
@@ -23,6 +24,12 @@ function setup(
     enabled: true,
     approval: { state: 'approved', revision: 'r1' },
   } as InstalledGhost;
+  const ghosts = [ghost];
+  const setEnabled = vi.fn(async (id: string, enabled: boolean) => {
+    const target = ghosts.find((candidate) => installedGhostStoragePart(candidate) === id);
+    if (target) target.enabled = enabled;
+  });
+  const taskSettings = { read: vi.fn(() => ({} as never)), update: vi.fn(async () => ({} as never)) };
   const clearUnread = vi.fn(),
     post = vi.fn(),
     disconnect = vi.fn(async () => {}),
@@ -38,7 +45,7 @@ function setup(
       const captured = peerGeneration;
       return () => captured === peerGeneration;
     },
-    list: () => [ghost],
+    list: () => ghosts,
     revision: () => revision,
     captureOwner: () => {
       const expected = owner;
@@ -46,9 +53,8 @@ function setup(
     },
     unread: () => ({ at: unreadAt, summary: 'New course' }),
     clearUnread,
-    setEnabled: async (_id, enabled) => {
-      ghost.enabled = enabled;
-    },
+    setEnabled,
+    taskSettings,
     bundle: async () => [{ path: 'panel.html', mime: 'text/html', size: 3 }],
     asset: async () => ({ mime: 'text/html', base64: 'YWJj' }),
     connect: async () => {},
@@ -82,6 +88,9 @@ function setup(
     invoke,
     open,
     ghost,
+    ghosts,
+    setEnabled,
+    taskSettings,
     clearUnread,
     post,
     disconnect,
@@ -105,6 +114,21 @@ function setup(
   };
 }
 describe('mobile plugin pages', () => {
+  it.each([undefined, true, false])('projects task card visibility without removing task settings access: %s', async (showTaskPreferences) => {
+    const h = setup();
+    h.ghost.manifest.agent = { tasks: true };
+    h.ghost.manifest.showTaskPreferences = showTaskPreferences;
+    const context = { controllerDeviceId: 'phone-a' };
+    const client = { protocolVersion: 1, primitives: ['plugin-capabilities'] };
+    const ref = { collectionId: 'plugins', kind: 'plugin', id: 'practice' };
+    const detail = await h.provider.get!(context, { ref, client });
+    expect(detail.blocks?.find(block => block.id === 'capabilities')?.data)
+      .toMatchObject({ tasks: showTaskPreferences !== false });
+    expect(h.ghost.manifest.agent.tasks).toBe(true);
+    await h.invoke('task-settings:get');
+    expect(h.taskSettings.read).toHaveBeenCalledWith('practice', 'r1');
+  });
+
   it('adds usage facts to the existing capabilities block and preserves unknown setup on a failed read', async () => {
     const h = setup({
       setupAssessment: () => {
@@ -134,6 +158,40 @@ describe('mobile plugin pages', () => {
       },
     );
     expect(list.items[0].actions?.find((action) => action.id === 'enable')?.disabled).toBe(true);
+  });
+  it.each([true, false])('keeps same-name resource details and mutations instance-bound (root first: %s)', async (rootFirst) => {
+    const fixture = setup();
+    const root = { ...fixture.ghost, namespace: null, dir: '/ghosts/_ns/_root/practice',
+      manifest: { ...fixture.ghost.manifest, name: 'Root', agent: { tasks: true } } } as InstalledGhost;
+    const organization = { ...fixture.ghost, namespace: 'acme', dir: '/ghosts/practice',
+      manifest: { ...fixture.ghost.manifest, name: 'Organization', agent: { tasks: true } } } as InstalledGhost;
+    fixture.ghosts.splice(0, 1, ...(rootFirst ? [root, organization] : [organization, root]));
+    const context = { controllerDeviceId: 'phone-a' };
+    const client = { protocolVersion: 1, primitives: ['plugin-page'] };
+    const list = await fixture.provider.list(context, { collectionId: 'plugins', client });
+    expect(new Set(list.items.map((item) => item.ref.id)).size).toBe(2);
+    const ref = list.items.find((item) => item.display.title === 'Root')!.ref;
+    expect((await fixture.provider.get!(context, { ref, client })).display.title).toBe('Root');
+    const opened = await fixture.provider.invoke!(context, { collectionId: 'plugins', resourceRef: ref,
+      actionId: 'open:panel', input: {}, client });
+    expect((opened.result as PluginPageDocument).pluginId).toBe('_root__practice');
+    await fixture.provider.invoke!(context, { collectionId: 'plugins', resourceRef: ref,
+      actionId: 'task-settings:set', input: { permissionMode: 'auto' }, client });
+    expect(fixture.taskSettings.update).toHaveBeenCalledWith('_root__practice', 'r1', { permissionMode: 'auto' }, expect.any(Function));
+    await fixture.provider.invoke!(context, { collectionId: 'plugins', resourceRef: ref, actionId: 'disable', input: {}, client });
+    expect(fixture.setEnabled).toHaveBeenCalledWith('_root__practice', false);
+    expect(organization.enabled).toBe(true);
+  });
+  it('keeps the longest valid physical identity usable through the wire parser', async () => {
+    const fixture = setup();
+    fixture.ghost.namespace = 'a'.repeat(128);
+    fixture.ghost.manifest.id = 'p'.repeat(32);
+    fixture.ghost.dir = '/ghosts/_ns/' + fixture.ghost.namespace + '/' + fixture.ghost.manifest.id;
+    const context = { controllerDeviceId: 'phone-a' }, client = { protocolVersion: 1, primitives: ['plugin-page'] };
+    const list = await fixture.provider.list(context, { collectionId: 'plugins', client });
+    const request = parseRemoteResourceGetRequest({ ref: list.items[0].ref, client });
+    expect(request).not.toBeNull();
+    expect((await fixture.provider.get!(context, request!)).display.title).toBe('Practice');
   });
   it('keeps a covered native preview readable but rejects source writes, unread consumption and another controller', async () => {
     const h = setup(),
@@ -446,6 +504,8 @@ it('projects optional Host ordering facts without changing legacy lists on metad
 });
 
 
+// The real get projection must retain semantic icon keys alongside localized copy;
+// checking both prevents controllers from having to infer permission kinds from text.
 it('projects PC permission facts in the phone locale, excludes tools and keeps OAuth scopes', async () => {
   const h = setup();
   h.ghost.manifest.tools = [{name: 'calendar_events', description: 'Read events', parameters: {type: 'object'}}];
@@ -460,10 +520,14 @@ it('projects PC permission facts in the phone locale, excludes tools and keeps O
     ref: {collectionId: 'plugins', kind: 'plugin', id: 'practice'},
     client: {protocolVersion: 1, primitives: ['plugin-capabilities'], locale: 'zh-CN'},
   });
-  const facts = detail.blocks?.find(block => block.id === 'capabilities')?.data as {tools: unknown[]; permissions: Array<{title: string; description: string}>};
+  const facts = detail.blocks?.find(block => block.id === 'capabilities')?.data as {tools: unknown[]; permissions: Array<{kind?: string; labelKey?: string; title: string; description: string}>};
   expect(facts.tools).toEqual([{name: 'calendar_events', description: 'Read events'}]);
-  expect(facts.permissions.some(item => item.title.includes('calendar.example'))).toBe(true);
-  expect(facts.permissions.some(item => item.description.includes('calendar.read'))).toBe(true);
+  expect(facts.permissions.find(item => item.title.includes('calendar.example'))).toMatchObject({
+    kind: 'network', labelKey: 'networkHost',
+  });
+  expect(facts.permissions.find(item => item.description.includes('calendar.read'))).toMatchObject({
+    kind: 'network', labelKey: 'networkSecretOauth',
+  });
   expect(JSON.stringify(facts.permissions)).not.toContain('calendar_events');
   expect(JSON.stringify(facts.permissions)).not.toContain('public-client-id');
   expect(JSON.stringify(facts.permissions)).not.toContain('settings.ghosts.perm');
