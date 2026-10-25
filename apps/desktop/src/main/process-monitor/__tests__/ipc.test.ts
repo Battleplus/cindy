@@ -81,6 +81,7 @@ function register(overrides: Parameters<typeof registerProcessMonitorIpc>[0] = {
     resolveAgentProcessRegistration: (pid) => ({
       kind: 'claude',
       role: 'task-host',
+      sessionId: null,
       instanceId: `start:${pid}`,
     }),
     killProcessTree: vi.fn().mockReturnValue(true),
@@ -114,6 +115,71 @@ describe('process monitor IPC authorization', () => {
     expect(mocks.assertTrustedAppRendererEvent).toHaveBeenCalledTimes(3);
   });
 
+  it('Main retains but does not sample a hidden prewarm subscription', async () => {
+    const sample = vi.fn().mockResolvedValue({ capturedAtMs: 1, entries: [] });
+    const allowsSampling = vi.fn().mockReturnValue(false);
+    const sender = fakeSender();
+    register({ sampler: { sample }, allowsSampling });
+
+    await handlerFor(PROCESS_MONITOR_SUBSCRIBE_CHANNEL)({ sender });
+    await Promise.resolve();
+
+    expect(allowsSampling).toHaveBeenCalledWith(sender);
+    expect(sample).not.toHaveBeenCalled();
+    expect(sender.once).toHaveBeenCalledOnce();
+    expect(sender.send).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the Main sampling gate before each tick and before publishing', async () => {
+    let resolveFirstSample!: (sample: { capturedAtMs: number; entries: [] }) => void;
+    const firstSample = new Promise<{ capturedAtMs: number; entries: [] }>((resolve) => {
+      resolveFirstSample = resolve;
+    });
+    const sample = vi
+      .fn()
+      .mockImplementationOnce(() => firstSample)
+      .mockResolvedValue({ capturedAtMs: 2, entries: [] });
+    let allowed = true;
+    const sender = fakeSender();
+    register({ sampler: { sample }, allowsSampling: () => allowed, sampleIntervalMs: 5 });
+    const subscribe = handlerFor(PROCESS_MONITOR_SUBSCRIBE_CHANNEL);
+    const unsubscribe = handlerFor(PROCESS_MONITOR_UNSUBSCRIBE_CHANNEL);
+
+    await subscribe({ sender });
+    await vi.waitFor(() => expect(sample).toHaveBeenCalledOnce());
+    allowed = false;
+    resolveFirstSample({ capturedAtMs: 1, entries: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(sender.send).not.toHaveBeenCalled();
+    expect(sample).toHaveBeenCalledOnce();
+
+    allowed = true;
+    await vi.waitFor(() => expect(sample.mock.calls.length).toBeGreaterThan(1));
+    await unsubscribe({ sender });
+  });
+
+  it('logs a stable child-process source before the first Windows OS scan', async () => {
+    const scanOsProcesses = vi.fn().mockResolvedValue({ rows: [], childrenByParent: new Map() });
+    const log = { info: vi.fn(), warn: vi.fn() };
+    const sender = fakeSender();
+    register({
+      sampler: undefined,
+      scanOsProcesses,
+      platform: 'win32',
+      log,
+    });
+
+    await handlerFor(PROCESS_MONITOR_SUBSCRIBE_CHANNEL)({ sender });
+    await vi.waitFor(() => expect(scanOsProcesses).toHaveBeenCalledOnce());
+
+    expect(log.info).toHaveBeenCalledWith(
+      'Windows OS process scan requested by resource usage sampling',
+      { childProcessSource: 'process-monitor.windows-os-scan' },
+    );
+    expect(JSON.stringify(log.info.mock.calls)).not.toContain('-NoProfile');
+  });
+
   it('订阅后立即推送一帧;窗口不再可信时不推', async () => {
     const sample = { capturedAtMs: 7, entries: [] };
     const sampleNow = vi.fn().mockResolvedValue(sample);
@@ -138,6 +204,30 @@ describe('process monitor IPC authorization', () => {
     expect(sender.removeListener).toHaveBeenCalledTimes(1);
   });
 
+  it('does not fabricate an empty snapshot after failure and recovers on the next tick', async () => {
+    const recovered = { capturedAtMs: 8, entries: [] };
+    const sample = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('read ENOTCONN'), { code: 'ENOTCONN', syscall: 'read' }),
+      )
+      .mockResolvedValue(recovered);
+    const log = { info: vi.fn(), warn: vi.fn() };
+    const sender = fakeSender();
+    register({ sampler: { sample }, log, sampleIntervalMs: 5 });
+
+    await handlerFor(PROCESS_MONITOR_SUBSCRIBE_CHANNEL)({ sender });
+    await vi.waitFor(() => expect(sample).toHaveBeenCalledOnce());
+    expect(sender.send).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith('process monitor sample failed', {
+      error: 'read ENOTCONN',
+    });
+
+    await vi.waitFor(() => {
+      expect(sender.send).toHaveBeenCalledWith(PROCESS_MONITOR_SAMPLE_CHANNEL, recovered);
+    });
+  });
+
   it('反复切换面板时清理旧 destroyed 监听器', async () => {
     register();
     const sender = fakeSender();
@@ -154,6 +244,44 @@ describe('process monitor IPC authorization', () => {
     expect(sender.removeListener).toHaveBeenNthCalledWith(1, 'destroyed', expect.any(Function));
     expect(sender.removeListener).toHaveBeenNthCalledWith(2, 'destroyed', expect.any(Function));
   });
+
+  it('生产装配把 resolveSessionLabel 传入采样器,后续帧的 agent 条目带归属标题', async () => {
+    const sender = fakeSender();
+    register({
+      sampler: undefined,
+      platform: 'linux',
+      sampleIntervalMs: 10,
+      scanOsProcesses: vi.fn().mockResolvedValue({
+        rows: [osRow({ pid: 511, ppid: SELF_PID, cmdLineLower: 'pi-marker host' })],
+        childrenByParent: new Map(),
+      }),
+      classify: (cmd) => (cmd.includes('pi-marker') ? 'pi' : null),
+      resolveAgentProcessRegistration: (pid) => ({
+        kind: 'pi',
+        role: 'task-host',
+        sessionId: 'session-9',
+        instanceId: `start:${pid}`,
+      }),
+      resolveSessionLabel: (sessionId) =>
+        sessionId === 'session-9' ? Promise.resolve('写发布说明') : Promise.resolve(null),
+    });
+
+    await handlerFor(PROCESS_MONITOR_SUBSCRIBE_CHANNEL)({ sender });
+    // 标题查询在后台缓存,首帧可能还没有;轮询后续帧直到标题出现。
+    await vi.waitFor(
+      () => {
+        const withLabel = sender.send.mock.calls
+          .map((call) => call[1] as { entries: Array<{ pid: number; sessionLabel?: string }> })
+          .some((sample) =>
+            sample.entries.some(
+              (entry) => entry.pid === 511 && entry.sessionLabel === '写发布说明',
+            ),
+          );
+        expect(withLabel).toBe(true);
+      },
+      { timeout: 2_000, interval: 20 },
+    );
+  }, 5_000);
 });
 
 describe('terminate ownership validation', () => {
@@ -389,7 +517,7 @@ describe('terminate ownership validation', () => {
       }),
       classify: () => 'codex',
       resolveAgentProcessRegistration: () =>
-        role ? { kind: 'codex', role, instanceId: 'start:970' } : null,
+        role ? { kind: 'codex', role, sessionId: null, instanceId: 'start:970' } : null,
       killProcessTree: kill,
     });
     expect(() =>
@@ -421,6 +549,7 @@ describe('terminate ownership validation', () => {
       resolveAgentProcessRegistration: () => ({
         kind: 'claude',
         role: 'task-host',
+        sessionId: null,
         instanceId: 'spawn:new',
       }),
       killProcessTree: kill,

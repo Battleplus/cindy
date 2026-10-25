@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ScheduleRun } from '@cindy/maker-scheduler';
@@ -9,7 +9,7 @@ import type { SessionReference } from '../../../../../shared/sessionReference';
 import { RunHistoryCard } from '../RunHistoryCard';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { exists: () => true } }),
 }));
 
 afterEach(cleanup);
@@ -49,6 +49,17 @@ describe('RunHistoryCard 会话引用状态', () => {
 });
 
 describe('RunHistoryCard 前置检查结果', () => {
+  // A failed model selection is persisted in errorMsg, not an agent message.
+  // Verify this separate consumer also hides technical text behind details.
+  it('shows switch guidance with expandable diagnostics in failed run history', () => {
+    renderRun({ id: 'run-selection', scheduleId: 'schedule-1', firedAt: 1,
+      finishedAt: 2, status: 'failed', readAt: 2,
+      errorMsg: '[MODEL_SELECTION_UNAVAILABLE] Scheduled model test is unavailable' });
+    expect(screen.getByText('chat.remoteError.MODEL_SELECTION_UNAVAILABLE')).toBeTruthy();
+    expect(screen.queryByText(/Scheduled model test/)).toBeNull();
+    fireEvent.click(screen.getByText('chat.errorBanner.networkShowRaw'));
+    expect(screen.getByText(/Scheduled model test/)).toBeTruthy();
+  });
   it('通过结果显示摘要且默认折叠', () => {
     const { container } = renderRun({
       id: 'run-passed',
@@ -108,6 +119,56 @@ describe('RunHistoryCard 前置检查结果', () => {
 });
 
 describe('RunHistoryCard 费用展示', () => {
+  it('有真实费用时只显示费用，不同时显示估算价值或 Token', () => {
+    renderRun({
+      id: 'run-priced',
+      scheduleId: 'schedule-1',
+      firedAt: 1,
+      finishedAt: 11,
+      status: 'success',
+      costAttribution: 'exact',
+      costUsd: 0.12,
+      estimatedValueUsd: 0.2,
+      totalTokens: 12_400,
+    });
+
+    expect(screen.getByText('scheduler.runs.runCost')).toBeTruthy();
+    expect(screen.queryByText('scheduler.runs.runValue')).toBeNull();
+    expect(screen.queryByText('scheduler.runs.runTokens')).toBeNull();
+  });
+
+  it('只有估算价值时改为显示 Token 用量', () => {
+    renderRun({
+      id: 'run-estimate-only',
+      scheduleId: 'schedule-1',
+      firedAt: 1,
+      finishedAt: 11,
+      status: 'success',
+      costAttribution: 'exact',
+      estimatedValueUsd: 0.2,
+      totalTokens: 12_400,
+    });
+
+    expect(screen.getByText('scheduler.runs.runTokens')).toBeTruthy();
+    expect(screen.queryByText('scheduler.runs.runCost')).toBeNull();
+    expect(screen.queryByText('scheduler.runs.runValue')).toBeNull();
+  });
+
+  it('不可可靠计价但有 Token 事实时显示 Token 用量', () => {
+    renderRun({
+      id: 'run-unavailable-token-usage',
+      scheduleId: 'schedule-1',
+      firedAt: 1,
+      finishedAt: 11,
+      status: 'success',
+      costAttribution: 'unavailable',
+      totalTokens: 8_000,
+    });
+
+    expect(screen.getByText('scheduler.runs.runTokens')).toBeTruthy();
+    expect(screen.queryByText('scheduler.runs.costUnavailable')).toBeNull();
+  });
+
   it('不可可靠计价时不显示假 $0.00', () => {
     renderRun({
       id: 'run-unavailable-cost',

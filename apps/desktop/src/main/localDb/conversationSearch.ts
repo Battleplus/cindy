@@ -1,4 +1,5 @@
-import { and, count, desc, eq, gte, inArray, isNull, ne, or } from 'drizzle-orm';
+import { and, count, desc, eq, getTableColumns, gte, inArray, isNull, ne, or } from 'drizzle-orm';
+import { normalizeProjectOrderPath } from '@cindy/maker-shared/project-order-sync';
 
 import type {
   ConversationSearchAgentFilter,
@@ -13,17 +14,20 @@ import type {
   ConversationSearchStatusFilter,
 } from '../../shared/conversationSearch.js';
 import { conversationSearchTitle } from '../../shared/conversationSearch.js';
-import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../shared/sessionSource.js';
+import { DESKTOP_TASK_LIST_SESSION_SOURCES } from '../../shared/sessionSource.js';
+import type { SessionSource } from '../../shared/sessionSource.js';
 import { normalizeWorkingDirForGrouping } from '../../shared/workingDir.js';
 import { getDbClient } from './client/current.js';
-import { messages, sessions } from './schema.js';
+import { botProfiles, botSessionLinks, messages, projectAliases, sessions } from './schema.js';
 import { searchChatHistoryHybrid } from './chatHistorySearch.js';
 import { normalizeDbAgentKind } from '../../shared/agentKindConversion.js';
+import { visibleTextMatchesMessagesFtsQuery } from './chatHistorySearch.pure.js';
 import {
   collectContentHitsUntilUniqueSessions,
   fuzzyTitleMatch,
   mergeConversationSearchResults,
   normalizeConversationContentPreview,
+  visibleMessageTextForConversationSearch,
 } from './conversationSearch.pure.js';
 
 const DEFAULT_LIMIT = 20;
@@ -45,10 +49,26 @@ const LAST_ACTIVITY_DAY_COUNTS: Record<
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-type SessionRow = typeof sessions.$inferSelect;
+type SessionRow = typeof sessions.$inferSelect & {
+  companionId: string | null;
+  companionName: string | null;
+  companionStatus: string | null;
+  companionRole: typeof botSessionLinks.$inferSelect.role | null;
+};
+
+export interface ConversationSearchHostScope {
+  /**
+   * Main-owned source scope. Undefined includes normal tasks and linked personal
+   * companion chats; null permits every source only when another authoritative
+   * filter (for example Bot-owned Session ids) already constrains the query.
+   */
+  sessionSources?: readonly SessionSource[] | null;
+  remoteVisibleOnly?: boolean;
+}
 
 export async function searchConversations(
   request: ConversationSearchRequest,
+  hostScope: ConversationSearchHostScope = {},
 ): Promise<ConversationSearchResponse> {
   const query = request.query.trim();
   if (!query) {
@@ -63,6 +83,9 @@ export async function searchConversations(
 
   const limit = clampLimit(request.limit);
   const filters = normalizeFilters(request);
+  // Linked personal history may retain an imported IM source. Candidate selection
+  // below owns the boundary; content retrieval uses those exact ids.
+  const sessionSources = hostScope.sessionSources ?? null;
   const sortBy = normalizeSortBy(request.sortBy);
   const skipVector = request.semanticMode === 'keyword';
   if (filters.sessionIds && filters.sessionIds.length === 0) {
@@ -74,7 +97,23 @@ export async function searchConversations(
       poolCapped: false,
     };
   }
-  const sessionRows = applyWorkingDirFilter(await listSearchableSessions(filters), filters.workingDirs);
+  // Remote callers cannot expand alias hits from their bounded home cache.
+  // Read the host's local aliases alongside the full, already-authorized candidate
+  // set, before ranking/limiting. Local renderer search keeps its existing behavior.
+  const [candidates, aliasRows] = await Promise.all([
+    listSearchableSessions(filters, hostScope.sessionSources, hostScope.remoteVisibleOnly),
+    hostScope.remoteVisibleOnly
+      ? getDbClient().drizzle.select().from(projectAliases).orderBy(desc(projectAliases.updatedAt))
+      : Promise.resolve([]),
+  ]);
+  const aliasesByPath = new Map<string, string>();
+  for (const row of aliasRows) {
+    if (!row.projectKey.startsWith('local:') || !row.projectKey.slice(6).trim() || !row.alias.trim()) continue;
+    const path = normalizeProjectOrderPath(row.projectKey.slice(6));
+    // Same newest-first identity resolution as the mobile alias snapshot.
+    if (!aliasesByPath.has(path)) aliasesByPath.set(path, row.alias.trim().toLowerCase());
+  }
+  const sessionRows = applyWorkingDirFilter(candidates, filters.workingDirs);
   if (sessionRows.length === 0) {
     return {
       query,
@@ -96,7 +135,12 @@ export async function searchConversations(
       // 文案,拿原始哨兵匹配会两头错位 —— 搜可见文案一条都搜不到,搜 "New Maker" 反而
       // 命中一堆不显示这个词的行,高亮下标也会落在别的字上(PR #1031 review P1)。
       // renderer 渲染时调同一个 conversationSearchTitle,两端逐字一致。
-      const match = fuzzyTitleMatch(conversationSearchTitle(row.title, request.unnamedLabel), query);
+      let match = fuzzyTitleMatch(conversationSearchTitle(row.title, request.unnamedLabel), query);
+      if (!match && row.workspaceKind === 'project' && !row.remoteHostId && row.workingDir
+        && aliasesByPath.get(normalizeProjectOrderPath(row.workingDir))?.includes(query.toLowerCase())) {
+        // Alias-only hits have no highlight positions in the task's title.
+        match = { score: 0, indices: [] };
+      }
       if (!match) return null;
       const session = sessionSummaries.get(row.id);
       if (!session) return null;
@@ -112,10 +156,11 @@ export async function searchConversations(
     filters,
     activityCutoff,
     skipVector,
+    sessionSources,
   });
 
   const contentMessageIds = content.hits.map((hit) => hit.messageId);
-  const clientIdByMessageId = await fetchClientIds(contentMessageIds);
+  const messageById = await fetchHitMessages(contentMessageIds);
   const contentHits: Array<{
     session: ConversationSearchSessionSummary;
     hit: ConversationSearchContentHit;
@@ -124,11 +169,24 @@ export async function searchConversations(
   for (const hit of content.hits) {
     const session = sessionSummaries.get(hit.sessionId);
     if (!session) continue;
-    const messageClientId = clientIdByMessageId.get(hit.messageId);
+    const message = messageById.get(hit.messageId);
+    const messageClientId = message?.clientId;
     if (!messageClientId) continue;
     const hitContext = hit.context.find((item) => item.isHit) ?? hit.context[0] ?? null;
-    const preview = normalizeConversationContentPreview(hit.role, hitContext?.content ?? '', query);
-    const ftsRank = preview.keywordMatchedVisibleText ? hit.ftsRank : null;
+    const preview = normalizeConversationContentPreview(hit.role, hitContext?.content ?? '', query, 180, message?.agentMeta);
+    // 可见文本对 query 字面不匹配时，仍可能是 FTS 命中（「边，界」按字相邻）。
+    // 不要只靠 keywordRanges 清掉 ftsRank，否则这类命中会被整条丢弃。
+    // 但附件文件名、内部 citation 等隐藏字段命中不能当可见结果：
+    // preview 非空只说明消息有正文，不能证明 MATCH 落在可见字上。
+    const visibleText = visibleMessageTextForConversationSearch(
+      hit.role,
+      hitContext?.content ?? '',
+      message?.agentMeta,
+    );
+    const ftsRank =
+      preview.keywordMatchedVisibleText || visibleTextMatchesMessagesFtsQuery(visibleText, query)
+        ? hit.ftsRank
+        : null;
     if (ftsRank === null && hit.vectorRank === null) continue;
     contentHits.push({
       session,
@@ -164,6 +222,7 @@ async function searchContentUntilUniqueSessions({
   filters,
   activityCutoff,
   skipVector,
+  sessionSources,
 }: {
   query: string;
   limit: number;
@@ -171,6 +230,7 @@ async function searchContentUntilUniqueSessions({
   filters: NormalizedConversationSearchFilters;
   activityCutoff: number | null;
   skipVector: boolean;
+  sessionSources: readonly SessionSource[] | null;
 }) {
   const targetUniqueSessions = Math.min(limit * 2, allowedSessionIds.length);
   const queryEmbeddingCache = new Map<string, number[]>();
@@ -190,7 +250,7 @@ async function searchContentUntilUniqueSessions({
       contextRadius: 0,
       limit: pageLimit,
       offset,
-      sessionSources: DESKTOP_VISIBLE_SESSION_SOURCES,
+      sessionSources,
       sessionStatuses: sessionStatusesForFilter(filters.status),
       excludeCleared: true,
       sessionActivityFromMs: activityCutoff,
@@ -288,27 +348,66 @@ function normalizeSortBy(value: ConversationSearchSortBy | undefined): Conversat
   return value === 'activityDesc' || value === 'activityAsc' ? value : 'relevance';
 }
 
-async function listSearchableSessions(filters: NormalizedConversationSearchFilters): Promise<SessionRow[]> {
+async function listSearchableSessions(
+  filters: NormalizedConversationSearchFilters,
+  sessionSources: readonly SessionSource[] | null | undefined,
+  remoteVisibleOnly = false,
+): Promise<SessionRow[]> {
+  if (sessionSources != null && sessionSources.length === 0) return [];
   const db = getDbClient().drizzle;
   const statusCond = statusCondition(filters.status);
   const agentCond = filters.agentKind === 'all' ? undefined : eq(sessions.agentKind, filters.agentKind);
   const sessionIdsCond = filters.sessionIds ? inArray(sessions.id, filters.sessionIds) : undefined;
   const workerCond = or(isNull(sessions.orcaRole), ne(sessions.orcaRole, 'worker'));
+  // 插件后台隐藏任务不进入任何会话搜索；用户从插件详情页「后台任务」查看与接手。
+  const visibleCond = isNull(sessions.hiddenAt);
   const activityCutoff = cutoffForLastActivity(filters.lastActivity);
   // 兼容存量 DB 行：旧版 touchUserSendInDb 只写 user_send_at 不 bump updated_at，
   // 侧栏排序用 max(userSendAt, updatedAt)，这里也同步用 OR 避免漏掉这些行。
   const activityCond = activityCutoff === null
     ? undefined
     : or(gte(sessions.updatedAt, activityCutoff), gte(sessions.userSendAt, activityCutoff));
+  const personalChat = and(
+    inArray(botSessionLinks.role, remoteVisibleOnly
+      ? ['canonical', 'history']
+      : ['canonical', 'history', 'channel']),
+    ne(botProfiles.status, 'deleting'),
+  );
   return db
-    .select()
+    .select({
+      ...getTableColumns(sessions),
+      companionId: botProfiles.id,
+      companionName: botProfiles.displayName,
+      companionStatus: botProfiles.status,
+      companionRole: botSessionLinks.role,
+    })
     .from(sessions)
+    .leftJoin(botSessionLinks, eq(botSessionLinks.sessionId, sessions.id))
+    .leftJoin(botProfiles, eq(botProfiles.id, botSessionLinks.botId))
     .where(and(
-      inArray(sessions.source, DESKTOP_VISIBLE_SESSION_SOURCES),
+      sessionSources === undefined
+        ? or(inArray(sessions.source, DESKTOP_TASK_LIST_SESSION_SOURCES), personalChat)
+        : sessionSources === null ? undefined : inArray(sessions.source, sessionSources),
+      // Group lanes remain private to their group. IM lanes are searchable on
+      // their own computer only, including migrated lanes with ordinary sources.
+      or(
+        isNull(botSessionLinks.role),
+        and(ne(botSessionLinks.role, 'group'), ne(botSessionLinks.role, 'channel')),
+        remoteVisibleOnly ? undefined : and(
+          eq(botSessionLinks.role, 'channel'),
+          ne(botProfiles.status, 'deleting'),
+        ),
+      ),
+      remoteVisibleOnly ? or(isNull(botProfiles.id), eq(botSessionLinks.role, 'delegation'), and(
+        or(isNull(botProfiles.hiddenAt), eq(botProfiles.hiddenAt, 0)),
+        ne(botProfiles.status, 'archived'),
+        ne(botProfiles.status, 'deleting'),
+      )) : undefined,
       statusCond,
       agentCond,
       sessionIdsCond,
       workerCond,
+      visibleCond,
       activityCond,
     ))
     .orderBy(desc(sessions.updatedAt));
@@ -346,13 +445,13 @@ async function fetchMessageCounts(sessionIds: string[]): Promise<Map<string, num
   return new Map(rows.map((row) => [row.sessionId, Number(row.cnt)]));
 }
 
-async function fetchClientIds(messageIds: string[]): Promise<Map<string, string>> {
+async function fetchHitMessages(messageIds: string[]): Promise<Map<string, { clientId: string; agentMeta: string | null }>> {
   if (messageIds.length === 0) return new Map();
   const rows = await getDbClient().drizzle
-    .select({ id: messages.id, clientId: messages.clientId })
+    .select({ id: messages.id, clientId: messages.clientId, agentMeta: messages.agentMeta })
     .from(messages)
     .where(inArray(messages.id, messageIds));
-  return new Map(rows.map((row) => [row.id, row.clientId]));
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
 function sessionSummaryFromRow(
@@ -369,6 +468,16 @@ function sessionSummaryFromRow(
     source: row.source,
     orcaRole: row.orcaRole,
     parentSessionId: row.parentSessionId,
+    ...(row.companionId && row.companionName != null
+      && (row.companionRole === 'canonical' || row.companionRole === 'history' || row.companionRole === 'channel')
+      ? { companion: {
+          id: row.companionId,
+          name: row.companionName,
+          role: row.companionRole,
+          readOnly: row.companionRole === 'history' || row.companionRole === 'channel'
+            || row.status !== 'active' || row.companionStatus !== 'active',
+        } }
+      : {}),
     userSendAt: row.userSendAt === null ? null : new Date(row.userSendAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
     createdAt: new Date(row.createdAt).toISOString(),

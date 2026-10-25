@@ -4,6 +4,11 @@ import { resolveDesktopDevRegion } from './shared/desktop-dev-region.mjs';
 
 export const DESKTOP_DEV_VERDICT_PREFIX = 'DESKTOP_DEV_VERDICT';
 export const WORKTREE_ISOLATED_ARG = '--isolated=@worktree';
+export const SHARED_USERDATA_ARG = '--shared';
+export const DEFAULT_ISOLATED_ARG = '--isolated=dev';
+/** `--mock`: login-free UI mock data, in its own sandbox unless one is named. */
+export const UI_MOCK_ARG = '--mock';
+export const UI_MOCK_ISOLATED_ARG = '--isolated=ui-mock';
 const WORKTREE_NAME_DIGEST_LEN = 6;
 
 const VERDICT_FIELDS = Object.freeze([
@@ -15,6 +20,7 @@ const VERDICT_FIELDS = Object.freeze([
   'pid',
   'region',
   'message',
+  'log',
   'next',
 ]);
 
@@ -89,6 +95,36 @@ export function resolveIsolatedArg(isolatedArg, rootDir, options) {
   return isolatedArg;
 }
 
+/**
+ * Dev restart defaults to one stable isolated sandbox shared by every
+ * checkout. The legacy official profile remains opt-in via --shared.
+ */
+export function normalizeDesktopRestartArgv(argv = [], env = process.env) {
+  if (argv.some((arg) => arg === '--isolated' || arg.startsWith('--isolated='))) {
+    return argv;
+  }
+  if (env.XDT_ISOLATED === '1') return argv;
+  if (argv.includes(SHARED_USERDATA_ARG) || argv.includes('--preserve-running')) {
+    return argv;
+  }
+  return [...argv, argv.includes(UI_MOCK_ARG) ? UI_MOCK_ISOLATED_ARG : DEFAULT_ISOLATED_ARG];
+}
+
+export function desktopRestartArgvConflictMessage(argv = [], env = process.env) {
+  if (argv.includes(UI_MOCK_ARG)
+    && (argv.includes(SHARED_USERDATA_ARG) || argv.includes('--preserve-running'))) {
+    return '--mock writes demo tasks and only runs in an isolated sandbox; drop --shared / --preserve-running';
+  }
+  if (!argv.includes(SHARED_USERDATA_ARG)) return null;
+  if (
+    argv.some((arg) => arg === '--isolated' || arg.startsWith('--isolated='))
+    || env.XDT_ISOLATED === '1'
+  ) {
+    return '--shared cannot be combined with --isolated or XDT_ISOLATED=1';
+  }
+  return null;
+}
+
 export function shouldSuggestIsolatedNext({ isolated, code } = {}) {
   return !isolated && SHARED_FAILURE_CODES_WITH_ISOLATED_NEXT.has(code);
 }
@@ -130,7 +166,9 @@ export function printDesktopDevVerdict(verdict, writer = console.log) {
 }
 
 function isolatedNextIfNeeded(context, code) {
-  return shouldSuggestIsolatedNext({ isolated: context.isolated, code })
+  // 默认 dev 沙箱跨 checkout 共用：被另一个 worktree 的实例占着时，换成本 worktree
+  // 自己的沙箱就能并行启动，不必停掉别人的实例。
+  return code === 'USERDATA_IN_USE' || shouldSuggestIsolatedNext({ isolated: context.isolated, code })
     ? { next: isolatedRestartNextCommand(context) }
     : {};
 }
@@ -188,6 +226,7 @@ export function buildDesktopDevVerdictFromFailure(error, context = {}) {
     mode: context.isolated ? 'isolated' : 'shared',
     ...(context.sandbox ? { sandbox: context.sandbox } : {}),
     ...(context.rootDir ? { root: context.rootDir } : {}),
+    ...(context.log ? { log: context.log } : {}),
     ...isolatedNextIfNeeded(context, code),
   };
 }

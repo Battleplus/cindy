@@ -34,6 +34,21 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Collect system/developer messages in order and emit a single leading system message. */
+export function coalesceLeadingSystemMessages(messages: ChatMessage[]): ChatMessage[] {
+  const systems: string[] = [];
+  const rest: ChatMessage[] = [];
+  for (const message of messages) {
+    if (message.role === 'system' || message.role === 'developer') {
+      if (message.content) systems.push(message.content);
+      continue;
+    }
+    rest.push(message);
+  }
+  if (systems.length === 0) return messages;
+  return [{ role: 'system', content: systems.join('\n\n') }, ...rest];
+}
+
 function cloneToolCallExtraContent(value: unknown): ChatToolCallExtraContent | undefined {
   if (!isPlainObject(value)) return undefined;
   const { google, ...rest } = value;
@@ -639,6 +654,25 @@ function translateInput(input: ResponsesRequest['input'], opts: TranslateInputOp
       continue;
     }
 
+    if (item.type === 'web_search_call') {
+      if (
+        record.status !== 'completed'
+        || !isPlainObject(record.action)
+        || typeof record.action.type !== 'string'
+        || !record.action.type.trim()
+      ) throw new UnsupportedResponsesFeatureError("input item 'web_search_call'");
+      const message: ChatMessage = {
+        role: 'assistant',
+        content: '[completed web search]\n' + JSON.stringify(record.action),
+      };
+      if ((assistant?.tool_calls?.length ?? 0) > 0 || pendingToolCalls.length > 0) {
+        deferredBarriers.push(message);
+      } else {
+        pushBarrier(message);
+      }
+      continue;
+    }
+
     if (item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call') {
       if (!assistant && pendingToolCalls.length > 0) closeUnresolvedToolRound();
       const callId = typeof record.call_id === 'string' && record.call_id
@@ -924,6 +958,10 @@ export function translateResponsesRequestWithContext(
         throw new UnsupportedResponsesFeatureError(`instructions[${index}].${part.type}`);
       }).join('');
     if (instructions) messages.unshift({ role: developerRole, content: instructions });
+  }
+  if (capabilities.systemMessagePolicy === 'coalesce-leading') {
+    const coalesced = coalesceLeadingSystemMessages(messages);
+    messages.splice(0, messages.length, ...coalesced);
   }
 
   const request: ChatCompletionsRequest = {

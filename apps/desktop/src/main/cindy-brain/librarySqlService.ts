@@ -1,7 +1,7 @@
 /**
  * librarySqlService.ts — 主进程侧的插件 Library SQLite RPC 服务。
  * ---------------------------------------------------------------------------
- * 每个声明 library 槽的插件一个 LibrarySqlService 实例(槽层在 commit 4 装配):
+ * 每个声明 library 能力的插件一个 LibrarySqlService 实例(分派层装配):
  *   - 语句门在**发送前**执行(main 侧第一道,worker 内 core 复读第二道);
  *   - worker 经 worker_threads 拉起(脚本 = 构建产出的 libraryDbWorker.js,
  *     与 main 输出同目录;better-sqlite3 模块路径由调用方注入,解析方式与
@@ -27,6 +27,8 @@ export interface LibrarySqlServiceDeps {
   workerScriptPath(): string;
   /** better-sqlite3 模块绝对路径(生产 = resolveBetterSqliteModuleEntry)。 */
   betterSqliteModulePath(): string;
+  /** Separate Electron native binding selected by Main (Node/package default when absent). */
+  betterSqliteNativeBinding?(): string | undefined;
   /** 进程内执行体(单测注入;缺省时拉真 worker)。 */
   createCore?: (DatabaseCtor: SqliteDatabaseConstructor) => ReturnType<typeof createLibraryDbCore>;
   /** 进程内构造器(仅当 createCore 提供时使用;测试直连 require 结果)。 */
@@ -62,7 +64,10 @@ export class LibrarySqlService {
     if (this.core) throw new Error('in-process mode has no worker');
     if (!this.worker) {
       const worker = new Worker(this.deps.workerScriptPath(), {
-        workerData: { betterSqliteModulePath: this.deps.betterSqliteModulePath() },
+        workerData: {
+          betterSqliteModulePath: this.deps.betterSqliteModulePath(),
+          betterSqliteNativeBinding: this.deps.betterSqliteNativeBinding?.(),
+        },
       });
       this.worker = worker;
       worker.on('message', (reply: WorkerReply) => {

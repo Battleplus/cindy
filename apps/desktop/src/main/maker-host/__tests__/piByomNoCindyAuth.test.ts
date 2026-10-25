@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ loggedIn: false, sharedSkillRefreshes: 0 }));
+const state = vi.hoisted(() => ({ loggedIn: false, proxyReady: true, sharedSkillRefreshes: 0 }));
+const ensureLocalReady = vi.hoisted(() => vi.fn());
+vi.mock('../../local-model-runtime/preflight.js', () => ({
+  ensureManagedOllamaReadyForSession: ensureLocalReady,
+}));
 
 vi.mock('electron', () => ({
   app: {
@@ -33,6 +37,18 @@ vi.mock('../custom-provider-header-secrets.js', () => ({
       },
     },
     {
+      id: 'openrouter-oauth',
+      name: 'OpenRouter OAuth',
+      auth: { method: 'oauth', oauth: { authorizeUrl: 'https://openrouter.ai/auth' } },
+      runtimes: {
+        pi: {
+          baseUrl: 'https://openrouter.ai/api/v1',
+          wireProtocol: 'openai-chat',
+          models: [{ id: 'google/gemini-test', api: 'openai-completions' }],
+        },
+      },
+    },
+    {
       id: 'xai',
       name: 'Legacy custom xAI',
       auth: { method: 'apiKey' },
@@ -47,6 +63,7 @@ vi.mock('../custom-provider-header-secrets.js', () => ({
   ],
 }));
 vi.mock('../../secrets/providerSecretStore.js', () => ({
+  setMivoSecretAliasVerifier: vi.fn(),
   readCustomProviderKey: (providerId: string) =>
     providerId === 'xai' ? 'legacy-custom-key' : null,
 }));
@@ -56,13 +73,38 @@ vi.mock('../grok-oauth-login.js', () => ({
   peekGrokAccessToken: () => (state.loggedIn ? 'grok-test-token' : null),
   recoverGrokAuthAfterRejection: async () => 'superseded' as const,
 }));
+vi.mock('../anthropic-compat-proxy-host.js', () => ({
+  getClaudeEndpoint: () => 'http://127.0.0.1:18765',
+  isAnthropicCompatProxyHandleReady: () => state.proxyReady,
+}));
 
 import { desktopPiAuthAdapter, resolvePiNativeProviders } from '../pi-host.js';
 
 describe('Pi pure BYOM auth without a Cindy account', () => {
   beforeEach(() => {
     state.loggedIn = false;
+    state.proxyReady = true;
     state.sharedSkillRefreshes = 0;
+    ensureLocalReady.mockReset();
+  });
+
+  it.each(['cindy-local-llamacpp', 'cindy-local-ollama'])('starts %s on demand during local Pi provider resolution only', async providerId => {
+    await resolvePiNativeProviders({ workingDir: '/tmp/project', providerId, model: 'local-model' });
+    expect(ensureLocalReady).toHaveBeenCalledWith(expect.objectContaining({ providerId, remoteHostId: null }));
+    ensureLocalReady.mockClear();
+    await resolvePiNativeProviders({ workingDir: '/tmp/project', providerId, model: 'local-model', purpose: 'preview' });
+    expect(ensureLocalReady).not.toHaveBeenCalled();
+    await resolvePiNativeProviders({ workingDir: '/remote/project', providerId, model: 'local-model', remoteHostId: 'remote-1' });
+    expect(ensureLocalReady).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when an official SuperGrok route has no local compat proxy', async () => {
+    state.proxyReady = false;
+    await expect(resolvePiNativeProviders({
+      workingDir: '/tmp/project',
+      providerId: 'xai',
+      model: 'grok-4.6',
+    })).rejects.toThrow('local compatibility proxy is not ready');
   });
 
   it('refreshes local shared skills before provider resolution and skips remote homes', async () => {
@@ -118,9 +160,9 @@ describe('Pi pure BYOM auth without a Cindy account', () => {
 
     expect(resolved.providers).toContainEqual(
       expect.objectContaining({
-        id: 'cindy-byom-xai',
+        id: 'xai',
         sourceProviderId: 'xai',
-        baseUrl: expect.not.stringContaining('private-xai.example'),
+        baseUrl: 'http://127.0.0.1:18765/v1',
       }),
     );
     expect(resolved.providers).toContainEqual(
@@ -148,5 +190,17 @@ describe('Pi pure BYOM auth without a Cindy account', () => {
       }),
     );
     expect(Object.values(resolved.env)).toContain('legacy-custom-key');
+  });
+
+  it('does not give remote OAuth Pi a local proxy endpoint', async () => {
+    const resolved = await resolvePiNativeProviders({
+      workingDir: '/remote/project',
+      remoteHostId: 'remote-1',
+      providerId: 'openrouter-oauth',
+      model: 'google/gemini-test',
+    });
+    expect(resolved.providers.some((provider) => provider.id.includes('openrouter-oauth'))).toBe(false);
+    expect(resolved.providers.some((provider) =>
+      provider.baseUrl?.includes('127.0.0.1:18765') && !provider.hostProxyForward)).toBe(false);
   });
 });

@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { ErrorNotice } from '@/components/ui/error-notice';
+import { Button } from '@/components/ui/button';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useSettingsSearchNavigation } from './SettingsSearchNavigation';
+import { DefaultOverrideControls } from './DefaultOverrideControls';
+import { VoiceSpeakerFilterCard } from './VoiceSpeakerFilterCard';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -10,6 +15,7 @@ import { Tip } from '@/components/ui/tooltip';
 import { useAuth } from '@/contexts/AuthContext';
 import { SUPPORTED_LOCALES } from '@/i18n';
 import { createLogger } from '@/lib/logger';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { cn } from '@/lib/utils';
 import { extractIpcError } from '@/utils/ipcError';
 import { dictionaryTermKey } from '@cindy/voice-input-core';
@@ -44,6 +50,11 @@ import {
 } from '@/voice-input/appShortcutConflict';
 import { findComposerVoiceInputConflict } from '@/voice-input/composerVoiceInputConflict';
 import { shouldShowInputMonitoringBadge } from '@/voice-input/inputMonitoringBadge';
+import {
+  formatVoiceInputDictionaryAliasDraft,
+  parseVoiceInputDictionaryAliasDraft,
+  voiceInputDictionaryEntryMatches,
+} from '@/voice-input/dictionaryEditor';
 import {
   createVoiceInputModifierShortcut,
   createVoiceInputShortcutFromEvent,
@@ -111,12 +122,14 @@ interface VoiceInputSelectProps<T extends string> {
 }
 
 interface VoiceInputCardProps {
+  id?: string;
   title: ReactNode;
   action?: ReactNode;
   children: ReactNode;
 }
 
 interface VoiceInputInlineSettingRowProps {
+  id?: string;
   label: ReactNode;
   labelAction?: ReactNode;
   hint?: ReactNode;
@@ -159,17 +172,6 @@ function formatUsd(costUsd: number): string {
   if (!Number.isFinite(costUsd) || costUsd <= 0) return '$0.00';
   if (costUsd < 0.01) return '<$0.01';
   return `$${costUsd.toFixed(2)}`;
-}
-
-function dictionaryEntryMatches(
-  entry: VoiceInputDictionaryEntry,
-  filter: DictionaryFilter,
-  query: string,
-): boolean {
-  if (filter !== 'all' && entry.source !== filter) return false;
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  if (!normalizedQuery) return true;
-  return entry.text.toLocaleLowerCase().includes(normalizedQuery);
 }
 
 function dictionarySourceIcon(source: VoiceInputDictionaryEntrySource): ReactNode {
@@ -225,7 +227,7 @@ function VoiceInputSelect<T extends string>({
                 {selectedOption?.label}
               </span>
               {selectedOption?.description ? (
-                <span className="truncate text-12 leading-[1.25] text-[var(--settings-section-sublabel)] opacity-75">
+                <span className="truncate text-12 leading-[1.25] text-[var(--text-secondary)]">
                   {selectedOption.description}
                 </span>
               ) : null}
@@ -301,9 +303,10 @@ function VoiceInputSelect<T extends string>({
   );
 }
 
-function VoiceInputCard({ title, action, children }: VoiceInputCardProps) {
+function VoiceInputCard({ id, title, action, children }: VoiceInputCardProps) {
   return (
     <section
+      id={id}
       className={cn(
         'flex flex-col gap-4 rounded-xl p-4',
         'bg-[var(--settings-theme-card-bg)]',
@@ -326,6 +329,7 @@ function VoiceInputCard({ title, action, children }: VoiceInputCardProps) {
 }
 
 function VoiceInputInlineSettingRow({
+  id,
   label,
   labelAction,
   hint,
@@ -334,6 +338,7 @@ function VoiceInputInlineSettingRow({
 }: VoiceInputInlineSettingRowProps) {
   return (
     <div
+      id={id}
       className={cn(
         'grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,320px)] sm:items-center',
         className,
@@ -350,7 +355,7 @@ function VoiceInputInlineSettingRow({
           {labelAction ? <div className="shrink-0">{labelAction}</div> : null}
         </div>
         {hint ? (
-          <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+          <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
             {hint}
           </p>
         ) : null}
@@ -369,20 +374,18 @@ function VoiceInputInlineSettingRow({
  */
 function VoiceInputServiceSourceCard() {
   const { t } = useTranslation();
+  const customAsrUrlErrorId = useId();
   const { mode: appMode } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const {
     ready,
     selection,
     asrProfiles,
-    refinerProfiles,
     readiness,
     customAsrApiKeyConfigured,
     saving,
     setServiceMode,
     setAsrProvider,
-    setRefinerProvider,
-    setRefinerFallbackProvider,
     saveCustomAsr,
     clearCustomAsrApiKey,
     resetToDefault,
@@ -447,6 +450,12 @@ function VoiceInputServiceSourceCard() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
+  const openPersonalizationTab = useCallback(() => {
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', 'personalization');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+
   const modeOptions = useMemo<ReadonlyArray<VoiceInputSelectOption<VoiceInputServiceModeData>>>(() => {
     const byokOption: VoiceInputSelectOption<VoiceInputServiceModeData> = {
       value: 'byok',
@@ -489,31 +498,11 @@ function VoiceInputServiceSourceCard() {
       }))
   ), [asrProfiles, credentialSourceLabel, t]);
 
-  const refinerOptions = useMemo<ReadonlyArray<VoiceInputSelectOption<string>>>(() => (
-    refinerProfiles.map((profile) => ({
-      value: profile.id,
-      label: profile.model,
-      description: credentialSourceLabel(profile),
-    }))
-  ), [refinerProfiles, credentialSourceLabel]);
-
-  // Explicit BYOK fallback (opt-in): "none" keeps the primary running alone,
-  // mirroring the single-credential reality of most BYOK setups.
-  const refinerFallbackValue = selection?.refinerProviderChain?.[1] ?? '';
-  const refinerFallbackOptions = useMemo<ReadonlyArray<VoiceInputSelectOption<string>>>(() => ([
-    {
-      value: '',
-      label: t('settings.voiceInput.serviceSource.refinerFallback.none'),
-      description: t('settings.voiceInput.serviceSource.refinerFallback.noneDescription'),
-    },
-    ...refinerProfiles
-      .filter((profile) => profile.id !== selection?.refinerProvider)
-      .map((profile) => ({
-        value: profile.id,
-        label: profile.model,
-        description: credentialSourceLabel(profile),
-      })),
-  ]), [refinerProfiles, selection?.refinerProvider, credentialSourceLabel, t]);
+  const cannotRefineWithAuxiliary = Boolean(
+    selection
+    && selection.refinerProviderChainSource === 'configured'
+    && selection.refinerProviderChain.length === 0,
+  );
 
   // BYOK credential problems map to i18n by credential source instead of the
   // raw main-process message (which is an untranslated profile constant).
@@ -591,23 +580,21 @@ function VoiceInputServiceSourceCard() {
   return (
     <VoiceInputCard
       title={t('settings.voiceInput.sections.serviceSource')}
-      action={customized ? (
-        <button
-          type="button"
-          disabled={saving}
-          onClick={() => void resetToDefault()}
-          className={cn(
-            'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-12',
-            'border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
-            'text-[var(--settings-section-sublabel)] outline-none transition-colors',
-            'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
-            saving && 'cursor-not-allowed opacity-55',
-          )}
-        >
-          <RotateCcw size={12} />
-          {t('settings.voiceInput.serviceSource.reset')}
-        </button>
-      ) : undefined}
+      action={
+        customized ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            compact
+            type="button"
+            disabled={saving}
+            onClick={() => void resetToDefault()}
+          >
+            <RotateCcw size={12} />
+            {t('settings.voiceInput.serviceSource.reset')}
+          </Button>
+        ) : undefined
+      }
     >
       <VoiceInputInlineSettingRow
         label={t('settings.voiceInput.serviceSource.label')}
@@ -627,32 +614,24 @@ function VoiceInputServiceSourceCard() {
         <>
           <VoiceInputInlineSettingRow
             label={t('settings.voiceInput.serviceSource.asr.label')}
-            labelAction={(
-              <button
+            labelAction={
+              <Button
+                variant="secondary"
+                size="sm"
+                compact
+                loading={connectionTestBusy}
                 type="button"
                 disabled={connectionTestDisabled}
                 onClick={() => void handleTestConnection()}
-                title={customAsrHasUnsavedChanges
-                  ? t('settings.voiceInput.serviceSource.connectionTest.saveBeforeTest')
-                  : undefined}
-                className={cn(
-                  'inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-12 outline-none transition-colors',
-                  'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
-                  'text-[var(--settings-section-sublabel)]',
-                  'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
-                  connectionTestDisabled && 'cursor-not-allowed opacity-55',
-                )}
+                title={
+                  customAsrHasUnsavedChanges
+                    ? t('settings.voiceInput.serviceSource.connectionTest.saveBeforeTest')
+                    : undefined
+                }
               >
-                {connectionTestBusy ? (
-                  <span className="inline-flex animate-spin motion-reduce:animate-none" aria-hidden>
-                    <Loader2 size={12} />
-                  </span>
-                ) : null}
-                {t(connectionTestBusy
-                  ? 'settings.voiceInput.serviceSource.connectionTest.testing'
-                  : 'settings.voiceInput.serviceSource.connectionTest.action')}
-              </button>
-            )}
+                {t('settings.voiceInput.serviceSource.connectionTest.action')}
+              </Button>
+            }
             hint={t('settings.voiceInput.serviceSource.asr.hint')}
           >
             <VoiceInputSelect
@@ -663,15 +642,19 @@ function VoiceInputServiceSourceCard() {
             />
           </VoiceInputInlineSettingRow>
 
-          {connectionTest.status !== 'idle' ? (
+          {connectionTest.status === 'error' ? (
+            <ErrorNotice
+              role="alert"
+              aria-live="polite"
+              message={t(VOICE_INPUT_CONNECTION_TEST_FAILURE_KEYS[connectionTest.reason])}
+            />
+          ) : connectionTest.status !== 'idle' ? (
             <div
-              role={connectionTest.status === 'error' ? 'alert' : 'status'}
+              role="status"
               aria-live="polite"
               className={cn(
                 'flex items-center gap-2 rounded-[10px] border px-3 py-2 text-12 leading-[1.4]',
-                connectionTest.status === 'error'
-                  ? 'border-[var(--error-border)] bg-[var(--error-bg)] text-[var(--error-fg)]'
-                  : 'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] text-[var(--settings-section-sublabel)]',
+                'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] text-[var(--settings-section-sublabel)]',
               )}
             >
               {connectionTest.status === 'success' ? <Check size={13} aria-hidden /> : null}
@@ -683,9 +666,7 @@ function VoiceInputServiceSourceCard() {
               <span>
                 {connectionTest.status === 'testing'
                   ? t('settings.voiceInput.serviceSource.connectionTest.testingStatus')
-                  : connectionTest.status === 'success'
-                    ? t('settings.voiceInput.serviceSource.connectionTest.success')
-                    : t(VOICE_INPUT_CONNECTION_TEST_FAILURE_KEYS[connectionTest.reason])}
+                  : t('settings.voiceInput.serviceSource.connectionTest.success')}
               </span>
             </div>
           ) : null}
@@ -727,6 +708,8 @@ function VoiceInputServiceSourceCard() {
                 <input
                   type="url"
                   value={customAsrWebsocketUrl}
+                  aria-invalid={customAsrUrlInvalid || undefined}
+                  aria-describedby={customAsrUrlInvalid ? customAsrUrlErrorId : undefined}
                   onChange={(event) => {
                     customAsrFormDirtyRef.current = true;
                     setCustomAsrWebsocketUrl(event.target.value);
@@ -738,15 +721,16 @@ function VoiceInputServiceSourceCard() {
                   className={cn(
                     'h-9 w-full rounded-full border px-3 text-13 outline-none transition-colors',
                     'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-                    'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-55',
+                    'placeholder:text-[var(--settings-input-placeholder)]',
                     'focus:border-[var(--settings-input-border-focus)]',
                   )}
                 />
               </VoiceInputInlineSettingRow>
               {customAsrUrlInvalid ? (
                 <p
+                  id={customAsrUrlErrorId}
                   role="alert"
-                  className="rounded-[10px] border border-[var(--error-border)] bg-[var(--error-bg)] px-3 py-2 text-12 leading-[1.4] text-[var(--error-fg)]"
+                  className="text-12 text-[var(--error-fg)]"
                 >
                   {t('settings.voiceInput.serviceSource.customAsr.websocketUrl.invalid')}
                 </p>
@@ -770,7 +754,7 @@ function VoiceInputServiceSourceCard() {
                   className={cn(
                     'h-9 w-full rounded-full border px-3 text-13 outline-none transition-colors',
                     'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-                    'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-55',
+                    'placeholder:text-[var(--settings-input-placeholder)]',
                     'focus:border-[var(--settings-input-border-focus)]',
                   )}
                 />
@@ -802,7 +786,7 @@ function VoiceInputServiceSourceCard() {
                   className={cn(
                     'h-9 w-full rounded-full border px-3 text-13 outline-none transition-colors',
                     'border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] text-[var(--settings-input-text)]',
-                    'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-55',
+                    'placeholder:text-[var(--settings-input-placeholder)]',
                     'focus:border-[var(--settings-input-border-focus)]',
                   )}
                 />
@@ -810,84 +794,68 @@ function VoiceInputServiceSourceCard() {
 
               <div className="flex flex-wrap justify-end gap-2">
                 {customAsrApiKeyConfigured ? (
-                  <button
+                  <Button
+                    variant="secondary"
+                    size="md"
+                    compact
                     type="button"
                     disabled={saving}
                     onClick={() => void clearCustomAsrApiKey()}
-                    className={cn(
-                      'h-8 rounded-full border px-3 text-12 outline-none transition-colors',
-                      'border-[var(--settings-input-border)] text-[var(--settings-section-sublabel)]',
-                      'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
-                      saving && 'cursor-not-allowed opacity-55',
-                    )}
                   >
                     {t('settings.voiceInput.serviceSource.customAsr.apiKey.clear')}
-                  </button>
+                  </Button>
                 ) : null}
-                <button
+                <Button
+                  variant="cta"
+                  size="md"
+                  compact
+                  loading={saving}
                   type="button"
                   disabled={saving || !customAsrCanSave}
                   onClick={() => void handleSaveCustomAsr()}
-                  className={cn(
-                    'h-8 rounded-full border px-3 text-12 font-medium outline-none transition-colors',
-                    'border-[var(--settings-input-border-focus)] bg-[var(--settings-btn-primary-bg)] text-[var(--settings-btn-primary-text)]',
-                    'hover:opacity-90 focus-visible:ring-2 focus-visible:ring-[var(--settings-input-border-focus)]',
-                    (saving || !customAsrCanSave) && 'cursor-not-allowed opacity-55',
-                  )}
                 >
                   {t('settings.voiceInput.serviceSource.customAsr.save')}
-                </button>
+                </Button>
               </div>
             </div>
           ) : null}
 
           <VoiceInputInlineSettingRow
             label={t('settings.voiceInput.serviceSource.refiner.label')}
-            hint={t('settings.voiceInput.serviceSource.refiner.hint')}
+            hint={
+              cannotRefineWithAuxiliary
+                ? t('settings.voiceInput.serviceSource.refiner.cannotRefine')
+                : t('settings.voiceInput.serviceSource.refiner.followHint')
+            }
           >
-            <VoiceInputSelect
-              value={selection?.refinerProvider ?? ''}
-              options={refinerOptions}
-              onChange={(value) => void setRefinerProvider(value)}
-              ariaLabel={t('settings.voiceInput.serviceSource.refiner.ariaLabel')}
-            />
-          </VoiceInputInlineSettingRow>
-
-          <VoiceInputInlineSettingRow
-            label={t('settings.voiceInput.serviceSource.refinerFallback.label')}
-            hint={t('settings.voiceInput.serviceSource.refinerFallback.hint')}
-          >
-            <VoiceInputSelect
-              value={refinerFallbackValue}
-              options={refinerFallbackOptions}
-              onChange={(value) => void setRefinerFallbackProvider(value)}
-              ariaLabel={t('settings.voiceInput.serviceSource.refinerFallback.ariaLabel')}
-            />
+            <div className="flex items-center justify-end gap-2">
+              <span className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)]">
+                {t('settings.voiceInput.serviceSource.refiner.followAuxiliary')}
+              </span>
+              <Button
+                variant="secondary"
+                size="md"
+                compact
+                type="button"
+                onClick={openPersonalizationTab}
+                className="shrink-0"
+              >
+                {t('settings.voiceInput.serviceSource.refiner.openAuxiliary')}
+              </Button>
+            </div>
           </VoiceInputInlineSettingRow>
 
           {byokCredentialErrorText ? (
-            <div
-              className={cn(
-                'flex flex-wrap items-center justify-between gap-2 rounded-[12px] px-3.5 py-2.5',
-                'border border-[var(--error-border)] bg-[var(--error-bg)]',
-              )}
-            >
-              <p className="min-w-0 text-12 leading-[1.4] text-[var(--error-fg)]">
-                {byokCredentialErrorText}
-              </p>
-              {!credentialRecoveryInVoiceSettings ? <button
-                type="button"
-                onClick={openProvidersTab}
-                className={cn(
-                  'shrink-0 rounded-full px-2.5 py-1 text-12 font-medium',
-                  'border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
-                  'text-[var(--settings-section-title)] outline-none transition-colors',
-                  'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
-                )}
-              >
-                {t('settings.voiceInput.serviceSource.manageProviders')}
-              </button> : null}
-            </div>
+            <ErrorNotice
+              message={byokCredentialErrorText}
+              actions={
+                !credentialRecoveryInVoiceSettings && (
+                  <Button size="sm" compact onClick={openProvidersTab}>
+                    {t('settings.voiceInput.serviceSource.manageProviders')}
+                  </Button>
+                )
+              }
+            />
           ) : null}
         </>
       ) : null}
@@ -928,7 +896,7 @@ function VoiceInputPermissionBadge({
   ) : (
     labelText
   );
-  const content = (
+  const content = granted ? (
     <button
       type="button"
       onClick={onGrant}
@@ -937,16 +905,22 @@ function VoiceInputPermissionBadge({
     >
       {children}
     </button>
+  ) : (
+    <Button
+      variant="secondary"
+      size="xs"
+      compact
+      onClick={onGrant}
+      aria-label={label + ': ' + labelText}
+    >
+      {labelText}
+    </Button>
   );
 
   if (!tooltip) return content;
 
   return (
-    <Tip
-      text={tooltip}
-      side="top"
-      contentClassName="max-w-[320px] break-normal text-left"
-    >
+    <Tip text={tooltip} side="top" contentClassName="max-w-[320px] break-normal text-left">
       <span className="inline-flex">{content}</span>
     </Tip>
   );
@@ -1003,7 +977,7 @@ function VoiceInputCollapsibleTextarea({
           >
             {label}
           </p>
-          <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+          <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
             {hint}
           </p>
         </div>
@@ -1041,7 +1015,7 @@ function VoiceInputCollapsibleTextarea({
             'mt-4 min-h-[128px] w-full resize-y rounded-[14px] px-4 py-3',
             'border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
             'text-13 leading-[1.45] text-[var(--settings-input-text)]',
-            'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-45',
+            'placeholder:text-[var(--settings-input-placeholder)]',
             'outline-none transition-colors',
             'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
           )}
@@ -1052,6 +1026,7 @@ function VoiceInputCollapsibleTextarea({
 }
 
 export function VoiceInputSection() {
+  const { entry: searchEntry, activation } = useSettingsSearchNavigation();
   const { t, i18n } = useTranslation();
   const supportsGlobalShortcutSetting = window.electronAPI.platform !== 'linux';
   const supportsSystemAudioMuteSetting =
@@ -1067,9 +1042,13 @@ export function VoiceInputSection() {
     setRefinementInstructions,
     setAutoDictionaryEnabled,
     setDictionarySyncEnabled,
+    resetDictionarySyncEnabled,
+    setSpeakerFilterEnabled,
+    setSpeakerFilterStrictness,
+    resetSpeakerFilterStrictness,
     addDictionaryEntry: addDictionarySettingEntry,
     importDictionaryEntries: importDictionarySettingEntries,
-    renameDictionaryEntry: renameDictionarySettingEntry,
+    editDictionaryEntry: editDictionarySettingEntry,
     deleteDictionaryEntry: deleteDictionarySettingEntry,
     setShortcut,
   } = useVoiceInputSettings();
@@ -1084,6 +1063,11 @@ export function VoiceInputSection() {
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [refinementRulesExpanded, setRefinementRulesExpanded] = useState(false);
   const [customDictionaryExpanded, setCustomDictionaryExpanded] = useState(false);
+  useLayoutEffect(() => {
+    if (searchEntry?.id === 'settings.voiceInput.refinement.instructions.label') setRefinementRulesExpanded(true);
+    if (searchEntry?.id === 'settings.voiceInput.refinement.dictionary.label') setCustomDictionaryExpanded(true);
+    if (searchEntry?.id === 'settings.voiceInput.history.label') setHistoryExpanded(true);
+  }, [searchEntry, activation]);
   const [dictionaryFilter, setDictionaryFilter] = useState<DictionaryFilter>('all');
   const [dictionarySearchExpanded, setDictionarySearchExpanded] = useState(false);
   const [dictionarySearch, setDictionarySearch] = useState('');
@@ -1091,6 +1075,7 @@ export function VoiceInputSection() {
   const [newDictionaryEntryText, setNewDictionaryEntryText] = useState('');
   const [editingDictionaryEntryId, setEditingDictionaryEntryId] = useState<string | null>(null);
   const [editingDictionaryEntryText, setEditingDictionaryEntryText] = useState('');
+  const [editingDictionaryEntryAliases, setEditingDictionaryEntryAliases] = useState('');
   const [permissions, setPermissions] = useState<VoiceInputSystemPermissions>(() =>
     normalizeVoiceInputSystemPermissions(window.electronAPI.voiceInput.getSystemPermissionsCached())
   );
@@ -1797,7 +1782,7 @@ export function VoiceInputSection() {
     () =>
       settings.dictionaryEntries
         .filter((entry) =>
-          dictionaryEntryMatches(entry, dictionaryFilter, dictionarySearch),
+          voiceInputDictionaryEntryMatches(entry, dictionaryFilter, dictionarySearch),
         )
         .sort((a, b) => {
           if (a.source !== b.source) return a.source === 'manual' ? -1 : 1;
@@ -1908,11 +1893,13 @@ export function VoiceInputSection() {
   const startEditingDictionaryEntry = useCallback((entry: VoiceInputDictionaryEntry) => {
     setEditingDictionaryEntryId(entry.id);
     setEditingDictionaryEntryText(entry.text);
+    setEditingDictionaryEntryAliases(formatVoiceInputDictionaryAliasDraft(entry.aliases));
   }, []);
 
   const cancelEditingDictionaryEntry = useCallback(() => {
     setEditingDictionaryEntryId(null);
     setEditingDictionaryEntryText('');
+    setEditingDictionaryEntryAliases('');
   }, []);
 
   const saveEditingDictionaryEntry = useCallback(() => {
@@ -1925,15 +1912,17 @@ export function VoiceInputSection() {
       });
       return;
     }
-    void renameDictionarySettingEntry(editingDictionaryEntryId, text).then((ok) => {
+    const aliases = parseVoiceInputDictionaryAliasDraft(editingDictionaryEntryAliases, text);
+    void editDictionarySettingEntry(editingDictionaryEntryId, text, aliases).then((ok) => {
       if (ok) cancelEditingDictionaryEntry();
     });
   }, [
     cancelEditingDictionaryEntry,
     deleteDictionarySettingEntry,
+    editDictionarySettingEntry,
+    editingDictionaryEntryAliases,
     editingDictionaryEntryId,
     editingDictionaryEntryText,
-    renameDictionarySettingEntry,
   ]);
 
   const deleteDictionaryEntry = useCallback(
@@ -1974,6 +1963,7 @@ export function VoiceInputSection() {
 
       <VoiceInputCard title={t('settings.voiceInput.sections.basics')}>
         <VoiceInputInlineSettingRow
+          id="settings-search-settings-voiceInput-language-label"
           label={t('settings.voiceInput.language.label')}
           hint={t('settings.voiceInput.language.hint')}
         >
@@ -1986,6 +1976,7 @@ export function VoiceInputSection() {
         </VoiceInputInlineSettingRow>
 
         <VoiceInputInlineSettingRow
+          id="settings-search-settings-voiceInput-microphone-label"
           label={t('settings.voiceInput.microphone.label')}
           labelAction={
             <VoiceInputPermissionBadge
@@ -2007,6 +1998,7 @@ export function VoiceInputSection() {
         </VoiceInputInlineSettingRow>
 
         <VoiceInputInlineSettingRow
+          id="settings-search-settings-voiceInput-shortcut-label"
           label={t('settings.voiceInput.shortcut.label')}
           labelAction={
             shouldShowInputMonitoringBadge({
@@ -2072,23 +2064,20 @@ export function VoiceInputSection() {
                 </span>
               </button>
 
-              <button
+              <Button
+                variant="secondary"
+                size="md"
+                compact
                 type="button"
                 disabled={!settings.shortcut}
                 onClick={() => commitRecordedShortcut(null)}
-                className={cn(
-                  'h-8 shrink-0 rounded-full px-3 text-12 font-medium transition-colors',
-                  'border border-[var(--settings-btn-secondary-border)]',
-                  'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
-                  'hover:bg-[var(--settings-btn-secondary-hover-bg)]',
-                  'disabled:cursor-not-allowed disabled:opacity-45',
-                )}
+                className="shrink-0"
               >
                 {t('settings.voiceInput.shortcut.clear')}
-              </button>
+              </Button>
             </div>
           ) : (
-            <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+            <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
               {t('settings.voiceInput.shortcut.linuxUnsupported')}
             </p>
           )}
@@ -2099,7 +2088,7 @@ export function VoiceInputSection() {
         <div className="flex items-center justify-between gap-5">
           <div className="flex min-w-0 flex-col gap-1">
             <div className="flex min-w-0 items-center gap-2">
-              <p
+              <p id="settings-search-settings-voiceInput-refinement-enabled-label"
                 className="min-w-0 text-13 font-medium text-[var(--settings-section-title)]"
                 style={{ letterSpacing: '0.12px' }}
               >
@@ -2116,7 +2105,7 @@ export function VoiceInputSection() {
                   />
                 )}
             </div>
-            <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+            <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
               {t('settings.voiceInput.refinement.enabled.hint')}
             </p>
           </div>
@@ -2129,7 +2118,7 @@ export function VoiceInputSection() {
         </div>
 
         {settings.refinementEnabled ? (
-          <div className="flex flex-col gap-4 border-t border-[var(--settings-theme-card-border)] pt-4">
+          <div id="settings-search-settings-voiceInput-refinement-instructions-label" className="flex flex-col gap-4 border-t border-[var(--settings-theme-card-border)] pt-4">
             <VoiceInputCollapsibleTextarea
               id="voice-input-refinement-instructions"
               label={t('settings.voiceInput.refinement.instructions.label')}
@@ -2149,18 +2138,21 @@ export function VoiceInputSection() {
             <div className="border-t border-[var(--settings-theme-card-border)] pt-4">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex min-w-0 flex-col gap-1">
-                  <p
+                  <p id="settings-search-settings-voiceInput-refinement-dictionary-label"
                     className="text-13 font-medium text-[var(--settings-section-title)]"
                     style={{ letterSpacing: '0.12px' }}
                   >
                     {t('settings.voiceInput.refinement.dictionary.label')}
                   </p>
-                  <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+                  <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
                     {t('settings.voiceInput.refinement.dictionary.hint')}
                   </p>
                 </div>
 
-                <button
+                <Button
+                  variant="secondary"
+                  size="md"
+                  compact
                   type="button"
                   aria-expanded={customDictionaryExpanded}
                   aria-controls="voice-input-custom-dictionary"
@@ -2171,12 +2163,6 @@ export function VoiceInputSection() {
                     }
                     setCustomDictionaryExpanded(!customDictionaryExpanded);
                   }}
-                  className={cn(
-                    'flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-12 font-medium transition-colors',
-                    'border border-[var(--settings-btn-secondary-border)]',
-                    'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
-                    'hover:bg-[var(--settings-btn-secondary-hover-bg)]',
-                  )}
                 >
                   <span>
                     {t(
@@ -2189,7 +2175,7 @@ export function VoiceInputSection() {
                     size={14}
                     className={cn('transition-transform', customDictionaryExpanded && 'rotate-180')}
                   />
-                </button>
+                </Button>
               </div>
 
               {customDictionaryExpanded ? (
@@ -2199,7 +2185,7 @@ export function VoiceInputSection() {
                       <p className="text-13 font-medium text-[var(--settings-section-title)]">
                         {t('settings.voiceInput.refinement.dictionary.autoLearning.label')}
                       </p>
-                      <p className="text-12 leading-[1.35] text-[var(--settings-section-sublabel)] opacity-70">
+                      <p className="text-12 leading-[1.35] text-[var(--text-secondary)]">
                         {t('settings.voiceInput.refinement.dictionary.autoLearning.hint')}
                         {!externalDictionaryLearningSupported ? (
                           <span className="mt-1 block">
@@ -2221,39 +2207,45 @@ export function VoiceInputSection() {
                       <p className="text-13 font-medium text-[var(--settings-section-title)]">
                         {t('settings.voiceInput.refinement.dictionary.deviceSync.label')}
                       </p>
-                      <p className="text-12 leading-[1.35] text-[var(--settings-section-sublabel)] opacity-70">
+                      <p className="text-12 leading-[1.35] text-[var(--text-secondary)]">
                         {t('settings.voiceInput.refinement.dictionary.deviceSync.hint')}
                       </p>
                     </div>
 
-                    <Switch
-                      checked={settings.dictionarySyncEnabled}
-                      onCheckedChange={setDictionarySyncEnabled}
-                      aria-label={t('settings.voiceInput.refinement.dictionary.deviceSync.ariaLabel')}
-                    />
+                    <div className="flex shrink-0 items-center gap-2">
+                      <DefaultOverrideControls
+                        isCustomized={settings.dictionarySyncEnabledOverride != null}
+                        onReset={() => {
+                          void resetDictionarySyncEnabled().then((ok) => {
+                            if (ok) toast.success(t('settings.defaults.restored'));
+                          });
+                        }}
+                      />
+                      <Switch
+                        checked={settings.dictionarySyncEnabled}
+                        onCheckedChange={setDictionarySyncEnabled}
+                        aria-label={t('settings.voiceInput.refinement.dictionary.deviceSync.ariaLabel')}
+                      />
+                    </div>
                   </div>
 
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex rounded-full bg-[var(--settings-btn-secondary-bg)] p-1">
-                      {DICTIONARY_FILTERS.map((filter) => (
-                        <button
-                          key={filter}
-                          type="button"
-                          onClick={() => setDictionaryFilter(filter)}
-                          className={cn(
-                            'flex h-8 items-center gap-1.5 rounded-full px-3 text-12 font-medium transition-colors',
-                            dictionaryFilter === filter
-                              ? 'bg-[var(--settings-theme-card-bg)] text-[var(--settings-section-title)]'
-                              : 'text-[var(--settings-section-sublabel)] hover:text-[var(--settings-section-title)]',
-                          )}
-                        >
-                          {t(`settings.voiceInput.refinement.dictionary.filters.${filter}`)}
-                          <span className="text-11 opacity-60">
-                            {dictionaryCounts[filter]}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
+                    <SegmentedControl
+                      aria-label={t('settings.voiceInput.refinement.dictionary.ariaLabel')}
+                      value={dictionaryFilter}
+                      onValueChange={setDictionaryFilter}
+                      height={40}
+                      optionHeight={32}
+                      options={DICTIONARY_FILTERS.map((filter) => ({
+                        value: filter,
+                        label: (
+                          <>
+                            {t(`settings.voiceInput.refinement.dictionary.filters.${filter}`)}
+                            <span className="text-11 opacity-60">{dictionaryCounts[filter]}</span>
+                          </>
+                        ),
+                      }))}
+                    />
 
                     <div className="flex items-center gap-2">
                       <Tip
@@ -2285,21 +2277,19 @@ export function VoiceInputSection() {
                         </button>
                       </Tip>
 
-                      <button
+                      <Button
+                        variant="cta"
+                        size="md"
+                        compact
                         type="button"
                         onClick={() => {
                           setAddingDictionaryEntry(true);
                           setNewDictionaryEntryText('');
                         }}
-                        className={cn(
-                          'flex h-8 items-center gap-1.5 rounded-full px-3 text-12 font-medium transition-colors',
-                          'bg-[var(--settings-section-title)] text-[var(--settings-theme-card-bg)]',
-                          'hover:opacity-85',
-                        )}
                       >
                         <Plus size={14} />
                         {t('settings.voiceInput.refinement.dictionary.add')}
-                      </button>
+                      </Button>
                     </div>
                   </div>
 
@@ -2319,7 +2309,7 @@ export function VoiceInputSection() {
                           'h-10 w-full rounded-full pl-9 pr-4',
                           'border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
                           'text-13 text-[var(--settings-input-text)] outline-none transition-colors',
-                          'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-45',
+                          'placeholder:text-[var(--settings-input-placeholder)]',
                           'hover:border-[var(--settings-input-border-focus)] focus-visible:border-[var(--settings-input-border-focus)]',
                         )}
                       />
@@ -2339,19 +2329,15 @@ export function VoiceInputSection() {
                     <Dialog.Portal>
                       <Dialog.Overlay
                         className={cn(
-                          'fixed inset-0 z-50 bg-[var(--overlay-modal)]',
-                          'data-[state=open]:animate-confirm-overlay-in',
-                          'data-[state=closed]:animate-confirm-overlay-out',
+                          'modal-scrim fixed inset-0 z-50',
                         )}
                         style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
                       />
                       <Dialog.Content
+                        onPointerDownOutside={(event) => event.preventDefault()}
                         className={cn(
-                          'fixed left-1/2 top-1/2 z-50 w-[min(520px,calc(100vw-48px))] -translate-x-1/2 -translate-y-1/2',
-                          'rounded-[18px] border border-[var(--settings-theme-card-border)] bg-[var(--settings-theme-card-bg)]',
-                          'p-5 shadow-[var(--shadow-menu)] outline-none',
-                          'data-[state=open]:animate-confirm-content-in',
-                          'data-[state=closed]:animate-confirm-content-out',
+                          'modal-panel fixed left-1/2 top-1/2 z-50 w-[min(520px,calc(100vw-48px))] -translate-x-1/2 -translate-y-1/2',
+                          'p-5 outline-none',
                         )}
                         style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
                       >
@@ -2380,7 +2366,7 @@ export function VoiceInputSection() {
                             'mt-5 h-12 w-full rounded-[12px] px-4',
                             'border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]',
                             'text-15 text-[var(--settings-input-text)] outline-none transition-colors',
-                            'placeholder:text-[var(--settings-section-sublabel)] placeholder:opacity-60',
+                            'placeholder:text-[var(--settings-input-placeholder)]',
                             'hover:border-[var(--settings-input-border-focus)]',
                             'focus-visible:border-[var(--settings-input-border-focus)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
                           )}
@@ -2399,44 +2385,32 @@ export function VoiceInputSection() {
                         />
                         <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
                           <Tip text={t('settings.voiceInput.refinement.dictionary.csvImport.tooltip')} side="top">
-                            <button
+                            <Button
+                              variant="secondary"
+                              size="lg"
+                              tone="quiet"
                               type="button"
                               onClick={() => dictionaryCsvInputRef.current?.click()}
-                              className={cn(
-                                'flex h-9 items-center gap-2 rounded-full px-3 text-13 font-medium transition-colors',
-                                'text-[var(--settings-btn-secondary-text)] hover:bg-[var(--settings-btn-secondary-hover-bg)]',
-                              )}
                             >
                               <Upload size={15} />
                               {t('settings.voiceInput.refinement.dictionary.csvImport.label')}
-                            </button>
+                            </Button>
                           </Tip>
                           <div className="flex items-center gap-2">
                             <Dialog.Close asChild>
-                              <button
-                                type="button"
-                                className={cn(
-                                  'h-9 rounded-full px-4 text-13 font-medium transition-colors',
-                                  'border border-[var(--settings-btn-secondary-border)]',
-                                  'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
-                                  'hover:bg-[var(--settings-btn-secondary-hover-bg)]',
-                                )}
-                              >
+                              <Button variant="secondary" size="lg" type="button">
                                 {t('settings.voiceInput.refinement.dictionary.cancel')}
-                              </button>
+                              </Button>
                             </Dialog.Close>
-                            <button
+                            <Button
+                              variant="cta"
+                              size="lg"
                               type="button"
                               onClick={addDictionaryEntry}
                               disabled={normalizeVoiceInputDictionaryEntryText(newDictionaryEntryText).length === 0}
-                              className={cn(
-                                'h-9 rounded-full px-4 text-13 font-medium transition-opacity',
-                                'bg-[var(--settings-section-title)] text-[var(--settings-theme-card-bg)]',
-                                'hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-45',
-                              )}
                             >
                               {t('settings.voiceInput.refinement.dictionary.addDialog.submit')}
-                            </button>
+                            </Button>
                           </div>
                         </div>
                       </Dialog.Content>
@@ -2454,92 +2428,192 @@ export function VoiceInputSection() {
                               'group min-w-0 rounded-[12px] border border-[var(--settings-input-border)]',
                               'bg-[var(--settings-input-bg)] px-3 py-2.5 transition-colors',
                               'hover:bg-[var(--settings-menu-bg-hover)]',
+                              editing && 'md:col-span-2',
                             )}
                           >
                             {editing ? (
-                              <div className="flex min-w-0 items-center gap-1.5">
-                                <input
-                                  ref={editingDictionaryEntryInputRef}
-                                  value={editingDictionaryEntryText}
-                                  onChange={(event) => setEditingDictionaryEntryText(event.currentTarget.value)}
-                                  onKeyDown={(event) => {
-                                    if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
-                                      event.preventDefault();
-                                      saveEditingDictionaryEntry();
+                              <div className="flex min-w-0 flex-col gap-2.5">
+                                <label className="flex min-w-0 flex-col gap-1">
+                                  <span className="text-11 font-medium text-[var(--settings-section-sublabel)]">
+                                    {t('settings.voiceInput.refinement.dictionary.termLabel')}
+                                  </span>
+                                  <input
+                                    ref={editingDictionaryEntryInputRef}
+                                    value={editingDictionaryEntryText}
+                                    onChange={(event) =>
+                                      setEditingDictionaryEntryText(event.currentTarget.value)
                                     }
-                                    if (event.key === 'Escape') {
-                                      cancelEditingDictionaryEntry();
-                                    }
-                                  }}
-                                  aria-label={t('settings.voiceInput.refinement.dictionary.editAriaLabel')}
-                                  className="h-8 min-w-0 flex-1 bg-transparent text-13 text-[var(--settings-input-text)] outline-none"
-                                />
-                                <Tip text={t('settings.voiceInput.refinement.dictionary.save')} side="top">
-                                  <button
-                                    type="button"
-                                    onClick={saveEditingDictionaryEntry}
-                                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--settings-section-title)] text-[var(--settings-theme-card-bg)] transition-opacity hover:opacity-85"
-                                    aria-label={t('settings.voiceInput.refinement.dictionary.save')}
-                                  >
-                                    <Check size={14} />
-                                  </button>
-                                </Tip>
-                                <Tip text={t('settings.voiceInput.refinement.dictionary.cancel')} side="top">
-                                  <button
-                                    type="button"
-                                    onClick={cancelEditingDictionaryEntry}
-                                    className={cn(
-                                      'flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors',
-                                      'border border-[var(--settings-btn-secondary-border)]',
-                                      'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
-                                      'hover:bg-[var(--settings-btn-secondary-hover-bg)]',
+                                    onKeyDown={(event) => {
+                                      if (
+                                        event.key === 'Enter' &&
+                                        !event.nativeEvent.isComposing
+                                      ) {
+                                        event.preventDefault();
+                                        saveEditingDictionaryEntry();
+                                      }
+                                      if (event.key === 'Escape') cancelEditingDictionaryEntry();
+                                    }}
+                                    aria-label={t(
+                                      'settings.voiceInput.refinement.dictionary.editAriaLabel',
                                     )}
-                                    aria-label={t('settings.voiceInput.refinement.dictionary.cancel')}
+                                    className={cn(
+                                      'h-9 min-w-0 rounded-full px-3 text-13',
+                                      'border border-[var(--settings-input-border)] bg-[var(--settings-theme-card-bg)]',
+                                      'text-[var(--settings-input-text)] outline-none transition-colors',
+                                      'focus-visible:border-[var(--settings-input-border-focus)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
+                                    )}
+                                  />
+                                </label>
+
+                                <label className="flex min-w-0 flex-col gap-1">
+                                  <span className="text-11 font-medium text-[var(--settings-section-sublabel)]">
+                                    {t(
+                                      'settings.voiceInput.refinement.dictionary.aliasesEditLabel',
+                                    )}
+                                  </span>
+                                  <textarea
+                                    value={editingDictionaryEntryAliases}
+                                    onChange={(event) =>
+                                      setEditingDictionaryEntryAliases(event.currentTarget.value)
+                                    }
+                                    onKeyDown={(event) => {
+                                      if (
+                                        (event.metaKey || event.ctrlKey) &&
+                                        event.key === 'Enter' &&
+                                        !event.nativeEvent.isComposing
+                                      ) {
+                                        event.preventDefault();
+                                        saveEditingDictionaryEntry();
+                                      }
+                                      if (event.key === 'Escape') cancelEditingDictionaryEntry();
+                                    }}
+                                    aria-label={t(
+                                      'settings.voiceInput.refinement.dictionary.aliasesEditAriaLabel',
+                                    )}
+                                    placeholder={t(
+                                      'settings.voiceInput.refinement.dictionary.aliasesPlaceholder',
+                                    )}
+                                    rows={3}
+                                    className={cn(
+                                      'min-h-[76px] w-full resize-y rounded-lg px-3 py-2 text-12 leading-[1.45]',
+                                      'border border-[var(--settings-input-border)] bg-[var(--settings-theme-card-bg)]',
+                                      'text-[var(--settings-input-text)] outline-none transition-colors',
+                                      'placeholder:text-[var(--text-placeholder)]',
+                                      'focus-visible:border-[var(--settings-input-border-focus)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
+                                    )}
+                                  />
+                                  <span className="text-11 leading-[1.35] text-[var(--text-secondary)]">
+                                    {t('settings.voiceInput.refinement.dictionary.aliasesEditHint')}
+                                  </span>
+                                </label>
+
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <Tip
+                                    text={t('settings.voiceInput.refinement.dictionary.cancel')}
+                                    side="top"
                                   >
-                                    <X size={14} />
-                                  </button>
-                                </Tip>
+                                    <button
+                                      type="button"
+                                      onClick={cancelEditingDictionaryEntry}
+                                      className={cn(
+                                        'flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors',
+                                        'border border-[var(--settings-btn-secondary-border)]',
+                                        'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
+                                        'hover:bg-[var(--settings-btn-secondary-hover-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
+                                      )}
+                                      aria-label={t(
+                                        'settings.voiceInput.refinement.dictionary.cancel',
+                                      )}
+                                    >
+                                      <X size={14} />
+                                    </button>
+                                  </Tip>
+                                  <Tip
+                                    text={t('settings.voiceInput.refinement.dictionary.save')}
+                                    side="top"
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={saveEditingDictionaryEntry}
+                                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--settings-section-title)] text-[var(--settings-theme-card-bg)] transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]"
+                                      aria-label={t(
+                                        'settings.voiceInput.refinement.dictionary.save',
+                                      )}
+                                    >
+                                      <Check size={14} />
+                                    </button>
+                                  </Tip>
+                                </div>
                               </div>
                             ) : (
-                              <div className="flex min-w-0 items-center gap-2">
+                              <div className="flex min-w-0 items-start gap-2">
                                 <span
                                   role="img"
                                   className={cn(
-                                    'flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
+                                    'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
                                     entry.source === 'automatic'
-                                      ? 'text-[var(--settings-section-title)] opacity-70'
-                                      : 'text-[var(--settings-section-sublabel)] opacity-45',
+                                      ? 'text-[var(--text-secondary-mid)]'
+                                      : 'text-[var(--text-tertiary)]',
                                   )}
-                                  aria-label={t(`settings.voiceInput.refinement.dictionary.sources.${entry.source}`)}
-                                  title={t(`settings.voiceInput.refinement.dictionary.sources.${entry.source}`)}
+                                  aria-label={t(
+                                    `settings.voiceInput.refinement.dictionary.sources.${entry.source}`,
+                                  )}
+                                  title={t(
+                                    `settings.voiceInput.refinement.dictionary.sources.${entry.source}`,
+                                  )}
                                 >
                                   {dictionarySourceIcon(entry.source)}
                                 </span>
-                                <span className="min-w-0 flex-1 truncate text-13 font-medium text-[var(--settings-section-title)]">
-                                  {entry.text}
-                                </span>
+                                <div className="min-w-0 flex-1">
+                                  <p className="truncate text-13 font-medium text-[var(--settings-section-title)]">
+                                    {entry.text}
+                                  </p>
+                                  {entry.aliases.length > 0 ? (
+                                    <p className="mt-0.5 line-clamp-2 text-11 leading-[1.35] text-[var(--text-secondary)]">
+                                      {t('settings.voiceInput.refinement.dictionary.aliases', {
+                                        aliases: entry.aliases
+                                          .map((alias) => alias.text)
+                                          .join(
+                                            t(
+                                              'settings.voiceInput.refinement.dictionary.aliasSeparator',
+                                            ),
+                                          ),
+                                      })}
+                                    </p>
+                                  ) : null}
+                                </div>
                                 <div
                                   className={cn(
                                     'flex shrink-0 items-center gap-1 opacity-0 transition-opacity',
                                     'group-hover:opacity-100 group-focus-within:opacity-100',
                                   )}
                                 >
-                                  <Tip text={t('settings.voiceInput.refinement.dictionary.edit')} side="top">
+                                  <Tip
+                                    text={t('settings.voiceInput.refinement.dictionary.edit')}
+                                    side="top"
+                                  >
                                     <button
                                       type="button"
                                       onClick={() => startEditingDictionaryEntry(entry)}
-                                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[var(--settings-section-sublabel)] transition-colors hover:bg-[var(--settings-btn-secondary-hover-bg)] hover:text-[var(--settings-section-title)]"
-                                      aria-label={t('settings.voiceInput.refinement.dictionary.edit')}
+                                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[var(--settings-section-sublabel)] transition-colors hover:bg-[var(--settings-btn-secondary-hover-bg)] hover:text-[var(--settings-section-title)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]"
+                                      aria-label={t(
+                                        'settings.voiceInput.refinement.dictionary.edit',
+                                      )}
                                     >
                                       <Pencil size={13} />
                                     </button>
                                   </Tip>
-                                  <Tip text={t('settings.voiceInput.refinement.dictionary.delete')} side="top">
+                                  <Tip
+                                    text={t('settings.voiceInput.refinement.dictionary.delete')}
+                                    side="top"
+                                  >
                                     <button
                                       type="button"
                                       onClick={() => deleteDictionaryEntry(entry.id)}
-                                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[var(--settings-section-sublabel)] transition-colors hover:bg-[var(--settings-btn-secondary-hover-bg)] hover:text-[var(--settings-section-title)]"
-                                      aria-label={t('settings.voiceInput.refinement.dictionary.delete')}
+                                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[var(--settings-section-sublabel)] transition-colors hover:bg-[var(--settings-btn-secondary-hover-bg)] hover:text-[var(--settings-section-title)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]"
+                                      aria-label={t(
+                                        'settings.voiceInput.refinement.dictionary.delete',
+                                      )}
                                     >
                                       <Trash2 size={13} />
                                     </button>
@@ -2552,7 +2626,7 @@ export function VoiceInputSection() {
                       })}
                     </div>
                   ) : (
-                    <p className="rounded-[12px] border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] px-4 py-3 text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+                    <p className="rounded-[12px] border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] px-4 py-3 text-12 leading-[1.4] text-[var(--text-secondary)]">
                       {t(
                         dictionaryFilter === 'automatic'
                           ? 'settings.voiceInput.refinement.dictionary.emptyAutomatic'
@@ -2573,13 +2647,13 @@ export function VoiceInputSection() {
         {supportsSystemAudioMuteSetting ? (
           <div className="flex items-center justify-between gap-5">
             <div className="flex min-w-0 flex-col gap-1">
-              <p
+              <p id="settings-search-settings-voiceInput-muteSystemAudio-label"
                 className="text-13 font-medium text-[var(--settings-section-title)]"
                 style={{ letterSpacing: '0.12px' }}
               >
                 {t('settings.voiceInput.muteSystemAudio.label')}
               </p>
-              <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+              <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
                 {t('settings.voiceInput.muteSystemAudio.hint')}
               </p>
             </div>
@@ -2591,7 +2665,7 @@ export function VoiceInputSection() {
             />
           </div>
         ) : (
-          <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+          <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
             {t('settings.voiceInput.muteSystemAudio.linuxUnsupported')}
           </p>
         )}
@@ -2601,13 +2675,13 @@ export function VoiceInputSection() {
           supportsSystemAudioMuteSetting && 'border-t border-[var(--settings-theme-card-border)]',
         )}>
           <div className="flex min-w-0 flex-col gap-1">
-            <p
+            <p id="settings-search-settings-voiceInput-fastActivation-label"
               className="text-13 font-medium text-[var(--settings-section-title)]"
               style={{ letterSpacing: '0.12px' }}
             >
               {t('settings.voiceInput.fastActivation.label')}
             </p>
-            <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+            <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
               {t('settings.voiceInput.fastActivation.hint')}
             </p>
           </div>
@@ -2621,13 +2695,13 @@ export function VoiceInputSection() {
 
         <div className="flex items-center justify-between gap-5 border-t border-[var(--settings-theme-card-border)] pt-4">
           <div className="flex min-w-0 flex-col gap-1">
-            <p
+            <p id="settings-search-settings-voiceInput-interactionSound-label"
               className="text-13 font-medium text-[var(--settings-section-title)]"
               style={{ letterSpacing: '0.12px' }}
             >
               {t('settings.voiceInput.interactionSound.label')}
             </p>
-            <p className="text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+            <p className="text-12 leading-[1.4] text-[var(--text-secondary)]">
               {t('settings.voiceInput.interactionSound.hint')}
             </p>
           </div>
@@ -2640,28 +2714,36 @@ export function VoiceInputSection() {
         </div>
       </VoiceInputCard>
 
+      <VoiceSpeakerFilterCard
+        enabled={settings.speakerFilterEnabled}
+        strictness={settings.speakerFilterStrictness}
+        strictnessCustomized={settings.speakerFilterStrictnessOverride != null}
+        microphoneDeviceId={settings.microphoneDeviceId}
+        onEnabledChange={setSpeakerFilterEnabled}
+        onStrictnessChange={setSpeakerFilterStrictness}
+        onStrictnessReset={resetSpeakerFilterStrictness}
+      />
+
       <VoiceInputCard
+        id="settings-search-voice-usage-data"
         title={t('settings.voiceInput.sections.usageData')}
         action={
-          <button
+          <Button
+            variant="secondary"
+            size="md"
+            compact
             type="button"
             disabled={!canResetUsageStats}
             onClick={resetUsageStats}
-            className={cn(
-              'h-8 shrink-0 rounded-full px-3 text-12 font-medium transition-colors',
-              'border border-[var(--settings-btn-secondary-border)]',
-              'bg-[var(--settings-btn-secondary-bg)] text-[var(--settings-btn-secondary-text)]',
-              'hover:bg-[var(--settings-btn-secondary-hover-bg)]',
-              'disabled:cursor-not-allowed disabled:opacity-45',
-            )}
+            className="shrink-0"
           >
             {t('settings.voiceInput.usage.reset')}
-          </button>
+          </Button>
         }
       >
         <dl className="grid gap-3 sm:grid-cols-3">
           <div className="min-w-0">
-            <dt className="text-12 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-70">
+            <dt className="text-12 leading-[1.3] text-[var(--text-secondary)]">
               {t('settings.voiceInput.usage.duration')}
             </dt>
             <dd className="mt-1 truncate text-16 font-medium leading-[1.2] text-[var(--settings-section-title)]">
@@ -2669,13 +2751,13 @@ export function VoiceInputSection() {
             </dd>
           </div>
           <div className="min-w-0">
-            <dt className="text-12 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-70">
+            <dt className="text-12 leading-[1.3] text-[var(--text-secondary)]">
               {t('settings.voiceInput.usage.estimatedCost')}
             </dt>
             <dd className="mt-1 truncate text-16 font-medium leading-[1.2] text-[var(--settings-section-title)]">
               {formatUsd(cost.totalUsd)}
             </dd>
-            <dd className="mt-1 truncate text-11 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-70">
+            <dd className="mt-1 truncate text-11 leading-[1.3] text-[var(--text-secondary)]">
               {t('settings.voiceInput.usage.costBreakdown', {
                 asr: formatUsd(cost.asrUsd),
                 refine: formatUsd(cost.refineUsd),
@@ -2683,13 +2765,13 @@ export function VoiceInputSection() {
             </dd>
           </div>
           <div className="min-w-0">
-            <dt className="text-12 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-70">
+            <dt className="text-12 leading-[1.3] text-[var(--text-secondary)]">
               {t('settings.voiceInput.usage.sessions')}
             </dt>
             <dd className="mt-1 truncate text-16 font-medium leading-[1.2] text-[var(--settings-section-title)]">
               {stats.sessionCount}
             </dd>
-            <dd className="mt-1 text-11 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-70">
+            <dd className="mt-1 text-11 leading-[1.3] text-[var(--text-secondary)]">
               {t('settings.voiceInput.usage.outcomes', {
                 noSpeech: stats.noSpeechSessionCount,
                 failed: stats.failedSessionCount,
@@ -2714,12 +2796,12 @@ export function VoiceInputSection() {
               'transition-colors hover:opacity-90',
             )}
           >
-            <span
+            <span id="settings-search-settings-voiceInput-history-label"
               className="text-13 font-medium text-[var(--settings-section-title)]"
               style={{ letterSpacing: '0.12px' }}
             >
               {t('settings.voiceInput.history.label')}
-              <span className="ml-2 text-12 font-normal text-[var(--settings-section-sublabel)] opacity-70">
+              <span className="ml-2 text-12 font-normal text-[var(--text-secondary)]">
                 ({historyEntries.length})
               </span>
             </span>
@@ -2750,7 +2832,7 @@ export function VoiceInputSection() {
                         <p className="max-h-[92px] overflow-y-auto whitespace-pre-wrap break-words text-13 leading-[1.45] text-[var(--settings-section-title)]">
                           {entry.text}
                         </p>
-                        <p className="mt-1 text-11 leading-[1.3] text-[var(--settings-section-sublabel)] opacity-60">
+                        <p className="mt-1 text-11 leading-[1.3] text-[var(--text-tertiary)]">
                           {formatHistoryTime(entry.createdAt, i18n.resolvedLanguage ?? i18n.language)}
                         </p>
                       </div>
@@ -2793,7 +2875,7 @@ export function VoiceInputSection() {
                   ))}
                 </div>
               ) : (
-                <p className="rounded-[12px] border border-[var(--settings-theme-card-border)] bg-[var(--settings-input-bg)] px-4 py-3 text-12 leading-[1.4] text-[var(--settings-section-sublabel)] opacity-70">
+                <p className="rounded-[12px] border border-[var(--settings-theme-card-border)] bg-[var(--settings-input-bg)] px-4 py-3 text-12 leading-[1.4] text-[var(--text-secondary)]">
                   {t('settings.voiceInput.history.empty')}
                 </p>
               )}

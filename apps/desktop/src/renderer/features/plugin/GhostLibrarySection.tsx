@@ -1,7 +1,7 @@
 /**
  * GhostLibrarySection — 插件详情页的「持久作品库」设置区(2026-08-20)。
  * ---------------------------------------------------------------------------
- * 只在 manifest 声明 library 槽时渲染。职责:
+ * 只在 manifest 声明 library 能力时渲染。职责:
  *   - 展示位置(默认/自定义)、占用、磁盘余量、状态横幅(漂移/只读/orphaned);
  *   - 更改位置(宿主弹原生选择器 → 候选校验 → 确认 → 迁移状态机);
  *   - 恢复默认位置(反向迁移 + 撤销 binding);漂移时的「解除位置记录」恢复;
@@ -25,7 +25,7 @@ const ROW_CLASS = 'flex items-center justify-between gap-4 text-13 leading-5';
 const ACTION_BUTTON_CLASS =
   'text-13 font-medium text-[var(--accent)] transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:cursor-not-allowed disabled:opacity-50';
 const DANGER_BUTTON_CLASS =
-  'text-13 font-medium text-[var(--danger)] transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:cursor-not-allowed disabled:opacity-50';
+  'text-13 font-medium text-[var(--error-fg)] transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:cursor-not-allowed disabled:opacity-50';
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
@@ -36,11 +36,11 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * 外层:未声明 library 槽直接不挂载内层(内层用了 useConfirmDialog,测试环境
+ * 外层:未声明 library 能力直接不挂载内层(内层用了 useConfirmDialog,测试环境
  * 无 Provider——不声明就不进 hook,老用例零影响)。
  */
-export function GhostLibrarySection({ ghostId, slots }: { ghostId: string; slots: readonly string[] }) {
-  if (!slots.includes('library')) return null;
+export function GhostLibrarySection({ ghostId, enabled }: { ghostId: string; enabled: boolean }) {
+  if (!enabled) return null;
   return <GhostLibrarySectionInner ghostId={ghostId} />;
 }
 
@@ -48,7 +48,7 @@ function GhostLibrarySectionInner({ ghostId }: { ghostId: string }) {
   const { t } = useTranslation();
   const { confirm } = useConfirmDialog();
   const [overview, setOverview] = useState<GhostLibraryOverview | null>(null);
-  const [busy, setBusy] = useState<'relocate' | 'delete' | null>(null);
+  const [busy, setBusy] = useState<'relocate' | 'delete' | 'reattach' | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -153,6 +153,23 @@ function GhostLibrarySectionInner({ ghostId }: { ghostId: string }) {
     }
   };
 
+  const handleReattachLegacy = async () => {
+    if (busy) return;
+    // 确认框由 Main 弹出(换掉当前作品数据，唯一有效确认在 Main)。
+    setBusy('reattach');
+    try {
+      const res = await window.electronAPI.ghosts.libraryReattachLegacy(ghostId);
+      if (res.ok) toast.success(t('settings.ghosts.library.legacyReattachDone'));
+      else if (!res.cancelled) {
+        const failed = t('settings.ghosts.library.legacyReattachFailed');
+        toast.error(res.message ? `${failed}:${res.message}` : failed);
+      }
+    } finally {
+      setBusy(null);
+      void refresh();
+    }
+  };
+
   return (
     <section className={SECTION_CLASS} aria-labelledby="ghost-library-title">
       <div className="flex items-center justify-between">
@@ -189,6 +206,32 @@ function GhostLibrarySectionInner({ ghostId }: { ghostId: string }) {
             ) : null}
             {overview.orphaned ? (
               <p className="mb-3 text-13 text-[var(--text-secondary)]">{t('settings.ghosts.library.orphanedBanner')}</p>
+            ) : null}
+            {overview.legacyLibraryInUse ? (
+              <p className="mb-3 text-13 text-[var(--text-secondary)]">{t('settings.ghosts.library.legacyInUseBanner')}</p>
+            ) : null}
+            {overview.legacyLibrary ? (
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <p className="min-w-0 flex-1 text-13 text-[var(--text-secondary)]">
+                  {t(
+                    overview.legacyLibrary.provenance === 'unknown'
+                      ? 'settings.ghosts.library.legacyFoundUnknownBanner'
+                      : 'settings.ghosts.library.legacyFoundBanner',
+                    {
+                      size: formatBytes(overview.legacyLibrary.usedBytes),
+                      count: overview.legacyLibrary.fileCount,
+                    },
+                  )}
+                </p>
+                <button
+                  type="button"
+                  className={ACTION_BUTTON_CLASS}
+                  disabled={busy !== null}
+                  onClick={() => void handleReattachLegacy()}
+                >
+                  {busy === 'reattach' ? t('settings.ghosts.library.legacyReattachBusy') : t('settings.ghosts.library.legacyReattach')}
+                </button>
+              </div>
             ) : null}
             <div className="space-y-2">
               <div className={ROW_CLASS}>

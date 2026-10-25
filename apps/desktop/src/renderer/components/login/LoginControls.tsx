@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import type {
+  CSSProperties,
+  FocusEvent as ReactFocusEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  ReactNode,
+} from 'react';
 
 import { cn } from '@/lib/utils';
 
@@ -18,13 +24,14 @@ import {
   SKIP_ENTRY,
   SOCIAL,
   SPINNER,
+  SSO_ORG_HISTORY,
   SUBTITLE,
   TEXT_LINK,
   TITLE,
 } from './loginDesignTokens';
 
 /**
- * LoginControls — 登录皮肤组件库(figma-component-spec §4 逐参数重建)。
+ * LoginControls — 登录皮肤组件库(按 Figma 组件库逐参数重建;现行值见 DESIGN.md §16)。
  *
  * 态系(design.md §2):
  * - hover 仅桌面(本文件即桌面端);pressed 双端;态只叠遮罩不改布局(§2.3-1)。
@@ -79,7 +86,7 @@ export function LoginPanel({
  * 20 Regular——2026-07-24 拍板,原 figma 单行 599@41 作废,见 DESIGN.md §16.2)。
  * 区域徽标变体(v2 inline 组,用户裁定 2026-07-25):标题 shrink-to-fit 单行 + 徽标
  * 紧随其后 gap 2 设计px,组整体相对面板水平居中;原 v1 固定几何(span @185 w236 +
- * pill @425,4)作废,见 DESIGN.md §16.2 与 figma-component-spec §4.10 的 v2 批注。
+ * pill @425,4)作废,见 DESIGN.md §16.2。
  * 徽标挂哪些区域由调用方决定(2026-07-27 起 global 不挂,见 LoginPage)。
  */
 export function LoginTitleBlock({
@@ -204,6 +211,14 @@ export function LoginInput({
   top = CONTROL.inputY,
   prefix,
   testId,
+  onFocus,
+  onBlur,
+  onClick,
+  onKeyDown,
+  role,
+  ariaControls,
+  ariaExpanded,
+  ariaActiveDescendant,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -222,6 +237,14 @@ export function LoginInput({
   /** 固定前缀块文本(仅左对齐形态;undefined = 无前缀,布局与旧版逐字节一致)。 */
   prefix?: string;
   testId?: string;
+  onFocus?: (event: ReactFocusEvent<HTMLInputElement>) => void;
+  onBlur?: (event: ReactFocusEvent<HTMLInputElement>) => void;
+  onClick?: (event: ReactMouseEvent<HTMLInputElement>) => void;
+  onKeyDown?: (event: ReactKeyboardEvent<HTMLInputElement>) => void;
+  role?: 'combobox';
+  ariaControls?: string;
+  ariaExpanded?: boolean;
+  ariaActiveDescendant?: string;
 }) {
   const filled = value.length > 0;
   const prefixNode = prefix != null && !center && (
@@ -256,7 +279,14 @@ export function LoginInput({
         pattern={pattern}
         value={value}
         onChange={(event) => onChange(event.target.value)}
+        onClick={onClick}
+        onKeyDown={onKeyDown}
         placeholder={placeholder}
+        role={role}
+        aria-autocomplete={role === 'combobox' ? 'list' : undefined}
+        aria-controls={ariaControls}
+        aria-expanded={ariaExpanded}
+        aria-activedescendant={ariaActiveDescendant}
         className={cn(
           'absolute box-border appearance-none overflow-hidden whitespace-nowrap outline-none',
           'login-skin-input transition-none',
@@ -275,7 +305,9 @@ export function LoginInput({
             width: CONTROL.width,
             height: CONTROL.height,
             borderRadius: CONTROL.radius,
-            background: LOGIN_COLORS.controlBg,
+            // backgroundColor 而非 background 简写:简写会把 background-image 重置为 none,
+            // 上面 hover:enabled 的 5% 叠层(background-image)因此从未生效。
+            backgroundColor: LOGIN_COLORS.controlBg,
             border: `1px solid ${
               error
                 ? LOGIN_COLORS.errorFg
@@ -299,6 +331,7 @@ export function LoginInput({
           if (!error) event.currentTarget.style.borderColor = LOGIN_COLORS.controlBorderActive;
           event.currentTarget.style.fontWeight = '700';
           event.currentTarget.style.color = LOGIN_COLORS.controlText;
+          onFocus?.(event);
         }}
         onBlur={(event) => {
           const nowFilled = event.currentTarget.value.length > 0;
@@ -311,9 +344,92 @@ export function LoginInput({
           event.currentTarget.style.color = nowFilled
             ? LOGIN_COLORS.controlText
             : LOGIN_COLORS.controlPlaceholder;
+          onBlur?.(event);
         }}
       />
     </>
+  );
+}
+
+export function ssoOrgHistoryOptionId(index: number): string {
+  return `login-sso-org-history-option-${index}`;
+}
+
+/** Visual-only listbox for recent successful organization identifiers. */
+export function LoginSsoOrgHistoryList({
+  entries,
+  value,
+  activeIndex,
+  onActiveIndexChange,
+  onSelect,
+  listId,
+}: {
+  entries: readonly string[];
+  value: string;
+  activeIndex: number;
+  onActiveIndexChange: (index: number) => void;
+  onSelect: (entry: string) => void;
+  listId: string;
+}) {
+  const selectedKey = value.trim().toLowerCase();
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  useEffect(() => {
+    if (activeIndex < 0) return;
+    optionRefs.current[activeIndex]?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex]);
+  return (
+    <div
+      id={listId}
+      data-testid="login-sso-org-history-list"
+      role="listbox"
+      className="absolute z-[4] box-border overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      style={{
+        left: SSO_ORG_HISTORY.x,
+        top: SSO_ORG_HISTORY.y,
+        width: SSO_ORG_HISTORY.width,
+        maxHeight: SSO_ORG_HISTORY.maxHeight,
+        borderRadius: SSO_ORG_HISTORY.radius,
+        background: LOGIN_COLORS.panelBg,
+        border: `1px solid ${LOGIN_COLORS.controlBorder}`,
+      }}
+    >
+      {entries.map((entry, index) => {
+        const highlighted = activeIndex === index || entry.toLowerCase() === selectedKey;
+        return (
+          <button
+            id={ssoOrgHistoryOptionId(index)}
+            key={entry.toLowerCase()}
+            ref={(node) => {
+              optionRefs.current[index] = node;
+            }}
+            type="button"
+            role="option"
+            aria-selected={entry.toLowerCase() === selectedKey}
+            data-testid={`login-sso-org-history-option-${index}`}
+            tabIndex={-1}
+            className="flex w-full items-center border-0 text-left hover:bg-[var(--login-action-control-bg)]"
+            style={{
+              minHeight: SSO_ORG_HISTORY.rowMinHeight,
+              paddingLeft: SSO_ORG_HISTORY.paddingX,
+              paddingRight: SSO_ORG_HISTORY.paddingX,
+              paddingTop: SSO_ORG_HISTORY.paddingY,
+              paddingBottom: SSO_ORG_HISTORY.paddingY,
+              borderRadius: SSO_ORG_HISTORY.rowRadius,
+              background: highlighted ? LOGIN_COLORS.actionControlBg : 'transparent',
+              color: LOGIN_COLORS.controlText,
+              fontSize: SSO_ORG_HISTORY.fontSize,
+              lineHeight: `${SSO_ORG_HISTORY.lineHeight}px`,
+              overflowWrap: 'anywhere',
+            }}
+            onMouseEnter={() => onActiveIndexChange(index)}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => onSelect(entry)}
+          >
+            {entry}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -535,8 +651,9 @@ export function LoginBackButton({
         border: `1px solid ${LOGIN_COLORS.backBorder}`,
       }}
     >
-      {/* 24 box 内左向 chevron(247:1635 icon 语义;矢量重绘,静态) */}
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden>
+      {/* 24 box 内左向 chevron(247:1635 icon 语义;矢量重绘,静态)。z-[1]:hover/pressed
+          叠层(::after,亮色白 70%)只染底色,不盖住箭头——否则悬停时箭头仅 1.76:1。 */}
+      <svg className="relative z-[1]" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden>
         <path
           d="M14.5 5.5 8 12l6.5 6.5"
           stroke={LOGIN_COLORS.controlText}
@@ -553,7 +670,9 @@ export function LoginBackButton({
  * Text_link(§4.7 状态表 + U-9 裁决):(70,238) 540×50 Regular 20 居中。
  * - link:default #2A2828 underline(247:1612)/hover #4A4848(358:792,仅桌面)/
  *   pressed #1A1818(U-9,--login-link-pressed;underline·字号·字重不变);
- * - countdown/info 变体:#D4D4D4 无 underline 不可交互(247:1614);
+ * - countdown/info 变体:次要档(--login-secondary-text,2026-10-23 起;原 figma 247:1614
+ *   为 #D4D4D4,与占位同档只有 1.3~2.2:1,倒计时与「验证码已发送至 X」是要读的信息)
+ *   无 underline 不可交互;
  *   binding code 子态「验证码已发送至 X」提示复用本变体(demo bindingPanel)。
  * 色变全走 CSS 类(hover:/active:),不改布局(design §2.3-1)。
  *
@@ -591,7 +710,7 @@ export function LoginTextLink({
       <span
         data-testid={testId ?? 'login-text-link-countdown'}
         className="absolute flex items-center justify-center overflow-hidden whitespace-nowrap"
-        style={{ ...geometry, color: LOGIN_COLORS.controlPlaceholder, textOverflow: 'ellipsis' }}
+        style={{ ...geometry, color: LOGIN_COLORS.secondaryText, textOverflow: 'ellipsis' }}
       >
         {children}
       </span>
@@ -619,7 +738,7 @@ export function LoginTextLink({
  * 「跳过登录」文字按钮(新稿容器 705:1068/700:910;用户拍板 2026-07-27)。
  *
  * **与 LoginTextLink 是两种组件**:那个是文字链接(link 族 hover/pressed 变色),
- * 本组件是文字按钮——颜色 light/dark 统一 `--login-secondary-text`(#6F6F6F 双模同值),
+ * 本组件是文字按钮——颜色 light/dark 统一 `--login-secondary-text`(墨水次要档 黑 56% / 白 55%),
  * hover/pressed **不变色**,只靠下划线与指针形状给反馈。
  *
  * 热区(用户拍板):**不全宽**。680×60(SKIP_ENTRY)只是布局容器且自身不可点
@@ -1083,7 +1202,7 @@ export function LoginErrorText({ children }: { children: ReactNode }) {
 }
 
 /**
- * 方式行(§4.9:540×100 r60 #EEEEEE/#D4D4D4;标题 24 Bold/副行 20 #6F6F6F 左对齐
+ * 方式行(§4.9:540×100 r60 #EEEEEE/#D4D4D4;标题 24 Bold/副行 20 次要档左对齐
  * x=67,文字块垂直居中行距 5;左 icon 24 box @(27,37)/person 18×20 @(30,39);
  * 右 share 18×18 @(490,40);hover 白 8%/pressed 黑 8%)。
  */
@@ -1137,7 +1256,7 @@ export function LoginMethodRow({
     >
       <span
         aria-hidden
-        className="absolute inline-flex"
+        className="absolute z-[1] inline-flex"
         style={
           !showLogo && icon === 'person'
             ? {
@@ -1169,7 +1288,7 @@ export function LoginMethodRow({
         )}
       </span>
       <span
-        className="absolute flex flex-col justify-center text-left"
+        className="absolute z-[1] flex flex-col justify-center text-left"
         style={{
           left: METHOD_ROW.textX,
           top: 0,
@@ -1192,7 +1311,7 @@ export function LoginMethodRow({
       </span>
       <span
         aria-hidden
-        className="absolute inline-flex"
+        className="absolute z-[1] inline-flex"
         style={{
           left: METHOD_ROW.rightIcon.x,
           top: METHOD_ROW.rightIcon.y,
@@ -1261,21 +1380,16 @@ function ShareIcon() {
   return (
     <svg width="100%" height="100%" viewBox="0 0 20 20" fill="none" aria-hidden>
       <path
-        d="M12 1H19V8"
-        stroke={LOGIN_COLORS.controlText}
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
         d="M19 12.7368V17.5C19 18.3285 18.3285 19 17.5 19H2.5C1.67158 19 1 18.3285 1 17.5V2.5C1 1.67158 1.67158 1 2.5 1H7"
         stroke={LOGIN_COLORS.controlText}
         strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+      {/* 箭头的拐角与斜线尖端在右上角重叠:合成同一条 path,一次描边只上一次透明度;
+          拆成两条 path 时,控件文字色是半透明墨水,交叠处会叠出深点(浅色)/亮点(深色)。 */}
       <path
-        d="M10.8999 9.09995L18.5499 1.44995"
+        d="M12 1H19V8M10.8999 9.09995L18.5499 1.44995"
         stroke={LOGIN_COLORS.controlText}
         strokeWidth="2"
         strokeLinecap="round"

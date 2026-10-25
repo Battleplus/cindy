@@ -6,6 +6,12 @@
  * An installed Ghost without a matching market record remains local.
  */
 import { isCindyAccountGhostId, type GhostInstallApproval } from '../../../../shared/ghost';
+import {
+  createPluginLogicalIdentity,
+  findInstalledGhostByIdentity,
+  hasDeliveryNamespace,
+  installedGhostStoragePart,
+} from '../../../../shared/pluginIdentity';
 import type { PluginMarketItem } from '../../../../shared/pluginMarket';
 
 export type PluginPresentationOrigin = 'public' | 'organization' | 'local' | 'custom';
@@ -44,9 +50,10 @@ export function pluginUpdateForInstalledVersion(
  * Whether the market install flow may run against an already-installed Plugin.
  *
  * A pending release is the usual case. The same release is also allowed when the
- * install carries no Host approval: re-installing that exact release is how such
- * an install gets reviewed again, and the flow shows every permission as newly
- * requested. An approved install at the current release has nothing to review.
+ * installation record is incomplete: reinstalling that exact release restores
+ * the Host receipt. Without an approved baseline Main cannot prove the previous
+ * permissions, so it asks the user as for a first install. A verified install at
+ * the current release has nothing to recover.
  */
 export function marketReviewTargetsInstalledGhost(
   item: Pick<PluginMarketItem, 'installState'> | null | undefined,
@@ -61,10 +68,10 @@ export function marketReviewTargetsInstalledGhost(
 }
 
 /**
- * Where an unapproved install gets reviewed again. Market-owned installs replay
- * the market confirmation; anything else needs the user to point at a `.cindy`
- * package. Both routes end in the same permission confirmation — there is no
- * path that restores an install without one.
+ * Where an unverifiable install is recovered. Market-owned installs redownload
+ * the bound release; anything else needs the user to point at a `.cindy` package.
+ * Both routes revalidate real bytes and restore the installation record without
+ * creating a separate capability authorization flow.
  */
 export function ghostReapprovalRoute(
   item: Pick<PluginMarketItem, 'installState'> | null | undefined,
@@ -72,6 +79,54 @@ export function ghostReapprovalRoute(
   return item?.installState === 'installed' || item?.installState === 'update-available'
     ? 'market'
     : 'local-package';
+}
+
+/**
+ * Bind a market row to the installed instance it is allowed to update.
+ *
+ * An explicit namespace must hit that logical identity. A legacy row
+ * (missing namespace) binds the physical root, including an
+ * in-place stamped plugin whose storage part is still the bare ghostId. It must
+ * not fall through to a `_ns/...` twin.
+ */
+export function findInstalledGhostForMarketItem<
+  T extends {
+    manifest: { id: string };
+    dir?: string;
+    namespace?: string | null;
+  },
+>(ghosts: readonly T[], item: Pick<PluginMarketItem, 'ghostId' | 'namespace'>): T | undefined {
+  const sameId = ghosts.filter((ghost) => ghost.manifest.id === item.ghostId);
+  if (sameId.length === 0) return undefined;
+  if (hasDeliveryNamespace(item)) {
+    return findInstalledGhostByIdentity(
+      sameId,
+      createPluginLogicalIdentity(item.namespace, item.ghostId),
+    );
+  }
+  return sameId.find((ghost) => installedGhostStoragePart(ghost) === item.ghostId);
+}
+
+/** True when this market row is the update/origin route for this installed instance. */
+export function marketItemMatchesInstalledGhost(
+  item: Pick<PluginMarketItem, 'ghostId' | 'namespace'>,
+  ghost: { manifest: { id: string }; dir?: string; namespace?: string | null },
+): boolean {
+  if (item.ghostId !== ghost.manifest.id) return false;
+  if (hasDeliveryNamespace(item) && hasDeliveryNamespace(ghost)) {
+    return item.namespace === ghost.namespace;
+  }
+  if (hasDeliveryNamespace(item) && item.namespace !== null) return false;
+  return installedGhostStoragePart(ghost) === item.ghostId;
+}
+
+export function marketItemForInstalledGhost(
+  items: readonly PluginMarketItem[],
+  ghost: { manifest: { id: string }; dir?: string; namespace?: string | null },
+): PluginMarketItem | null {
+  return items.find((item) =>
+    (item.installState === 'installed' || item.installState === 'update-available') &&
+    marketItemMatchesInstalledGhost(item, ghost)) ?? null;
 }
 
 /**

@@ -7,7 +7,7 @@
 //  - advanced unsupported actions yield a structured error (no throw)
 
 import fs from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -116,6 +116,39 @@ beforeEach(() => {
 
 afterEach(() => {
   dispatchTabOpSpy.mockReset();
+});
+
+describe('RsbWebviewBackend — bundled recipe sessions', () => {
+  it('routes commands to the owning guest, rejects another session and releases listeners', async () => {
+    const wc = fakeWc();
+    const send = vi.fn(async (_method: string) => ({ root: { nodeId: 42 } }));
+    const listeners = new Set<unknown>();
+    Object.assign(wc, { removeListener: vi.fn(), debugger: {
+      isAttached: () => true, sendCommand: send,
+      on: (_event: string, listener: unknown) => { listeners.add(listener); },
+      removeListener: (_event: string, listener: unknown) => { listeners.delete(listener); },
+    } });
+    let activeSession = 'owner';
+    const backend = new RsbWebviewBackend({
+      registry: fakeRegistry([{ sessionId: 'owner', tabId: 't', webContentsId: 1 }], new Map([['t', wc]])),
+      getActiveSessionId: () => activeSession,
+      bridge: { getHostWebContents: () => null, logger: logger() }, logger: logger(),
+    });
+    try {
+      const begin = await backend.call({ action: 'recipeCommand', targetId: 't', recipeCommand: { method: 'Cindy.begin' } });
+      expect(begin.ok).toBe(true);
+      const sessionId = (begin.data as { sessionId: string }).sessionId;
+      const request = { action: 'recipeCommand' as const, targetId: 't', recipeCommand: { method: 'DOM.getDocument', sessionId } };
+      expect((await backend.call(request)).data).toMatchObject({ root: { nodeId: 42 } });
+      activeSession = 'other';
+      expect((await backend.call(request)).ok).toBe(false);
+      expect(send.mock.calls.filter(([method]) => method === 'DOM.getDocument')).toHaveLength(1);
+      activeSession = 'owner';
+      const before = listeners.size;
+      expect((await backend.call({ ...request, recipeCommand: { method: 'Cindy.end', sessionId } })).ok).toBe(true);
+      expect(listeners.size).toBeLessThan(before);
+    } finally { await backend.dispose(); }
+  });
 });
 
 describe('RsbWebviewBackend — diagnostic actions', () => {
@@ -1418,7 +1451,7 @@ describe('RsbWebviewBackend — uploads and page dialogs', () => {
       expect(res.ok).toBe(true);
       expect(res.data).toMatchObject({ tabId: 't1', uploadedFiles: 1 });
       expect(env.sendCommand).toHaveBeenCalledWith('DOM.setFileInputFiles', {
-        files: [await fs.realpath(file)],
+        files: [realpathSync(file)],
         objectId: 'file-input',
       });
       await env.backend.dispose();
@@ -2040,6 +2073,30 @@ describe('RsbWebviewBackend — detached-window ensure/wait for direct actions',
       url: 'https://example.com',
     } as never);
     expect(ensureHost).toHaveBeenCalledTimes(1);
+    expect(ensureHost).toHaveBeenCalledWith('s1');
+    expect(res.ok).toBe(true);
+  });
+
+  it('direct action asks ensureHost for the request session, not the focused one', async () => {
+    const ensureHost = vi.fn(async () => undefined);
+    const wc = fakeWc();
+    const registry = fakeRegistry(
+      [{ sessionId: 's1', tabId: 't1', webContentsId: 101 }],
+      new Map([['t1', wc]]),
+    );
+    const backend = new RsbWebviewBackend({
+      registry,
+      getActiveSessionId: () => 's2',
+      bridge: { getHostWebContents: () => null, ensureHost, logger: logger() },
+      logger: logger(),
+    });
+    const res = await backend.call({
+      action: 'navigate',
+      targetId: 't1',
+      url: 'https://example.com',
+      __mcpSessionId: 's1',
+    } as never);
+    expect(ensureHost).toHaveBeenCalledWith('s1');
     expect(res.ok).toBe(true);
   });
 
@@ -2175,9 +2232,9 @@ describe('RsbWebviewBackend — detached-window ensure/wait for direct actions',
     expect(res.message).toMatch(/t-ghost not in active session s1/);
   });
 
-  it('ensureHost rejection does not mask a resolvable tab', async () => {
+  it('ensureHost rejection fails closed even if a pooled tab still exists', async () => {
     const ensureHost = vi.fn(async () => {
-      throw new Error('ready timeout');
+      throw new Error('host context not ready');
     });
     const wc = fakeWc();
     const registry = fakeRegistry(
@@ -2186,15 +2243,17 @@ describe('RsbWebviewBackend — detached-window ensure/wait for direct actions',
     );
     const backend = new RsbWebviewBackend({
       registry,
-      getActiveSessionId: () => 's1',
+      getActiveSessionId: () => 's2',
       bridge: { getHostWebContents: () => null, ensureHost, logger: logger() },
       logger: logger(),
     });
     const res = await backend.call({
       action: 'screenshot',
       targetId: 't1',
+      __mcpSessionId: 's1',
     } as never);
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/host context not ready/);
   });
 
   it('embedded mode (isDetached false) → resolve miss fails fast, no polling', async () => {

@@ -9,12 +9,16 @@ const envState = vi.hoisted(() => ({
     global: 'https://relay.global.example',
   },
 }));
+const devEnvironmentState = vi.hoisted(() => ({
+  active: 'dev' as 'dev' | 'release',
+}));
 const mocks = vi.hoisted(() => ({
   asyncGetItem: vi.fn(async (key: string) => store.get(key) ?? null),
   loadMobileEndpointsForRealm: vi.fn(async (_realm: 'cn' | 'global') => ({})),
   getPermissionsAsync: vi.fn(),
   requestPermissionsAsync: vi.fn(),
   getDevicePushTokenAsync: vi.fn(),
+  setNotificationHandler: vi.fn(),
 }));
 
 vi.mock('@react-native-async-storage/async-storage', () => ({
@@ -30,7 +34,7 @@ vi.mock('@react-native-async-storage/async-storage', () => ({
 }));
 
 vi.mock('expo-notifications', () => ({
-  setNotificationHandler: vi.fn(),
+  setNotificationHandler: mocks.setNotificationHandler,
   getPermissionsAsync: mocks.getPermissionsAsync,
   requestPermissionsAsync: mocks.requestPermissionsAsync,
   getDevicePushTokenAsync: mocks.getDevicePushTokenAsync,
@@ -51,7 +55,12 @@ vi.mock('@/config/env', () => ({
     envState.endpointByRealm[realm],
 }));
 
+vi.mock('@/config/devServerEnvironment', () => ({
+  getDevServerEnvironment: () => devEnvironmentState.active,
+}));
+
 import {
+  configureForegroundNotificationBehavior,
   retryPendingUnregister,
   syncPushRegistration,
   unregisterPushTokenBestEffort,
@@ -59,6 +68,10 @@ import {
 
 const REGISTERED_KEY = 'cindy.push.registered';
 const PENDING_KEY = 'cindy.push.pendingUnregister';
+const DEV_REGISTERED_KEY = `${REGISTERED_KEY}.dev`;
+const RELEASE_REGISTERED_KEY = `${REGISTERED_KEY}.release`;
+const DEV_PENDING_KEY = `${PENDING_KEY}.dev`;
+const RELEASE_PENDING_KEY = `${PENDING_KEY}.release`;
 
 function setStoredRealms(key: string, realms: Array<'cn' | 'global'>): void {
   store.set(key, JSON.stringify({ version: 1, realms }));
@@ -72,11 +85,42 @@ function readStoredRealms(key: string): string[] {
 }
 
 describe('push notification realm routing', () => {
+  it('compensates both endpoints when first enable partially fails, retaining retry state if DELETE fails', async () => {
+    let failDelete = true;
+    const apiFetch = vi.fn(async (path: string, opts: { method?: string }) => {
+      if (path === '/v1/push-token' && (opts.method === 'PUT' || failDelete)) throw new Error('offline');
+      return {};
+    });
+    await expect(syncPushRegistration({ enabled: true, apiFetch: apiFetch as any })).rejects.toThrow('offline');
+    expect(apiFetch.mock.calls.filter(call => call[1].method === 'DELETE').map(call => call[0]))
+      .toEqual(['/api/device-link/push-token', '/v1/push-token']);
+    expect(readStoredRealms(PENDING_KEY)).toEqual(['cn']);
+    expect(readStoredRealms(REGISTERED_KEY)).toEqual(['cn']);
+    failDelete = false;
+    await retryPendingUnregister(apiFetch as any);
+    expect(readStoredRealms(PENDING_KEY)).toEqual([]);
+    expect(readStoredRealms(REGISTERED_KEY)).toEqual([]);
+  });
+  // Same group, another thread must still be noticeable while reading the main timeline.
+  it('passes the thread route to the foreground visibility gate', async () => {
+    const room = '00000000-0000-4000-8000-000000000001';
+    const message = '00000000-0000-4000-8000-000000000002';
+    const thread = '00000000-0000-4000-8000-000000000003';
+    const reading = vi.fn((_route: string) => false);
+    configureForegroundNotificationBehavior(reading);
+    const handler = mocks.setNotificationHandler.mock.calls.at(-1)![0];
+    const notification = { request: { content: { data: { deepLink: `/companions/groups/${room}?messageId=${message}&threadRootId=${thread}` } } } };
+    expect(await handler.handleNotification(notification)).toMatchObject({ shouldShowBanner: true });
+    expect(reading.mock.calls[0][0]).toContain(`threadRootId=${thread}`);
+    reading.mockReturnValue(true);
+    expect(await handler.handleNotification(notification)).toMatchObject({ shouldShowBanner: false, shouldPlaySound: false });
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     store.clear();
     envState.activeRealm = 'cn';
     envState.buildRegion = 'cn';
+    devEnvironmentState.active = 'dev';
     mocks.getPermissionsAsync.mockResolvedValue({
       status: 'granted',
       canAskAgain: false,
@@ -135,6 +179,74 @@ describe('push notification realm routing', () => {
         }),
       }),
     );
+    expect(readStoredRealms(DEV_REGISTERED_KEY)).toEqual(['cn']);
+    expect(store.has(REGISTERED_KEY)).toBe(false);
+  });
+
+  it('CindyDev 的 Dev 与 Release 推送状态互相隔离', async () => {
+    envState.buildRegion = 'dev';
+    const apiFetch = vi.fn().mockResolvedValue({ registered: true });
+
+    await syncPushRegistration({ enabled: true, apiFetch });
+    devEnvironmentState.active = 'release';
+    await syncPushRegistration({ enabled: true, apiFetch });
+
+    expect(readStoredRealms(DEV_REGISTERED_KEY)).toEqual(['cn']);
+    expect(readStoredRealms(RELEASE_REGISTERED_KEY)).toEqual(['cn']);
+    expect(apiFetch).toHaveBeenCalledTimes(4); // Each environment registers task and chat delivery.
+    expect(apiFetch.mock.calls.filter(([path]) => path === '/v1/push-token')).toHaveLength(2);
+  });
+
+  it('注册期间切换 CindyDev 环境仍把补偿状态留在原 namespace', async () => {
+    envState.buildRegion = 'dev';
+    let releaseRead: (() => void) | undefined;
+    const readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    mocks.asyncGetItem.mockImplementationOnce(async (key: string) => {
+      expect(key).toBe(DEV_REGISTERED_KEY);
+      await readGate;
+      return null;
+    });
+    const apiFetch = vi.fn();
+
+    const registration = syncPushRegistration({ enabled: true, apiFetch });
+    await vi.waitFor(() => {
+      expect(mocks.asyncGetItem).toHaveBeenCalledWith(DEV_REGISTERED_KEY);
+    });
+    await unregisterPushTokenBestEffort(null, 'cn');
+    devEnvironmentState.active = 'release';
+    releaseRead?.();
+
+    await expect(registration).resolves.toBe('skipped');
+    expect(apiFetch).not.toHaveBeenCalled();
+    expect(readStoredRealms(DEV_REGISTERED_KEY)).toEqual(['cn']);
+    expect(readStoredRealms(DEV_PENDING_KEY)).toEqual(['cn']);
+    expect(store.has(RELEASE_REGISTERED_KEY)).toBe(false);
+    expect(store.has(RELEASE_PENDING_KEY)).toBe(false);
+  });
+
+  it('Release 环境不读取旧 CindyDev 的无后缀状态', async () => {
+    envState.buildRegion = 'dev';
+    devEnvironmentState.active = 'release';
+    setStoredRealms(REGISTERED_KEY, ['global']);
+    const apiFetch = vi.fn().mockResolvedValue({ registered: true });
+
+    await syncPushRegistration({ enabled: true, apiFetch });
+
+    expect(readStoredRealms(RELEASE_REGISTERED_KEY)).toEqual(['cn']);
+    expect(readStoredRealms(REGISTERED_KEY)).toEqual(['global']);
+  });
+
+  it('Dev 环境把旧 CindyDev 的无后缀状态迁移到环境专属 key', async () => {
+    envState.buildRegion = 'dev';
+    setStoredRealms(REGISTERED_KEY, ['global']);
+    const apiFetch = vi.fn().mockResolvedValue({ registered: true });
+
+    await syncPushRegistration({ enabled: true, apiFetch });
+
+    expect(readStoredRealms(DEV_REGISTERED_KEY)).toEqual(['cn', 'global']);
+    expect(store.has(REGISTERED_KEY)).toBe(false);
   });
 
   it('切换区域前用旧 token 向显式冻结的旧区域撤销', async () => {

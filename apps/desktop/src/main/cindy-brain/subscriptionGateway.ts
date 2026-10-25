@@ -46,6 +46,7 @@ import {
 import { isGhostOwnerScopeUsable, type GhostOwnerScope } from './ghostOwnerScope.js';
 import { getDbClient } from '../localDb/client/current.js';
 import * as localDbSchema from '../localDb/schema.js';
+import { installedGhostStoragePart } from '../../shared/pluginIdentity.js';
 
 /** block 理由展示上限(超长截断,防意识用理由塞小作文)。 */
 const BLOCK_REASON_MAX_CHARS = 200;
@@ -196,7 +197,6 @@ export class GhostSubscriptionGateway {
   ): void {
     for (const ghost of this.deps.listGhosts()) {
       if (!ghost.enabled) continue;
-      if (!ghost.manifest.slots.includes('subscribe')) continue;
       if (!ghost.manifest.subscribe?.topics?.includes(topic)) continue;
       this.dispatchTo(ghost, topic, name, data);
     }
@@ -225,7 +225,7 @@ export class GhostSubscriptionGateway {
     name: GhostDidEventName,
     data: GhostDidEventData,
   ): void {
-    const ghostId = ghost.manifest.id;
+    const ghostId = installedGhostStoragePart(ghost);
     const e = this.entry(ghostId);
     const ownerScope = this.captureOwnerScope();
     if (!this.ownerScopeUsable(ownerScope)) {
@@ -293,23 +293,24 @@ export class GhostSubscriptionGateway {
   private kickWake(ghost: InstalledGhost, e: SubEntry, ownerScope: unknown): void {
     if (e.waking) return;
     if (!this.ownerScopeUsable(ownerScope)) {
-      this.invalidateOwner(ghost.manifest.id, e);
+      this.invalidateOwner(installedGhostStoragePart(ghost), e);
       return;
     }
     e.waking = true;
     void this.deps
       .wake(ghost)
       .then(() => {
+        if (this.entries.get(installedGhostStoragePart(ghost)) !== e) return;
         if (!this.ownerScopeUsable(ownerScope)) {
-          this.invalidateOwner(ghost.manifest.id, e);
+          this.invalidateOwner(installedGhostStoragePart(ghost), e);
           return;
         }
-        this.flush(ghost.manifest.id, e, ownerScope);
+        this.flush(installedGhostStoragePart(ghost), e, ownerScope);
       })
       .catch((err) => {
         // 唤醒失败缓冲保留(封顶丢最旧),下一条事件再试。
         this.deps.log?.warn('ghost subscribe wake failed', {
-          ghostId: ghost.manifest.id,
+          ghostId: installedGhostStoragePart(ghost),
           error: err instanceof Error ? err.message : String(err),
         });
       })
@@ -377,7 +378,7 @@ export class GhostSubscriptionGateway {
     for (const ghost of this.deps.listGhosts()) {
       if (!ghost.enabled) continue;
       if (!ghost.manifest.subscribe?.hooks?.includes('will-user-message')) continue;
-      const ghostId = ghost.manifest.id;
+      const ghostId = installedGhostStoragePart(ghost);
       const e = this.entry(ghostId);
       if (e.hookFused) continue;
       context ??= this.resolveMessageHookContext(input.sessionId, GHOST_HOOK_TIMEOUT_MS / 2);
@@ -406,7 +407,7 @@ export class GhostSubscriptionGateway {
     if (rewritten && lastRewriteGhost) {
       return {
         action: 'rewrite',
-        ghostId: lastRewriteGhost.manifest.id,
+        ghostId: installedGhostStoragePart(lastRewriteGhost),
         ghostName: lastRewriteGhost.manifest.name,
         text: currentText,
       };
@@ -441,7 +442,7 @@ export class GhostSubscriptionGateway {
     for (const ghost of this.deps.listGhosts()) {
       if (!ghost.enabled) continue;
       if (!ghost.manifest.subscribe?.hooks?.includes('will-assistant-message')) continue;
-      const ghostId = ghost.manifest.id;
+      const ghostId = installedGhostStoragePart(ghost);
       const e = this.entry(ghostId);
       if (e.hookFused) continue;
       context ??= this.resolveMessageHookContext(
@@ -476,7 +477,7 @@ export class GhostSubscriptionGateway {
     if (renderGhost) {
       return {
         action: 'render',
-        ghostId: renderGhost.manifest.id,
+        ghostId: installedGhostStoragePart(renderGhost),
         ghostName: renderGhost.manifest.name,
         html: renderHtml,
         height: renderHeight,
@@ -486,7 +487,7 @@ export class GhostSubscriptionGateway {
     if (lastRewriteGhost) {
       return {
         action: 'rewrite',
-        ghostId: lastRewriteGhost.manifest.id,
+        ghostId: installedGhostStoragePart(lastRewriteGhost),
         ghostName: lastRewriteGhost.manifest.name,
         text: currentText,
       };
@@ -505,7 +506,7 @@ export class GhostSubscriptionGateway {
     ownerStamp?: unknown,
     ownerScope?: unknown,
   ): Promise<HookVerdict | null> {
-    const ghostId = ghost.manifest.id;
+    const ghostId = installedGhostStoragePart(ghost);
     const hookId = this.deps.newHookId?.() ?? randomUUID();
     // 超时按钩子分:入口(user-message)必须快(挡发送);出口(assistant-message)
     // 是后台后置钩,容许长处理(见 GHOST_ASSISTANT_HOOK_TIMEOUT_MS)。
@@ -603,14 +604,14 @@ export class GhostSubscriptionGateway {
   ): void {
     e.hookFails += 1;
     this.deps.log?.warn('ghost hook failed (fail-open)', {
-      ghostId: ghost.manifest.id,
+      ghostId: installedGhostStoragePart(ghost),
       why,
       fails: e.hookFails,
     });
     if (e.hookFails >= GHOST_HOOK_FUSE_THRESHOLD && !e.hookFused) {
       e.hookFused = true;
       this.deps.log?.warn('ghost hook fused: degraded to observe-only', {
-        ghostId: ghost.manifest.id,
+        ghostId: installedGhostStoragePart(ghost),
       });
       this.deps.onHookFused?.(ghost, ownerStamp);
     }
@@ -637,6 +638,13 @@ export class GhostSubscriptionGateway {
 
   /** 意识停用/抽离时清态(缓冲、熔断、seq 全部归零;待决钩子按超时自然收口)。 */
   dropGhost(ghostId: string): void {
+    const entry = this.entries.get(ghostId);
+    if (entry) entry.buffer.length = 0;
+    for (const [hookId, pending] of this.pendingHooks) {
+      if (pending.ghostId !== ghostId) continue;
+      this.pendingHooks.delete(hookId);
+      pending.resolve(null);
+    }
     this.entries.delete(ghostId);
   }
 }
@@ -1113,7 +1121,7 @@ export class GhostActivityTracker {
   }
 }
 
-/** 从 done 事件的 usage 里尽力抽 token 数。三种真实形态都认:
+/** 从终态事件的 usage 里尽力抽 token 数。三种真实形态都认:
  *  cc snake_case(input_tokens/cache_read_input_tokens…)、通用 camelCase、
  *  codex translator 形态(promptTokens/completionTokens/cachedTokens);
  *  抽不出的字段缺省——协议里 usage 字段全部可选。 */
@@ -1135,7 +1143,7 @@ export function normalizeTurnUsage(raw: unknown): GhostEventTurnEndData['usage']
     'cachedInputTokens',
     'cachedTokens',
   );
-  const cacheCreationTokens = pick('cacheCreateTokens', 'cache_creation_input_tokens');
+  const cacheCreationTokens = pick('cacheCreationTokens', 'cacheCreateTokens', 'cache_creation_input_tokens');
   const usage = {
     ...(inputTokens !== undefined ? { inputTokens } : {}),
     ...(outputTokens !== undefined ? { outputTokens } : {}),
@@ -1252,19 +1260,14 @@ export class GhostTurnTranslator {
     }
 
     if (this.state === 'idle') return; // done/error 只在 turn 内有意义,幂等防重
-    if (ev.type === 'done') {
-      const usage = normalizeTurnUsage(
+    if (ev.type === 'done' || ev.type === 'error') {
+      const data =
         typeof ev.data === 'object' && ev.data !== null
-          ? (ev.data as { usage?: unknown }).usage
-          : undefined,
-      );
-      this.finish(base, 'completed', mergeTurnUsage(this.continuationUsage, usage));
-    } else if (ev.type === 'error') {
-      const isTerminal =
-        typeof ev.data === 'object' && ev.data !== null
-          ? (ev.data as { isTerminal?: unknown }).isTerminal !== false
-          : true;
-      if (isTerminal) this.finish(base, 'error', undefined);
+          ? ev.data as { isTerminal?: unknown; usage?: unknown }
+          : undefined;
+      if (ev.type === 'error' && data?.isTerminal === false) return;
+      const usage = normalizeTurnUsage(data?.usage);
+      this.finish(base, ev.type === 'error' ? 'error' : 'completed', mergeTurnUsage(this.continuationUsage, usage));
     }
   }
 

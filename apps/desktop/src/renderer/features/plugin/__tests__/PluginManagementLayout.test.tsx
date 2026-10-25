@@ -5,7 +5,7 @@
  */
 
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, useLocation } from 'react-router-dom';
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -42,6 +42,18 @@ function CurrentPath() {
 
 function ActiveMainView() {
   return <output data-testid="active-main-view">{useActiveMainView().activeKey}</output>;
+}
+
+function ActiveMainViewNavigationProbe() {
+  const navigate = useNavigate();
+  return (
+    <>
+      <ActiveMainView />
+      <button type="button" onClick={() => navigate('/apps/workspace')}>
+        Open main view
+      </button>
+    </>
+  );
 }
 
 describe('PluginManagementLayout', () => {
@@ -87,6 +99,20 @@ describe('PluginManagementLayout', () => {
     );
 
     expect(screen.getByTestId('active-main-view').textContent).toBe('plugins');
+  });
+
+  it('clears the sticky Plugin active state when entering a plugin main view', async () => {
+    render(
+      <MemoryRouter initialEntries={['/plugins']}>
+        <ActiveMainViewNavigationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId('active-main-view').textContent).toBe('plugins');
+    fireEvent.click(screen.getByRole('button', { name: 'Open main view' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('active-main-view').textContent).toBe('');
+    });
   });
 
   it('uses the same constrained frame for the tab row and page content', () => {
@@ -209,6 +235,33 @@ describe('PluginManagementLayout', () => {
 
     fireEvent.keyDown(searchInput, { key: 'Escape' });
     expect(document.activeElement).not.toBe(searchInput);
+  });
+
+  it('ignores a held Escape auto-repeat so one press clears without also blurring', () => {
+    const onQueryChange = vi.fn();
+    render(
+      <MemoryRouter>
+        <PluginManagementLayout activeTab="skills" query="calendar" onQueryChange={onQueryChange}>
+          <span>Content</span>
+        </PluginManagementLayout>
+      </MemoryRouter>,
+    );
+
+    const searchInput = screen.getByRole('textbox', { name: 'Search skills' });
+    searchInput.focus();
+    const repeat = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      searchInput.dispatchEvent(repeat);
+    });
+
+    expect(onQueryChange).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(searchInput);
+    expect(repeat.defaultPrevented).toBe(true);
   });
 
   it('leaves the search query and focus intact when IME handles Escape', () => {

@@ -9,13 +9,15 @@ let revokedControllers: string[] = [];
 vi.mock('../device-link/settings-store', () => ({
   readDeviceLinkSettings: () => ({ remoteControlEnabled, revokedControllers }),
 }));
-vi.mock('../logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
-}));
+const diagnosticLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
+vi.mock('../logger', () => ({ createLogger: () => diagnosticLog }));
 vi.mock('electron', () => ({
   ipcMain: { handle: vi.fn(), removeHandler: vi.fn() },
   app: { getVersion: () => '1.0.0' },
 }));
+// This suite exercises dispatch authorization, not authenticated ICE HTTP setup.
+vi.mock('../task-migration/service', () => ({ requestTaskMigration: vi.fn() }));
+vi.mock('../remote-desktop/iceConfig', () => ({ loadDesktopIceServers: vi.fn(async () => []) }));
 // media:fetch 拦截走 mediaFetch.fetchLocalMediaToOss;mock 掉避免拉起 OSS/cache-store 真实依赖。
 const fetchLocalMediaToOssMock = vi.hoisted(() => vi.fn());
 vi.mock('../device-link/mediaFetch', () => ({ fetchLocalMediaToOss: fetchLocalMediaToOssMock }));
@@ -30,6 +32,8 @@ import {
   markRemoteSettingPersistedInsideHandler,
   runInvoke,
   setRemoteReviewInputGuard,
+  setRemoteClaudeSubscriptionUsageReader,
+  setRemoteXaiSubscriptionUsageReader,
   setRemoteWorkingDirGuard,
   setRemoteSettingsPersist,
   handleControllerOffline,
@@ -43,6 +47,12 @@ import {
   isDeviceLinkInvoke,
 } from '../device-link/invoke-context';
 import * as subscriptions from '../device-link/subscriptions';
+import { createDesktopOnlyConfirmationRequestId } from '../cindy-brain/desktopOnlyConfirmationProjection';
+import { PLUGIN_OAUTH_CHANNEL } from '@cindy/device-link';
+import { initializePluginOauthHost, invalidatePluginOauth, publishedPluginOauthIdentity } from '../plugin-oauth/runtime';
+import { OauthBox } from '../plugin-oauth/box';
+import { testOauthSigningKey } from '../plugin-oauth/__tests__/fixtures';
+import { authenticateOauthController } from '../plugin-oauth/authentication';
 
 beforeEach(() => {
   remoteControlEnabled = true;
@@ -58,6 +68,31 @@ beforeEach(() => {
 });
 
 describe('runInvoke 双层校验', () => {
+  it('routes OAuth with the authenticated src and applies revocation before its private handler', async () => {
+    initializePluginOauthHost({
+      owner: () => 'member:g1', available: () => true,
+      bind: async () => ({ ghostId: 'p', current: () => true }), run: () => true,
+    }, () => ({deviceId:'cloud',membershipId:'member',realm:'global'}), testOauthSigningKey);
+    try {
+      const now=Date.now(), action={requestId:'card',actionId:'oauth_connect:x',expectedRevision:1};
+      let last: unknown;
+      const exchange=await authenticateOauthController({
+        target:{...(await publishedPluginOauthIdentity())!,realm:'global',deviceId:'cloud',membershipId:'member',observedAtMs:now,expiresAtMs:now+60000},
+        peer:'ctrl-a',action,ghostId:'p',assertCurrent:()=>{},trustIdentity:async()=>{},
+        invoke:async raw=>{last=raw;const reply=await runInvoke('ctrl-a',{channel:PLUGIN_OAUTH_CHANNEL,args:[raw]});
+          if(!reply.ok)throw Error('rejected');return reply.result;},
+      });
+      const started=await exchange({op:'start',...action,publicKey:new OauthBox().publicKey}) as {id:string};
+      const id=started.id;expect(id).toBeTruthy();
+      expect((await runInvoke('ctrl-b',{channel:PLUGIN_OAUTH_CHANNEL,args:[last]})).ok).toBe(false);
+      expect((await runInvoke('ctrl-a',{channel:'device-link:plugin-oauth:v1',args:[{op:'capabilities'}]}))).toMatchObject({ok:false,error:{code:'CHANNEL_NOT_ALLOWED'}});
+      revokedControllers = ['ctrl-a'];
+      await expect(runInvoke('ctrl-a', { channel: PLUGIN_OAUTH_CHANNEL, args: [{ op: 'status', id }] })).resolves.toMatchObject({
+        ok: false, error: { code: 'ACCESS_REVOKED' },
+      });
+      expect((await runInvoke('ctrl-b', { channel: PLUGIN_OAUTH_CHANNEL, args: [{ op: 'capabilities', src: 'ctrl-a' }] })).ok).toBe(false);
+    } finally { invalidatePluginOauth(); }
+  });
   it('开关关闭 → REMOTE_DISABLED', async () => {
     remoteControlEnabled = false;
     const r = await runInvoke('ctrl', { channel: 'maker:list-active', args: [] });
@@ -177,6 +212,20 @@ describe('runInvoke 双层校验', () => {
     expect(r).toMatchObject({
       ok: false,
       error: { code: 'IPC_ERROR', message: '[SESSION_RUNNING] busy' },
+    });
+  });
+
+  it('DB worker 队列打满时远程 listing 回 BACKPRESSURE', async () => {
+    registry.register('local-db:sessions:list', () => {
+      throw new Error('db worker RPC queue overloaded: op="rawAll" inFlight=128 queued=512');
+    });
+    const r = await runInvoke('ctrl', { channel: 'local-db:sessions:list', args: [1, 'all'] });
+    expect(r).toMatchObject({
+      ok: false,
+      error: {
+        code: 'BACKPRESSURE',
+        message: expect.stringContaining('db worker RPC queue overloaded'),
+      },
     });
   });
 
@@ -1105,6 +1154,186 @@ describe('被控端控制链路生命周期', () => {
     expect(dispatchTesting.remoteInvokeResultOutboxSize()).toBe(0);
   });
 
+  it('同一控制端相同 listing 并发只执行一次并把结果复用到各 requestId', async () => {
+    remoteControlEnabled = true;
+    let resolveList: ((value: unknown[]) => void) | undefined;
+    const handler = vi.fn(() => new Promise<unknown[]>((resolve) => {
+      resolveList = resolve;
+    }));
+    registry.register('local-db:sessions:list', handler);
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    const payload = {
+      channel: 'local-db:sessions:list',
+      args: [20, 'all', { includePinned: true }],
+    };
+    feed({
+      v: 1,
+      kind: 'invoke',
+      id: 'list-1',
+      src: 'ctrl-a',
+      payload,
+    });
+    feed({
+      v: 1,
+      kind: 'invoke',
+      id: 'list-2',
+      src: 'ctrl-a',
+      payload,
+    });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    resolveList?.([{ id: 's1' }]);
+    await vi.waitFor(() => {
+      expect(calls.invokeResult.filter(
+        (call) => call.requestId === 'list-1' || call.requestId === 'list-2',
+      )).toHaveLength(2);
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(calls.invokeResult).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        requestId: 'list-1',
+        payload: { ok: true, result: [{ id: 's1' }] },
+      }),
+      expect.objectContaining({
+        requestId: 'list-2',
+        payload: { ok: true, result: [{ id: 's1' }] },
+      }),
+    ]));
+  });
+
+  it('listing 合并 waiter 仍计入 per-controller 准入上限', async () => {
+    remoteControlEnabled = true;
+    let resolveList: ((value: unknown[]) => void) | undefined;
+    const handler = vi.fn(() => new Promise<unknown[]>((resolve) => {
+      resolveList = resolve;
+    }));
+    registry.register('local-db:sessions:list', handler);
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    const payload = { channel: 'local-db:sessions:list', args: [20, 'all'] };
+    const limit = dispatchTesting.remoteInvokeInFlightPerControllerLimit;
+    for (let index = 0; index < limit + 1; index += 1) {
+      feed({
+        v: 1,
+        kind: 'invoke',
+        id: `list-admit-${index}`,
+        src: 'ctrl-a',
+        payload,
+      });
+    }
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(calls.invokeResult).toContainEqual({
+      dst: 'ctrl-a',
+      requestId: `list-admit-${limit}`,
+      payload: {
+        ok: false,
+        error: {
+          code: 'BACKPRESSURE',
+          message: 'remote invoke execution queue is full',
+        },
+      },
+    }));
+    expect(diagnosticLog.debug).toHaveBeenCalledWith('remote invoke admission busy', expect.objectContaining({
+      executing: limit, pendingResults: 0, controllerAtLimit: true, globalAtLimit: false,
+      channels: { 'local-db:sessions:list': limit },
+    }));
+    resolveList?.([{ id: 's1' }]);
+    await vi.waitFor(() => {
+      expect(calls.invokeResult.filter((call) => call.payload && (call.payload as { ok?: boolean }).ok === true))
+        .toHaveLength(limit);
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  // 控制端把 16 个名额填满历史 / 列表读取后,用户正在等的发送以前会被 BACKPRESSURE 打回、
+  // 再等 ≥2s 重试;交互类写入另有少量名额,读取仍按原上限拒绝。
+  it('交互类 invoke 在 per-controller 名额用满后仍被执行,读取照旧 BACKPRESSURE', async () => {
+    remoteControlEnabled = true;
+    let resolveList: ((value: unknown[]) => void) | undefined;
+    registry.register('local-db:sessions:list', vi.fn(() => new Promise<unknown[]>((resolve) => {
+      resolveList = resolve;
+    })));
+    const enqueue = vi.fn(() => ({ accepted: true }));
+    registry.register('maker:input:enqueue', enqueue);
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    const limit = dispatchTesting.remoteInvokeInFlightPerControllerLimit;
+    const extra = dispatchTesting.remoteInvokeInteractiveExtraPerController;
+    for (let index = 0; index < limit; index += 1) {
+      feed({ v: 1, kind: 'invoke', id: `list-${index}`, src: 'ctrl-a', payload: {
+        channel: 'local-db:sessions:list', args: [20, 'all', { fresh: true, index }],
+      } });
+    }
+    for (let index = 0; index < extra + 1; index += 1) {
+      feed({ v: 1, kind: 'invoke', id: `send-${index}`, src: 'ctrl-a', payload: {
+        channel: 'maker:input:enqueue', args: ['s1', { text: `hello ${index}` }],
+      } });
+    }
+    await vi.waitFor(() => expect(enqueue).toHaveBeenCalledTimes(extra));
+    const busy = { ok: false, error: { code: 'BACKPRESSURE', message: 'remote invoke execution queue is full' } };
+    await vi.waitFor(() => expect(calls.invokeResult).toContainEqual({ dst: 'ctrl-a', requestId: `send-${extra}`, payload: busy }));
+    feed({ v: 1, kind: 'invoke', id: 'list-late', src: 'ctrl-a', payload: {
+      channel: 'local-db:sessions:list', args: [20, 'all', { fresh: true, index: 'late' }],
+    } });
+    await vi.waitFor(() => expect(calls.invokeResult).toContainEqual({ dst: 'ctrl-a', requestId: 'list-late', payload: busy }));
+    resolveList?.([]);
+  });
+
+  it('sessions:list fresh 请求不并入已有 listing 单飞', async () => {
+    remoteControlEnabled = true;
+    let resolvers: Array<(value: unknown[]) => void> = [];
+    const handler = vi.fn(() => new Promise<unknown[]>((resolve) => {
+      resolvers.push(resolve);
+    }));
+    registry.register('local-db:sessions:list', handler);
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    const payload = {
+      channel: 'local-db:sessions:list',
+      args: [20, 'all', { includePinned: true, fresh: true }],
+    };
+    feed({ v: 1, kind: 'invoke', id: 'fresh-1', src: 'ctrl-a', payload });
+    feed({ v: 1, kind: 'invoke', id: 'fresh-2', src: 'ctrl-a', payload });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+    resolvers[0]?.([{ id: 'old' }]);
+    resolvers[1]?.([{ id: 'new' }]);
+    await vi.waitFor(() => {
+      expect(calls.invokeResult.filter(
+        (call) => call.requestId === 'fresh-1' || call.requestId === 'fresh-2',
+      )).toHaveLength(2);
+    });
+    expect(calls.invokeResult).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requestId: 'fresh-1', payload: { ok: true, result: [{ id: 'old' }] } }),
+      expect.objectContaining({ requestId: 'fresh-2', payload: { ok: true, result: [{ id: 'new' }] } }),
+    ]));
+  });
+
+  it('sessions:get 写后回读不并入已有查询', async () => {
+    remoteControlEnabled = true;
+    const resolvers: Array<(value: unknown) => void> = [];
+    const handler = vi.fn(() => new Promise<unknown>((resolve) => {
+      resolvers.push(resolve);
+    }));
+    registry.register('local-db:sessions:get', handler);
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    const payload = { channel: 'local-db:sessions:get', args: ['sess-1'] };
+    feed({ v: 1, kind: 'invoke', id: 'get-stale', src: 'ctrl-a', payload });
+    feed({ v: 1, kind: 'invoke', id: 'get-after-write', src: 'ctrl-a', payload });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+    resolvers[0]?.({ id: 'sess-1', model: 'old' });
+    resolvers[1]?.({ id: 'sess-1', model: 'new' });
+    await vi.waitFor(() => {
+      expect(calls.invokeResult.filter(
+        (call) => call.requestId === 'get-stale' || call.requestId === 'get-after-write',
+      )).toHaveLength(2);
+    });
+    expect(calls.invokeResult).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requestId: 'get-stale', payload: { ok: true, result: { id: 'sess-1', model: 'old' } } }),
+      expect.objectContaining({ requestId: 'get-after-write', payload: { ok: true, result: { id: 'sess-1', model: 'new' } } }),
+    ]));
+  });
+
   it('显式 link-close 后丢弃旧世代晚到 IPC 结果，快速重开也不串进新链路', async () => {
     remoteControlEnabled = true;
     let resolveInvoke: ((value: string[]) => void) | undefined;
@@ -1253,6 +1482,34 @@ describe('被控端控制链路生命周期', () => {
       },
     }));
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  // 准入给交互类请求多放了名额,它们的回包也得有位置:否则已生效的发送因回包入不了 outbox
+  // 而让控制端超时、用户重试。
+  it('交互类 invoke 的结果在 per-controller outbox 用满后仍有预留位置,读取结果照旧被拒', () => {
+    const client = {
+      sendInvokeResult: () => {
+        throw new DeviceLinkError('BACKPRESSURE', 'socket buffer full');
+      },
+    } as never;
+    const limit = dispatchTesting.remoteInvokeResultOutboxPerControllerLimit;
+    const extra = dispatchTesting.remoteInvokeInteractiveExtraPerController;
+    for (let index = 0; index < limit; index++) {
+      expect(dispatchTesting.sendInvokeResultSafe(
+        client, 'ctrl-a', `invoke-reserve-read-${index}`, { ok: true, result: index }, 'maker:list-active',
+      )).toBe(true);
+    }
+    expect(dispatchTesting.sendInvokeResultSafe(
+      client, 'ctrl-a', 'invoke-reserve-read-over', { ok: true, result: 'x' }, 'maker:list-active',
+    )).toBe(false);
+    for (let index = 0; index < extra; index++) {
+      expect(dispatchTesting.sendInvokeResultSafe(
+        client, 'ctrl-a', `invoke-reserve-send-${index}`, { ok: true, result: index }, 'maker:input:enqueue',
+      )).toBe(true);
+    }
+    expect(dispatchTesting.sendInvokeResultSafe(
+      client, 'ctrl-a', 'invoke-reserve-send-over', { ok: true, result: 'x' }, 'maker:input:enqueue',
+    )).toBe(false);
   });
 
   it('多个控制端的 invoke-result outbox 仍受全局消息上限保护', () => {
@@ -2448,7 +2705,7 @@ describe('被控端订阅 registry + topic 转发', () => {
     'issue_confirm',
     'rename_sessions_confirm',
     'ghost_grant_confirm',
-  ])('device-link does not forward Desktop-only %s live pushes', (kind) => {
+  ])('device-link forwards a redacted Desktop-only %s live status', (kind) => {
     remoteControlEnabled = true;
     const { client, calls, feed } = makeFakeClient();
     wireInboundDispatch(client);
@@ -2464,7 +2721,46 @@ describe('被控端订阅 registry + topic 转发', () => {
       },
     });
 
-    expect(calls.push).toEqual([]);
+    expect(calls.push).toHaveLength(1);
+    expect(calls.push[0]).toMatchObject({
+      dst: 'ctrl-a',
+      channel: MAKER_PUSH.INTERACTION_REQUEST,
+      payload: {
+        sessionId: 's1',
+        request: { kind, requestId: expect.stringMatching(/^desktop-confirm-/) },
+      },
+    });
+    expect(JSON.stringify(calls.push[0].payload)).not.toContain('private');
+    expect(JSON.stringify(calls.push[0].payload)).not.toContain(`${kind}-1`);
+  });
+
+  it('device-link dismisses a Desktop-only status with its opaque request id', () => {
+    remoteControlEnabled = true;
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    feed(subFrame('ctrl-a', SUB, ['session:s1']));
+
+    const sourceRequestId = createDesktopOnlyConfirmationRequestId();
+    tapWindowBroadcast(MAKER_PUSH.INTERACTION_REQUEST, {
+      sessionId: 's1',
+      request: { kind: 'issue_confirm', requestId: sourceRequestId, draft: { title: 'private' } },
+    });
+    const remoteRequestId = (calls.push[0].payload as {
+      request: { requestId: string };
+    }).request.requestId;
+
+    tapWindowBroadcast(MAKER_PUSH.INTERACTION_DISMISSED, {
+      sessionId: 's1',
+      requestId: sourceRequestId,
+      reason: 'resolved',
+    });
+
+    expect(calls.push[1]).toMatchObject({
+      dst: 'ctrl-a',
+      channel: MAKER_PUSH.INTERACTION_DISMISSED,
+      payload: { sessionId: 's1', requestId: remoteRequestId, reason: 'resolved' },
+    });
+    expect(JSON.stringify(calls.push[1].payload)).not.toContain(sourceRequestId);
   });
 
   it('explicit unsubscribe removes the final remembered topic and stops the tap', () => {
@@ -2546,6 +2842,43 @@ describe('远程 set-* 持久化回流', () => {
     expect(persist).toHaveBeenCalledWith('sess-1', { model: 'claude-x' });
   });
 
+  it('set-model 最终窗口待确认时不提前持久化 model/provider', async () => {
+    const persist = vi.fn();
+    setRemoteSettingsPersist(persist);
+    const confirmation = {
+      deferred: false,
+      superseded: false,
+      contextWindowConfirmationRequired: 272_000,
+      contextTokensForConfirmation: 244_800,
+    };
+    registry.register('maker:set-model', () => confirmation);
+
+    const r = await runInvoke('ctrl-a', {
+      channel: 'maker:set-model',
+      args: ['sess-1', 'small-pi-model', 'pi-provider'],
+    });
+
+    expect(r).toEqual({ ok: true, result: confirmation });
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ contextTokensForConfirmation: 244_800 }],
+    [{ contextWindowConfirmationRequired: '272000' }],
+  ])('set-model 最终窗口确认字段不完整时也不得提前持久化 %#', async (confirmation) => {
+    const persist = vi.fn();
+    setRemoteSettingsPersist(persist);
+    registry.register('maker:set-model', () => confirmation);
+
+    const r = await runInvoke('ctrl-a', {
+      channel: 'maker:set-model',
+      args: ['sess-1', 'small-pi-model', 'pi-provider'],
+    });
+
+    expect(r).toEqual({ ok: true, result: confirmation });
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('set-model 持久化 trim 后的 providerId', async () => {
     const persist = vi.fn();
     setRemoteSettingsPersist(persist);
@@ -2580,8 +2913,12 @@ describe('远程 set-* 持久化回流', () => {
   it('set-model handler 已在 session 锁内持久化时 dispatch 不重复回流', async () => {
     const persist = vi.fn();
     setRemoteSettingsPersist(persist);
-    const handlerResult = { deferred: false, superseded: false };
-    markRemoteSettingPersistedInsideHandler(handlerResult);
+    const response = { deferred: false, superseded: false };
+    markRemoteSettingPersistedInsideHandler(response);
+    const handlerResult = Object.assign(response, {
+      generation: 2,
+      effectiveProviderId: 'anthropic',
+    });
     registry.register('maker:set-model', () => handlerResult);
 
     const r = await runInvoke('ctrl-a', {
@@ -2590,6 +2927,19 @@ describe('远程 set-* 持久化回流', () => {
     });
 
     expect(r).toEqual({ ok: true, result: handlerResult });
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it.each([['maker:set-permission-mode','ask'],['maker:set-plan-mode',true]])('%s commits inside the handler without a later duplicate write', async (channel,value) => {
+    const persist = vi.fn();
+    setRemoteSettingsPersist(persist);
+    const response = {};
+    markRemoteSettingPersistedInsideHandler(response);
+    registry.register(channel as string, () => response);
+    const result = await runInvoke('ctrl-a', {
+      channel: channel as string, args: ['sess-1', value],
+    });
+    expect(result).toEqual({ ok: true, result: response });
     expect(persist).not.toHaveBeenCalled();
   });
 
@@ -2664,5 +3014,35 @@ describe('远程 set-* 持久化回流', () => {
     registry.register('maker:set-model', () => undefined);
     const r = await runInvoke('ctrl-a', { channel: 'maker:set-model', args: ['sess-1', 'm'] });
     expect(r).toMatchObject({ ok: true });
+  });
+});
+
+
+describe('remote subscription data reads', () => {
+  it.each([
+    ['maker:usage:claude-subscription', setRemoteClaudeSubscriptionUsageReader],
+    ['maker:usage:xai-subscription', setRemoteXaiSubscriptionUsageReader],
+  ] as const)('%s uses the local reader with the selected account after authorization', async (channel, setReader) => {
+    const reader = vi.fn(async () => ({ fiveHour: { utilization: 12 } }));
+    const ipcHandler = vi.fn(() => { throw new Error('Untrusted synthetic sender'); });
+    registry.register(channel, ipcHandler);
+    setReader(reader);
+    await expect(runInvoke('ctrl', { channel, args: ['account-2'] })).resolves.toEqual({
+      ok: true, result: { providerId: 'account-2', fiveHour: { utilization: 12 } },
+    });
+    expect(reader).toHaveBeenCalledWith('account-2');
+    await runInvoke('ctrl', { channel, args: ['account-2', true] });
+    expect(reader).toHaveBeenLastCalledWith('account-2', { fresh: true });
+    expect(ipcHandler).not.toHaveBeenCalled();
+    reader.mockClear();
+    await expect(runInvoke('ctrl', { channel, args: [42] })).resolves.toMatchObject({ ok: false, error: { code: 'IPC_ERROR', message: expect.stringContaining('[INVALID_PARAMS]') } });
+    expect(reader).not.toHaveBeenCalled();
+    remoteControlEnabled = false;
+    await expect(runInvoke('ctrl', { channel, args: ['account-2'] })).resolves.toMatchObject({ ok: false, error: { code: 'REMOTE_DISABLED' } });
+    expect(reader).not.toHaveBeenCalled();
+    remoteControlEnabled = true;
+    revokedControllers = ['ctrl'];
+    await expect(runInvoke('ctrl', { channel, args: ['account-2'] })).resolves.toMatchObject({ ok: false, error: { code: 'ACCESS_REVOKED' } });
+    expect(reader).not.toHaveBeenCalled();
   });
 });

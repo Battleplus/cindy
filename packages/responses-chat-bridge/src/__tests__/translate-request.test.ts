@@ -75,6 +75,29 @@ describe('translateResponsesRequest', () => {
     expect(keep.messages[1]).toEqual({ role: 'developer', content: 'mid-conversation dev note' });
   });
 
+  it('coalesces mid-conversation system/developer into one leading system when asked', () => {
+    const source = base({
+      instructions: 'top-level',
+      input: [
+        { type: 'message', role: 'user', content: 'first' },
+        { type: 'message', role: 'assistant', content: 'ok' },
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'later note' }] },
+        { type: 'message', role: 'user', content: 'second' },
+      ],
+    });
+    const out = translateResponsesRequest(source, {
+      capabilities: { systemMessagePolicy: 'coalesce-leading' },
+    });
+    expect(out.messages).toEqual([
+      { role: 'system', content: 'top-level\n\nlater note' },
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+    ]);
+    const unchanged = translateResponsesRequest(source);
+    expect(unchanged.messages.filter((message) => message.role === 'system')).toHaveLength(2);
+  });
+
   it.each([
     { type: 'input_image', image_url: 'https://example.com/image.png' },
     { type: 'input_file', file_data: 'data:text/plain;base64,eA==' },
@@ -414,6 +437,108 @@ describe('translateResponsesRequest', () => {
     expect(() => translateResponsesRequest(base({
       input: [{ type: 'computer_call', id: 'x' }],
     }))).toThrowError(UnsupportedResponsesFeatureError);
+  });
+
+  it.each([
+    { type: 'search', query: 'image editor', queries: ['image editor', 'canvas export'], sources: [{ url: 'https://example.com/docs' }] },
+    { type: 'open_page', url: 'https://example.com/docs' },
+    { type: 'find_in_page', url: 'https://example.com/docs', pattern: 'export' },
+  ])('preserves completed web search $type history as assistant text', (action) => {
+    const input: ResponsesRequest = base({
+      input: [
+        { type: 'message', role: 'user', content: 'Research image editors' },
+        { type: 'web_search_call', id: 'ws_history', status: 'completed', action },
+        { type: 'message', role: 'assistant', content: 'Findings: https://example.com/docs' },
+        { type: 'message', role: 'user', content: 'Continue' },
+      ],
+    });
+    const original = JSON.stringify(input);
+    const out = translateResponsesRequest(input);
+
+    expect(out.messages).toEqual([
+      { role: 'user', content: 'Research image editors' },
+      { role: 'assistant', content: '[completed web search]\n' + JSON.stringify(action) },
+      { role: 'assistant', content: 'Findings: https://example.com/docs' },
+      { role: 'user', content: 'Continue' },
+    ]);
+    expect(JSON.stringify(input)).toBe(original);
+    expect(out.tools).toBeUndefined();
+  });
+
+  it.each([
+    { status: 'in_progress', action: { type: 'search', query: 'image editor' } },
+    { status: 'searching', action: { type: 'search', query: 'image editor' } },
+    { status: 'failed', action: { type: 'search', query: 'image editor' } },
+    { action: { type: 'search', query: 'image editor' } },
+    { status: 'completed' },
+    { status: 'completed', action: 'image editor' },
+    { status: 'completed', action: {} },
+  ])('rejects unfinished or malformed web search history: %j', (item) => {
+    expect(() => translateResponsesRequest(base({
+      input: [
+        { type: 'web_search_call', ...item },
+        { type: 'message', role: 'user', content: 'Continue' },
+      ],
+    }))).toThrow("input item 'web_search_call'");
+  });
+
+  it('keeps completed web search history after a pending function result', () => {
+    const action = { type: 'search', query: 'image editor' };
+    const out = translateResponsesRequest(base({
+      input: [
+        { type: 'function_call', call_id: 'call_1', name: 'shell', arguments: '{}' },
+        { type: 'web_search_call', id: 'ws_history', status: 'completed', action },
+        { type: 'function_call_output', call_id: 'call_1', output: 'done' },
+        { type: 'message', role: 'user', content: 'Continue' },
+      ],
+    }));
+
+    expect(out.messages).toEqual([
+      {
+        role: 'assistant', content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'shell', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+      { role: 'assistant', content: '[completed web search]\n' + JSON.stringify(action) },
+      { role: 'user', content: 'Continue' },
+    ]);
+  });
+
+  it.each([
+    { outputIds: ['call_1'] },
+    { outputIds: ['call_1', 'call_2'] },
+    { outputIds: ['call_2', 'call_1'] },
+  ])('preserves real results when web search interleaves calls: $outputIds', ({ outputIds }) => {
+    const action = { type: 'search', query: 'image editor' };
+    const out = translateResponsesRequest(base({
+      input: [
+        { type: 'function_call', call_id: 'call_1', name: 'shell', arguments: '{}' },
+        { type: 'web_search_call', id: 'ws_history', status: 'completed', action },
+        { type: 'function_call', call_id: 'call_2', name: 'shell', arguments: '{}' },
+        ...outputIds.map((callId) => ({
+          type: 'function_call_output', call_id: callId, output: 'result for ' + callId,
+        })),
+        { type: 'message', role: 'user', content: 'Continue' },
+      ],
+    }));
+
+    expect(out.messages[0]).toEqual({
+      role: 'assistant', content: null,
+      tool_calls: ['call_1', 'call_2'].map((callId) => ({
+        id: callId, type: 'function', function: { name: 'shell', arguments: '{}' },
+      })),
+    });
+    const results = out.messages.filter((message) => message.role === 'tool');
+    for (const callId of outputIds) {
+      expect(results.find((message) => message.tool_call_id === callId)?.content)
+        .toBe('result for ' + callId);
+    }
+    expect(out.messages.slice(-2)).toEqual([
+      { role: 'assistant', content: '[completed web search]\n' + JSON.stringify(action) },
+      { role: 'user', content: 'Continue' },
+    ]);
+    expect(out.messages.map((message) => message.role))
+      .toEqual(['assistant', 'tool', 'tool', 'assistant', 'user']);
   });
 
   it('converts replayed agent messages to assistant text', () => {
@@ -983,6 +1108,22 @@ describe('translateResponsesRequest', () => {
     expect((out.messages[0] as {
       tool_calls?: Array<{ function: { name: string } }>;
     }).tool_calls?.[0]?.function.name).not.toBe('tool_search');
+  });
+
+  it('does not duplicate a large custom tool description in Chat metadata', () => {
+    const description = 'x'.repeat(200);
+    const out = translateResponsesRequest(base({
+      tools: [{
+        type: 'custom',
+        name: 'exec',
+        description,
+        format: { type: 'text' },
+      }],
+    }));
+    const chatDescription = out.tools?.[0]?.function.description ?? '';
+    expect(chatDescription.split(description)).toHaveLength(2);
+    expect(chatDescription).toContain('"format":{"type":"text"}');
+    expect(chatDescription).not.toContain(`"description":"${description}"`);
   });
 
   it('keeps function and custom tools with the same name distinct', () => {

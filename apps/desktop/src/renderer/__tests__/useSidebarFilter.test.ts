@@ -16,6 +16,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   STATUS_KEY,
+  VENDOR_KEY,
+  loadVendor,
+  persistVendor,
   PROJECTS_KEY,
   GROUP_BY_KEY,
   LAST_ACTIVITY_KEY,
@@ -23,6 +26,8 @@ import {
   PROJECT_ORDER_KEY,
   TASK_INFO_KEY,
   MANUAL_PROJECT_ORDER_KEY,
+  DEVICE_GROUP_COLLAPSED_KEY,
+  loadDeviceGroupCollapsedKeys,
   DIALOGUE_GROUP_COLLAPSED_KEY,
   DIALOGUE_GROUP_ALL_KEY,
   loadStatus,
@@ -293,7 +298,7 @@ describe('loadProjectOrder', () => {
     expect(loadProjectOrder()).toBe('activity');
   });
 
-  it("maps leftover sortBy=manual to custom when projectOrder is unset", () => {
+  it('maps leftover sortBy=manual to custom when projectOrder is unset', () => {
     localStorage.setItem(SORT_BY_KEY, 'manual');
     expect(loadProjectOrder()).toBe('custom');
     expect(loadSortBy()).toBe('recency');
@@ -378,10 +383,23 @@ describe('taskInfoFields（任务行右侧信息复选）', () => {
     expect(loadTaskInfoFields()).toEqual(['time', 'cost']);
   });
 
+  it('标签不再是任务信息项：旧存储里的 tags 静默丢弃，其余选择与顺序保留', () => {
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify(['cost', 'time', 'pr']));
+    expect(loadTaskInfoFields()).toEqual(['cost', 'time', 'pr']);
+    localStorage.setItem(TASK_INFO_KEY, '[]');
+    expect(loadTaskInfoFields()).toEqual([]);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify(['time', 'tags']));
+    expect(loadTaskInfoFields()).toEqual(['time']);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ version: 1, fields: ['tags', 'time'] }));
+    expect(loadTaskInfoFields()).toEqual(['time']);
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ version: 1, fields: ['tags'] }));
+    expect(loadTaskInfoFields()).toEqual([]);
+  });
+
   it('falls back to default on broken JSON or shape mismatch', () => {
     localStorage.setItem(TASK_INFO_KEY, '{not-json');
     expect(loadTaskInfoFields()).toEqual(['time']);
-    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ fields: ['time'] }));
+    localStorage.setItem(TASK_INFO_KEY, JSON.stringify({ fields: ['cost'] }));
     expect(loadTaskInfoFields()).toEqual(['time']);
   });
 
@@ -390,6 +408,22 @@ describe('taskInfoFields（任务行右侧信息复选）', () => {
     expect(nextTaskInfoAfterToggle(['time', 'cost'], 'time')).toEqual(['cost']);
     expect(nextTaskInfoAfterToggle(['cost'], 'cost')).toEqual([]);
     expect(nextTaskInfoAfterToggle([], 'pr')).toEqual(['pr']);
+  });
+});
+
+// #6615: component remount tests cover valid device preferences; this unit test
+// protects the storage boundary against malformed values before mounting React.
+describe('deviceGroupCollapsedKeys', () => {
+  beforeEach(() => installMemoryLocalStorage());
+  afterEach(() => uninstallLocalStorage());
+
+  it.each([
+    { raw: '{not-json', expected: [] },
+    { raw: '{"local":true}', expected: [] },
+    { raw: '["local",42,null,"device-1"]', expected: ['local', 'device-1'] },
+  ])('safely restores device collapse preferences from $raw', ({ raw, expected }) => {
+    localStorage.setItem(DEVICE_GROUP_COLLAPSED_KEY, raw);
+    expect([...loadDeviceGroupCollapsedKeys()]).toEqual(expected);
   });
 });
 
@@ -494,6 +528,8 @@ describe('persist round-trip', () => {
   });
 
   it('persistSortBy → loadSortBy returns the same value', () => {
+    persistSortBy('created');
+    expect(loadSortBy()).toBe('created');
     persistSortBy('priority');
     expect(loadSortBy()).toBe('priority');
     persistSortBy('recency');
@@ -561,15 +597,15 @@ describe('nextProjectsAfterToggle', () => {
     ).toBe('all');
   });
 
-  it("toggles the dialogue sentinel without treating it as a project path", () => {
+  it('toggles the dialogue sentinel without treating it as a project path', () => {
     expect(nextProjectsAfterToggle('all', DIALOGUE_FILTER_KEY)).toEqual([DIALOGUE_FILTER_KEY]);
     expect(nextProjectsAfterToggle([DIALOGUE_FILTER_KEY], 'local:/proj-a')).toEqual([
       DIALOGUE_FILTER_KEY,
       'local:/proj-a',
     ]);
-    expect(nextProjectsAfterToggle([DIALOGUE_FILTER_KEY, 'local:/proj-a'], DIALOGUE_FILTER_KEY)).toEqual([
-      'local:/proj-a',
-    ]);
+    expect(
+      nextProjectsAfterToggle([DIALOGUE_FILTER_KEY, 'local:/proj-a'], DIALOGUE_FILTER_KEY),
+    ).toEqual(['local:/proj-a']);
   });
 });
 
@@ -826,5 +862,25 @@ describe('项目拖拽(机器过滤态):mergeVisibleReorder + normalizeManualPro
     expect(merged).toEqual([p2, h1, p1, h2]);
     // setManualProjectOrder 内部会再归一化一次 → 必须幂等(不追加、不打乱)。
     expect(normalizeManualProjectOrder(merged, all)).toEqual([p2, h1, p1, h2]);
+  });
+});
+
+describe('Harness filter persistence', () => {
+  beforeEach(() => installMemoryLocalStorage());
+  afterEach(() => uninstallLocalStorage());
+
+  it.each(['all', 'cc', 'codex', 'pi'] as const)(
+    'restores %s from the existing preference key',
+    (vendor) => {
+      persistVendor(vendor);
+      expect(localStorage.getItem(VENDOR_KEY)).toBe(vendor);
+      expect(loadVendor()).toBe(vendor);
+    },
+  );
+
+  it('keeps the all default for absent or unknown harness values', () => {
+    expect(loadVendor()).toBe('all');
+    localStorage.setItem(VENDOR_KEY, 'unknown');
+    expect(loadVendor()).toBe('all');
   });
 });

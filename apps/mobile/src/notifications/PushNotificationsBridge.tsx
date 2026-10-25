@@ -1,9 +1,10 @@
-import { useRouter } from 'expo-router';
+import { useGlobalSearchParams, usePathname, useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef } from 'react';
 import { AppState } from 'react-native';
 import { useAuth } from '@/auth/AuthContext';
 import Notifications from './nativeNotifications';
-import { parseNotificationResponseDeepLink } from './pushRegistrationModel';
+import { ChatBackgroundBridge } from './ChatBackgroundBridge';
+import { notificationRecoveryRoute, parseNotificationResponseDeepLink } from './pushRegistrationModel';
 import {
   configureForegroundNotificationBehavior,
   isPushSupported,
@@ -24,11 +25,15 @@ type NotificationResponse = Parameters<
  * 1. 登录后按本机开关同步 token 注册(启动补偿:上次注册失败/换账号后自愈);
  * 2. APNs token 轮换时重新上报;
  * 3. 通知点击(前台/后台/冷启动)→ 解析 APNs / Expo 深链 → 路由到对应会话;
- * 4. 前台压掉系统横幅。
+ * 4. 只在前台正阅读对应群聊／话题时压掉横幅。
  */
 export function PushNotificationsBridge() {
   const auth = useAuth();
   const router = useRouter();
+  const pathname = usePathname();
+  const { threadRootId } = useGlobalSearchParams<{ threadRootId?: string }>();
+  const visibleChat = useRef({ pathname, threadRootId });
+  visibleChat.current = { pathname, threadRootId };
   const routerRef = useRef(router);
   routerRef.current = router;
   /** 冷启动点通知时 auth 可能未就绪,先存下待路由的深链。 */
@@ -46,7 +51,11 @@ export function PushNotificationsBridge() {
 
   useEffect(() => {
     if (!isPushSupported()) return;
-    configureForegroundNotificationBehavior();
+    configureForegroundNotificationBehavior(route => {
+      const [path, query] = route.split('?');
+      const thread = new URLSearchParams(query).get('threadRootId') ?? undefined;
+      return visibleChat.current.pathname === path && visibleChat.current.threadRootId === thread;
+    });
   }, []);
 
   // 登录态就绪后同步注册状态(开关关闭 / 从未注册时是 no-op)
@@ -65,7 +74,7 @@ export function PushNotificationsBridge() {
     return () => {
       cancelled = true;
     };
-  }, [auth.initialized, auth.isAuthenticated, auth.user]);
+  }, [auth.accountGeneration, auth.initialized, auth.isAuthenticated, auth.user]);
 
   // APNs token 轮换 → 重新上报(仅开关开启且已登录时)
   useEffect(() => {
@@ -103,7 +112,7 @@ export function PushNotificationsBridge() {
       if (consumedNotificationResponseKeys.has(dedupeKey)) return;
       consumedNotificationResponseKeys.add(dedupeKey);
       void Notifications.clearLastNotificationResponseAsync?.()?.catch(() => undefined);
-      pendingDeepLinkRef.current = deepLink;
+      pendingDeepLinkRef.current = notificationRecoveryRoute(deepLink, dedupeKey);
       flushPendingDeepLink();
     };
 
@@ -134,5 +143,5 @@ export function PushNotificationsBridge() {
     flushPendingDeepLink();
   }, [auth.initialized, auth.isAuthenticated, flushPendingDeepLink]);
 
-  return null;
+  return <ChatBackgroundBridge />;
 }

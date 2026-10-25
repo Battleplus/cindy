@@ -1,15 +1,28 @@
+import { formatForwardedRequest } from './forwardedRequest.js';
 import type {
   AgentKind,
+  Effort,
   SessionGracefulStopResult,
   SessionTurnControlSnapshot,
 } from '@cindy/maker-core';
+import { assertTaskActionCurrent, bindTaskActionInput, combineInputGuards } from './taskActionAuthorization.js';
 import type { SessionActivitySnapshot } from '@cindy/maker-shared/session-activity';
+
+import type {
+  PendingSessionRuntimeMutation,
+  SessionRuntimeProfile,
+} from './sessionRuntimeControl.js';
 
 import {
   updateQueuedMessageText,
   type AgentInputQueuedMessage,
 } from '../../shared/agentInputQueue.js';
-import { createSessionQueueControlService } from './sessionQueueControl.js';
+import {
+  createSessionQueueControlService,
+  type QueuedSteerOutcome,
+  type SessionQueueMoveResult,
+  type SessionQueueSteerResult,
+} from './sessionQueueControl.js';
 
 type Failure<Code extends string> = { ok: false; errorCode: Code; message: string };
 
@@ -36,8 +49,27 @@ export type SessionStopResult =
     }
   | Failure<'NOT_FOUND' | 'UNSUPPORTED_CAPABILITY'>;
 
+export interface SessionRuntimeDetails extends SessionActivitySnapshot {
+  runtimeGeneration: number;
+  baselineProfile: SessionRuntimeProfile;
+  effectiveProfile: SessionRuntimeProfile;
+  pendingMutation: PendingSessionRuntimeMutation | null;
+  fallbackEnabled: boolean;
+}
+
 export type SessionRuntimeResult =
-  { ok: true; runtime: SessionActivitySnapshot } | Failure<'NOT_FOUND'>;
+  { ok: true; runtime: SessionRuntimeDetails } | Failure<'NOT_FOUND'>;
+
+export type SessionRuntimeSetResult =
+  | {
+      ok: true;
+      status: 'applied' | 'deferred';
+      effectiveBoundary?: 'next_send';
+      generation: number;
+      effectiveProfile: SessionRuntimeProfile;
+      pendingMutation: PendingSessionRuntimeMutation | null;
+    }
+  | Failure<'NOT_FOUND' | 'CONFLICT' | 'INVALID_ARGS' | 'ROUTE_UNAVAILABLE'>;
 
 export interface SessionControlLiveSession {
   agentKind: AgentKind;
@@ -51,12 +83,26 @@ export interface SessionControlLiveSession {
 export interface SessionSteerTurnIdentity {
   session: SessionControlLiveSession;
   turnGeneration: number;
+  beforeMutation?: () => Promise<void>;
 }
 
 export interface SessionControlServiceDeps {
   sessionExists(sessionId: string): Promise<boolean>;
   getLiveSession(sessionId: string): SessionControlLiveSession | null;
   getSessionActivitySnapshot(sessionId: string): Promise<SessionActivitySnapshot>;
+  getSessionRuntimeDetails(sessionId: string): Promise<SessionRuntimeDetails>;
+  setSessionRuntime(params: {
+    targetSessionId: string;
+    expectedGeneration?: number;
+    beforeMutation?: () => Promise<void>;
+    patch: {
+      harness?: AgentKind;
+      model?: string;
+      providerId?: string | null;
+      effort?: Effort | null;
+      fastMode?: boolean | 'ultrafast';
+    };
+  }): Promise<SessionRuntimeSetResult>;
   assertExternalInputAllowed(sessionId: string): Promise<void>;
   createQueuedMessage(params: {
     targetSessionId: string;
@@ -73,8 +119,10 @@ export interface SessionControlServiceDeps {
     pendingQueue: AgentInputQueuedMessage[];
     consumingClientIds: string[];
   }>;
-  replaceQueuedMessage(sessionId: string, clientId: string, next: AgentInputQueuedMessage): boolean;
-  removeQueuedMessage(sessionId: string, clientId: string): boolean;
+  replaceQueuedMessage(sessionId: string, clientId: string, next: AgentInputQueuedMessage, expected?: AgentInputQueuedMessage): boolean;
+  removeQueuedMessage(sessionId: string, clientId: string, expected?: AgentInputQueuedMessage): boolean;
+  steerStoredQueuedMessage(sessionId: string, clientId: string): Promise<QueuedSteerOutcome>;
+  moveQueuedMessage(sessionId: string, clientId: string, position: number): number | null | 'locked';
   createId(): string;
 }
 
@@ -83,6 +131,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
     getSnapshot: deps.getQueueSnapshot,
     replaceQueuedMessage: deps.replaceQueuedMessage,
     removeQueuedMessage: deps.removeQueuedMessage,
+    steerQueuedMessage: deps.steerStoredQueuedMessage,
+    moveQueuedMessage: deps.moveQueuedMessage,
   });
 
   async function ensureTarget(sessionId: string): Promise<Failure<'NOT_FOUND'> | null> {
@@ -99,6 +149,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       callerSessionId: string;
       targetSessionId: string;
       queuedMessageId: string;
+      /** Host-only authorization check after async reads, immediately before mutation. */
+      beforeMutation?: () => Promise<void>;
       message: string;
     }): Promise<SessionQueuedMessageControlResult> {
       const missing = await ensureTarget(params.targetSessionId);
@@ -108,7 +160,12 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
         queuedMessageId: params.queuedMessageId,
         message: params.message,
         authorize: (item) => authorizeSessionQueueItem(item, params.callerSessionId),
-        rebuild: rebuildSessionQueueItem,
+        beforeMutation: combineInputGuards(params.beforeMutation, assertTaskActionCurrent),
+        rebuild: (item, message) => {
+          const next = rebuildSessionQueueItem(item, message);
+          bindTaskActionInput(params.targetSessionId, next);
+          return next;
+        },
       });
     },
 
@@ -116,6 +173,8 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       callerSessionId: string;
       targetSessionId: string;
       queuedMessageId: string;
+      /** Host-only authorization check after async reads, immediately before mutation. */
+      beforeMutation?: () => Promise<void>;
     }): Promise<SessionQueuedMessageControlResult> {
       const missing = await ensureTarget(params.targetSessionId);
       if (missing) return missing;
@@ -123,6 +182,41 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
         sessionId: params.targetSessionId,
         queuedMessageId: params.queuedMessageId,
         authorize: (item) => authorizeSessionQueueItem(item, params.callerSessionId),
+        beforeMutation: combineInputGuards(params.beforeMutation, assertTaskActionCurrent),
+      });
+    },
+
+    async steerQueuedMessage(params: {
+      callerSessionId: string;
+      targetSessionId: string;
+      queuedMessageId: string;
+    }): Promise<SessionQueueSteerResult | Failure<'NOT_FOUND'>> {
+      const missing = await ensureTarget(params.targetSessionId);
+      if (missing) return missing;
+      return queueControl.steer({
+        sessionId: params.targetSessionId,
+        queuedMessageId: params.queuedMessageId,
+        beforeMutation: assertTaskActionCurrent,
+        authorize: (item) =>
+          authorizeSessionQueueReorder(item, params.callerSessionId, params.targetSessionId),
+      });
+    },
+
+    async moveQueuedMessage(params: {
+      callerSessionId: string;
+      targetSessionId: string;
+      queuedMessageId: string;
+      position: number;
+    }): Promise<SessionQueueMoveResult | Failure<'NOT_FOUND'>> {
+      const missing = await ensureTarget(params.targetSessionId);
+      if (missing) return missing;
+      return queueControl.move({
+        sessionId: params.targetSessionId,
+        queuedMessageId: params.queuedMessageId,
+        position: params.position,
+        beforeMutation: assertTaskActionCurrent,
+        authorize: (item) =>
+          authorizeSessionQueueReorder(item, params.callerSessionId, params.targetSessionId),
       });
     },
 
@@ -130,12 +224,18 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       callerSessionId: string;
       targetSessionId: string;
       message: string;
+      /** Host-owned stable ID; the input coordinator owns acceptance deduplication. */
+      queuedMessageId?: string;
+      beforeMutation?: () => Promise<void>;
     }): Promise<SessionSteerResult> {
+      const beforeMutation = combineInputGuards(params.beforeMutation, assertTaskActionCurrent);
       const missing = await ensureTarget(params.targetSessionId);
+      await beforeMutation?.();
       if (missing) return missing;
       try {
         await deps.assertExternalInputAllowed(params.targetSessionId);
       } catch (error) {
+        await beforeMutation?.();
         if ((error as { code?: unknown }).code === 'UNSUPPORTED_CAPABILITY') {
           return {
             ok: false,
@@ -145,6 +245,7 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
         }
         throw error;
       }
+      await beforeMutation?.();
       const live = deps.getLiveSession(params.targetSessionId);
       if (!live?.isTurnRunning()) {
         return {
@@ -161,11 +262,12 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
         };
       }
       const turnGeneration = live.getTurnGeneration();
-      const queuedMessageId = deps.createId();
+      const queuedMessageId = params.queuedMessageId ?? deps.createId();
       const item = await deps.createQueuedMessage({
         ...params,
         queuedMessageId,
       });
+      await beforeMutation?.();
       const current = deps.getLiveSession(params.targetSessionId);
       if (
         current !== live ||
@@ -178,7 +280,7 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
           message: `session ${params.targetSessionId} changed turns before steer was accepted`,
         };
       }
-      const expectedTurn = { session: live, turnGeneration };
+      const expectedTurn = { session: live, turnGeneration, beforeMutation };
       const accepted = await deps.steerQueuedMessage(params.targetSessionId, item, expectedTurn);
       if (!accepted) {
         const latest = deps.getLiveSession(params.targetSessionId);
@@ -199,8 +301,9 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
       return { ok: true, queuedMessageId };
     },
 
-    async stopSessionTurn(params: { targetSessionId: string }): Promise<SessionStopResult> {
+    async stopSessionTurn(params: { targetSessionId: string; beforeMutation?: () => Promise<void> }): Promise<SessionStopResult> {
       const missing = await ensureTarget(params.targetSessionId);
+      await combineInputGuards(params.beforeMutation, assertTaskActionCurrent)?.();
       if (missing) return missing;
       const live = deps.getLiveSession(params.targetSessionId);
       if (!live) return { ok: true, status: 'no-active-turn' };
@@ -223,16 +326,40 @@ export function createSessionControlService(deps: SessionControlServiceDeps) {
     async getSessionRuntime(params: { targetSessionId: string }): Promise<SessionRuntimeResult> {
       const missing = await ensureTarget(params.targetSessionId);
       if (missing) return missing;
-      const activity = await deps.getSessionActivitySnapshot(params.targetSessionId);
+      const [activity, details] = await Promise.all([
+        deps.getSessionActivitySnapshot(params.targetSessionId),
+        deps.getSessionRuntimeDetails(params.targetSessionId),
+      ]);
       const control = deps.getLiveSession(params.targetSessionId)?.getTurnControlSnapshot();
       return {
         ok: true,
         runtime: {
+          ...details,
           ...activity,
           turnGeneration: control?.turnGeneration ?? null,
           gracefulStopState: control?.gracefulStopState ?? 'none',
         },
       };
+    },
+
+    async setSessionRuntime(params: {
+      targetSessionId: string;
+      expectedGeneration?: number;
+      beforeMutation?: () => Promise<void>;
+      patch: {
+        harness?: AgentKind;
+        model?: string;
+        providerId?: string | null;
+        effort?: Effort | null;
+        fastMode?: boolean | 'ultrafast';
+      };
+    }): Promise<SessionRuntimeSetResult> {
+      const missing = await ensureTarget(params.targetSessionId);
+      if (params.beforeMutation) await params.beforeMutation();
+      if (missing) return missing;
+      return deps.setSessionRuntime({ ...params,
+        beforeMutation: combineInputGuards(params.beforeMutation, assertTaskActionCurrent),
+      });
     },
   };
 }
@@ -246,17 +373,49 @@ export function authorizeSessionQueueItem(
     : { ok: false, message: 'queued message was not sent by the current session' };
 }
 
+/**
+ * 插话 / 排序不改正文：除了自己投递的消息，任务还可以处理自己队列里由其它任务或协同
+ * 成员发来的机器消息。用户手打、伙伴委派、插件与定时任务的条目有各自的接受簿记，不开放。
+ */
+export function authorizeSessionQueueReorder(
+  item: AgentInputQueuedMessage,
+  callerSessionId: string,
+  targetSessionId: string,
+): { ok: true } | { ok: false; message: string } {
+  const plainMachineMessage =
+    !item.sourcePlugin &&
+    (item.origin?.kind === 'orca' ||
+      (item.origin?.kind === 'session' && !item.origin.senderBotId));
+  const owned =
+    authorizeSessionQueueItem(item, callerSessionId).ok || callerSessionId === targetSessionId;
+  return plainMachineMessage && owned
+    ? { ok: true }
+    : {
+        ok: false,
+        message:
+          'queued message is neither sent by the current session nor a task/collaboration message in its own queue',
+      };
+}
+
 export function rebuildSessionQueueItem(
   item: AgentInputQueuedMessage,
   message: string,
 ): AgentInputQueuedMessage {
+  const request = typeof item.autoReviewUserText === 'object' ? item.autoReviewUserText.request : undefined;
+  if (item.origin?.kind === 'session') message = formatForwardedRequest(request ?? { userText: null }, message);
   const updated = updateQueuedMessageText(item, message);
   if (updated.origin?.kind === 'session') {
+    updated.autoReviewUserText = {
+      kind: typeof item.autoReviewUserText === 'object' ? item.autoReviewUserText.kind : 'agent-request',
+      request: request ?? { userText: null },
+    };
     // send_to_session owns raw user text, not a renderer composer envelope.
     // A valid JSON object/array is still literal message content, so editing it
     // must replace the persisted history row wholesale instead of merging a
-    // synthetic `text` property into the old JSON value.
-    updated.persistedContent = message;
+    // synthetic `text` property into the old JSON value. Attachment items are
+    // the exception: their persisted row is the host-built `{text, images, files}`
+    // envelope, which updateQueuedMessageText already rewrote in place.
+    if (!item.files?.length) updated.persistedContent = item.botTaskCoordination ? updated.text : message;
     updated.origin = { ...updated.origin, displayText: message };
   }
   return updated;
@@ -264,14 +423,23 @@ export function rebuildSessionQueueItem(
 
 export function sessionQueueOriginForDispatcher(params: {
   dispatcherSessionId?: string;
+  /** 来源会话当前标题快照；缺失时接收方 renderer 回退实时查询或通用文案。 */
+  dispatcherSessionTitle?: string | null;
+  /** 来源会话所属伙伴；有则接收方标签显示「由伙伴「X」发送」。 */
+  dispatcherBot?: { id: string; name: string } | null;
   message: string;
   explicitOrigin?: AgentInputQueuedMessage['origin'];
 }): AgentInputQueuedMessage['origin'] | undefined {
   if (params.explicitOrigin) return params.explicitOrigin;
   if (!params.dispatcherSessionId) return undefined;
+  const senderSessionTitle = params.dispatcherSessionTitle?.trim();
   return {
     kind: 'session',
     senderSessionId: params.dispatcherSessionId,
     displayText: params.message,
+    ...(senderSessionTitle ? { senderSessionTitle } : {}),
+    ...(params.dispatcherBot
+      ? { senderBotId: params.dispatcherBot.id, senderBotName: params.dispatcherBot.name }
+      : {}),
   };
 }

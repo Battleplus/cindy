@@ -15,9 +15,13 @@
 
 import { and, asc, desc, eq, gt, gte, lt, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 
+import type { HistoryCompanion } from '@cindy/mcps';
+import { historyCompanionJson, parseHistoryCompanion, teammateHistoryFilter } from './historyCompanion';
 import { getDbClient } from './client/current';
 import { sessions, messages } from './schema';
 import { messageToCamel } from './mapper';
+import { parseOrcaRemoteLead, type OrcaRemoteLead } from '../../shared/orcaRemoteWorker.js';
+import { remoteVisibleSessionSql } from './ipc/botRemoteVisibility.js';
 import {
   managedDialogueRootLikePatterns,
   normalizeHistoryWorkingDir,
@@ -25,6 +29,11 @@ import {
 } from './workingDirHistoryFilter';
 
 const messageRowid = sql<number>`"messages"."rowid"`;
+
+function remoteOrcaHistoryIdentity(raw: unknown): { orcaRemoteLead?: OrcaRemoteLead } {
+  const lead = parseOrcaRemoteLead(raw);
+  return lead ? { orcaRemoteLead: lead } : {};
+}
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -47,6 +56,7 @@ export interface HistoryPage<T> {
 // ── list_workdirs ───────────────────────────────────────────────────────────
 
 export interface ListWorkdirsParams {
+  sessionIds?: string[] | null;
   limit: number;
   cursor: HistoryCursor | null; // cursor.createdAt = lastSessionAt 的 ms; cursor.id = workingDir 字符串
   order: HistoryOrder;
@@ -72,6 +82,10 @@ export interface WorkdirAggregate {
 export async function listWorkdirsForHistory(
   params: ListWorkdirsParams,
 ): Promise<HistoryPage<WorkdirAggregate>> {
+  const scopedSessionIds = params.sessionIds ?? null;
+  if (scopedSessionIds !== null && scopedSessionIds.length === 0) {
+    return { items: [], nextCursor: null, hasMore: false };
+  }
   const db = getDbClient().drizzle;
   const orderFn = params.order === 'asc' ? asc : desc;
   // SQLite GROUP_CONCAT 没有内置 DISTINCT 区分; 用 sql 表达式更直观, 后端再 split
@@ -82,6 +96,7 @@ export async function listWorkdirsForHistory(
 
   // 基础过滤: 不要 deleted, 不要无 workingDir
   const baseConds = [ne(sessions.status, 'deleted'), isNotNull(sessions.workingDir)];
+  if (scopedSessionIds !== null) baseConds.push(inArray(sessions.id, scopedSessionIds));
   // 排除 app-managed dialogue 子树(<userData>/dialogues/<day>/<sessionId>):
   // 每个 standalone dialogue 会话一个目录, 是无界增长源——不排除的话大聊天历史
   // 用户一次 list_workdirs 会物化上千个单会话组(Codex review)。它们是内部
@@ -157,6 +172,12 @@ export async function listWorkdirsForHistory(
 // ── list_sessions ───────────────────────────────────────────────────────────
 
 export interface ListSessionsParams {
+  teammateId?: string;
+  source?: string;
+  timeField?: 'created' | 'activity';
+  /** Set only by the authorized remote history handler, never by tool input. */
+  remoteVisibleOnly?: boolean;
+  sessionIds?: string[] | null;
   workdir: string | null;
   fromMs: number | null;
   toMs: number | null;
@@ -168,6 +189,8 @@ export interface ListSessionsParams {
 }
 
 export interface SessionSummary {
+  lastActivityAt: number;
+  companion: HistoryCompanion | null;
   id: string;
   title: string;
   workingDir: string | null;
@@ -177,6 +200,7 @@ export interface SessionSummary {
   status: string;
   source: string;
   orcaRole: string | null;
+  orcaRemoteLead?: OrcaRemoteLead;
   parentSessionId: string | null;
   createdAt: number; // unix ms
   updatedAt: number;
@@ -187,31 +211,41 @@ export interface SessionSummary {
 export async function listSessionsForHistory(
   params: ListSessionsParams,
 ): Promise<HistoryPage<SessionSummary>> {
+  const scopedSessionIds = params.sessionIds ?? null;
+  if (scopedSessionIds !== null && scopedSessionIds.length === 0) {
+    return { items: [], nextCursor: null, hasMore: false };
+  }
   const db = getDbClient().drizzle;
   const orderFn = params.order === 'asc' ? asc : desc;
 
+  const lastActivityAt = sql<number>`MAX(${sessions.createdAt}, ${sessions.updatedAt}, COALESCE(${sessions.userSendAt}, 0))`;
+  const time = params.timeField === 'activity' ? lastActivityAt : sql<number>`${sessions.createdAt}`;
   const conds = [];
+  if (params.teammateId) conds.push(teammateHistoryFilter(sql`${sessions.id}`, params.teammateId));
+  if (params.source) conds.push(sql`${sessions.source} = ${params.source}`);
+  if (params.remoteVisibleOnly) conds.push(sql.raw(remoteVisibleSessionSql('sessions')));
+  if (scopedSessionIds !== null) conds.push(inArray(sessions.id, scopedSessionIds));
   if (!params.includeDeleted) conds.push(ne(sessions.status, 'deleted'));
   if (params.workdir !== null) {
     const candidates = await resolveStoredWorkingDirCandidates(params.workdir);
     if (candidates.length === 0) return { items: [], nextCursor: null, hasMore: false };
     conds.push(inArray(sessions.workingDir, candidates));
   }
-  if (params.fromMs !== null) conds.push(gte(sessions.createdAt, params.fromMs));
-  if (params.toMs !== null) conds.push(lt(sessions.createdAt, params.toMs));
+  if (params.fromMs !== null) conds.push(gte(time, params.fromMs));
+  if (params.toMs !== null) conds.push(lt(time, params.toMs));
   if (params.agentKind !== null) conds.push(eq(sessions.agentKind, params.agentKind));
 
   if (params.cursor) {
     const { createdAt: c, id } = params.cursor;
     if (params.order === 'desc') {
       conds.push(
-        or(lt(sessions.createdAt, c), and(eq(sessions.createdAt, c), lt(sessions.id, id))),
+        or(lt(time, c), and(eq(time, c), lt(sessions.id, id))),
       );
     } else {
       conds.push(
         or(
-          sql`${sessions.createdAt} > ${c}`,
-          and(eq(sessions.createdAt, c), sql`${sessions.id} > ${id}`),
+          sql`${time} > ${c}`,
+          and(eq(time, c), sql`${sessions.id} > ${id}`),
         ),
       );
     }
@@ -226,6 +260,8 @@ export async function listSessionsForHistory(
   // 但 limit 上限 1000 下完全可接受, 且语义清晰。
   const sessionRows = await db
     .select({
+      lastActivityAt,
+      companionJson: historyCompanionJson(sql`${sessions.id}`),
       id: sessions.id,
       title: sessions.title,
       workingDir: sessions.workingDir,
@@ -235,6 +271,7 @@ export async function listSessionsForHistory(
       status: sessions.status,
       source: sessions.source,
       orcaRole: sessions.orcaRole,
+      orcaRemoteLead: sessions.orcaRemoteLead,
       parentSessionId: sessions.parentSessionId,
       createdAt: sessions.createdAt,
       updatedAt: sessions.updatedAt,
@@ -242,7 +279,7 @@ export async function listSessionsForHistory(
     })
     .from(sessions)
     .where(and(...conds))
-    .orderBy(orderFn(sessions.createdAt), orderFn(sessions.id))
+    .orderBy(orderFn(time), orderFn(sessions.id))
     .limit(fetchLimit);
 
   const hasMore = sessionRows.length > params.limit;
@@ -264,6 +301,8 @@ export async function listSessionsForHistory(
   }
 
   const items: SessionSummary[] = sliced.map((r) => ({
+    lastActivityAt: r.lastActivityAt,
+    companion: parseHistoryCompanion(r.companionJson),
     id: r.id,
     title: r.title,
     workingDir: r.workingDir,
@@ -273,6 +312,7 @@ export async function listSessionsForHistory(
     status: r.status,
     source: r.source,
     orcaRole: r.orcaRole,
+    ...remoteOrcaHistoryIdentity(r.orcaRemoteLead),
     parentSessionId: r.parentSessionId,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
@@ -281,7 +321,7 @@ export async function listSessionsForHistory(
   }));
   const last = items[items.length - 1];
   const nextCursor: HistoryCursor | null = hasMore && last
-    ? { createdAt: last.createdAt, id: last.id }
+    ? { createdAt: params.timeField === 'activity' ? last.lastActivityAt : last.createdAt, id: last.id }
     : null;
   return { items, nextCursor, hasMore };
 }
@@ -312,6 +352,8 @@ export interface GetMessagesParams {
 
 export interface HistoryMessage {
   id: string;
+  /** Stable send/terminal identity, distinct from the storage row ID. */
+  clientId?: string;
   sessionId: string;
   sessionWorkingDir: string | null;
   sessionAgentKind: string;
@@ -341,6 +383,9 @@ const MAX_WORKDIR_SESSION_RESOLUTION = 5000;
 export async function getMessagesForHistory(
   params: GetMessagesParams,
 ): Promise<HistoryPage<HistoryMessage>> {
+  if (params.sessionIds !== null && params.sessionIds.length === 0) {
+    return { items: [], nextCursor: null, hasMore: false };
+  }
   const db = getDbClient().drizzle;
   const orderFn = params.order === 'asc' ? asc : desc;
 
@@ -447,6 +492,7 @@ export async function getMessagesForHistory(
     const camel = messageToCamel(r.m);
     return {
       id: camel.id,
+      clientId: camel.clientId,
       sessionId: camel.sessionId,
       sessionWorkingDir: r.sWorkingDir,
       sessionAgentKind: r.sAgentKind,

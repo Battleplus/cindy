@@ -1,4 +1,5 @@
 import { BRAND_NAME } from '@cindy/maker-shared/branding';
+import type { AgentKind, Effort } from '@cindy/maker-core';
 import type { SessionActivitySnapshot } from '@cindy/maker-shared/session-activity';
 import { z } from 'zod';
 
@@ -13,6 +14,13 @@ export type SessionQueueControlErrorCode =
   | 'NOT_AUTHORIZED'
   | 'INVALID_ARGS';
 
+/** 排队消息转插话未成功、消息仍留在队列时的原因。 */
+export type SessionQueueSteerReason =
+  | 'NO_ACTIVE_TURN'
+  | 'STEER_UNSUPPORTED'
+  | 'INPUT_BOUNDARY_BUSY'
+  | 'STEER_UNCERTAIN';
+
 export type SessionSteerErrorCode =
   | 'NOT_FOUND'
   | 'NO_ACTIVE_TURN'
@@ -22,7 +30,25 @@ export type SessionSteerErrorCode =
 
 export type SessionStopErrorCode = 'NOT_FOUND' | 'UNSUPPORTED_CAPABILITY';
 
-export type SessionRuntimeSnapshot = SessionActivitySnapshot;
+export interface SessionRuntimeProfile {
+  agentKind: AgentKind;
+  model: string;
+  providerId: string | null;
+  effort: Effort | null;
+  fastMode: boolean | 'ultrafast';
+}
+
+export interface SessionRuntimeSnapshot extends SessionActivitySnapshot {
+  runtimeGeneration?: number;
+  baselineProfile?: SessionRuntimeProfile;
+  effectiveProfile?: SessionRuntimeProfile;
+  pendingMutation?: {
+    generation: number;
+    source: 'agent' | 'fallback';
+    profile: SessionRuntimeProfile;
+  } | null;
+  fallbackEnabled?: boolean;
+}
 
 export interface SessionControlDeps {
   getSessionContext: () => LiziMcpSessionContext;
@@ -37,6 +63,30 @@ export interface SessionControlDeps {
     targetSessionId: string;
     queuedMessageId: string;
   }): Promise<ControlResult<{ queuedMessageId: string }, SessionQueueControlErrorCode>>;
+  /** 把一条排队消息转为插话;没插成时消息留在队列,返回 delivery=queued + reason。 */
+  steerQueuedMessage(params: {
+    callerSessionId: string;
+    targetSessionId: string;
+    queuedMessageId: string;
+  }): Promise<
+    ControlResult<
+      {
+        queuedMessageId: string;
+        delivery: 'steered' | 'queued';
+        reason?: SessionQueueSteerReason;
+      },
+      SessionQueueControlErrorCode
+    >
+  >;
+  /** 调整一条排队消息的位置(position 越界放队尾),返回实际最终位置。 */
+  moveQueuedMessage(params: {
+    callerSessionId: string;
+    targetSessionId: string;
+    queuedMessageId: string;
+    position: number;
+  }): Promise<
+    ControlResult<{ queuedMessageId: string; position: number }, SessionQueueControlErrorCode>
+  >;
   steerSession(params: {
     callerSessionId: string;
     targetSessionId: string;
@@ -57,6 +107,28 @@ export interface SessionControlDeps {
   getSessionRuntime(params: {
     targetSessionId: string;
   }): Promise<ControlResult<{ runtime: SessionRuntimeSnapshot }, 'NOT_FOUND'>>;
+  setSessionRuntime(params: {
+    targetSessionId: string;
+    expectedGeneration?: number;
+    patch: {
+      harness?: AgentKind;
+      model?: string;
+      providerId?: string | null;
+      effort?: Effort;
+      fastMode?: boolean | 'ultrafast';
+    };
+  }): Promise<
+    ControlResult<
+      {
+        status: 'applied' | 'deferred';
+        effectiveBoundary?: 'next_send';
+        generation: number;
+        effectiveProfile: SessionRuntimeProfile;
+        pendingMutation: SessionRuntimeSnapshot['pendingMutation'];
+      },
+      'NOT_FOUND' | 'CONFLICT' | 'INVALID_ARGS' | 'ROUTE_UNAVAILABLE'
+    >
+  >;
 }
 
 function requireCallerSession(deps: SessionControlDeps): string | null {
@@ -140,6 +212,87 @@ export function registerCancelSessionQueuedMessageTool(
   });
 }
 
+// 转插话 / 重排的可操作范围(host 校验,不满足返回 NOT_AUTHORIZED):调用方通过
+// send_to_session 投递到目标的消息,或调用方自己任务队列里由其它任务 / 协同成员发来的
+// 机器消息;用户手打、伙伴委派、插件、定时任务消息不可操作。
+const SESSION_QUEUE_MANAGEABLE_SCOPE =
+  '可操作的是你通过 send_to_session 投递的消息,或你自己任务队列里由其它任务 / 协同成员发来的机器消息;' +
+  '用户手打、伙伴委派、插件、定时任务消息不可操作。';
+
+export function registerSteerSessionQueuedMessageTool(
+  registry: XdtHelperToolRegistry,
+  deps: SessionControlDeps,
+): void {
+  registry.register({
+    name: 'steer_session_queued_message',
+    category: 'control',
+    description:
+      '把一条排队中的消息转为插话,插进目标 session 当前 turn。' +
+      SESSION_QUEUE_MANAGEABLE_SCOPE +
+      'delivery=steered 表示已插进当前 turn;delivery=queued 表示没插成、消息仍留在队列,reason: ' +
+      'NO_ACTIVE_TURN(目标没在运行,会按顺序发出) / STEER_UNSUPPORTED / INPUT_BOUNDARY_BUSY(输入边界暂被占用) / ' +
+      'STEER_UNCERTAIN(无法确认是否送达,已暂停队列待用户处置)。',
+    inputShape: {
+      session_id: z.string().min(1).describe('目标 session id(操作自己任务的队列时传当前 session id)。'),
+      queued_message_id: z.string().min(1).describe('来自 send_to_session 或 list_session_queue 的消息 id。'),
+    },
+    handler: async ({ session_id, queued_message_id }) => {
+      const callerSessionId = requireCallerSession(deps);
+      if (!callerSessionId) {
+        return errorPayload('NO_SESSION_CONTEXT', '当前 MCP 调用没有绑定 session，无法校验消息所有权。');
+      }
+      const result = await deps.steerQueuedMessage({
+        callerSessionId,
+        targetSessionId: session_id,
+        queuedMessageId: queued_message_id,
+      });
+      if (!result.ok) return mapControlFailure(result);
+      return okPayload({
+        session_id,
+        queued_message_id: result.queuedMessageId,
+        delivery: result.delivery,
+        ...(result.reason ? { reason: result.reason } : {}),
+      });
+    },
+  });
+}
+
+export function registerMoveSessionQueuedMessageTool(
+  registry: XdtHelperToolRegistry,
+  deps: SessionControlDeps,
+): void {
+  registry.register({
+    name: 'move_session_queued_message',
+    category: 'control',
+    description:
+      '把目标 session 中一条尚未消费的排队消息移到指定位置(0 = 队首,超出队列长度放到队尾),返回实际最终位置。' +
+      SESSION_QUEUE_MANAGEABLE_SCOPE,
+    inputShape: {
+      session_id: z.string().min(1).describe('目标 session id(操作自己任务的队列时传当前 session id)。'),
+      queued_message_id: z.string().min(1).describe('来自 send_to_session 或 list_session_queue 的消息 id。'),
+      position: z.number().int().min(0).describe('目标位置,0 = 队首;超出队列长度时放到队尾。'),
+    },
+    handler: async ({ session_id, queued_message_id, position }) => {
+      const callerSessionId = requireCallerSession(deps);
+      if (!callerSessionId) {
+        return errorPayload('NO_SESSION_CONTEXT', '当前 MCP 调用没有绑定 session，无法校验消息所有权。');
+      }
+      const result = await deps.moveQueuedMessage({
+        callerSessionId,
+        targetSessionId: session_id,
+        queuedMessageId: queued_message_id,
+        position,
+      });
+      if (!result.ok) return mapControlFailure(result);
+      return okPayload({
+        session_id,
+        queued_message_id: result.queuedMessageId,
+        position: result.position,
+      });
+    },
+  });
+}
+
 export function registerSteerSessionTool(
   registry: XdtHelperToolRegistry,
   deps: SessionControlDeps,
@@ -211,17 +364,21 @@ export function registerGetSessionRuntimeTool(
     category: 'control',
     description:
       '只读查询本机 session 的统一状态：记录生命周期、运行/等待/正常结束/出错结束、标题工作流语义、' +
-      '开始时间、最后活动时间、动作摘要和优雅停止状态；' +
+      '开始时间、最后活动时间、动作摘要、优雅停止状态，以及运行时模型组合、待生效修改和 generation；' +
       '不返回提示词正文、工具参数或凭证。',
     inputShape: {
-      session_id: z.string().min(1).describe('目标 session id。'),
+      session_id: z.string().min(1).optional().describe('目标 session id；省略时查询当前任务。'),
     },
     handler: async ({ session_id }) => {
-      const result = await deps.getSessionRuntime({ targetSessionId: session_id });
+      const targetSessionId = session_id ?? requireCallerSession(deps);
+      if (!targetSessionId) {
+        return errorPayload('NO_SESSION_CONTEXT', '当前 MCP 调用没有绑定 session，请显式提供 session_id。');
+      }
+      const result = await deps.getSessionRuntime({ targetSessionId });
       if (!result.ok) return mapControlFailure(result);
       const runtime = result.runtime;
       return okPayload({
-        session_id,
+        session_id: targetSessionId,
         phase: runtime.phase,
         active: runtime.phase === 'running' || runtime.phase === 'needs-interaction',
         record_status: runtime.recordStatus ?? null,
@@ -234,6 +391,111 @@ export function registerGetSessionRuntimeTool(
           runtime.lastActivityAtMs === null ? null : new Date(runtime.lastActivityAtMs).toISOString(),
         current_action_summary: runtime.currentActionSummary,
         graceful_stop_state: runtime.gracefulStopState,
+        generation: runtime.runtimeGeneration ?? 0,
+        baseline: runtime.baselineProfile ? runtimeProfilePayload(runtime.baselineProfile) : null,
+        effective: runtime.effectiveProfile ? runtimeProfilePayload(runtime.effectiveProfile) : null,
+        pending: runtime.pendingMutation
+          ? {
+              generation: runtime.pendingMutation.generation,
+              source: runtime.pendingMutation.source,
+              profile: runtimeProfilePayload(runtime.pendingMutation.profile),
+            }
+          : null,
+        fallback_enabled: runtime.fallbackEnabled ?? false,
+      });
+    },
+  });
+}
+
+const EFFORT_VALUES = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+
+function runtimeProfilePayload(profile: SessionRuntimeProfile) {
+  return {
+    harness: profile.agentKind,
+    model: profile.model,
+    provider_id: profile.providerId,
+    effort: profile.effort,
+    fast: profile.fastMode,
+  };
+}
+
+export function registerSetSessionRuntimeTool(
+  registry: XdtHelperToolRegistry,
+  deps: SessionControlDeps,
+): void {
+  registry.register({
+    name: 'set_session_runtime',
+    category: 'control',
+    description:
+      '原子调整当前或指定本机任务的模型来源、模型、推理强度与 Fast。省略 session_id 时作用于当前任务；' +
+      '临时调整在忙碌任务的当前 turn 结束后生效。先用 get_session_runtime 读取 generation，再用 expected_generation 防止覆盖并发修改。' +
+      '提供 harness 时必须同时指定 model：完整选择会保存到目标任务，并在下一条消息发送时切换（返回 next_send）；' +
+      '省略 harness 保持临时调整语义。不修改全局默认选择。',
+    inputShape: {
+      harness: z.enum(['claude-code', 'codex', 'pi']).optional().describe('目标执行引擎；提供时必须同时指定 model。'),
+      session_id: z.string().min(1).optional().describe('目标 session id；省略时使用当前任务。'),
+      provider_id: z
+        .string()
+        .min(1)
+        .nullable()
+        .optional()
+        .describe('来源 id；null 表示恢复该模型的默认来源。'),
+      model: z.string().min(1).optional().describe('目标模型 id。'),
+      effort: z.enum(EFFORT_VALUES).optional().describe('推理强度。省略表示保持当前值。'),
+      fast: z.union([z.boolean(), z.literal('ultrafast')]).optional().describe('false=标准，true=快速，ultrafast=超快（仅支持该档位的 Codex 模型）。'),
+      expected_generation: z
+        .number()
+        .int()
+        .nonnegative()
+        .describe(
+          '必填:先调用 get_session_runtime 读取当前 generation 并原样传回,用于防止覆盖并发修改。',
+        ),
+    },
+    handler: async ({ session_id, harness, provider_id, model, effort, fast, expected_generation }) => {
+      const targetSessionId = session_id ?? requireCallerSession(deps);
+      if (!targetSessionId) {
+        return errorPayload('NO_SESSION_CONTEXT', '当前 MCP 调用没有绑定 session，请显式提供 session_id。');
+      }
+      if (harness !== undefined && !model?.trim()) {
+        return errorPayload('INVALID_ARGS', '提供 harness 时必须同时指定目标 model。');
+      }
+      if (
+        provider_id === undefined &&
+        model === undefined &&
+        effort === undefined &&
+        fast === undefined
+      ) {
+        return errorPayload('INVALID_ARGS', '至少提供 provider_id、model、effort 或 fast 之一。');
+      }
+      if (expected_generation === undefined) {
+        // schema 已必填,此分支为纵深防御:任何绕过 zod 的调用路径仍拿到同一引导。
+        return errorPayload('INVALID_ARGS', '请先调用 get_session_runtime 获取 generation,并作为 expected_generation 传回。');
+      }
+      const result = await deps.setSessionRuntime({
+        targetSessionId,
+        expectedGeneration: expected_generation,
+        patch: {
+          ...(harness !== undefined ? { harness } : {}),
+          ...(provider_id !== undefined ? { providerId: provider_id } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...(effort !== undefined ? { effort } : {}),
+          ...(fast !== undefined ? { fastMode: fast } : {}),
+        },
+      });
+      if (!result.ok) return mapControlFailure(result);
+      return okPayload({
+        session_id: targetSessionId,
+        status: result.status,
+        generation: result.generation,
+        effective: runtimeProfilePayload(result.effectiveProfile),
+        pending: result.pendingMutation
+          ? {
+              generation: result.pendingMutation.generation,
+              source: result.pendingMutation.source,
+              profile: runtimeProfilePayload(result.pendingMutation.profile),
+            }
+          : null,
+        effective_boundary: result.effectiveBoundary ?? (result.status === 'deferred' ? 'next_turn' : 'immediate'),
       });
     },
   });

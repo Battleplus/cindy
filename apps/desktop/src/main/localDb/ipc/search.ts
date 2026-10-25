@@ -1,4 +1,5 @@
 import { ipcMain } from 'electron';
+import { isDeviceLinkInvoke } from '../../device-link/invoke-context.js';
 
 import { searchConversations } from '../conversationSearch.js';
 import type {
@@ -14,7 +15,7 @@ import { optionalEnum, requireObject, throwIpcError } from '../../utils/ipcValid
 const SORT_VALUES = ['relevance', 'activityDesc', 'activityAsc'] as const;
 const SEMANTIC_MODE_VALUES = ['hybrid', 'keyword'] as const;
 const STATUS_VALUES = ['active', 'archived', 'all'] as const;
-const AGENT_VALUES = ['all', 'cc', 'codex'] as const;
+const AGENT_VALUES = ['all', 'cc', 'codex', 'pi'] as const;
 const LAST_ACTIVITY_VALUES = ['all', '1d', '3d', '7d', '30d'] as const;
 
 export function registerSearchIpc(): void {
@@ -36,7 +37,7 @@ export function registerSearchIpc(): void {
       | undefined;
     const filters = parseFilters(body.filters);
     const unnamedLabel = parseUnnamedLabel(body.unnamedLabel);
-    return searchConversations({
+    const request = {
       query,
       limit,
       includeArchived,
@@ -44,7 +45,10 @@ export function registerSearchIpc(): void {
       semanticMode,
       filters,
       unnamedLabel,
-    });
+    };
+    return isDeviceLinkInvoke()
+      ? searchConversations(request, { remoteVisibleOnly: true })
+      : searchConversations(request);
   });
 }
 

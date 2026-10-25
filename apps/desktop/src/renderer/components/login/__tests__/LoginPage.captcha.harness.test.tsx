@@ -46,7 +46,7 @@ vi.mock('react-i18next', () => ({
 vi.mock('@/hooks/useLogin', () => ({ useLogin: () => loginHook.value }));
 vi.mock('@/components/title-bar/WindowControls', () => ({ WindowControls: () => null }));
 // 重发倒计时置零:本文件测的是发码前的 captcha 闸,identifier → verification-code
-// 的 step 迁移会武装 42s 倒计时,把重发链接换成倒计时文案,先掐掉。
+// 的 step 迁移会武装 60s 倒计时,把重发链接换成倒计时文案,先掐掉。
 vi.mock('../useResendCountdown', () => ({
   useResendCountdown: () => ({ remaining: 0, arm: vi.fn() }),
 }));
@@ -293,7 +293,8 @@ describe('LoginPage captcha 前置闸(providers 主动触发)', () => {
     const duplicate = gate!();
     await expect(duplicate).resolves.toBeNull();
     await screen.findByTestId('login-captcha-overlay');
-    expect(document.querySelectorAll('webview')).toHaveLength(1);
+    // overlay 先提交，WebView 再由 effect 插入；Windows CI 上两步可能跨 tick。
+    await waitFor(() => expect(document.querySelectorAll('webview')).toHaveLength(1));
 
     await emitCaptchaResult('cindy-captcha=ok.single-flight-token');
     await expect(first).resolves.toBe('single-flight-token');

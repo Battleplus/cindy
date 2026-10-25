@@ -7,11 +7,12 @@
  */
 
 import { ipcMain } from 'electron';
-import type { BrowserWindow } from 'electron';
+import type { BrowserWindow, WebContents } from 'electron';
 import type { SubagentProvider } from '@cindy/maker-shared/subagent-workspace';
 
 import { MAKER_INVOKE, MAKER_SEND } from '../maker-ipc/channels.js';
 import { createLogger } from '../logger.js';
+import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
 import { requireEnum, requireObject, throwIpcError } from '../utils/ipcValidate.js';
 import type {
   RsbWindowCommand,
@@ -38,34 +39,68 @@ const SUBAGENT_PROVIDERS = [
   'pi',
 ] as const satisfies readonly SubagentProvider[];
 
+const MAX_CONTEXT_SESSION_ID_LENGTH = 128;
+const MAX_CONTEXT_PATH_LENGTH = 4096;
+
 function parseContext(raw: unknown): RsbWindowContext {
   const r = requireObject(raw, 'context');
-  const nullableString = (v: unknown, name: string): string | null => {
+  const nullableString = (v: unknown, name: string, maxLength: number): string | null => {
     if (v === null || v === undefined) return null;
     if (typeof v !== 'string') throwIpcError('INVALID_PARAMS', `${name} must be string | null`);
+    if (v.length > maxLength) {
+      throwIpcError('INVALID_PARAMS', `${name} must be at most ${maxLength} characters`);
+    }
     return v;
   };
-  const optionalNullableString = (v: unknown, name: string): string | null | undefined => {
+  const optionalNullableString = (
+    v: unknown,
+    name: string,
+    maxLength: number,
+  ): string | null | undefined => {
     if (v === undefined) return undefined;
-    return nullableString(v, name);
+    return nullableString(v, name, maxLength);
   };
   if (typeof r.available !== 'boolean') {
     throwIpcError('INVALID_PARAMS', 'available must be boolean');
   }
-  const deviceLinkDeviceId = optionalNullableString(r.deviceLinkDeviceId, 'deviceLinkDeviceId');
+  if (r.subagentsAvailable !== undefined && typeof r.subagentsAvailable !== 'boolean') {
+    throwIpcError('INVALID_PARAMS', 'subagentsAvailable must be boolean when provided');
+  }
+  const deviceLinkDeviceId = optionalNullableString(
+    r.deviceLinkDeviceId,
+    'deviceLinkDeviceId',
+    MAX_CONTEXT_SESSION_ID_LENGTH,
+  );
+  const botOwner = r.botOwner === undefined || r.botOwner === null
+    ? r.botOwner
+    : requireObject(r.botOwner, 'botOwner');
+  if (botOwner && (typeof botOwner.botId !== 'string' || !botOwner.botId ||
+      botOwner.botId.length > MAX_CONTEXT_SESSION_ID_LENGTH || typeof botOwner.canonical !== 'boolean')) {
+    throwIpcError('INVALID_PARAMS', 'botOwner must contain a valid botId and canonical flag');
+  }
   return {
-    sessionId: nullableString(r.sessionId, 'sessionId'),
-    workdir: nullableString(r.workdir, 'workdir'),
-    remoteHostId: nullableString(r.remoteHostId, 'remoteHostId'),
+    sessionId: nullableString(r.sessionId, 'sessionId', MAX_CONTEXT_SESSION_ID_LENGTH),
+    workdir: nullableString(r.workdir, 'workdir', MAX_CONTEXT_PATH_LENGTH),
+    remoteHostId: nullableString(r.remoteHostId, 'remoteHostId', MAX_CONTEXT_SESSION_ID_LENGTH),
     ...(deviceLinkDeviceId === undefined ? {} : { deviceLinkDeviceId }),
+    ...(r.subagentsAvailable === undefined
+      ? {}
+      : { subagentsAvailable: r.subagentsAvailable }),
+    ...(botOwner === undefined ? {} : { botOwner: botOwner === null ? null : {
+      botId: botOwner.botId as string, canonical: botOwner.canonical as boolean,
+    } }),
     available: r.available,
   };
 }
 
 function parseCommand(raw: unknown): RsbWindowCommand {
   const r = requireObject(raw, 'command');
-  if (typeof r.sessionId !== 'string' || r.sessionId.length === 0) {
-    throwIpcError('INVALID_PARAMS', 'command.sessionId required');
+  if (
+    typeof r.sessionId !== 'string' ||
+    r.sessionId.length === 0 ||
+    r.sessionId.length > 128
+  ) {
+    throwIpcError('INVALID_PARAMS', 'command.sessionId must be a 1–128 character string');
   }
   if (r.type === 'open-terminal') {
     return { type: 'open-terminal', sessionId: r.sessionId };
@@ -73,11 +108,17 @@ function parseCommand(raw: unknown): RsbWindowCommand {
   if (r.type === 'toggle-review-tab') {
     return { type: 'toggle-review-tab', sessionId: r.sessionId };
   }
-  if (r.type === 'open-web-browser') {
+  if (r.type === 'open-web-browser' || r.type === 'open-mail-preview') {
     if (typeof r.url !== 'string' || r.url.length === 0) {
       throwIpcError('INVALID_PARAMS', 'command.url required');
     }
-    return { type: 'open-web-browser', sessionId: r.sessionId, url: r.url };
+    return { type: r.type, sessionId: r.sessionId, url: r.url };
+  }
+  if (r.type === 'open-mail-card') {
+    if (typeof r.callId !== 'string' || !r.callId || r.callId.length > 128) {
+      throwIpcError('INVALID_PARAMS', 'command.callId must be a 1–128 character string');
+    }
+    return { type: r.type, sessionId: r.sessionId, callId: r.callId };
   }
   if (r.type === 'ensure-orca-workers-tab') {
     const hasFocusWorkerSessionId =
@@ -110,6 +151,16 @@ function parseCommand(raw: unknown): RsbWindowCommand {
   }
   if (r.type === 'close-orca-workers-tab') {
     return { type: 'close-orca-workers-tab', sessionId: r.sessionId };
+  }
+  if (r.type === 'open-plugin-task') {
+    if (typeof r.instanceId !== 'string' || !r.instanceId || r.instanceId.length > 256) {
+      throwIpcError('INVALID_PARAMS', 'Invalid plugin instance');
+    }
+    return { type: 'open-plugin-task', sessionId: r.sessionId, instanceId: r.instanceId };
+  }
+  if (r.type === 'open-routines-tab') {
+    if (typeof r.botId !== 'string' || !r.botId || r.botId.length > 128) throwIpcError('INVALID_PARAMS', 'Invalid teammate');
+    return { type: 'open-routines-tab', sessionId: r.sessionId, botId: r.botId };
   }
   if (r.type === 'open-background-tasks-tab') {
     const hasFocusTaskId =
@@ -252,13 +303,22 @@ function parseCommandRouteRequest(raw: unknown): RsbWindowCommandRouteRequest {
 }
 
 /** open 的可选 payload:缺省(旧签名 / 无参调用)= 用户手势,保持既有聚焦行为。 */
-function parseOpenUserInitiated(raw: unknown): boolean {
-  if (raw === undefined || raw === null) return true;
+function parseOpenOptions(raw: unknown): { userInitiated: boolean; sessionId?: string } {
+  if (raw === undefined || raw === null) return { userInitiated: true };
   const r = requireObject(raw, 'options');
   if (r.userInitiated !== undefined && typeof r.userInitiated !== 'boolean') {
     throwIpcError('INVALID_PARAMS', 'options.userInitiated must be boolean');
   }
-  return r.userInitiated !== false;
+  if (
+    r.sessionId !== undefined &&
+    (typeof r.sessionId !== 'string' || r.sessionId.length === 0 || r.sessionId.length > 128)
+  ) {
+    throwIpcError('INVALID_PARAMS', 'options.sessionId must be a 1–128 character string');
+  }
+  return {
+    userInitiated: r.userInitiated !== false,
+    ...(typeof r.sessionId === 'string' ? { sessionId: r.sessionId } : {}),
+  };
 }
 
 const MAX_HANDOFF_SNAPSHOTS = 8;
@@ -322,13 +382,40 @@ function parseTabHandoff(raw: unknown): RsbWindowTabHandoff | undefined {
 export function registerRsbWindowIpc(opts: {
   controller: RsbWindowController;
   getMainWindow: () => BrowserWindow | null;
+  allowBotWorkbenchPermission: (botId: string, sessionId: string, requestId: string) => { accepted: boolean };
+  authorizePoppedWorkbench?: (sender: WebContents, botId: string) => Promise<boolean>;
 }): void {
-  const { controller, getMainWindow } = opts;
+  const { controller, getMainWindow, allowBotWorkbenchPermission, authorizePoppedWorkbench } = opts;
+
+  ipcMain.handle(MAKER_INVOKE.RSB_WINDOW_ALLOW_BOT_WORKBENCH_PERMISSION, async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    const request = requireObject(raw, 'workbench permission');
+    for (const key of ['botId', 'sessionId', 'requestId'] as const) {
+      if (typeof request[key] !== 'string' || !request[key] || request[key].length > 128) {
+        throwIpcError('INVALID_PARAMS', `${key} must be a 1–128 character string`);
+      }
+    }
+    const context = event.sender === controller.getVisibleSidebarWebContents() ? controller.getContext() : null;
+    const botOwner = context?.botOwner;
+    const authorizedSidebar = Boolean(botOwner && botOwner.botId === request.botId &&
+      botOwner.canonical && context?.remoteHostId === null);
+    const authorizedPopout = !authorizedSidebar && await authorizePoppedWorkbench?.(event.sender, request.botId as string);
+    if (!authorizedSidebar && !authorizedPopout) {
+      return { accepted: false };
+    }
+    return allowBotWorkbenchPermission(request.botId as string, request.sessionId as string, request.requestId as string);
+  });
 
   ipcMain.handle(MAKER_INVOKE.RSB_WINDOW_GET_STATE, () => controller.getState());
 
-  ipcMain.handle(MAKER_INVOKE.RSB_WINDOW_OPEN, (_e, payload: unknown) => {
-    controller.open({ userInitiated: parseOpenUserInitiated(payload) });
+  ipcMain.handle(MAKER_INVOKE.RSB_WINDOW_OPEN, (event, payload: unknown) => {
+    const options = parseOpenOptions(payload);
+    const main = getMainWindow();
+    if (!main || main.isDestroyed() || event.sender !== main.webContents) {
+      log.warn('RSB_WINDOW_OPEN from non-main-window sender, dropped');
+      return;
+    }
+    controller.open(options);
   });
 
   ipcMain.handle(MAKER_INVOKE.RSB_WINDOW_CLOSE, () => {
