@@ -1,6 +1,8 @@
+import { CodexResetAutoUseControl } from './CodexResetAutoUseControl';
 import { TaskTagLabels, TaskTagsPanel } from './TaskTags';
 import { TaskTagsSheet, useTaskTagsSheet } from './TaskTagsSheet';
 import type { OpenAiAccountProvider } from './sessionControls';
+import { formatQuotaResetCountdown } from './sessionUsagePresentation';
 /**
  * SessionMenuSheet —— 会话右上角「…」菜单浮窗(取代旧三 tab 的会话设置面板)。
  *
@@ -29,6 +31,7 @@ import {
   PinOff,
   RefreshCw,
   Search,
+  MessageSquarePlus,
   Sparkles,
   Trash2,
 } from 'lucide-react-native';
@@ -36,6 +39,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Easing,
   Pressable,
   Platform,
   StyleSheet,
@@ -46,9 +50,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 import { mobilePresentationLocalizer } from '@/i18n/presentationLocalizer';
 import { Text, TextInput } from '@/components/AppText';
-import { MainWindowActionGroup } from '@/components/MobilePrimitives';
+import { MainWindowActionButton, MainWindowActionGroup } from '@/components/MobilePrimitives';
 import type { MobileMakerTransport, RemoteDirectoryEntry } from '@/device-link/mobileMakerTransport';
-import type { MobileCodexRateLimitsResult } from '@cindy/maker-shared/device-link-contract';
+import type { CodexResetAutoUseSettings, MobileCodexRateLimitsResult } from '@cindy/maker-shared/device-link-contract';
 import { projectDraftSessionTitle } from '@cindy/maker-shared/session-title';
 import { isSharedTaskPeer } from '@cindy/device-link';
 import { computeContextSheetSnapHeights, type ContextSheetSnap } from '@/session/contextSheetModel';
@@ -64,7 +68,11 @@ import {
   summarizeCodexRateLimitReset,
   summarizeContextUsage,
 } from '@/session/sessionControls';
-import { useSessionMenuUsage, type SessionMenuUsageReader } from '@/session/useSessionMenuUsage';
+import {
+  useSessionMenuUsage,
+  type SessionMenuAccountReader,
+  type SessionMenuUsageReader,
+} from '@/session/useSessionMenuUsage';
 import { useSessionMenuContextUsage } from '@/session/useSessionMenuContextUsage';
 import { SessionUsageSummary } from '@/session/SessionUsageSummary';
 import {
@@ -75,6 +83,7 @@ import {
   buildSessionMenuHeader,
   removeSessionExtraDir,
   sessionInfoShowsExtraDirs,
+  sessionMenuAllowsRename,
   sessionMenuCopyLink,
   settleSessionMenuBack,
   type SessionMenuAction,
@@ -85,10 +94,9 @@ import { SheetSurface } from '@/session/SheetSurface';
 import { SessionDetailsNative, SessionDetailsNativeActions } from './SessionDetailsNative';
 import type { RemoteSession } from '@/session/types';
 import { iconSize, iconStroke, monoFont, useTheme, useThemedStyles, type ThemeColors } from '@/theme';
-import { fontWeight, lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
+import { fontWeight, lineHeight, motionDuration, motionEasing, radius, spacing, typeScale } from '@/theme/tokens';
+import { useReduceMotionEnabled } from '@/hooks/useReduceMotion';
 
-/** 二级 Surface 滑入/滑出时长(对齐 useContextSheetDrag 的 SNAP_ANIMATION_DURATION_MS)。 */
-const SECONDARY_SLIDE_DURATION_MS = 180;
 /** 复制反馈(行内文案临时替换)展示时长。 */
 const COPY_FEEDBACK_MS = 1500;
 
@@ -112,10 +120,18 @@ export interface SessionMenuWorkerActions {
 export interface SessionMenuSheetProps {
   tagDeviceId?: string;
   providerName?: string;
+  /** 当前模型在模型目录里的用户可读展示名(用量卡显示;缺席时卡片自行兜底)。 */
+  modelLabel?: string | null;
   messageOnly?: boolean;
   onOpenSearch?: () => void;
+  onOpenSideChats?: () => void;
   accountProvider?: OpenAiAccountProvider;
   usageReader: SessionMenuUsageReader & Pick<MobileMakerTransport, 'getContextUsage'>;
+  /**
+   * 账号余量从哪台电脑读(远程 Agent 时是 Agent 所在那台,见 sessionUsageAccount)。缺省 = usageReader
+   * (被控电脑);null = 读不到那份账号,只显示任务价值。
+   */
+  accountUsageReader?: SessionMenuAccountReader | null;
   visible: boolean;
   /** 打开时落在哪个视图(header 用量入口可直达 info)。 */
   initialView: SessionMenuView;
@@ -132,6 +148,7 @@ export interface SessionMenuSheetProps {
   codexRateLimits: MobileCodexRateLimitsResult | null;
   codexResetBusy: boolean;
   onResetCodexRateLimits(): void;
+  onSaveCodexResetAutoUse?: (patch: Partial<CodexResetAutoUseSettings> | null) => Promise<void>;
   onRefreshAccountUsage(): void;
   extraDirBrowser?: SessionExtraDirBrowserState | null;
   onLoadExtraDirPath(path: string): void;
@@ -151,7 +168,10 @@ export interface SessionMenuSheetProps {
   worker?: SessionMenuWorkerActions;
   leavingSharing?: boolean;
   onTogglePinned(): void;
-  onArchive(): void;
+  /** 由调用方在列表预览事务内等待确认，再提交归档。 */
+  onArchive(prepare: (isCurrent: () => boolean) => Promise<boolean>): void;
+  /** 菜单收起后执行归档确认(如绑定了自动化);返回 false 时留在当前任务、不归档。 */
+  confirmArchive?: (isCurrent: () => boolean) => Promise<boolean>;
   onRestore(): void;
   onDelete(): void;
   onClose(): void;
@@ -162,9 +182,12 @@ export interface SessionMenuSheetProps {
 export function SessionMenuSheet({
   tagDeviceId,
   providerName,
+  modelLabel,
   messageOnly = false,
   onOpenSearch,
+  onOpenSideChats,
   usageReader,
+  accountUsageReader = usageReader,
   accountProvider,
   visible,
   initialView,
@@ -175,6 +198,7 @@ export function SessionMenuSheet({
   codexRateLimits,
   codexResetBusy,
   onResetCodexRateLimits,
+  onSaveCodexResetAutoUse,
   onRefreshAccountUsage,
   extraDirBrowser,
   onLoadExtraDirPath,
@@ -189,6 +213,7 @@ export function SessionMenuSheet({
   leavingSharing = false,
   onTogglePinned,
   onArchive,
+  confirmArchive,
   onRestore,
   onDelete,
   onClose,
@@ -198,16 +223,31 @@ export function SessionMenuSheet({
   const styles = useThemedStyles(makeStyles);
   const { colors } = useTheme();
   const { t, i18n: i18nInstance } = useTranslation();
-  const menuUsage = useSessionMenuUsage(session, usageReader, visible && !messageOnly, codexRateLimits, accountProvider);
+  const pendingArchiveRef = useRef<(() => void) | null>(null);
+  const handleClosed = useCallback(() => {
+    const archive = pendingArchiveRef.current;
+    pendingArchiveRef.current = null;
+    onClosed?.();
+    archive?.();
+  }, [onClosed]);
+  const menuUsage = useSessionMenuUsage(
+    session,
+    usageReader,
+    visible && !messageOnly,
+    codexRateLimits,
+    accountProvider,
+    accountUsageReader,
+  );
   const { height: windowHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
 
-  const [view, setView] = useState<SessionMenuView>(initialView);
+  // 'rename' 只是打开位置(落在一级菜单的重命名编辑态),视图本身仍是 menu / info 两级。
+  const [view, setView] = useState<SessionMenuView>(initialView === 'info' ? 'info' : 'menu');
   const [opening, setOpening] = useState({ visible, initialView });
   // Reset before effects: reopening the primary menu must not inspect the old info view.
   if (opening.visible !== visible || opening.initialView !== initialView) {
     setOpening({ visible, initialView });
-    if (visible) setView(initialView);
+    if (visible) setView(initialView === 'info' ? 'info' : 'menu');
   }
   const { contextUsage, contextLoading, refresh: onRefreshContextUsage } = useSessionMenuContextUsage(
     session, usageReader, visible && !messageOnly && view === 'info', onContextError,
@@ -215,6 +255,9 @@ export function SessionMenuSheet({
   const [primarySnap, setPrimarySnap] = useState<ContextSheetSnap>('half');
   const [secondarySnap, setSecondarySnap] = useState<ContextSheetSnap>('half');
   const [renaming, setRenaming] = useState(false);
+  // 双击标题直达的重命名:确定 / 取消后直接收起菜单,不退回一级菜单。
+  const [renameOnly, setRenameOnly] = useState(false);
+  const renameAllowed = sessionMenuAllowsRename(session, messageOnly);
   const [renameGenerating, setRenameGenerating] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
   // 重命名输入框的预填值:哨兵先过投影,输入框里不能出现内部哨兵 "New Maker"
@@ -229,6 +272,8 @@ export function SessionMenuSheet({
   const renameSeqRef = useRef(0);
   // 二级 Surface 滑入/滑出动画(0 = 就位;windowHeight = 屏下)。动画期间锁交互防连点。
   const secondaryTranslate = useRef(new Animated.Value(windowHeight)).current;
+  // 只有明确 === false 才播二级滑入/滑出(null / true 直接就位)。
+  const animateSecondary = useReduceMotionEnabled() === false;
   const secondaryAnimatingRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -255,20 +300,31 @@ export function SessionMenuSheet({
     setPrimarySnap('half');
     setSecondarySnap('half');
     renameSeqRef.current += 1;
-    setRenaming(false);
+    const startRenaming = initialView === 'rename' && renameAllowed && !busy;
+    setRenaming(startRenaming);
+    setRenameOnly(startRenaming);
+    if (startRenaming) setTitleDraft(renamePrefill);
     setRenameGenerating(false);
     setRenameError(null);
     setCopiedKey(null);
     setExtraDirsNotice(null);
     secondaryAnimatingRef.current = false;
     secondaryTranslate.setValue(initialView === 'info' ? 0 : windowHeightRef.current);
+    // 只在打开时决定落点;打开期间 busy / 标题变化不重跑整段重置。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, initialView, secondaryTranslate]);
 
-  // 会话切换 / 远端改名后同步标题草稿,并退出编辑态。
+  // 会话切换 / 远端改名后同步标题草稿,并退出编辑态。首次挂载跳过:浮窗由
+  // MountOnFirstOpen 首开即挂载,此时上面的打开重置可能刚进入重命名编辑态。
+  const renameSourceRef = useRef({ id: session.id, prefill: renamePrefill });
   useEffect(() => {
+    const source = renameSourceRef.current;
+    if (source.id === session.id && source.prefill === renamePrefill) return;
+    renameSourceRef.current = { id: session.id, prefill: renamePrefill };
     renameSeqRef.current += 1;
     setTitleDraft(renamePrefill);
     setRenaming(false);
+    setRenameOnly(false);
     setRenameGenerating(false);
     setRenameError(null);
   }, [session.id, renamePrefill]);
@@ -291,28 +347,42 @@ export function SessionMenuSheet({
     secondaryAnimatingRef.current = true;
     setSecondarySnap('half');
     setView('info');
+    // 二级 Surface 滑入 = 重浮层入场档;减弱动态效果(或偏好未查到)时直接就位。
+    if (!animateSecondary) {
+      secondaryTranslate.setValue(0);
+      secondaryAnimatingRef.current = false;
+      return;
+    }
     secondaryTranslate.setValue(windowHeight);
     Animated.timing(secondaryTranslate, {
-      duration: SECONDARY_SLIDE_DURATION_MS,
+      duration: motionDuration.enter,
+      easing: Easing.bezier(...motionEasing.out),
       toValue: 0,
       useNativeDriver: true,
     }).start(() => {
       secondaryAnimatingRef.current = false;
     });
-  }, [secondaryTranslate, view, windowHeight]);
+  }, [animateSecondary, secondaryTranslate, view, windowHeight]);
 
   const backToMenu = useCallback(() => {
     if (secondaryAnimatingRef.current) return;
     secondaryAnimatingRef.current = true;
+    if (!animateSecondary) {
+      secondaryTranslate.setValue(windowHeight);
+      secondaryAnimatingRef.current = false;
+      setView('menu');
+      return;
+    }
     Animated.timing(secondaryTranslate, {
-      duration: SECONDARY_SLIDE_DURATION_MS,
+      duration: motionDuration.exit,
+      easing: Easing.bezier(...motionEasing.in),
       toValue: windowHeight,
       useNativeDriver: true,
     }).start(() => {
       secondaryAnimatingRef.current = false;
       setView('menu');
     });
-  }, [secondaryTranslate, windowHeight]);
+  }, [animateSecondary, secondaryTranslate, windowHeight]);
 
   // Android 返回键 / iOS 关闭手势:两段式(info 先回 menu,menu 才关浮窗)。
   const handleRequestClose = useCallback(() => {
@@ -356,6 +426,7 @@ export function SessionMenuSheet({
     setRenaming(false);
     setRenameGenerating(false);
     setRenameError(null);
+    if (renameOnly) onClose();
     // 「没改就不落库」要同时比原始标题**和**预填的投影值:未起名会话预填的是本地化
     // 兜底文案,只比原始标题会把这个文案写进 DB,哨兵被毁 → 自动起名永久跳过该会话。
     if (!next || next === session.title || next === renamePrefill) {
@@ -363,7 +434,7 @@ export function SessionMenuSheet({
       return;
     }
     onRename(next);
-  }, [onRename, renamePrefill, session.title, titleDraft]);
+  }, [onClose, onRename, renameOnly, renamePrefill, session.title, titleDraft]);
 
   const cancelRename = useCallback(() => {
     renameSeqRef.current += 1;
@@ -371,7 +442,8 @@ export function SessionMenuSheet({
     setRenameGenerating(false);
     setRenameError(null);
     setTitleDraft(renamePrefill);
-  }, [renamePrefill]);
+    if (renameOnly) onClose();
+  }, [onClose, renameOnly, renamePrefill]);
 
   // 自动起名:生成结果只回填输入框,停留在编辑态等用户按「确定」提交(2026-07-06
   // 产品确认,与桌面「生成即提交」刻意不同);生成期间用户手动提交 / 取消 →
@@ -430,8 +502,13 @@ export function SessionMenuSheet({
         onClose();
         return;
       case 'archive':
-        if (session.status === 'archived') onRestore();
-        else onArchive();
+        if (session.status === 'archived') {
+          onRestore();
+          onClose();
+          return;
+        }
+        // 先响应点击收起菜单，关闭动画结束后再查询/弹确认，避免原生 Modal 吞掉 Alert。
+        pendingArchiveRef.current = () => onArchive(confirmArchive ?? (async () => true));
         onClose();
         return;
       case 'delete':
@@ -440,7 +517,7 @@ export function SessionMenuSheet({
       default:
         return;
     }
-  }, [confirmDelete, copyValue, onArchive, onClose, onRestore, onTogglePinned, renamePrefill, session]);
+  }, [confirmArchive, confirmDelete, copyValue, onArchive, onClose, onRestore, onTogglePinned, renamePrefill, session]);
 
   const currentExtraDirs = normalizeExtraDirs(session.extraDirs ?? undefined);
   const addExtraDir = useCallback((path: string) => {
@@ -479,6 +556,15 @@ export function SessionMenuSheet({
     return () => clearTimeout(timer);
   }, [visible, quotaBucketTables, quotaStaleTick]);
 
+  // Countdown labels move with the clock while the sheet is open; the card refreshes
+  // on the same 30s cadence through its usage polling.
+  const [countdownTick, setCountdownTick] = useState(0);
+  useEffect(() => {
+    if (!visible) return undefined;
+    const timer = setInterval(() => setCountdownTick((tick) => tick + 1), 30_000);
+    return () => clearInterval(timer);
+  }, [visible]);
+
   const accountLimits = useMemo(() => {
     const now = Date.now();
     // 账号可能同时有主配额桶与模型专属促销桶(如 GPT-5.3-Codex-Spark), 上游每次
@@ -491,9 +577,11 @@ export function SessionMenuSheet({
       modelId: session.model,
       nowMs: now,
     });
-    return summarizeAccountRateLimits(scoped, now, mobilePresentationLocalizer);
-    // visible / quotaStaleTick 进依赖: 重开与到点失效都要按当前时间重选。
-  }, [accountUsage, i18nInstance.language, quotaBucketTables, session.model, visible, quotaStaleTick]);
+    return summarizeAccountRateLimits(scoped, now, mobilePresentationLocalizer, (resetsAt, windowMinutes) =>
+      formatQuotaResetCountdown(resetsAt, now, t, windowMinutes),
+    );
+    // visible / quotaStaleTick / countdownTick 进依赖: 重开、到点失效与倒计时推进都按当前时间重算。
+  }, [accountUsage, i18nInstance.language, quotaBucketTables, session.model, visible, quotaStaleTick, countdownTick, t]);
   const resetSummary = useMemo(
     () => summarizeCodexRateLimitReset(codexRateLimits, Date.now(), mobilePresentationLocalizer),
     [codexRateLimits, i18nInstance.language],
@@ -528,7 +616,7 @@ export function SessionMenuSheet({
     );
   }, [codexRateLimits, codexResetBusy, onResetCodexRateLimits, resetSummary, t]);
 
-  const tagsSheet = useTaskTagsSheet(visible, onClosed);
+  const tagsSheet = useTaskTagsSheet(visible, handleClosed);
   const menuContent = (
     <View style={styles.menuBody} testID="session.menuSheetBody">
       {renaming ? (
@@ -605,28 +693,17 @@ export function SessionMenuSheet({
             </View>
                 )}
 
-          {!messageOnly ? <SessionUsageSummary providerName={providerName} session={session} usage={menuUsage} contextUsage={contextUsage} onPress={openInfo} translucent={Platform.OS === 'ios'} /> : null}
+          {!messageOnly ? <SessionUsageSummary modelLabel={modelLabel} providerName={providerName} session={session} usage={menuUsage} contextUsage={contextUsage} onPress={openInfo} translucent={Platform.OS === 'ios'} /> : null}
 
           {workerMode ? (
             <WorkerMenuActions onClose={onClose} worker={worker} />
           ) : null}
 
-          {workerMode ? null : !messageOnly && isSharedTaskPeer(session.deviceLinkDeviceId) && onLeaveSharing ? (
+          {onOpenSideChats ? (
             Platform.OS === 'ios' ? <SessionDetailsNativeActions actions={[{
-              label: t('sharedTask.leave'), danger: true, disabled: leavingSharing,
-              onPress: onLeaveSharing, testID: 'session.leaveSharingButton',
+              label: t('session.sideChat.title'), onPress: onOpenSideChats, testID: 'session.sideChat.entry',
             }]} /> : <View style={styles.actionGroup}>
-              <MenuActionRow icon={LogOut} label={t('sharedTask.leave')} danger disabled={leavingSharing}
-                onPress={onLeaveSharing} testID="session.leaveSharingButton" />
-            </View>
-          ) : !messageOnly && onOpenSharing && !isSharedTaskPeer(session.deviceLinkDeviceId) ? (
-            Platform.OS === 'ios' ? <SessionDetailsNativeActions actions={[{
-              label: t('sharedTask.title'),
-              onPress: onOpenSharing,
-              testID: 'session.sharingButton',
-            }]} /> : <View style={styles.actionGroup}>
-              <MenuActionRow icon={Link2} label={t('sharedTask.title')}
-                onPress={onOpenSharing} testID="session.sharingButton" />
+              <MenuActionRow icon={MessageSquarePlus} label={t('session.sideChat.title')} onPress={onOpenSideChats} testID="session.sideChat.entry" />
             </View>
           ) : null}
           {Platform.OS === 'ios' ? (
@@ -650,6 +727,25 @@ export function SessionMenuSheet({
               />
             ))}
           </View>}
+
+          {workerMode ? null : !messageOnly && isSharedTaskPeer(session.deviceLinkDeviceId) && onLeaveSharing ? (
+            Platform.OS === 'ios' ? <SessionDetailsNativeActions actions={[{
+              label: t('sharedTask.leave'), danger: true, disabled: leavingSharing,
+              onPress: onLeaveSharing, testID: 'session.leaveSharingButton',
+            }]} /> : <View style={styles.actionGroup}>
+              <MenuActionRow icon={LogOut} label={t('sharedTask.leave')} danger disabled={leavingSharing}
+                onPress={onLeaveSharing} testID="session.leaveSharingButton" />
+            </View>
+          ) : !messageOnly && onOpenSharing && !isSharedTaskPeer(session.deviceLinkDeviceId) ? (
+            Platform.OS === 'ios' ? <SessionDetailsNativeActions actions={[{
+              label: t('sharedTask.title'),
+              onPress: onOpenSharing,
+              testID: 'session.sharingButton',
+            }]} /> : <View style={styles.actionGroup}>
+              <MenuActionRow icon={Link2} label={t('sharedTask.title')}
+                onPress={onOpenSharing} testID="session.sharingButton" />
+            </View>
+          ) : null}
 
           {onOpenSearch && !workerMode ? (
             Platform.OS === 'ios' ? <SessionDetailsNativeActions actions={[{
@@ -723,7 +819,7 @@ export function SessionMenuSheet({
 
   const infoContent = (
     <View style={styles.infoBody} testID="session.infoSheetBody">
-      <SessionUsageSummary providerName={providerName} session={session} usage={menuUsage} contextUsage={contextUsage} detail translucent={Platform.OS === 'ios'} />
+      <SessionUsageSummary modelLabel={modelLabel} providerName={providerName} session={session} usage={menuUsage} contextUsage={contextUsage} detail translucent={Platform.OS === 'ios'} />
       <View style={styles.infoSection}>
         <View style={styles.infoSectionHeader}>
           <Text style={styles.infoSectionTitle}>{t('session.menu.usageSection')}</Text>
@@ -731,6 +827,7 @@ export function SessionMenuSheet({
             accessibilityLabel={t('session.menu.refreshContextUsage')}
             accessibilityRole="button"
             disabled={contextLoading}
+            hitSlop={6}
             onPress={() => { onRefreshContextUsage(); menuUsage.refresh(); onRefreshAccountUsage(); }}
             style={({ pressed }) => [styles.refreshButton, pressed && styles.pressed]}
             testID="session.contextRefreshButton"
@@ -762,15 +859,16 @@ export function SessionMenuSheet({
           {resetSummary?.rows.map((row, index) => (
             <InfoRow key={`reset:${row.label}:${index}`} label={row.label} value={row.value} />
           ))}
+          {codexRateLimits?.autoUse && onSaveCodexResetAutoUse && <CodexResetAutoUseControl key={codexRateLimits.autoUse.accountKey} state={codexRateLimits.autoUse} onSave={onSaveCodexResetAutoUse} />}
           {resetSummary?.canReset ? (
             <>
-              <Text style={styles.infoCaption}>
+              {resetSummary.shouldPrompt && <Text style={styles.infoCaption}>
                 {t('session.menu.quotaExhaustedResettable')}
-              </Text>
+              </Text>}
               <View style={styles.infoActionRow}>
                 <MenuPillButton
-                  disabled={codexResetBusy}
-                  label={codexResetBusy ? t('session.menu.resetting') : t('session.menu.resetCodexUsage')}
+                  busy={codexResetBusy}
+                  label={t('session.menu.resetCodexUsage')}
                   onPress={confirmCodexReset}
                   testID="session.codexRateLimitResetButton"
                   tone="primary"
@@ -907,7 +1005,7 @@ export function SessionMenuSheet({
     <MainWindowActionGroup
       primaryActions={[{
         accessibilityLabel: t('session.menu.confirmRename'),
-        label: t('session.menu.confirm'),
+        label: t('session.menu.renameSubmit'),
         onPress: submitRename,
         testID: 'session.renameButton',
         tone: 'primary',
@@ -1109,42 +1207,34 @@ function MenuActionRow({
   );
 }
 
+/** 信息面板内的紧凑操作按钮:统一走共享 MainWindowActionButton(compact,自带 44pt 命中区与加载转圈)。 */
 function MenuPillButton({
+  busy = false,
   disabled = false,
   label,
   onPress,
   testID,
   tone = 'default',
 }: {
+  busy?: boolean;
   disabled?: boolean;
   label: string;
   onPress: () => void;
   testID?: string;
   tone?: 'default' | 'primary';
 }) {
-  const styles = useThemedStyles(makeStyles);
   return (
-    <Pressable
-      accessibilityLabel={label}
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-      disabled={disabled}
-      onPress={disabled ? undefined : onPress}
-      style={({ pressed }) => [
-        styles.pillButton,
-        tone === 'primary' && styles.pillButtonPrimary,
-        pressed && styles.pressed,
-        disabled && styles.disabled,
-      ]}
-      testID={testID}
-    >
-      <Text
-        numberOfLines={1}
-        style={[styles.pillButtonText, tone === 'primary' && styles.pillButtonTextPrimary]}
-      >
-        {label}
-      </Text>
-    </Pressable>
+    <MainWindowActionButton
+      action={{
+        busy,
+        disabled,
+        label,
+        onPress,
+        testID,
+        tone: tone === 'primary' ? 'primary' : 'secondary',
+      }}
+      density="compact"
+    />
   );
 }
 
@@ -1253,12 +1343,13 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   renameInput: {
     backgroundColor: colors.surface,
     borderColor: colors.border,
-    borderRadius: radius.container,
+    // 单行输入框统一胶囊。
+    borderRadius: radius.pill,
     borderWidth: StyleSheet.hairlineWidth,
     color: colors.textPrimary,
     fontSize: typeScale.body,
       minHeight: 44,
-      paddingLeft: spacing.md,
+      paddingLeft: spacing.lg,
       paddingRight: 44,
     },
     renameAiButton: {
@@ -1396,29 +1487,6 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
       lineHeight: lineHeight.micro,
       marginTop: 2,
     },
-    pillButton: {
-      alignItems: 'center',
-      borderColor: colors.borderStrong,
-      borderRadius: radius.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-      justifyContent: 'center',
-      minHeight: 36,
-      minWidth: 72,
-      paddingHorizontal: spacing.md,
-    },
-    pillButtonPrimary: {
-      backgroundColor: colors.cta,
-      borderColor: colors.cta,
-    },
-    pillButtonText: {
-    color: colors.textPrimary,
-    fontSize: typeScale.caption,
-    lineHeight: lineHeight.caption,
-    fontWeight: fontWeight.medium,
-  },
-  pillButtonTextPrimary: {
-    color: colors.ctaText,
-  },
   pressed: {
     opacity: 0.72,
   },

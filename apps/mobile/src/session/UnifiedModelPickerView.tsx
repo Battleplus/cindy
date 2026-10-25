@@ -1,3 +1,6 @@
+import { ModelSpeedIcon } from "./ModelSpeedIcon";
+import { ModelQuotaBar } from "./ModelQuotaBar";
+import { ErrorNotice } from "@/components/ErrorNotice";
 /**
  * 统一模型选择器的 Android / 兼容呈现(iOS 见 UnifiedModelPickerView.ios.tsx)。
  *
@@ -23,6 +26,8 @@ import {
 } from "lucide-react-native";
 import {
   Pressable,
+  FlatList,
+  Platform,
   StyleSheet,
   View,
   useWindowDimensions,
@@ -50,6 +55,7 @@ import {
   type ThemeColors,
 } from "@/theme";
 import { MobileModelIconMark, MobileProviderMark } from "./MobileProviderMark";
+import { groupSourceFilters } from "./remoteSourceFilters";
 import { SheetModal } from "./SheetModal";
 import { SheetSurface } from "./SheetSurface";
 import {
@@ -61,6 +67,7 @@ import type {
   UnifiedMobilePickerViewProps,
   UnifiedMobileRow,
 } from "./UnifiedModelPickerSheet";
+import { mobileInteractionStyles } from "@/components/mobileInteractionStyles";
 
 type Page = "sources" | "harness" | null;
 
@@ -171,30 +178,6 @@ function Row({
   );
 }
 
-function QuotaBar({
-  remaining,
-  label,
-  testID,
-}: {
-  remaining: number;
-  label: string;
-  testID?: string;
-}) {
-  const styles = useThemedStyles(makeStyles);
-  const now = Math.max(0, Math.min(100, remaining));
-  return (
-    <View
-      accessibilityLabel={label}
-      accessibilityRole="progressbar"
-      accessibilityValue={{ min: 0, max: 100, now }}
-      style={styles.quotaTrack}
-      testID={testID}
-    >
-      <View style={[styles.quotaFill, { width: `${now}%` }]} />
-    </View>
-  );
-}
-
 export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
   const styles = useThemedStyles(makeStyles);
   const { colors } = useTheme();
@@ -213,6 +196,23 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
   const [page, setPage] = useState<Page>(null);
   const [effortExpanded, setEffortExpanded] = useState(false);
   const searchRef = useRef<RNTextInput>(null);
+  const modelListRef = useRef<FlatList>(null);
+  const modelItems = useMemo(
+    () =>
+      p.groups.flatMap((group) => [
+        { kind: "header" as const, key: `header:${group.key}`, group },
+        ...group.rows.map((row, index) => ({
+          kind: "model" as const,
+          key: `${group.key}:${row.key}`,
+          row,
+          separator: index > 0,
+        })),
+      ]),
+    [p.groups],
+  );
+  useEffect(() => {
+    modelListRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, [p.query, p.filter]);
   // 与 iOS 同口径:重新打开或切换设置对象都回到主页。
   useEffect(() => {
     setPage(null);
@@ -233,6 +233,11 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
   const level = (id: string) =>
     t(`models.options.effortLevels.${id}`, { defaultValue: id });
   const options = p.options;
+  const showSecondary = !!options || !!page;
+  useEffect(() => {
+    if (showSecondary) searchRef.current?.blur();
+  }, [showSecondary]);
+  const isFavorite = options?.isFavorite ?? !!options?.row.favorite;
   const config = options?.row.config;
   const back = page ? () => setPage(null) : p.onBack;
   const currentFilter = p.filters.find((item) => item.id === p.filter);
@@ -249,109 +254,125 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
     ) : filter.id === "favorites" ? (
       icon(Star, selected || p.filter === "favorites")
     ) : filter.providerMark ? (
-      <MobileProviderMark {...filter.providerMark} />
+      <MobileProviderMark
+        {...filter.providerMark}
+        remote={filter.remote != null}
+      />
     ) : (
       icon(LayoutGrid)
     );
 
-  const searchHeader =
-    !options && !page ? (
-      <View style={styles.searchRow}>
-        <View style={styles.searchField}>
-          <Search
-            color={colors.textSecondary}
-            size={iconSize.md}
-            strokeWidth={iconStroke.regular}
-          />
-          <TextInput
-            accessibilityLabel={t("models.picker.searchAccessibility")}
-            autoCapitalize="none"
-            autoCorrect={false}
-            onChangeText={p.onQuery}
-            // Android adjustResize:聚焦搜索时吸到 full,边输边看列表(与旧版模型浮窗同口径)。
-            onFocus={() => setSnap("full")}
-            placeholder={t("models.picker.searchPlaceholder")}
-            placeholderTextColor={colors.textPlaceholder}
-            ref={searchRef}
-            style={styles.searchInput}
-            testID={`${p.testID}.search`}
-            value={p.query}
-          />
-          {p.query ? (
-            <Pressable
-              accessibilityLabel={t("devices.detail.search.clearA11y")}
-              accessibilityRole="button"
-              hitSlop={4}
-              onPress={() => p.onQuery("")}
-              style={({ pressed }) => [
-                styles.iconButton,
-                pressed && styles.pressed,
-              ]}
-              testID={`${p.testID}.search.clear`}
-            >
-              <X
-                color={colors.textTertiary}
-                size={iconSize.md}
-                strokeWidth={iconStroke.regular}
-              />
-            </Pressable>
+  const searchHeader = (
+    <View style={styles.searchRow}>
+      <View style={styles.searchField}>
+        <Search
+          color={colors.textSecondary}
+          size={iconSize.md}
+          strokeWidth={iconStroke.regular}
+        />
+        <TextInput
+          accessibilityLabel={t("models.picker.searchAccessibility")}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={p.onQuery}
+          // Android adjustResize:聚焦搜索时吸到 full,边输边看列表(与旧版模型浮窗同口径)。
+          onFocus={() => setSnap("full")}
+          placeholder={t("models.picker.searchPlaceholder")}
+          placeholderTextColor={colors.textPlaceholder}
+          ref={searchRef}
+          style={styles.searchInput}
+          testID={`${p.testID}.search`}
+          value={p.query}
+        />
+        {p.query ? (
+          <Pressable
+            accessibilityLabel={t("devices.detail.search.clearA11y")}
+            accessibilityRole="button"
+            hitSlop={4}
+            onPress={() => p.onQuery("")}
+            style={({ pressed }) => [
+              styles.iconButton,
+              pressed && styles.pressed,
+            ]}
+            testID={`${p.testID}.search.clear`}
+          >
+            <X
+              color={colors.textTertiary}
+              size={iconSize.md}
+              strokeWidth={iconStroke.regular}
+            />
+          </Pressable>
+        ) : null}
+      </View>
+      <Pressable
+        accessibilityLabel={t("models.unified.source")}
+        accessibilityRole="button"
+        accessibilityValue={{ text: currentFilter?.label ?? "" }}
+        onPress={() => setPage("sources")}
+        style={({ pressed }) => [
+          styles.sourceButton,
+          pressed && styles.pressed,
+        ]}
+        testID={`${p.testID}.filter`}
+      >
+        <View style={styles.markBox}>{filterMark()}</View>
+        <Text numberOfLines={1} style={styles.sourceLabel}>
+          {currentFilter?.label ?? ""}
+        </Text>
+        <ChevronRight
+          color={colors.textTertiary}
+          size={iconSize.sm}
+          strokeWidth={iconStroke.regular}
+        />
+      </Pressable>
+    </View>
+  );
+
+  const sourceRow = (item: (typeof p.filters)[number]) => (
+    <Row
+      key={item.id}
+      leading={
+        <View style={styles.sourceLeading}>
+          {filterMark(
+            item,
+            item.id === "favorites" && p.filter === "favorites",
+          )}
+          {item.quota ? (
+            <ModelQuotaBar
+              label={item.quota.label}
+              remaining={item.quota.remaining}
+              testID={`${p.testID}.source.${item.id}.quota`}
+            />
           ) : null}
         </View>
-        <Pressable
-          accessibilityLabel={t("models.unified.source")}
-          accessibilityRole="button"
-          accessibilityValue={{ text: currentFilter?.label ?? "" }}
-          onPress={() => setPage("sources")}
-          style={({ pressed }) => [
-            styles.sourceButton,
-            pressed && styles.pressed,
-          ]}
-          testID={`${p.testID}.filter`}
-        >
-          <View style={styles.markBox}>{filterMark()}</View>
-          <Text numberOfLines={1} style={styles.sourceLabel}>
-            {currentFilter?.label ?? ""}
-          </Text>
-          <ChevronRight
-            color={colors.textTertiary}
-            size={iconSize.sm}
-            strokeWidth={iconStroke.regular}
-          />
-        </Pressable>
-      </View>
-    ) : undefined;
-
+      }
+      onPress={() => {
+        p.onFilter(item.id);
+        setPage(null);
+      }}
+      selected={p.filter === item.id}
+      subtitle={item.quota?.label}
+      testID={`${p.testID}.source.${item.id}`}
+      title={item.remote?.providerLabel ?? item.label}
+    />
+  );
+  // 其他电脑的供应商:每台电脑单独一块,块标题是电脑名。
+  const sourceGroups = groupSourceFilters(p.filters);
   const sourcesPage = (
-    <Group testID={`${p.testID}.sources`}>
-      {p.filters.map((item) => (
-        <Row
-          key={item.id}
-          leading={
-            <View style={styles.sourceLeading}>
-              {filterMark(
-                item,
-                item.id === "favorites" && p.filter === "favorites",
-              )}
-              {item.quota ? (
-                <QuotaBar
-                  label={item.quota.label}
-                  remaining={item.quota.remaining}
-                  testID={`${p.testID}.source.${item.id}.quota`}
-                />
-              ) : null}
-            </View>
-          }
-          onPress={() => {
-            p.onFilter(item.id);
-            setPage(null);
-          }}
-          selected={p.filter === item.id}
-          subtitle={item.quota?.label}
-          testID={`${p.testID}.source.${item.id}`}
-          title={item.label}
-        />
+    <>
+      <Group testID={`${p.testID}.sources`}>
+        {sourceGroups.local.map(sourceRow)}
+      </Group>
+      {sourceGroups.devices.map((device) => (
+        <Group
+          key={device.deviceId}
+          testID={`${p.testID}.sources.device.${device.deviceId}`}
+          title={device.name}
+        >
+          {device.filters.map(sourceRow)}
+        </Group>
       ))}
-    </Group>
+    </>
   );
 
   const harnessPage =
@@ -456,6 +477,21 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
             {options.context}
           </Text>
         ) : null}
+        {options.onEditFavorite ? (
+          <Group>
+            <Row
+              title={t("models.unified.editFavorite")}
+              onPress={options.onEditFavorite}
+              disabled={p.busy || options.favoritesDisabled}
+              testID={`${p.testID}.editFavorite`}
+            />
+          </Group>
+        ) : null}
+        {options.editingFavorite ? (
+          <Text style={styles.footnote}>
+            {t("models.unified.editFavoriteHint")}
+          </Text>
+        ) : null}
         <Group>
           <Row
             disabled={p.busy}
@@ -479,7 +515,32 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
             value={mobileAgentLabel(config.agent)}
           />
           {effortRow}
-          {options.fastCapable ? (
+          {options.fastCapable &&
+          options.row.entry.capabilities[config.agent]
+            ?.supportsUltrafastMode ? (
+            <>
+              {(["standard", "fast", "ultrafast"] as const).map((speed) => {
+                const value =
+                  speed === "ultrafast" ? "ultrafast" : speed === "fast";
+                return (
+                  <Row
+                    key={speed}
+                    disabled={p.busy}
+                    title={t(`models.options.speed.${speed}`)}
+                    onPress={() => options.onChange({ ...config, fast: value })}
+                    trailing={
+                      config.fast === value ? (
+                        <Check
+                          size={iconSize.action}
+                          color={colors.textPrimary}
+                        />
+                      ) : null
+                    }
+                  />
+                );
+              })}
+            </>
+          ) : options.fastCapable ? (
             <View style={styles.row}>
               <View style={styles.leading}>{icon(Zap, true)}</View>
               <Text numberOfLines={1} style={[styles.rowTitle, styles.rowMain]}>
@@ -491,11 +552,35 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
                 onValueChange={(fast) => options.onChange({ ...config, fast })}
                 seedColor={colors.cta}
                 testID={`${p.testID}.fast`}
-                value={config.fast}
+                value={!!config.fast}
               />
             </View>
           ) : null}
         </Group>
+        {!options.editingFavorite ? (
+          <>
+            <Text style={styles.footnote} testID={`${p.testID}.configState`}>
+              {t(
+                options.canReset
+                  ? "models.unified.customized"
+                  : "models.unified.usingRecommended",
+              )}
+            </Text>
+            {options.canReset ? (
+              <Group>
+                <Row
+                  title={t("models.unified.restoreRecommended")}
+                  onPress={options.onReset}
+                  disabled={p.busy}
+                  testID={`${p.testID}.reset`}
+                />
+              </Group>
+            ) : null}
+            <Text style={styles.footnote}>
+              {t("models.unified.resetScopeHint")}
+            </Text>
+          </>
+        ) : null}
         {options.price ? (
           <Text
             style={[styles.footnote, styles.price]}
@@ -504,27 +589,55 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
             {options.price}
           </Text>
         ) : null}
-        <Group>
-          <Row
-            disabled={p.busy || options.favoritesDisabled}
-            leading={icon(Star, !!options.row.favorite)}
-            onPress={options.onFavorite}
-            testID={`${p.testID}.favorite`}
-            title={t(
-              options.row.favorite
-                ? "models.unified.removeFavorite"
-                : "models.unified.addFavorite",
-            )}
-          />
-          {!options.row.favorite ? (
+        {options.editingFavorite ? (
+          <Group>
             <Row
-              disabled={p.busy}
-              onPress={options.onReset}
-              testID={`${p.testID}.reset`}
-              title={t("models.unified.restoreRecommended")}
+              title={t("models.unified.saveFavorite")}
+              onPress={() => options.onSaveEdit?.()}
+              disabled={p.busy || options.favoritesDisabled}
+              testID={`${p.testID}.saveFavorite`}
             />
-          ) : null}
-        </Group>
+            <Row
+              title={t("models.unified.cancelEdit")}
+              onPress={() => options.onCancelEdit?.()}
+              disabled={p.busy}
+              testID={`${p.testID}.cancelEdit`}
+            />
+          </Group>
+        ) : (
+          <>
+            <Group title={t("models.unified.currentConfiguration")}>
+              <Row
+                disabled={p.busy || options.favoritesDisabled}
+                leading={icon(Star, isFavorite)}
+                onPress={options.onFavorite}
+                testID={`${p.testID}.favorite`}
+                title={t(
+                  isFavorite
+                    ? "models.unified.savedConfiguration"
+                    : "models.unified.favoriteConfiguration",
+                )}
+                subtitle={options.configurationSummary}
+              />
+            </Group>
+            <Text style={styles.footnote}>
+              {t(
+                isFavorite
+                  ? "models.unified.removeFavoriteHint"
+                  : "models.unified.saveFavoriteHint",
+              )}
+            </Text>
+          </>
+        )}
+        {options.notice ? (
+          <Text
+            style={styles.footnote}
+            accessibilityLiveRegion="polite"
+            testID={`${p.testID}.notice`}
+          >
+            {options.notice}
+          </Text>
+        ) : null}
       </>
     ) : null;
 
@@ -536,6 +649,7 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
         <Pressable
           accessibilityLabel={[
             row.entry.displayName,
+            row.remoteDevice?.name,
             agentLabel,
             row.subtitle,
             row.config.fast ? t("models.options.fastMode") : null,
@@ -559,6 +673,7 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
               icon={row.entry.icon}
               {...row.providerMark}
               color={colors.textSecondary}
+              remote={row.remoteDevice != null}
             />
           </View>
           <View style={styles.rowMain}>
@@ -582,11 +697,10 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
                 </Text>
               ) : null}
               {row.config.fast ? (
-                <Zap
+                <ModelSpeedIcon
+                  mode={row.config.fast}
                   color={colors.textSecondary}
-                  fill={colors.textSecondary}
                   size={iconSize.sm}
-                  strokeWidth={iconStroke.regular}
                 />
               ) : null}
             </View>
@@ -641,24 +755,25 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
     );
   };
 
-  const listPage = (
-    <>
-      {p.groups.map((group) => (
-        <Group
-          key={group.key}
-          testID={`${p.testID}.group.${group.key}`}
-          title={group.title}
-        >
-          {group.rows.map(modelRow)}
-        </Group>
-      ))}
-      {!p.groups.length ? (
-        <Text style={styles.empty} testID={`${p.testID}.empty`}>
-          {p.loading ? t("models.picker.loadingDefault") : p.emptyHint}
-        </Text>
-      ) : null}
-    </>
-  );
+  const listPage =
+    Platform.OS === "android" ? null : (
+      <>
+        {p.groups.map((group) => (
+          <Group
+            key={group.key}
+            testID={`${p.testID}.group.${group.key}`}
+            title={group.title}
+          >
+            {group.rows.map(modelRow)}
+          </Group>
+        ))}
+        {!p.groups.length ? (
+          <Text style={styles.empty} testID={`${p.testID}.empty`}>
+            {p.loading ? t("models.picker.loadingDefault") : p.emptyHint}
+          </Text>
+        ) : null}
+      </>
+    );
 
   return (
     <SheetModal
@@ -668,39 +783,119 @@ export function UnifiedModelPickerView(p: UnifiedMobilePickerViewProps) {
       onRequestClose={back ?? p.onClose}
       visible={p.visible}
     >
-      <SheetSurface
-        backAccessibilityLabel={
-          page ? undefined : t("models.picker.backToModels")
+      <View
+        pointerEvents={showSecondary ? "none" : "auto"}
+        accessibilityElementsHidden={showSecondary}
+        importantForAccessibility={
+          showSecondary ? "no-hide-descendants" : "auto"
         }
-        bottomInset={insets.bottom}
-        heights={heights}
-        onBack={back}
-        onClose={p.onClose}
-        onSnapChange={(next) => {
-          // 拖回 half 视为想收起键盘(与旧版模型浮窗同口径)。
-          if (next === "half") searchRef.current?.blur();
-          setSnap(next);
-        }}
-        pinnedTop={searchHeader}
-        snap={snap}
-        testID={p.testID}
-        title={title}
+        style={showSecondary ? styles.hiddenList : undefined}
       >
-        {p.error ? <Text style={styles.error}>{p.error}</Text> : null}
-        {page === "sources"
-          ? sourcesPage
-          : page === "harness" && options
-            ? harnessPage
-            : options
-              ? settingsPage
-              : listPage}
-      </SheetSurface>
+        <SheetSurface
+          bottomInset={insets.bottom}
+          heights={heights}
+          onClose={p.onClose}
+          onSnapChange={(next) => {
+            if (next === "half") searchRef.current?.blur();
+            setSnap(next);
+          }}
+          pinnedTop={searchHeader}
+          snap={snap}
+          testID={showSecondary ? `${p.testID}.list` : p.testID}
+          title={t("models.picker.title")}
+          renderScrollContent={
+            Platform.OS === "android"
+              ? (scrollProps) => (
+                  <FlatList
+                    {...scrollProps}
+                    ref={modelListRef}
+                    data={modelItems}
+                    keyExtractor={(item) => item.key}
+                    initialNumToRender={8}
+                    maxToRenderPerBatch={4}
+                    windowSize={3}
+                    removeClippedSubviews={false}
+                    ListHeaderComponent={
+                      p.error ? <ErrorNotice message={p.error} /> : null
+                    }
+                    ListEmptyComponent={
+                      <Text style={styles.empty} testID={`${p.testID}.empty`}>
+                        {p.loading
+                          ? t("models.picker.loadingDefault")
+                          : p.emptyHint}
+                      </Text>
+                    }
+                    renderItem={({ item }) =>
+                      item.kind === "header" ? (
+                        <View
+                          style={styles.group}
+                          testID={`${p.testID}.group.${item.group.key}`}
+                        >
+                          <Text style={styles.groupLabel}>
+                            {item.group.title}
+                          </Text>
+                        </View>
+                      ) : (
+                        <View>
+                          {item.separator ? (
+                            <View style={styles.separator} />
+                          ) : null}
+                          {modelRow(item.row)}
+                        </View>
+                      )
+                    }
+                  />
+                )
+              : undefined
+          }
+        >
+          {!showSecondary && p.error ? <ErrorNotice message={p.error} /> : null}
+          {listPage}
+        </SheetSurface>
+      </View>
+      {showSecondary ? (
+        <View style={styles.secondaryLayer}>
+          <SheetSurface
+            backAccessibilityLabel={
+              page ? undefined : t("models.picker.backToModels")
+            }
+            bottomInset={insets.bottom}
+            heights={heights}
+            onBack={back}
+            onClose={p.onClose}
+            onSnapChange={(next) => {
+              // 拖回 half 视为想收起键盘(与旧版模型浮窗同口径)。
+              if (next === "half") searchRef.current?.blur();
+              setSnap(next);
+            }}
+            snap={snap}
+            testID={p.testID}
+            title={title}
+          >
+            {p.error ? <ErrorNotice message={p.error} /> : null}
+            {page === "sources"
+              ? sourcesPage
+              : page === "harness" && options
+                ? harnessPage
+                : options
+                  ? settingsPage
+                  : null}
+          </SheetSurface>
+        </View>
+      ) : null}
     </SheetModal>
   );
 }
 
 function makeStyles(colors: ThemeColors) {
   return StyleSheet.create({
+    hiddenList: { opacity: 0 },
+    secondaryLayer: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: 0,
+    },
     searchRow: {
       alignItems: "center",
       flexDirection: "row",
@@ -778,9 +973,7 @@ function makeStyles(colors: ThemeColors) {
     rowDisabled: {
       opacity: 0.4,
     },
-    pressed: {
-      opacity: 0.6,
-    },
+    pressed: mobileInteractionStyles.pressed,
     leading: {
       alignItems: "center",
       justifyContent: "center",
@@ -814,17 +1007,6 @@ function makeStyles(colors: ThemeColors) {
     sourceLeading: {
       alignItems: "center",
       gap: spacing.xs,
-    },
-    quotaTrack: {
-      backgroundColor: colors.surfaceChip,
-      borderRadius: radius.pill,
-      height: 3,
-      overflow: "hidden",
-      width: 24,
-    },
-    quotaFill: {
-      backgroundColor: colors.textSecondary,
-      height: "100%",
     },
     modelRow: {
       alignItems: "center",

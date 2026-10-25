@@ -11,6 +11,8 @@
  * 问题,留在 footer 最自然。
  */
 import { AgentErrorDetails } from './AgentErrorDetails';
+import { ErrorNotice, ErrorNoticeAction } from '@/components/ErrorNotice';
+import { ReadableHistoryRecovery } from './ReadableHistoryRecovery';
 import { useTranslation } from 'react-i18next';
 import {
   ActivityIndicator,
@@ -25,6 +27,7 @@ import { Text } from '@/components/AppText';
 import { Pause, Play } from 'lucide-react-native';
 import { describeAgentAuthError } from '@/device-link/remoteStatus';
 import type { InputProjection } from '@/session/types';
+import type { ErrorDiagnosisSource } from '@/session/errorDiagnosisPrompt';
 import { inputProjectionErrorI18nKey } from '@/session/inputProjectionError';
 import { localizeAgentError, localizeUnclassifiedAgentError, requiresAgentErrorConfigurationChange } from '@/session/agentErrorI18n';
 import {
@@ -39,6 +42,7 @@ import {
 import { radius, spacing, typeScale } from '@/theme/tokens';
 
 export interface InlineQueueSectionProps {
+  onRecoverHistory?: () => void;
   projection: InputProjection;
   sessionSource?: string | null;
   busy?: boolean;
@@ -46,9 +50,14 @@ export interface InlineQueueSectionProps {
   onResume(): void;
   onRetryError(): void;
   onClearError(): void;
+  /** 取消账号限额重置后的自动继续(只在投影带 usageLimitWait 时出现)。 */
+  onCancelUsageLimitWait?(): void;
+  /** 展开详情后的「诊断」：上层带着错误与出错任务去新任务里排查。 */
+  onDiagnose?(error: ErrorDiagnosisSource): void;
 }
 
 export function InlineQueueSection({
+  onRecoverHistory,
   projection,
   sessionSource,
   busy,
@@ -56,10 +65,12 @@ export function InlineQueueSection({
   onResume,
   onRetryError,
   onClearError,
+  onCancelUsageLimitWait,
+  onDiagnose,
 }: InlineQueueSectionProps) {
   const styles = useThemedStyles(makeStyles);
   const { colors } = useTheme();
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   const hasBanner = !!projection.error
     || !!projection.credentialSwitchWait
@@ -87,37 +98,66 @@ export function InlineQueueSection({
         : (describeAgentAuthError(projection.error) ?? localizeUnclassifiedAgentError(projection.error, sessionSource)))
     : null;
 
+  const usageLimitResumeAt = projection.error && projection.usageLimitWait
+    ? formatUsageLimitResumeAt(projection.usageLimitWait.resumeAt, i18n.resolvedLanguage || i18n.language)
+    : null;
+
   return (
     <View style={styles.container} testID="queue.inline.section">
       {projection.error ? (
-        <View style={styles.errorBox} testID="queue.inline.error">
-          {/* 稳定错误 marker 按当前显示端语言翻译；其它错误保留 auth 引导，否则使用本地化摘要。 */}
-          <Text style={styles.errorText}>{projectionError}</Text>
-          <AgentErrorDetails message={projection.error} />
-          <View style={styles.errorActions}>
-            {retryable ? <ActionPill
-              busy={busy}
+        <ErrorNotice
+          message={projectionError ?? ''}
+          testID="queue.inline.error"
+          description={onRecoverHistory ? t('session.tail.readableHistoryRecoveryDescription') : undefined}
+          onDismiss={onClearError}
+          dismissLabel={t('session.tail.dismissNotice')}
+          dismissTestID="queue.inline.clearErrorButton"
+          dismissDisabled={!!errorDisabledReason}
+          dismissBusy={busy}
+          dismissHint={errorDisabledReason ?? undefined}
+        >
+          <AgentErrorDetails message={projection.error} onDiagnose={onDiagnose
+            ? () => onDiagnose({
+              message: projectionError ?? '',
+              details: projection.error ?? '',
+              reason: projection.errorReason,
+            })
+            : undefined} actions={<>
+            {retryable ? <ErrorNoticeAction
+              primary
               disabled={!!retryDisabledReason}
-              disabledReason={retryDisabledReason}
+              busy={busy}
+              hint={retryDisabledReason ?? undefined}
               label={t('message.queue.retrySend')}
               onPress={onRetryError}
               testID="queue.inline.retryButton"
             /> : null}
-            <ActionPill
-              busy={busy}
-              disabled={!!errorDisabledReason}
-              disabledReason={errorDisabledReason}
-              label={t('message.queue.clearError')}
-              onPress={onClearError}
-              testID="queue.inline.clearErrorButton"
-            />
-          </View>
+            {onRecoverHistory ? <ReadableHistoryRecovery onRecover={onRecoverHistory} busy={busy} disabled={controlsDisabled} /> : null}
+          </>} />
           {retryable && retryDisabledReason ? (
             <Text style={styles.disabledHint} testID="queue.inline.errorDisabledReason">
               {retryDisabledReason}
             </Text>
           ) : null}
-        </View>
+          {usageLimitResumeAt ? (
+            // 额度重置后自动继续(桌面端执行);等待期间重试 / 清除照常可用。
+            <View style={styles.errorActions} testID="queue.inline.usageLimitWait">
+              <Text style={styles.disabledHint}>
+                {t('message.queue.usageLimitAutoContinueAt', { time: usageLimitResumeAt })}
+              </Text>
+              {onCancelUsageLimitWait ? (
+                <ActionPill
+                  busy={busy}
+                  disabled={!!errorDisabledReason}
+                  disabledReason={errorDisabledReason}
+                  label={t('message.queue.usageLimitAutoContinueCancel')}
+                  onPress={onCancelUsageLimitWait}
+                  testID="queue.inline.cancelUsageLimitWaitButton"
+                />
+              ) : null}
+            </View>
+          ) : null}
+        </ErrorNotice>
       ) : null}
 
       {projection.credentialSwitchWait ? (
@@ -152,6 +192,19 @@ export function InlineQueueSection({
       ) : null}
     </View>
   );
+}
+
+/** 同一天只显示时刻,跨天带日期(与桌面横幅同口径)。 */
+function formatUsageLimitResumeAt(resumeAt: number, language: string): string | null {
+  if (!Number.isFinite(resumeAt)) return null;
+  const date = new Date(resumeAt);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return new Intl.DateTimeFormat(
+    language,
+    sameDay
+      ? { hour: '2-digit', minute: '2-digit' }
+      : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' },
+  ).format(date);
 }
 
 function ActionPill({
@@ -226,61 +279,67 @@ function QueueTouchButton({
   );
 }
 
-const makeStyles = (colors: ThemeColors) => StyleSheet.create({
-  container: { gap: spacing.sm, paddingTop: spacing.sm, width: '100%' },
-  banner: {
-    alignItems: 'center',
-    backgroundColor: colors.surfaceElevated,
-    borderColor: colors.border,
-    borderRadius: radius.container,
-    borderWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-  },
-  bannerText: {
-    color: colors.textSecondary,
-    flex: 1,
-    fontSize: typeScale.footnote,
-    lineHeight: lineHeight.caption,
-    minWidth: 0,
-  },
-  resumePill: {
-    alignItems: 'center',
-    backgroundColor: colors.cta,
-    borderRadius: radius.pill,
-    flexDirection: 'row',
-    gap: 4,
-    justifyContent: 'center',
-    minHeight: 30,
-    paddingHorizontal: spacing.md,
-  },
-  resumePillText: { color: colors.ctaText, fontSize: typeScale.caption, lineHeight: lineHeight.caption, fontWeight: fontWeight.medium },
-  errorBox: {
-    backgroundColor: colors.surfaceElevated,
-    borderColor: colors.border,
-    borderRadius: radius.container,
-    borderWidth: StyleSheet.hairlineWidth,
-    gap: spacing.sm,
-    padding: spacing.md,
-  },
-  errorText: { color: colors.errorText, fontSize: typeScale.footnote, lineHeight: lineHeight.caption },
-  disabledHint: { color: colors.textSecondary, fontSize: typeScale.footnote, lineHeight: lineHeight.caption },
-  errorActions: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  actionPill: {
-    alignItems: 'center',
-    backgroundColor: colors.surfaceElevated,
-    borderColor: colors.border,
-    borderRadius: radius.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
-    gap: 6,
-    justifyContent: 'center',
-    minHeight: 36,
-    paddingHorizontal: spacing.md,
-  },
-  actionPillText: { color: colors.textPrimary, fontSize: typeScale.caption, lineHeight: lineHeight.caption, fontWeight: fontWeight.medium },
-  pressed: { opacity: 0.72 },
-  disabled: { opacity: 0.42 },
-});
+const makeStyles = (colors: ThemeColors) =>
+  StyleSheet.create({
+    container: { gap: spacing.sm, paddingTop: spacing.sm, width: '100%' },
+    banner: {
+      alignItems: 'center',
+      backgroundColor: colors.surfaceElevated,
+      borderColor: colors.border,
+      borderRadius: radius.container,
+      borderWidth: StyleSheet.hairlineWidth,
+      flexDirection: 'row',
+      gap: spacing.sm,
+      paddingHorizontal: spacing.md,
+      paddingVertical: spacing.sm,
+    },
+    bannerText: {
+      color: colors.textSecondary,
+      flex: 1,
+      fontSize: typeScale.footnote,
+      lineHeight: lineHeight.caption,
+      minWidth: 0,
+    },
+    resumePill: {
+      alignItems: 'center',
+      backgroundColor: colors.cta,
+      borderRadius: radius.pill,
+      flexDirection: 'row',
+      gap: 4,
+      justifyContent: 'center',
+      minHeight: 30,
+      paddingHorizontal: spacing.md,
+    },
+    resumePillText: {
+      color: colors.ctaText,
+      fontSize: typeScale.caption,
+      lineHeight: lineHeight.caption,
+      fontWeight: fontWeight.medium,
+    },
+    disabledHint: {
+      color: colors.textSecondary,
+      fontSize: typeScale.footnote,
+      lineHeight: lineHeight.caption,
+    },
+    errorActions: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+    actionPill: {
+      alignItems: 'center',
+      backgroundColor: colors.surfaceElevated,
+      borderColor: colors.border,
+      borderRadius: radius.pill,
+      borderWidth: StyleSheet.hairlineWidth,
+      flexDirection: 'row',
+      gap: 6,
+      justifyContent: 'center',
+      minHeight: 36,
+      paddingHorizontal: spacing.md,
+    },
+    actionPillText: {
+      color: colors.textPrimary,
+      fontSize: typeScale.caption,
+      lineHeight: lineHeight.caption,
+      fontWeight: fontWeight.medium,
+    },
+    pressed: { opacity: 0.72 },
+    disabled: { opacity: 0.42 },
+  });

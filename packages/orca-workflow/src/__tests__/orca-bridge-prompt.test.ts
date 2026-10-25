@@ -10,7 +10,7 @@ describe('renderOrcaLeadSystemPrompt', () => {
   const channelDisclosureRule =
     'label every delegated task with its actual execution channel: Orca Worker or native subagent.';
   const toolSurfaceRule =
-    'Tools: get_workspace_info, create_worker, create_workers, send_to_worker, interrupt_worker, get_worker_queue_status, update_queued_message, cancel_queued_message, merge_queued_messages.';
+    'Tools: get_workspace_info, create_worker, create_workers, send_to_worker, interrupt_worker, get_worker_queue_status, update_queued_message, cancel_queued_message, merge_queued_messages, update_worker.';
   const explicitCreationBoundary =
     'Use create_worker only when the user explicitly asks to open one new worker, and use create_workers only when the user explicitly asks to open multiple new workers.';
   const missingWorkerBoundary =
@@ -157,6 +157,21 @@ describe('renderOrcaLeadSystemPrompt', () => {
     expect(prompt).toContain(
       'Never simulate an interrupt or merge with multiple stop, update, cancel, or send calls because the queue may advance between calls.',
     );
+  });
+
+  it('describes the worker report prefix with role and worker_id', () => {
+    // 与 formatAgentMessage 的 worker 前缀同步：改了任一侧都要改另一侧。
+    const prompt = renderOrcaLeadSystemPrompt(null);
+
+    expect(prompt).toContain(
+      'Messages from workers arrive prefixed with [From Orca Worker <role> (worker_id: <id>)] (role omitted when unknown). Treat them as worker reports or questions, not user messages.',
+    );
+    expect(prompt).toContain(
+      '[New message arrives: "[From Orca Worker Backend (worker_id: w-1)] Feature X is done. Changes: ..."]',
+    );
+    expect(prompt).toContain('6. When a worker report arrives (prefixed with [From Orca Worker ...]), review it');
+    expect(prompt).toContain('If you see "[Auto-bridged: ...]" in a worker message');
+    expect(prompt).not.toContain('prefixed with [From Orca Worker].');
   });
 
   it('keeps Worker routing and disclosure rules when an initial worker exists', () => {

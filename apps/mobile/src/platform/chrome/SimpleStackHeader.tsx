@@ -34,17 +34,33 @@ export function simpleScreenSafeAreaEdges(): readonly Edge[] | undefined {
   return Platform.OS === "ios" ? ["left", "right", "bottom"] : undefined;
 }
 
+/**
+ * 整页滚动的简单页(配合 `<SimpleStackHeader scrollEdge />`):iOS 上内容铺到透明顶栏
+ * 和底部指示条下面,由滚动视图自己让出上下安全区,系统柔和边缘替代硬分界。
+ */
+export function simpleScrollScreenSafeAreaEdges(): readonly Edge[] | undefined {
+  return Platform.OS === "ios" ? ["left", "right"] : undefined;
+}
+
+export const simpleScrollInsetProps = Platform.OS === "ios"
+  ? { automaticallyAdjustsScrollIndicatorInsets: true, contentInsetAdjustmentBehavior: "automatic" as const }
+  : {};
+
 export function SimpleStackHeader({
   action,
   right,
+  rightToolbar,
   backTestID,
   onBack,
   title,
   titleTestID,
   syncing,
+  scrollEdge = false,
 }: {
   action?: MainWindowAction;
   right?: ReactNode;
+  /** Native toolbar elements, rendered beside Stack.Screen rather than inside headerRight. */
+  rightToolbar?: ReactNode;
   backTestID?: string;
   /**
    * @deprecated 两端都不渲染(iOS 系统顶栏无此槽,Android 跟随 iOS)。
@@ -57,6 +73,8 @@ export function SimpleStackHeader({
   title: string;
   titleTestID?: string;
   syncing?: boolean;
+  /** 页面根部是整页滚动视图时打开;配套使用 simpleScrollScreenSafeAreaEdges / simpleScrollInsetProps。 */
+  scrollEdge?: boolean;
 }) {
   const { colors } = useTheme();
   const { t } = useTranslation();
@@ -83,7 +101,11 @@ export function SimpleStackHeader({
         headerShown: true,
         headerShadowVisible: false,
         headerBackVisible: false,
-        headerStyle: { backgroundColor: colors.surface },
+        headerStyle: { backgroundColor: scrollEdge ? "transparent" : colors.surface },
+        headerTransparent: scrollEdge,
+        scrollEdgeEffects: scrollEdge
+          ? { bottom: "soft", left: "hidden", right: "hidden", top: "soft" }
+          : undefined,
         headerTintColor: colors.textPrimary,
         headerTitle: () => (
           <View style={styles.wrap} testID={titleTestID}>
@@ -98,6 +120,7 @@ export function SimpleStackHeader({
           : undefined,
       }}
     />
+    {rightToolbar}
     {onBack ? <Stack.Toolbar placement="left">
       <Stack.Toolbar.Button icon="chevron.backward" onPress={onBack} accessibilityLabel={t('shared.back')} />
     </Stack.Toolbar> : null}

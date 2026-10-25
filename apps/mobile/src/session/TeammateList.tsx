@@ -1,49 +1,78 @@
 import { readWorkingPhase } from '@cindy/maker-shared';
-import { TeammateGenerationLabel } from './TeammateGenerationLabel';
-import { useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
+import { useCallback, useMemo, useSyncExternalStore } from 'react';
+import { View } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { RefreshCw, TriangleAlert } from 'lucide-react-native';
 import { resolveRemoteText } from '@cindy/device-link';
-import { Text, TextInput } from '@/components/AppText';
-import { MainWindowEmptyState } from '@/components/MobilePrimitives';
 import { RemoteCompanionAvatar } from '@/components/RemoteCompanionAvatar';
 import { useAuth } from '@/auth/AuthContext';
 import { isRemoteResourceUnread } from '@/device-link/remoteResourceCache';
 import type { HostedRemoteCollectionItem, RemoteResourceHostTarget } from '@/device-link/remoteResources';
 import { useMinuteNow } from '@/utils/useMinuteNow';
-import { useThemedStyles, useTheme, type ThemeColors } from '@/theme';
-import { fontWeight, iconSize, lineHeight, radius, spacing, typeScale } from '@/theme/tokens';
+import { BotGroupListRow, OFFLINE_AVATAR_OPACITY } from './BotGroupList';
+import { orderedBotGroups } from './botGroupRemote';
+import { CompanionListRow, CompanionPresenceDot, COMPANION_ROW_AVATAR_SIZE } from './CompanionListRow';
+import { CompanionPresenceRing } from './CompanionPresenceRing';
+import { remoteSessionStore } from './remoteSessionStore';
 import { formatRemoteSessionSidebarTime } from './sessionList';
-import { orderedTeammates, sameTeammate, teammateIdentity } from './teammateNavigation';
-import type { LastTeammateIdentity } from './homeViewPreferenceStore';
+import { orderedTeammates } from './teammateNavigation';
 import { parseMobileMarkdownInlines } from './messageMarkdown';
+import { TeammateGenerationLabel } from './TeammateGenerationLabel';
 
-export interface TeammateListProps {
+interface TeammateListGroups {
   items: readonly HostedRemoteCollectionItem[];
-  loading: boolean;
-  refreshing: boolean;
-  error: string | null;
+  isOnline(host: RemoteResourceHostTarget): boolean;
+  onSelect(item: HostedRemoteCollectionItem): void;
+}
+
+interface TeammateRowOptions {
+  items: readonly HostedRemoteCollectionItem[];
   isOnline(host: RemoteResourceHostTarget): boolean;
   connectionState?(host: RemoteResourceHostTarget): boolean | null;
-  onRefresh(): void;
+  /**
+   * A cloud companion's row (docs/product-rules/cloud-companions.md §3.1): it belongs to the
+   * account, so presence is not shown — like an IM contact, it stays a normal row while its
+   * computer is briefly unreachable; a send that cannot get through is what asks to switch.
+   */
+  quietPresence?(row: HostedRemoteCollectionItem): boolean;
   onSelect(item: HostedRemoteCollectionItem): void;
-  current?: LastTeammateIdentity | null;
-  /** SheetSurface already owns the scroll view. */
-  embedded?: boolean;
-  autoFocusSearch?: boolean;
-  onInteract?(): void;
+  /** Group chats, mixed with the teammates by latest activity. */
+  groups?: TeammateListGroups;
 }
-/** Flat identity list shared by home, collection route and the name picker. No host headings or groups. */
-export function TeammateList({ items, loading, refreshing, error, isOnline, connectionState, onRefresh, onSelect,
-  current = null, embedded = false, autoFocusSearch = false, onInteract }: TeammateListProps) {
+
+function conversationSessionId(row: HostedRemoteCollectionItem): string | null {
+  const target = row.item.links.find(({ rel, target: link }) => rel === 'conversation' && link.kind === 'session')?.target;
+  return target?.kind === 'session' ? target.sessionId : null;
+}
+
+/** Bot conversations stopped on a question or a permission prompt (「等你确认」). */
+function useAwaitingSessions(items: readonly HostedRemoteCollectionItem[]): ReadonlySet<string> {
+  const sessions = useMemo(() => items.map(conversationSessionId).filter((id): id is string => !!id), [items]);
+  const snapshot = useCallback(() => sessions.filter((id) => remoteSessionStore.getSessionLiveActivity(id)?.phase === 'needs-interaction'
+    || remoteSessionStore.getPendingInteractions(id).length > 0).join('\u0000'), [sessions]);
+  // A joined id string keeps unrelated store churn (streaming, other sessions) from re-rendering the list.
+  const key = useSyncExternalStore(remoteSessionStore.subscribe, snapshot);
+  return useMemo(() => new Set(key ? key.split('\u0000') : []), [key]);
+}
+
+export type TeammateListEntry = { kind: 'bot' | 'group'; row: HostedRemoteCollectionItem };
+
+/** Teammates and group chats, mixed by latest activity and filtered by the same search. */
+export function useTeammateEntries(items: readonly HostedRemoteCollectionItem[], groups: readonly HostedRemoteCollectionItem[] | undefined, query = '') {
+  const { i18n } = useTranslation();
+  return useMemo<TeammateListEntry[]>(() => {
+    const bots = orderedTeammates(items, query, i18n.language).map((row) => ({ kind: 'bot' as const, row }));
+    if (!groups) return bots;
+    const chats = orderedBotGroups(groups, query, i18n.language).map((row) => ({ kind: 'group' as const, row }));
+    return [...bots, ...chats].sort((a, b) => (b.row.item.display.timestamp ?? 0) - (a.row.item.display.timestamp ?? 0));
+  }, [groups, items, query, i18n.language]);
+}
+
+/** The teammate / group row of the task home's teammate section. */
+export function useTeammateRowRenderer({ items, isOnline, connectionState, quietPresence, onSelect, groups }: TeammateRowOptions) {
   const { t, i18n } = useTranslation();
   const { user } = useAuth();
-  const { colors } = useTheme();
-  const styles = useThemedStyles(makeStyles);
   const now = useMinuteNow();
-  const [query, setQuery] = useState('');
-  const rows = useMemo(() => orderedTeammates(items, query, i18n.language), [items, query, i18n.language]);
+  const awaiting = useAwaitingSessions(items);
   const duplicateNames = useMemo(() => {
     const names = new Map<string, number>();
     for (const row of items) {
@@ -52,24 +81,7 @@ export function TeammateList({ items, loading, refreshing, error, isOnline, conn
     }
     return names;
   }, [items, i18n.language]);
-  const header = <View style={styles.controls}>
-    <TextInput accessibilityLabel={t('devices.companions.search')} autoFocus={autoFocusSearch}
-      autoCorrect={false} onChangeText={(value) => { onInteract?.(); setQuery(value); }} onFocus={onInteract} placeholder={t('devices.companions.search')}
-      placeholderTextColor={colors.textPlaceholder} selectionColor={colors.inputCaret}
-      style={styles.search} value={query} testID="teammates.search" />
-    {error ? <View style={styles.noticeRow}>
-      <Text accessibilityRole="alert" style={[styles.notice, styles.noticeText]} testID="teammates.error">{t(items.length ? 'devices.companions.stale' : 'devices.resources.loadFailed')}</Text>
-      <Pressable accessibilityRole="button" accessibilityLabel={t('devices.resources.retry')} disabled={refreshing}
-        onPress={onRefresh} style={styles.retry} testID="teammates.refresh">
-        {refreshing ? <ActivityIndicator color={colors.textSecondary} /> : <RefreshCw size={iconSize.sm} color={colors.textSecondary} />}
-      </Pressable>
-    </View> : null}
-  </View>;
-  const empty = loading ? <View style={styles.empty}><ActivityIndicator color={colors.textSecondary} /><Text style={styles.notice}>{t('devices.resources.loading')}</Text></View>
-    : <MainWindowEmptyState centered style={styles.empty} testID="teammates.empty"
-      title={query.trim() ? t('devices.companions.noResults') : t('devices.companions.emptyTitle')}
-      copy={query.trim() || error ? '' : t('devices.companions.emptyCopy')} />;
-  const renderRow = (row: HostedRemoteCollectionItem) => {
+  const renderBot = (row: HostedRemoteCollectionItem, last: boolean) => {
     const display = row.item.display;
     const title = resolveRemoteText(display.title, i18n.language);
     const preview = display.preview ? parseMobileMarkdownInlines(resolveRemoteText(display.preview, i18n.language))
@@ -80,67 +92,47 @@ export function TeammateList({ items, loading, refreshing, error, isOnline, conn
     const subtitle = display.subtitle ? resolveRemoteText(display.subtitle, i18n.language).replace(/\s+/g, ' ').trim() : '';
     const summary = preview || subtitle || t('devices.companions.startChat');
     const generating = online && !!display.generation;
-    const accessiblePreview = generating
-      ? t(`devices.companions.working.${readWorkingPhase(display.generation!.phase) ?? 'processing'}`) : summary;
+    const workingCopy = generating ? t(`devices.companions.working.${readWorkingPhase(display.generation!.phase) ?? 'processing'}`) : '';
     const attention = display.status?.tone === 'warning' || display.status?.tone === 'critical'
       ? resolveRemoteText(display.status.label, i18n.language) : '';
+    const sessionId = conversationSessionId(row);
+    const waiting = online && !generating && !!sessionId && awaiting.has(sessionId);
     const ambiguous = (duplicateNames.get(title.normalize('NFKC').toLocaleLowerCase(i18n.language)) ?? 0) > 1;
-    const source = ambiguous ? row.host.deviceName : '';
     const unread = isRemoteResourceUnread(user?.id ?? '', row.host.deviceId, row.item.ref.id, display.lastReplyAt);
     const timestamp = display.timestamp;
     const time = timestamp !== undefined && Number.isFinite(new Date(timestamp).getTime())
       ? formatRemoteSessionSidebarTime(new Date(timestamp).toISOString(), now) : '';
-    const selected = sameTeammate(current, teammateIdentity(row));
-    const meta = [connected === false ? t('devices.resources.hostOffline') : connected === null ? t('devices.resources.connectionUnknown') : '', source].filter(Boolean).join(' · ');
-    return <Pressable key={row.key} accessibilityRole="button" accessibilityState={{ selected, disabled: !online }}
-      accessibilityLabel={[title, attention, accessiblePreview, time, unread ? t('devices.companions.unread') : '', meta].filter(Boolean).join(', ')}
-      disabled={!online} onPress={() => onSelect(row)} style={({ pressed }) => [styles.row, selected && styles.selected, pressed && styles.pressed]}
-      testID={`teammates.item.${row.host.deviceId}.${row.item.ref.id}`}>
-      <View style={styles.avatar}><RemoteCompanionAvatar avatar={display.avatar} deviceId={row.host.deviceId} name={title} online={online} /><View testID="teammate.connection" style={[styles.connection, { backgroundColor: connected === null ? colors.textTertiary : connected ? colors.statusDone : colors.statusError }]} /></View>
-      <View style={styles.body}>
-        <View style={styles.titleRow}><Text numberOfLines={1} style={styles.title}>{title}</Text>
-          {attention ? <TriangleAlert accessibilityLabel={attention} size={iconSize.sm} color={colors.warningFg} testID="teammate.attention" /> : null}
-          {time ? <Text numberOfLines={1} style={styles.time}>{time}</Text> : null}
-          {unread ? <View style={styles.unread} accessibilityLabel={t('devices.companions.unread')} /> : null}
+    const quiet = !!quietPresence?.(row);
+    const connection = quiet ? ''
+      : connected === false ? t('devices.resources.hostOffline') : connected === null ? t('devices.resources.connectionUnknown') : '';
+    const prefix = attention || (waiting ? t('devices.companions.awaiting') : '');
+    return <CompanionListRow key={`bot:${row.key}`} testID={`teammates.item.${row.host.deviceId}.${row.item.ref.id}`}
+      accessibilityLabel={[title, ambiguous ? row.host.deviceName : '', connection, prefix, generating ? workingCopy : summary, time,
+        unread ? t('devices.companions.unread') : ''].filter(Boolean).join(', ')}
+      avatar={<>
+        <View style={connected === false && !quiet ? { opacity: OFFLINE_AVATAR_OPACITY } : undefined}>
+          <RemoteCompanionAvatar avatar={display.avatar} deviceId={row.host.deviceId} name={title} online={connected === true} size={COMPANION_ROW_AVATAR_SIZE} framed />
         </View>
-        {generating ? <TeammateGenerationLabel deviceId={row.host.deviceId} botId={row.item.ref.id} generation={display.generation!} />
-          : <Text numberOfLines={1} style={styles.preview}>{summary}</Text>}
-        {meta ? <Text numberOfLines={1} style={styles.meta}>{meta}</Text> : null}
-      </View>
-    </Pressable>;
+        <CompanionPresenceRing active={generating} />
+        {quiet ? null : <CompanionPresenceDot connected={connected} />}
+      </>}
+      title={title}
+      device={ambiguous ? row.host.deviceName : undefined}
+      trailing={generating ? { kind: 'working' } : { kind: 'time', text: time }}
+      preview={generating
+        ? <TeammateGenerationLabel deviceId={row.host.deviceId} botId={row.item.ref.id} generation={display.generation!} />
+        : connection ? `${connection} · ${summary}` : summary}
+      previewTone={connection ? 'tertiary' : 'secondary'}
+      previewPrefix={connection ? undefined : prefix || undefined}
+      previewPrefixTestID={attention ? 'teammate.attention' : undefined}
+      unread={unread}
+      unreadLabel={t('devices.companions.unread')}
+      last={last}
+      onPress={() => onSelect(row)} />;
   };
-  if (embedded) return <View testID="teammates.list">{header}{rows.length ? rows.map(renderRow) : empty}</View>;
-  return <FlatList style={styles.list} contentContainerStyle={styles.content} data={rows} keyExtractor={(row) => row.key}
-    keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" onScrollBeginDrag={onInteract} testID="teammates.list"
-    ListHeaderComponent={header} ListEmptyComponent={empty} renderItem={({ item }) => renderRow(item)}
-    refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.textSecondary} />} />;
+  return (entry: TeammateListEntry, last: boolean) => {
+    if (entry.kind === 'bot' || !groups) return renderBot(entry.row, last);
+    return <BotGroupListRow key={`group:${entry.row.key}`} row={entry.row} online={groups.isOnline(entry.row.host)} last={last}
+      onPress={() => groups.onSelect(entry.row)} />;
+  };
 }
-const makeStyles = (colors: ThemeColors) => StyleSheet.create({
-  list: { flex: 1 },
-  content: { flexGrow: 1, paddingBottom: spacing.xl },
-  controls: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, gap: spacing.sm },
-  search: { borderRadius: radius.pill, backgroundColor: colors.surfaceElevated, borderColor: colors.border,
-    borderWidth: StyleSheet.hairlineWidth, minHeight: 44, paddingHorizontal: spacing.lg, color: colors.textPrimary, fontSize: typeScale.body },
-  notice: { color: colors.textSecondary, fontSize: typeScale.footnote, lineHeight: lineHeight.caption },
-  empty: { padding: spacing.xl, gap: spacing.md },
-  noticeRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  noticeText: { flex: 1 },
-  retry: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
-  // 行本身不留上下内边距,分割线落在行的最底边:选中底色正好铺在上下两条分割线之间。
-  row: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, paddingHorizontal: spacing.lg, minHeight: 78 },
-  avatar: { width: 44, height: 44, borderRadius: radius.pill, backgroundColor: colors.surfaceChip, alignItems: 'center', justifyContent: 'center' },
-  connection: { position: 'absolute', right: 0, bottom: 0, width: 10, height: 10, borderRadius: radius.pill, borderWidth: 2, borderColor: colors.surface },
-  selected: { backgroundColor: colors.surfaceChip, borderRadius: radius.container },
-  pressed: { opacity: 0.72 },
-  // 原先是行上下各 12 + 文字区底部 12,分割线在行底上方 12 处,选中底色因此整体下错 12。
-  // 现在 36 的留白上下各 18 放进文字区,行高不变,文字在两条分割线之间居中。
-  body: { flex: 1, minWidth: 0, alignSelf: 'stretch', justifyContent: 'center', gap: spacing.xs,
-    borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 18 },
-  titleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  // Match task rows in HomeListVisuals: title, preview and metadata keep the same hierarchy.
-  title: { flex: 1, color: colors.textPrimary, fontSize: typeScale.subtitle, fontWeight: fontWeight.medium, lineHeight: lineHeight.listTitle },
-  preview: { color: colors.textSecondary, fontSize: typeScale.bodySmall, fontWeight: fontWeight.regular, lineHeight: lineHeight.subtitle },
-  time: { color: colors.textTertiary, fontSize: typeScale.footnote, fontWeight: fontWeight.regular, lineHeight: lineHeight.body },
-  meta: { color: colors.textTertiary, fontSize: typeScale.footnote, fontWeight: fontWeight.regular, lineHeight: lineHeight.body },
-  unread: { width: 7, height: 7, borderRadius: radius.pill, backgroundColor: colors.textPrimary },
-});

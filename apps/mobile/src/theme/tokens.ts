@@ -36,6 +36,8 @@ export interface ThemeColors {
   surface: string;
   /** 抬一层的 Card / 弹窗 / 输入框 */
   surfaceElevated: string;
+  /** 首页导航抽屉投影，局部浮层例外（2026-09-27 用户要求）。 */
+  homeDrawerShadow: string;
   /** Surface 半透明(吸顶栏等,solid 非模糊——chrome/composer 热路径专用,守护测试禁 BlurView) */
   surfaceTranslucent: string;
   /** 侧栏/抽屉类面板毛玻璃底色(R1 audit 模式1,blur≈50 等效;BlurView tint 用) */
@@ -137,6 +139,10 @@ export interface ThemeColors {
   statusAccent: string;
   /** 房主皇冠标识金色；与 Desktop --warning-fg 对齐，Light / Dark 均保持醒目。 */
   warningFg: string;
+  /** 账号额度条预警填充（剩余不足 30%）；仅额度图形使用，双模式同值。 */
+  quotaBarWarn: string;
+  /** 账号额度条紧张填充（剩余不超过 10%）；仅额度图形使用，双模式同值。 */
+  quotaBarCrit: string;
   /** 会话状态点 — 等待用户回复/选择(TapTap 蓝,对齐桌面 --card-status-awaiting 与灵动岛 needs-interaction) */
   statusAwaiting: string;
   /**
@@ -149,6 +155,16 @@ export interface ThemeColors {
   statusDone: string;
   /** 自动审批权限模式强调色(Auto Approval 蓝 #417CDD,L=D 同值,设计定稿 2026-07-17;取代 M2 的 #1D4ED8/#19D2C1 拆值) */
   permAutoAccent: string;
+  /**
+   * 伙伴列表未读点(信息蓝 #417CDD,L=D 同值)。对齐桌面 `--bot-unread-bg`(DESIGN.md「Bot Unread Badge」):
+   * 表示 IM 未读语义,只用于伙伴列表行(伙伴与群聊)的未读点,不是 CTA、不是状态色,不得挪作他用。
+   */
+  botUnread: string;
+  /**
+   * PR 已合并图标色(焦点蓝 #417CDD,L=D 同值)。对齐桌面 PR_STATUS_COLOR.merged = `--focus-ring`;
+   * 只用于 PR 状态图标,不得挪作他用。其余 PR 状态复用 statusDone / statusError / textTertiary。
+   */
+  prMerged: string;
   /**
    * 错误说明文案的黑白系前景 —— **刻意跟随 textPrimary,不是红色**(黑白反色设计里成段
    * 错误文案不点红,错误语义由文案与上下文承担;"error" 是历史命名)。勿用于按钮文字
@@ -177,9 +193,11 @@ export interface ThemeColors {
   homeListFabBorder: string;
   /** 会话行右滑「置顶/取消置顶」按钮底色(Heart Orange,与 statusAccent 同值但语义独立) */
   swipeActionPin: string;
+  /** 右滑已读:沿用灵动岛青绿色语义,加深底色保证白色单勾的对比度。 */
+  swipeActionRead: string;
   /** 会话行左滑「选项」按钮底色(iOS systemGray 感的中性灰) */
   swipeActionNeutral: string;
-  /** 会话行左滑「归档」按钮底色(iOS 系统蓝;不用 statusAwaiting 青——其上白字对比不足) */
+  /** 会话行左滑「归档」按钮底色:保留手机版原有蓝色,与灵动岛归档对齐 */
   swipeActionArchive: string;
   /** swipe 按钮上的文字/图标色:两个主题都是白(按钮底色恒为深色系,不能用会反相的 ctaText) */
   swipeActionText: string;
@@ -407,6 +425,7 @@ export const lightColors: ThemeColors = {
   taskTagWhiteCheck: '#525252',
 
   surfaceElevated: '#FFFFFC',
+  homeDrawerShadow: 'rgba(0, 0, 0, 0.16)',
   surfaceTranslucent: 'rgba(249, 249, 246, 0.78)',
   surfaceTranslucentSidebar: 'rgba(255, 255, 252, 0.90)',
   chatHeaderSurface: 'rgba(249, 249, 246, 0.90)',
@@ -449,10 +468,14 @@ export const lightColors: ThemeColors = {
   statusRecording: '#D91F37',
   statusAccent: '#EA6B17',
   warningFg: '#F3A115',
+  quotaBarWarn: '#F3A115',
+  quotaBarCrit: '#D91F37',
   statusAwaiting: '#19D2C1',
   statusError: '#D91F37',
   statusDone: '#2AAE5B',
   permAutoAccent: '#417CDD',
+  botUnread: '#417CDD',
+  prMerged: '#417CDD',
   errorText: '#0F0F0F',
   destructive: '#f43d3f',
   sharedTaskConfirmBackground: '#ac3535',
@@ -466,6 +489,7 @@ export const lightColors: ThemeColors = {
   homeListFab: '#0F0F0F',
   homeListFabBorder: 'transparent',
   swipeActionPin: '#EA6B17',
+  swipeActionRead: '#008579',
   swipeActionNeutral: '#8e8e93',
   swipeActionArchive: '#3b82f6',
   swipeActionText: '#fbfbfa',
@@ -494,6 +518,7 @@ export const darkColors: ThemeColors = {
   taskTagWhite: '#ffffff',
   taskTagWhiteCheck: '#525252',
   surfaceElevated: '#1E1E1E',
+  homeDrawerShadow: 'rgba(0, 0, 0, 0.40)',
   surfaceTranslucent: 'rgba(18, 18, 18, 0.78)',
   surfaceTranslucentSidebar: 'rgba(10, 10, 10, 0.85)',
   chatHeaderSurface: 'rgba(18, 18, 18, 0.80)',
@@ -537,10 +562,14 @@ export const darkColors: ThemeColors = {
   statusRecording: '#D91F37',
   statusAccent: '#EA6B17',
   warningFg: '#F3A115',
+  quotaBarWarn: '#F3A115',
+  quotaBarCrit: '#D91F37',
   statusAwaiting: '#19D2C1',
   statusError: '#D91F37',
   statusDone: '#2AAE5B',
   permAutoAccent: '#417CDD',
+  botUnread: '#417CDD',
+  prMerged: '#417CDD',
   errorText: '#EDEDED',
   destructive: '#f43d3f',
   sharedTaskConfirmBackground: '#ec9898',
@@ -551,6 +580,7 @@ export const darkColors: ThemeColors = {
   homeListFab: '#E6E6E6',
   homeListFabBorder: '#FFFFFF',
   swipeActionPin: '#EA6B17',
+  swipeActionRead: '#008579',
   swipeActionNeutral: '#636366',
   swipeActionArchive: '#3b82f6',
   swipeActionText: '#fbfbfa',
@@ -804,6 +834,16 @@ export const motionEasing = {
   move: [0.4, 0, 0.2, 1],
 } as const;
 
+/**
+ * 移动端列表展开 / 收起节奏(DESIGN.md §14.4 登记的移动端例外,2026-09-30 用户要求
+ * 「符合 iOS 节奏」,同日要求把首版 450ms 加快一倍)。手机列表用 225ms 二次缓出,约
+ * 150ms 完成九成位移,先快后缓、无回弹(桌面 base 档为 200ms)。只用于列表分组的展开 /
+ * 收起(session/listDisclosureTransition.tsx)。
+ */
+export const listDisclosureMotion = {
+  duration: 225,
+} as const;
+
 /** Shared size for floating iOS navigation/menu controls (points). */
 export const navigationChrome = {
   target: 44,
@@ -819,5 +859,11 @@ export const navigationChrome = {
       scrim: 'rgba(0, 0, 0, 0.35)',
       selected: 'rgba(255, 255, 255, 0.18)',
     },
+  },
+  // Regular glass over arbitrary page content (in-app browser): a theme tint keeps the
+  // material in the app's polarity instead of adapting to the page behind it.
+  pageTint: {
+    light: '#FFFFFCB3',
+    dark: '#1E1E1EB3',
   },
 } as const;

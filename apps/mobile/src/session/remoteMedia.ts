@@ -1,4 +1,4 @@
-import { peerMediaUri, peerMediaExpiry } from "@/device-link/peerFileRegistry";
+import { peerMediaUri, peerMediaExpiry, releasePeerMedia } from "@/device-link/peerFileRegistry";
 import type { NormalizedToolMedia } from "@/session/messageNormalize";
 import {
   isPayloadDesktopLocalMediaUrl,
@@ -10,7 +10,21 @@ import { mobileDebugLog } from "@/debug/mobileDebugLog";
 
 const EXPIRY_SAFETY_WINDOW_MS = 60 * 1000;
 
+/** Match stable Host/transport codes, never expose raw errors containing local paths. */
+export function mediaLoadFailureKey(error: unknown): 'message.lightbox.sourceMissing' | 'message.lightbox.deviceOffline' | 'message.lightbox.loadFailed' {
+  const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (code === 'MEDIA_SOURCE_MISSING' || message.includes('[MEDIA_SOURCE_MISSING]')) return 'message.lightbox.sourceMissing';
+  const offlineCodes = ['NOT_CONNECTED', 'DEVICE_LINK_NOT_CONNECTED', 'DEVICE_OFFLINE', 'PEER_OFFLINE'];
+  if ((typeof code === 'string' && offlineCodes.includes(code))
+    || /\b(?:NOT_CONNECTED|DEVICE_LINK_NOT_CONNECTED|DEVICE_OFFLINE|PEER_OFFLINE)\b/.test(message)) return 'message.lightbox.deviceOffline';
+  return 'message.lightbox.loadFailed';
+}
+
 export interface MobileRemoteMediaFetchResult {
+  version?: string;
+  /** Local adapter only; never sent over device-link. Copies an OSS result into the shared file cache. */
+  cacheDownload?: (downloadUrl: string) => Promise<MobileRemoteMediaFetchResult | null>;
   /** inline 缩略图回包(新被控端)时为空串。 */
   ossKey: string;
   mimeType: string;
@@ -37,6 +51,13 @@ export interface MobileResolvedRemoteMedia {
 }
 
 export interface MobileRemoteMediaFetchOptions {
+  /** Await Host version validation; still reuse bytes for that confirmed version. */
+  revalidate?: boolean;
+  /** Local callbacks: only connect on a cache miss or during background revalidation. */
+  beforeFetch?: () => Promise<unknown>;
+  retainBackground?: (result: MobileRemoteMediaFetchResult, isCurrent?: () => boolean) => Promise<void>;
+  /** Local receiver bytes; never sent to the remote computer. */
+  onProgress?: (loaded: number, total: number) => void;
   /** Local read intent only; false for consumers that copy complete bytes. */
   stream?: boolean;
   skipCache?: boolean;
@@ -47,6 +68,7 @@ export interface MobileRemoteMediaFetchOptions {
 }
 
 export interface MobileRemoteMediaResolverDeps {
+  findLocalImage?(url: string): Promise<{ uri: string; mimeType: string; size: number } | null>;
   fetchRemoteMedia(
     url: string,
     opts?: MobileRemoteMediaFetchOptions,
@@ -55,6 +77,10 @@ export interface MobileRemoteMediaResolverDeps {
 }
 
 export interface MobileRemoteMediaResolveOptions {
+  revalidate?: boolean;
+  beforeFetch?: () => Promise<unknown>;
+  discardBackgroundOssKey?: (key: string) => void;
+  onProgress?: (loaded: number, total: number) => void;
   stream?: boolean;
   signal?: AbortSignal;
   /** 强制被控端绕过上传去重缓存(上次的 ossKey 已悬空时的自愈路径)。 */
@@ -93,6 +119,7 @@ export type ResolveRemoteMediaFn = (
     front?: boolean;
     signal?: AbortSignal;
     forceRefresh?: boolean;
+    /** 不新建取件;与 front 同用可提升已有排队项。 */
     cachedOnly?: boolean;
   },
 ) => Promise<MobileResolvedRemoteMedia>;
@@ -165,10 +192,34 @@ export async function resolveMobileRemoteMedia(
   deps: MobileRemoteMediaResolverDeps,
   opts?: MobileRemoteMediaResolveOptions,
 ): Promise<MobileResolvedRemoteMedia> {
+  if (media.kind === 'image' && !opts?.skipCache) {
+    // Shared by task history, group chat and file viewers. Keeping this here
+    // avoids fixing thumbnails in one screen while original-image reads still go online.
+    const local = await (deps.findLocalImage
+      ? deps.findLocalImage(media.url)
+      : import('./sentAttachmentThumbStore').then((store) => store.resolveSentAttachmentThumb(media.url)))
+      .catch(() => null);
+    if (local) return {
+      url: local.uri, mimeType: local.mimeType, size: local.size,
+      ossKey: '', expiresAt: REMOTE_MEDIA_NEVER_EXPIRES, previewable: true,
+    };
+  }
   if (!isDesktopLocalMediaUrl(media.url)) {
     throw new Error(i18n.t("composer.attachments.notFetchableMedia"));
   }
   const fetchOpts = {
+    ...(opts?.revalidate ? { revalidate: true } : {}),
+    ...(opts?.beforeFetch ? { beforeFetch: opts.beforeFetch } : {}),
+    ...(opts?.stream === false ? { retainBackground: async (result: MobileRemoteMediaFetchResult, isCurrent?: () => boolean) => {
+      if (!result.ossKey || isCurrent?.() === false) return;
+      try {
+        const signed = await deps.presignGet(result.ossKey);
+        const copy = await result.cacheDownload?.(signed.getUrl);
+        const uri = copy && peerMediaUri(copy);
+        if (uri) releasePeerMedia(uri);
+      } finally { if (isCurrent?.() !== false) opts.discardBackgroundOssKey?.(result.ossKey); }
+    } } : {}),
+    ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}),
     ...(opts?.stream !== undefined ? { stream: opts.stream } : {}),
     ...(opts?.onOssKey ? { onDiscardOssKey: opts.onOssKey } : {}),
     ...(opts?.signal ? { signal: opts.signal } : {}),
@@ -227,6 +278,13 @@ export async function resolveMobileRemoteMedia(
     mobileDebugLog("warn", "files", "remote media presign invalid", { kind: media.kind });
     throw new Error(i18n.t("composer.attachments.mediaUrlInvalid"));
   }
+  const downloaded = await fetched.cacheDownload?.(signed.getUrl);
+  const downloadedUri = downloaded && peerMediaUri(downloaded);
+  if (downloadedUri) return {
+    url: downloadedUri, ossKey: fetched.ossKey, mimeType: fetched.mimeType, size: fetched.size,
+    expiresAt: peerMediaExpiry(downloaded!)!,
+    previewable: canPreviewResolvedRemoteMedia(media.kind, fetched.mimeType),
+  };
   if (media.kind !== "image")
     mobileDebugLog("debug", "files", "remote media presigned", {
       kind: media.kind,

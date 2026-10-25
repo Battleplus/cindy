@@ -7,6 +7,7 @@ import { BotGroupCreateDialog } from '../BotGroupCreateDialog';
 
 const mocks = vi.hoisted(() => ({
   profiles: [] as unknown[],
+  status: vi.fn(),
   createBotGroup: vi.fn(),
   refreshBotGroups: vi.fn(),
 }));
@@ -20,7 +21,7 @@ vi.mock('@/contexts/dataOwnerGeneration', () => ({
 }));
 vi.mock('../botStore', () => ({ useBotProfiles: () => mocks.profiles }));
 vi.mock('../botGroupStore', () => ({
-  botGroupApi: () => ({ createBotGroup: mocks.createBotGroup }),
+  botGroupApi: () => ({ createBotGroup: mocks.createBotGroup, chatServer: { status: mocks.status } }),
   refreshBotGroups: mocks.refreshBotGroups,
 }));
 vi.mock('../BotAvatar', () => ({
@@ -43,6 +44,7 @@ function checkbox(name: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  mocks.status.mockResolvedValue({ enabled: false });
   mocks.createBotGroup.mockReset().mockResolvedValue({ ok: true, groupId: 'g-new' });
   mocks.refreshBotGroups.mockReset();
   mocks.profiles = [
@@ -110,9 +112,32 @@ describe('BotGroupCreateDialog', () => {
     expect(onCreated).not.toHaveBeenCalled();
   });
 
+  it('starts with the private-chat teammate already picked and still lets the user change it', async () => {
+    const onCreated = vi.fn();
+    render(<BotGroupCreateDialog initialBotIds={['c']} onOpenChange={vi.fn()} onCreated={onCreated} />);
+    expect(checkbox('Bot c').getAttribute('aria-checked')).toBe('true');
+    expect(checkbox('Bot a').getAttribute('aria-checked')).toBe('false');
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '新项目' } });
+    fireEvent.click(checkbox('Bot a'));
+    fireEvent.click(screen.getByRole('button', { name: 'bots.groupChat.create.submit' }));
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith('g-new'));
+    expect(mocks.createBotGroup).toHaveBeenCalledWith({ name: '新项目', botIds: ['a', 'c'] });
+  });
+
   it('closes from Cancel', () => {
     const { onOpenChange } = renderDialog();
     fireEvent.click(screen.getByRole('button', { name: 'bots.cancel' }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
+});
+
+
+it('lets a server group start without bots so people can join by invitation', async () => {
+  mocks.status.mockResolvedValue({ enabled: true });
+  mocks.profiles = [];
+  renderDialog();
+  await screen.findByText('bots.groupChat.server.createDescription');
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'People first' } });
+  fireEvent.click(screen.getByRole('button', { name: 'bots.groupChat.create.submit' }));
+  await waitFor(() => expect(mocks.createBotGroup).toHaveBeenCalledWith({ name: 'People first', botIds: [] }));
 });

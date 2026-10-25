@@ -8,10 +8,14 @@
     "notFound": "此裝置已不在你的帳號中。",
     "deleteDevice": "刪除裝置",
     "deleteTitle": "刪除「{{name}}」？",
-    "deleteMessage": "將此裝置從裝置列表中移除，不會刪除電腦上的檔案。",
+    "deleteMessage": "將此裝置從帳號中移除並中斷遠端連線。裝置上的任務和檔案會保留，重新登入後可再次加入。",
     "deleteFailed": "刪除裝置失敗。",
-    "deleteOnline": "裝置目前在線，請讓裝置離線後再刪除。",
+    "deleteOnline": "目前伺服器尚不支援移除線上裝置，請待服務升級後重試。",
     "currentlyOnline": "目前在線",
+    "availableSection": "在線裝置",
+    "offlineSection": "離線裝置",
+    "showAllOffline": "顯示全部 {{count}} 台",
+    "showFewerOffline": "收合",
     "nameTooLong": "裝置名稱不能超過 {{limit}} 個字元。",
     "fields": {
       "name": "名稱",
@@ -29,9 +33,7 @@
   "common": {
     "cancel": "取消",
     "save": "儲存",
-    "saving": "儲存中",
     "delete": "刪除",
-    "deleting": "刪除中",
     "create": "新建"
   },
   "resources": {
@@ -47,7 +49,8 @@
     "openFailed": "無法開啟任務",
     "resolving": "正在開啟最新任務…",
     "retry": "重試",
-    "hostCount": "{{count}} 台電腦"
+    "hostCount": "{{count}} 台電腦",
+    "stale": "內容可能已過期，暫時無法更新"
   },
   "presentation": {
     "deviceList": {
@@ -177,10 +180,10 @@
     },
     "home": {
       "allDevices": "全部",
-      "allComputers": "全部電腦",
+      "allComputers": "全部裝置",
       "waitingCount": "{{count}} 待處理",
       "synced": "已同步",
-      "unknownComputer": "未知電腦",
+      "unknownComputer": "未知裝置",
       "uncategorizedProject": "未分類專案",
       "cindyMake": "Cindy Make",
       "empty": {
@@ -238,6 +241,11 @@
     }
   },
   "list": {
+    "projectActions": {
+      "newTask": "新增任務",
+      "allTasks": "全部任務",
+      "search": "搜尋"
+    },
     "taskSuggestions": {
       "connected": "電腦已連線",
       "title": "不在電腦旁，\n也能開始一件事。",
@@ -294,7 +302,7 @@
     "error": {
       "sessionDeviceNotFound": "找不到這個任務所屬裝置，請重新同步後再試。",
       "taskDeviceNotFound": "找不到這個任務所屬裝置，請重新同步後再試。",
-      "noDevice": "沒有可用裝置。請先開啟桌面端遠端控制，然後重新同步。"
+      "noDevice": "沒有可用裝置。請先在電腦端開啟遠端控制，然後重新同步。"
     },
     "alert": {
       "cacheSaveFailed": "離線快取未能儲存",
@@ -309,18 +317,20 @@
       "openMenu": "打開選單",
       "closeMenu": "關閉選單",
       "openDisplaySettings": "打開顯示設定",
+      "openDisplaySettingsWithStatus": "打開顯示設定（目前：{{status}}）",
       "openSearch": "搜尋",
       "openSettings": "開啟設定",
       "syncing": "正在重新同步",
       "sync": "重新同步",
       "pinnedConversations": "置頂 {{count}} 條任務",
-      "newRemoteConversation": "新建遠端任務",
+      "newRemoteConversation": "新建任務",
       "renameDevice": "重新命名 {{label}}",
       "project": "專案 {{title}}",
       "dialogue": "對話",
       "openAutomationLatest": "開啟自動化 {{title}} 的最新任務",
       "automationTask": "自動化 {{title}}",
       "openConversation": "開啟任務 {{title}}",
+      "followedBy": "，{{names}}在跟進",
       "collapse": "收起 {{title}}",
       "expand": "展開 {{title}}",
       "taskError": "任務出錯",
@@ -339,13 +349,7 @@
       "switchConfirm": "繼續切換"
     },
     "menu": {
-      "groupByProject": "按專案分組",
-      "groupDialogue": "對話歸為一組",
-      "sortByTime": "按時間排序",
-      "sortByPriority": "優先級",
-      "statusActive": "活躍",
-      "statusArchived": "已歸檔",
-      "statusAll": "全部",
+      "groupDialogue": "對話",
       "dialogueFolder": "對話",
       "search": "搜尋",
       "settings": "設定",
@@ -353,14 +357,65 @@
       "displaySettings": "顯示設定",
       "groupHeading": "分組",
       "sortHeading": "任務排序",
-      "projectOrderHeading": "專案順序",
-      "projectOrderActivity": "按最近活動",
-      "projectOrderManual": "手動",
+      "projectOrderHeading": "專案排序",
       "projectOrderManualTip": "長按專案行拖動調整順序，組內任務仍按上面的排序",
-      "statusHeading": "狀態",
+      "statusHeading": "任務狀態",
       "showDeviceTasks": "查看任務",
       "openDevice": "打開",
-      "renameDevice": "重新命名"
+      "renameDevice": "重新命名",
+      "groupProject": "專案",
+      "sortBy": {
+        "priority": "優先級",
+        "recency": "最近活動",
+        "created": "建立時間"
+      },
+      "sortByPriorityTip": "等你處理的排在最前，然後是未讀、執行中，其餘按時間",
+      "projectOrder": {
+        "activity": "跟隨任務",
+        "custom": "手動"
+      },
+      "status": {
+        "active": "活躍",
+        "archived": "已歸檔",
+        "all": "全部"
+      },
+      "filterHeading": "篩選",
+      "filterSummaryActive": "{{count}} 項生效",
+      "filterReset": "重設篩選",
+      "filterAll": "全部",
+      "filterProjectsHeading": "專案",
+      "filterAllProjects": "所有專案",
+      "filterSelectedProjects": "已選 {{count}} 個",
+      "filterVendorHeading": "Harness",
+      "filterVendor": {
+        "all": "全部",
+        "cc": "Claude Code",
+        "codex": "Codex",
+        "pi": "Pi"
+      },
+      "filterLastActivityHeading": "最近活躍",
+      "filterLastActivity": {
+        "1d": "1 天",
+        "3d": "3 天",
+        "7d": "7 天",
+        "30d": "30 天",
+        "all": "全部"
+      },
+      "displayHeading": "顯示",
+      "view": {
+        "text": "文字",
+        "list": "列表"
+      },
+      "taskInfoHeading": "任務資訊",
+      "taskInfo": {
+        "time": "時間",
+        "pr": "PR 狀態",
+        "tokens": "Token",
+        "cost": "費用"
+      },
+      "summaryNone": "無",
+      "summarySeparator": "、",
+      "filterEmptyCopy": "可在顯示設定的「篩選」中調整或重設。"
     },
     "search": {
       "placeholder": "搜尋標題或內容…",
@@ -424,7 +479,13 @@
       "needAttention": "{{count}} 個需關注",
       "waiting": "等待處理 {{count}} 個",
       "automationRunning": "自動化執行中",
-      "totalRuns": "共 {{count}} 次執行"
+      "totalRuns": "共 {{count}} 次執行",
+      "runCount": "共 {{count}} 次",
+      "nextRunMinutes": "{{count}} 分鐘後執行",
+      "nextRunHours": "{{count}} 小時後執行",
+      "nextRunDays": "{{count}} 天後執行",
+      "imminent": "即將執行",
+      "stopped": "已停止"
     }
   },
   "detail": {
@@ -528,6 +589,12 @@
     "viewAllRuns": "檢視全部 {{count}} 次執行"
   },
   "companions": {
+    "section": {
+      "showAll": "顯示全部",
+      "showAllA11y": "顯示全部 {{count}} 位",
+      "showLess": "收起"
+    },
+    "noCreateHosts": "目前沒有可用的相容電腦。在電腦上開啟 Cindy 並登入同一帳號後即可新建夥伴。",
     "messageSent": "已向背景任務傳送訊息",
     "sentTo": "已傳訊息給 {{name}}",
     "receivedFrom": "訊息來自 {{name}}",
@@ -557,28 +624,22 @@
     "unread": "有新回覆",
     "status": {
       "queued": "正在開始",
-      "running": "正在做",
+      "running": "執行中",
       "waiting": "等待處理",
       "completed": "已完成",
-      "failed": "失敗了",
+      "failed": "失敗",
       "cancelled": "已停止",
       "timed-out": "已逾時",
-      "unknown": "任務狀態查不到了"
+      "unknown": "狀態未知"
     },
     "title": "夥伴",
-    "tasks": "任務",
     "search": "搜尋夥伴",
-    "emptyTitle": "還沒有夥伴",
-    "emptyCopy": "在電腦上的 Cindy 中建立一個夥伴。",
-    "noResults": "沒有找到符合的夥伴",
     "startChat": "開始對話",
-    "preferenceSaveFailed": "未能儲存檢視偏好，請重新切換檢視。",
     "automation": {
       "unsavedTitle": "放棄變更？",
       "unsavedBody": "你的變更尚未儲存。",
       "discard": "放棄變更"
     },
-    "openNavigation": "開啟導覽",
     "openProfile": "查看 {{name}} 的資料",
     "switchCompanion": "切換夥伴",
     "activity": {
@@ -622,7 +683,12 @@
     },
     "viewResult": "查看結果",
     "noWrittenResult": "沒有文字結果。",
-    "errorDetails": "錯誤詳情"
+    "errorDetails": "錯誤詳情",
+    "createTeammate": "新增夥伴",
+    "createMenu": "新增",
+    "awaiting": "等你確認",
+    "taskResult": "任務結果",
+    "collapseResult": "收起結果"
   },
   "companionProfile": {
     "avatar": "頭像",
@@ -649,7 +715,7 @@
     "memorySaveFailed": "沒有儲存成功，你的編輯已保留。",
     "memoryMissing": "這條記憶已不存在。",
     "memoryDeleteFailed": "刪除失敗",
-    "create": "新夥伴",
+    "create": "新建夥伴",
     "createFailed": "尚未確認建立結果，請重試核對。",
     "title": "夥伴資料",
     "profile": "資料與性格",
@@ -671,6 +737,8 @@
     "artifactsEmpty": "還沒有成果，可以讓夥伴創作一些內容。",
     "openSourceTask": "開啟來源任務",
     "modelFollowsDefault": "跟隨目前預設模型鏈",
+    "taskModel": "任務模型",
+    "taskInheritsPrimary": "繼承主模型",
     "modelOverride": "使用此夥伴的自訂模型鏈",
     "modelsUnavailable": "暫無可用模型，請在電腦上檢查此夥伴的模型設定後重新整理。",
     "artifactsRecovery": "請從訊息卡中開啟檔案，或在 {{deviceName}} 上瀏覽檔案。",
@@ -688,7 +756,11 @@
     "portraitNumber": "頭像 {{number}}",
     "uploadAvatar": "上傳頭像",
     "avatarFailed": "無法開啟此圖片，請換一張。",
-    "nameTaken": "已有同名夥伴，請換一個名字。"
+    "nameTaken": "已有同名夥伴，請換一個名字。",
+    "home": "主力電腦",
+    "chat": "對話",
+    "showReplyTarget": "顯示回覆對應的訊息",
+    "showReplyTargetHint": "夥伴回覆上方標出它回的是你哪則訊息。對所有夥伴生效，較早的回覆不顯示。"
   },
   "companionImport": {
     "title": "匯入夥伴",
@@ -702,13 +774,13 @@
     "automations": "自動化",
     "paused": "匯入後仍停用",
     "itemAttention": "需要處理",
-    "takeover": "檢查通過後，由夥伴接管自動化",
+    "takeover": "匯入後檢查並接管自動化",
     "takeoverNote": "資料連線驗證通過後才暫停原任務。取消所需依賴時，原任務繼續執行。",
     "submit": "匯入",
     "back": "上一步",
     "open": "開啟夥伴",
     "running": "正在匯入並檢查連線…",
-    "complete": "匯入完成",
+    "complete": "匯入已儲存",
     "attention": "部分內容需要處理，詳見下方。",
     "error": "未能完成匯入，可按原選擇重試。",
     "keptAtSource": "尚未完成接管",
@@ -723,6 +795,111 @@
     "credentialFailed": "憑證未能安全儲存。",
     "scriptMissing": "缺少這項任務所需的指令碼。",
     "sourceCommand": "找不到原 Agent 的控制命令。",
-    "readFailed": "尚未驗證這項任務實際需要的資料查詢。"
+    "readFailed": "尚未驗證這項任務實際需要的資料查詢。",
+    "search": "搜尋",
+    "selectAll": "全選",
+    "previous": "上一頁",
+    "next": "下一頁",
+    "chatSetup": "已儲存可匯入的資料，可以開始交流了。部分內容還需要登入或檢查，你方便時我們再繼續。接管前，原來的自動化保持原狀。",
+    "chatReady": "資料已經匯入，可以開始交流了。",
+    "partial": "部分內容未完整匯入",
+    "details": "查看匯入詳情",
+    "partlySaved": "僅部分儲存",
+    "savedNeedsSetup": "已儲存，尚未啟用或完成設定",
+    "notSaved": "未儲存",
+    "databaseDriver": "資料庫驅動程式無法載入，請更新或修復 Cindy 後重試。",
+    "databaseUnavailable": "無法讀取來源資料庫，原資料未變更。修復後可重試。",
+    "fileTooLarge": "檔案或本次資料超過讀取上限，未截斷匯入。",
+    "memoryMetadata": "記憶摘要或標題不符合儲存要求。",
+    "memoryWrite": "記憶寫入或完整性檢查失敗，可重試。",
+    "memoryChanged": "已儲存的記憶發生變更，未覆寫。",
+    "attachmentUnsupported": "此附件格式暫不支援，原檔案保留在來源。",
+    "diskFull": "磁碟空間不足，釋放空間後可重試。",
+    "permissionDenied": "沒有權限讀取或儲存此項，修復權限後可重試。",
+    "setupDeferred": "可在夥伴對話中繼續登入與驗證。",
+    "automationInvalid": "自動化定義無法轉換，尚未建立。",
+    "itemFailed": "此項未完成，可重試並查看匯入詳情。",
+    "chatPartial": "夥伴已建立，但部分資料未完整儲存。以下項目仍需處理；其他內容和對話可以正常使用。",
+    "imBotOwnerMissing": "沒找到主人的使用者 ID，請到夥伴的「訊息平台」頁把這個機器人連上。",
+    "imBotGatewayRunning": "原本的閘道還在使用這個機器人。先停掉它，再到「訊息平台」頁連線。",
+    "imBotInUse": "這個機器人已經在這台電腦上使用了：在 設定 → IM 機器人 裡，或是在另一位夥伴那裡。",
+    "imBotConnectFailed": "沒能連上這個機器人，請到夥伴的「訊息平台」頁重試。",
+    "imBotSourceStopUnconfirmed": "原本的機器人還沒停下，暫時沒有接給夥伴。可以稍後在夥伴的「訊息平台」頁連線。",
+    "imBotSourceChanged": "原本的機器人在預覽後換過了，沒有停用它。請重新讀取後再匯入。",
+    "bots": "訊息機器人",
+    "botsNote": "匯入後，{{source}} 裡的這些機器人會停用，由夥伴接管。",
+    "sourceDisabled": "原本已停用",
+    "botOwner": "主人 ID {{id}}"
+  },
+  "glance": {
+    "open": "{{name}}的近況",
+    "dueUnseen": "有待辦到期",
+    "computers": "電腦",
+    "runningHere": "正在這台上執行",
+    "online": "線上",
+    "offline": "離線",
+    "current": "目前",
+    "offlineCount_one": "離線 {{count}} 台",
+    "offlineCount_other": "離線 {{count}} 台",
+    "todos": "待辦",
+    "showMore": "顯示更多",
+    "showLess": "收起",
+    "doneCount_one": "已完成 {{count}}",
+    "doneCount_other": "已完成 {{count}}",
+    "delete": "刪除",
+    "deleted": "已刪除，同一件事之後不再記錄",
+    "undo": "復原",
+    "undoFailed": "無法復原，請重試",
+    "deleteFailed": "無法刪除，請重試",
+    "check": "幫我查查",
+    "checkMeta": "在已連接的郵件和訊息裡找新待辦",
+    "checkPrompt": "幫我查查已連接的信箱、訊息等來源裡，有沒有需要我處理的新事項，有就記成待辦。",
+    "dailyCheck": "每天幫我查一次",
+    "dailyCheckMeta": "工作日 9:00，沒有新待辦不打擾",
+    "dailyCheckFailed": "沒能儲存，請重試",
+    "loadFailed": "無法讀取待辦",
+    "outputs": "輸出內容",
+    "outputMeta": "{{time}} · {{task}}",
+    "source": {
+      "conversation": "你交代的",
+      "mail": "來自郵件",
+      "feishu": "來自飛書",
+      "github": "來自 GitHub",
+      "community": "來自社群",
+      "task": "來自任務"
+    }
+  },
+  "cloudCompanion": {
+    "homeOffline": "主力電腦「{{device}}」離線",
+    "switchAction": "換一台電腦繼續",
+    "composerHint": "主力電腦離線，換一台電腦後繼續",
+    "readOnlyNote": "這裡是雲端儲存的對話，只能檢視。",
+    "empty": "還沒有雲端對話。",
+    "loadFailed": "暫時無法讀取雲端對話。",
+    "loadOlder": "載入更早的訊息",
+    "noTargets": "沒有其他可用的電腦。在另一台電腦上開啟 Cindy、登入同一帳號，並開啟「允許同帳號裝置控制本機」後再試。",
+    "devicesFailed": "暫時無法讀取你的電腦清單，請稍後再試。",
+    "preparing": "正在「{{device}}」上準備…",
+    "preparingHint": "那台電腦會依雲端資料接手夥伴，準備好後自動開啟。",
+    "timeout": "「{{device}}」還沒準備好。請確認那台電腦上的 Cindy 已開啟並連上網路，再試一次。",
+    "conflict": "{{name}} 已經換到「{{device}}」繼續了。",
+    "switchFailed": "暫時無法更換主力電腦，請稍後再試。",
+    "unknownDevice": "另一台電腦",
+    "runsOn": "在「{{device}}」上執行",
+    "homeTitle": "主力電腦",
+    "moveTo": "換到「{{device}}」",
+    "moveTitle": "把 {{name}} 換到「{{device}}」執行？",
+    "moveDescription": "從現在起 {{name}} 在「{{device}}」上執行，對話紀錄一起帶過去。工作目錄、連線和本機檔案留在原來的電腦上。",
+    "moveAction": "換到「{{device}}」",
+    "moving": "正在把 {{name}} 換到「{{device}}」…",
+    "busyTitle": "{{name}} 還在回覆",
+    "busyDescription": "可以等這一輪結束後再換到「{{device}}」，也可以停止這一輪馬上換。",
+    "busyWait": "等回覆完再換",
+    "busyStop": "停止並換",
+    "transferBusy": "{{name}} 還在回覆，等這一輪結束再換電腦",
+    "switchConflict": "{{name}} 的主力電腦已經變了，這次沒有更換",
+    "homeOutdated": "主力電腦「{{device}}」上的 Cindy 版本較舊，請先更新它，或在那台電腦上更換",
+    "homeUnreachable": "現在連不上「{{device}}」，它需要在線並開啟「允許同帳號裝置控制本機」",
+    "sendUnreachable": "訊息還沒送到主力電腦「{{device}}」，它可能已離線。可以換一台電腦繼續。"
   }
 }

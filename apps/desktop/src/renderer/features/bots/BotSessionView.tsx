@@ -1,17 +1,24 @@
+import { getDataOwnerGeneration, isDataOwnerGenerationCurrent } from '@/contexts/dataOwnerGeneration';
 import { Button } from '@/components/ui/button';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, CircleAlert, RefreshCcw } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 
 import { Spinner } from '@/components/ui/spinner';
 import { CCAgentSessionView } from '@/features/cc-agent/CCAgentSessionView';
+import { useCompanionCloud } from './companionCloudStore';
+import { withoutShadowedBots } from './companionCloudPresentation';
+import { useCompanionArrivalNotice } from './useCompanionArrivalNotice';
+import { CompanionShadowBanner } from './CompanionShadowBanner';
 import type { ComposerBotMention } from '@/lib/fileTypes';
 import { getBotLastReadAt, markBotRead } from './botReadState';
 import { useBotProfiles } from './botStore';
 import type { BotChatIdentity } from './BotSessionContentHeader';
 import type { BotChatBinding } from './botChatPresentation';
 import { useBotIslandVisibleSession } from './useBotIslandVisibleSession';
+import { BotDmThreadHost } from './BotDmThreadHost';
+import { useBotPluginFocusedSession } from './useBotPluginFocusedSession';
 
 type BotSessionGate =
   | { kind: 'loading' }
@@ -75,18 +82,30 @@ export function BotSessionView() {
 }
 
 function BotSessionGateView() {
+  const readOwner = useRef(getDataOwnerGeneration());
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { botId, sessionId } = useParams();
   const [reloadVersion, setReloadVersion] = useState(0);
   const [gate, setGate] = useState<BotSessionGate>({ kind: 'loading' });
-  useBotIslandVisibleSession(gate.kind === 'ready' ? sessionId ?? null : null);
+  // The companion now runs on its main computer: this copy's main task is read only.
+  const cloud = useCompanionCloud();
+  const shadowed = cloud.demotedBotIds.includes(botId ?? '');
+  // The send / delegate choices leave out copies that run on another computer or were retired
+  // there, like the roster (cloud-companions.md §6); read live, the gate's list is a one-off.
+  const readyMentions = gate.kind === 'ready' ? gate.mentions : null;
+  const mentions = useMemo(() => (readyMentions ? withoutShadowedBots(readyMentions, cloud) : []), [readyMentions, cloud]);
+  const ownedSessionId = gate.kind === 'ready' ? sessionId ?? null : null;
+  useBotIslandVisibleSession(ownedSessionId);
+  useBotPluginFocusedSession(ownedSessionId);
   // The gate proves ownership once; name and avatar edited in settings must
   // still reach the open chat's header and composer.
   const liveProfile = useBotProfiles().find((profile) => profile.id === botId);
   const liveName = liveProfile?.name;
   const liveAvatar = liveProfile?.avatar;
   const liveAvatarColor = liveProfile?.avatarColor;
+  const liveInvitationStage = liveProfile?.invitation?.stage;
+  useCompanionArrivalNotice(gate.kind === 'ready' ? botId : undefined, liveName);
   const gateIdentity = gate.kind === 'ready' ? gate.identity : null;
   const identity = useMemo(
     () =>
@@ -100,9 +119,16 @@ function BotSessionGateView() {
         : gateIdentity,
     [gateIdentity, liveName, liveAvatar, liveAvatarColor],
   );
+  // A read-only demoted copy offers no add-to-group entry, like its settings.
+  const canonicalChat = gate.kind === 'ready' && gate.isCanonical && !shadowed;
+  const chatIdentity = useMemo(
+    () => (gateIdentity ? { ...(identity ?? gateIdentity), canonicalChat } : null),
+    [gateIdentity, identity, canonicalChat],
+  );
 
   useEffect(() => {
     let cancelled = false;
+    const owner = getDataOwnerGeneration();
     if (!botId || !sessionId) {
       setGate({ kind: 'unavailable' });
       return () => {
@@ -118,7 +144,7 @@ function BotSessionGateView() {
       ),
     ])
       .then(([bot, bots]) => {
-        if (cancelled) return;
+        if (cancelled || !isDataOwnerGenerationCurrent(owner)) return;
         if (!bot || typeof bot !== 'object') {
           setGate({ kind: 'unavailable' });
           return;
@@ -154,6 +180,7 @@ function BotSessionGateView() {
           typeof (listedBot as { unreadCount?: unknown }).unreadCount === 'number'
             ? (listedBot as { unreadCount: number }).unreadCount
             : 0;
+        readOwner.current = owner;
         setGate({
           kind: 'ready',
           // 欢迎语只属于主任务:渠道路由任务是「别处的对话被接进来」,
@@ -170,7 +197,7 @@ function BotSessionGateView() {
         });
       })
       .catch((error: unknown) => {
-        if (cancelled) return;
+        if (cancelled || !isDataOwnerGenerationCurrent(owner)) return;
         setGate({
           kind: 'error',
           message: error instanceof Error ? error.message : String(error),
@@ -181,24 +208,9 @@ function BotSessionGateView() {
     };
   }, [botId, reloadVersion, sessionId]);
 
-  // Opening the conversation is what marks it read, and staying in it keeps it
-  // read: while this view is mounted every row that lands in the task advances
-  // the read position, so a reply the user is watching arrive never turns into
-  // an unread badge behind their back.
-  useEffect(() => {
-    if (gate.kind !== 'ready' || !botId || !sessionId) return;
-    markBotRead(botId);
-    const subscribe = window.electronAPI?.localDb?.messages?.onCreated;
-    if (typeof subscribe !== 'function') return;
-    const unsubscribe = subscribe((payload: unknown) => {
-      const incoming = (payload as { sessionId?: unknown } | null)?.sessionId;
-      if (incoming !== sessionId) return;
-      markBotRead(botId);
-    });
-    return () => {
-      unsubscribe?.();
-    };
-  }, [botId, gate.kind, sessionId]);
+  const onReadThrough = useCallback((at: number) => {
+    if (isDataOwnerGenerationCurrent(readOwner.current) && gate.kind === 'ready' && gate.isCanonical && botId && gate.identity.sessionId === sessionId) markBotRead(botId, at);
+  }, [botId, gate, sessionId]);
 
   if (gate.kind === 'loading') {
     return (
@@ -257,15 +269,24 @@ function BotSessionGateView() {
       </main>
     );
   }
+  const readOnly = shadowed && gate.isCanonical;
   return (
     <main className="relative flex h-full min-w-0 overflow-hidden bg-[var(--surface)]">
-      <div className="min-w-0 flex-1">
-        <CCAgentSessionView
-          botMentions={gate.mentions}
-          botIdentity={identity ?? gate.identity}
-          botUnreadBoundaryAt={gate.unreadBoundaryAt}
-        />
-      </div>
+      {/* 私聊话题只属于本机的伙伴主对话；只读副本没有话题。 */}
+      <BotDmThreadHost enabled={gate.isCanonical && !readOnly} bot={identity ?? gate.identity}
+        rootSessionId={sessionId} mentions={mentions}>
+        {readOnly && botId ? <CompanionShadowBanner botId={botId} name={(identity ?? gate.identity).name} /> : null}
+        <div className="min-h-0 flex-1">
+          <CCAgentSessionView
+            botMentions={mentions}
+            botIdentity={chatIdentity ?? gate.identity}
+            botInvitationStage={gate.isCanonical ? liveInvitationStage : undefined}
+            botUnreadBoundaryAt={gate.unreadBoundaryAt}
+            onBotReadThrough={gate.isCanonical ? onReadThrough : undefined}
+            {...(readOnly ? { readOnly: true } : {})}
+          />
+        </div>
+      </BotDmThreadHost>
     </main>
   );
 }

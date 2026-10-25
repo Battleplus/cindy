@@ -158,15 +158,25 @@ describe("iOS chrome presenters stay on the system menu path", () => {
       "utf8",
     );
 
-    expect(sessionSheet).toContain('testID="home.sessionActions"');
+    expect(sessionSheet).toContain("<SessionActionSheetFrame");
+    for (const file of [
+      "SessionActionSheetFrame.tsx",
+      "SessionActionSheetFrame.android.tsx",
+    ]) {
+      expect(
+        readTextLf(resolve(process.cwd(), "src/session", file), "utf8"),
+      ).toContain('testID="home.sessionActions"');
+    }
     expect(messageSheet).toContain("<SheetModal");
     expect(chipSheet).toContain('testID="session.chipMenu"');
     expect(settings).toContain('backTestID="settings.backButton"');
     expect(settings).toContain('titleTestID="settings.title"');
     expect(settings).toContain("<SimpleStackHeader");
     expect(settings).not.toContain("ScreenHeader");
-    expect(settings).toContain('backTestID="settings.voiceDictionary.backButton"');
-    expect(settings).toContain('backTestID="settings.renameSelfDevice.backButton"');
+    expect(readTextLf(resolve(process.cwd(), "app/settings/voice-dictionary.tsx"), "utf8"))
+      .toContain('backTestID="settings.voiceDictionary.backButton"');
+    expect(readTextLf(resolve(process.cwd(), "app/settings/device-name.tsx"), "utf8"))
+      .toContain('backTestID="settings.renameSelfDevice.backButton"');
     expect(accountDeletion).toContain("<SimpleStackHeader");
     expect(accountDeletion).toContain(
       'backTestID="accountDeletion.backButton"',
@@ -190,7 +200,8 @@ describe("iOS chrome presenters stay on the system menu path", () => {
     expect(settings).toContain(
       "accessibilityLabel={t('settings.notifications.taskDone')}",
     );
-    expect(settings).toContain(
+    // Beta 渠道开关在二级页「开发者」。
+    expect(readTextLf(resolve(process.cwd(), "app/settings/developer.tsx"), "utf8")).toContain(
       "accessibilityLabel={t('settings.betaChannel.title')}",
     );
     expect(settings).toContain(

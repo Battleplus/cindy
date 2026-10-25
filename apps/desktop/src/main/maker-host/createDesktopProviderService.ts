@@ -1,4 +1,5 @@
 import { readProviderPresentation } from './provider-presentation-store.js';
+import { projectSubscriptionFastPolicy } from './subscription-fast-policy.js';
 import { filterLegacyGptContextProfiles } from './legacy-context-profiles.js';
 import { subscriptionAccountState, isXaiSubscriptionProviderId, resetSubscriptionAccountCaches } from './subscription-account-auth.js';
 /**
@@ -32,6 +33,8 @@ import {
   loadCatalog,
   loadCatalogWithSource,
   parseCatalog,
+  isModelDisabled,
+  isProviderDisabled,
   storedCustomProviderId,
   type Catalog,
   type CatalogCapabilityEvidence,
@@ -43,6 +46,8 @@ import {
 import { createLogger } from '../logger.js';
 import { codexAccountState } from './codex-account-auth.js';
 import { listReadyProviderMediaModels } from '../cindy-media/providerMediaRuntime.js';
+import { speechModels } from '../voice-conversation/models.js';
+import { effectiveXdGatewayBaseUrl } from '../model-access/effectiveEndpoint.js';
 import {
   filterEnabledGatewayMediaModels,
   isMediaModelExecutable,
@@ -163,10 +168,15 @@ function fetchText(url: string, timeoutMs: number): Promise<string> {
       }, timeoutMs);
 
       request.on('response', (response) => {
+        response.on('error', (err) => {
+          clearTimeout(timer);
+          settle(() => reject(err));
+        });
         if (response.statusCode !== 200) {
           clearTimeout(timer);
-          response.on('data', () => {});
           settle(() => reject(new Error(`catalog fetch HTTP ${response.statusCode}`)));
+          // No error body is needed; draining after clearing the timer can hang.
+          request.abort();
           return;
         }
         response.on('data', (chunk) => {
@@ -175,10 +185,6 @@ function fetchText(url: string, timeoutMs: number): Promise<string> {
         response.on('end', () => {
           clearTimeout(timer);
           settle(() => resolve(body));
-        });
-        response.on('error', (err) => {
-          clearTimeout(timer);
-          settle(() => reject(err));
         });
       });
       request.on('error', (err) => {
@@ -1000,6 +1006,7 @@ export function getDesktopProviderService(options: { allowSideEffects?: boolean 
   }
   if (singleton) return singleton;
   singleton = createProviderService({
+    projectProvider: projectSubscriptionFastPolicy,
     getProviderPresentation: readProviderPresentation,
     getCatalog: getDesktopSelectableCatalog,
     connection: {
@@ -1085,6 +1092,21 @@ export function getDesktopProviderService(options: { allowSideEffects?: boolean 
       hasCustomProviderCredential(provider, readCustomProviderKey),
     getAvailableMediaModels: () => [
       ...listReadyProviderMediaModels(),
+      // Keep hidden, admitted TTS routes manageable. This is the same catalog/key
+      // policy as companion voice; list visibility never grants execution access.
+      ...speechModels({
+        catalog: getActiveCatalog(),
+        gatewayAllowed: getAppCapabilities().canUseCindyGateway,
+        disabled: (providerId, modelId) => {
+          const access = readModelDisableOverrides();
+          return isProviderDisabled(access, providerId) || isModelDisabled(access, providerId, modelId);
+        },
+        readKey: readCustomProviderKey,
+        gatewayConnection: () => ({
+          baseUrl: effectiveXdGatewayBaseUrl(),
+          apiKey: getProviderSecretStore().get('xd') ?? '',
+        }),
+      }).map((model) => ({ providerId: model.providerId ?? 'xd', id: model.id })),
       ...(getAppCapabilities().canUseCindyGateway && readClaudeApiKey() != null
         ? filterEnabledGatewayMediaModels(
             getXdGatewayModels(),

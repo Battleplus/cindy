@@ -23,10 +23,31 @@ describe('mobile session header desktop-first surface', () => {
     expect(native).toContain('flexShrink: 1');
   });
 
+  it('shows task tags right after the title in every header branch', () => {
+    const source = readTextLf(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8');
+    const titles = source.split('<SessionHeaderNativeTitle').slice(1)
+      .map((branch) => branch.slice(0, branch.indexOf('/>')));
+    // 竖屏原生标题栏与横屏／折叠屏系统标题栏都要带标签,不能只有一条分支显示。
+    expect(titles).toHaveLength(2);
+    for (const title of titles) {
+      expect(title).toContain('tags={isDeviceAccessRevoked ? undefined : currentSession?.tags}');
+      expect(title).toContain('onTagsPress={onOpenSettings}');
+    }
+    const native = readTextLf(resolve(process.cwd(), 'src/session/SessionHeaderNativeControls.ios.tsx'), 'utf8');
+    const titleRow = native.slice(native.indexOf('{label}'), native.indexOf('<QuietSyncIndicator'));
+    expect(titleRow).toContain('<TaskTagDots');
+  });
+
   it('releases the new-session handoff heavy topic when the session screen unmounts', () => {
     const source = readTextLf(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8');
+    const layout = readTextLf(resolve(process.cwd(), 'src/session/SessionTaskLayout.tsx'), 'utf8');
+    const gate = readTextLf(resolve(process.cwd(), 'src/session/CindyMakeSessionGate.tsx'), 'utf8');
 
-    expect(source).toMatch(
+    expect(source).toContain('<SessionTaskLayout>');
+    expect(layout).toMatch(/<CindyMakeSessionGate\b[^>]*\bownsSessionSubscription[\s>]/);
+    expect(gate).toContain('useEffect(() => () => {');
+    expect(gate).toContain('if (!ownsSessionSubscription || !deviceId || !sessionId) return;');
+    expect(gate).toMatch(
       /unsubscribe\(`session:\$\{sessionId\}`, deviceId, \['sessions', `session:\$\{sessionId\}`\]\)/,
     );
   });
@@ -62,7 +83,7 @@ describe('mobile session header desktop-first surface', () => {
     expect(source).toContain('<View style={styles.safeArea} testID="session.screen">');
     expect(source).not.toContain('<SafeAreaView style={styles.safeArea} testID="session.screen">');
     expect(source).not.toContain("import { BlurView } from 'expo-blur';");
-    expect(source).toContain("import { BlurBackdrop } from '@/session/BlurBackdrop';");
+    expect(source).toContain("import { BlurBackdrop, FLOATING_CHROME_BLUR_INTENSITY } from '@/session/BlurBackdrop';");
     // iOS floats individual glass capsules over the message canvas.
     expect(source).not.toContain('<TranslucentBackdrop />');
     expect(source).not.toContain('colors.chatHeaderSurface');
@@ -80,7 +101,12 @@ describe('mobile session header desktop-first surface', () => {
     expect(source).toContain('<View onLayout={handleKeyboardAreaLayout} pointerEvents="none" style={StyleSheet.absoluteFill} />');
     expect(source).toContain('testID="session.composerFrost"');
     expect(source).toContain('<View ref={topOverlayRef} onLayout={handleTopOverlayLayout} pointerEvents="box-none" style={styles.sessionChrome} testID="session.chrome">');
-    expect(source).toContain('<View style={[styles.sessionChromeContent, { paddingTop: horizontalSystemHeader ? nativeHeaderHeight : insets.top + (paneLayout.persistent ? spacing.lg : 0) }, companionChat && { backgroundColor: colors.surface }]}>');
+    expect(source).toContain('<View style={[styles.sessionChromeContent, { paddingTop: horizontalSystemHeader ? nativeHeaderHeight : insets.top + (paneLayout.persistent ? spacing.lg : 0) }, companionChat && Platform.OS !== \'ios\' && { backgroundColor: colors.surface }]}>');
+    // 临时任务列表抽屉在树内,盖不住 iOS 系统栏:抽屉存续期间收起系统栏,内容区沿用打开前的顶栏高度。
+    expect(source).toContain(']), sessionListDrawerOverlayMounted);');
+    expect(source).toContain('systemBarHidden={sessionListDrawerOverlayMounted}');
+    // Stack.Toolbar 左右栏会强制 headerShown: true,收起期间整组不渲染。
+    expect(source).toContain('if (systemBarHidden) return <Stack.Screen options={{ headerShown: false }} />;');
     expect(chromeStyle).toContain("position: 'absolute'");
     // Let native glass press feedback extend beyond the 44pt iOS header.
     expect(chromeStyle).toContain("overflow: Platform.OS === 'ios' ? 'visible' : 'hidden'");
@@ -102,6 +128,7 @@ describe('mobile session header desktop-first surface', () => {
 
   it('keeps narrow navigation back-only and the persistent Home column', () => {
     const source = readTextLf(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8');
+    const layout = readTextLf(resolve(process.cwd(), 'src/session/SessionTaskLayout.tsx'), 'utf8');
 
     // 窄窗口仅保留返回；主页列仅在宽窗口常驻。
     expect(source).toContain('onOpenSessionList={!paneLayout.persistent && wideSessionNav.enabled ? openSessionListDrawer : undefined}');
@@ -159,9 +186,11 @@ describe('mobile session header desktop-first surface', () => {
     expect(source).toContain("importantForAccessibility={sessionListDrawerOverlayMounted ? 'no-hide-descendants' : 'auto'}");
     // 退场期间旋转/折叠/收窄不能直接卸载 Drawer:保留到 onClosed,三类 pending 导航
     // 才都能执行;宽屏 layout 失效后 drawerWidth=0,退场继续用最后有效宽度。
-    expect(source).toContain('persistent={paneLayout.persistent && !sessionListDrawerOverlayMounted}');
+    expect(layout).toContain('persistent={paneLayout.persistent}');
+    expect(source).toContain('{!paneLayout.persistent || sessionListDrawerOverlayMounted ? (');
     expect(source).toContain('if (wideSessionNav.enabled) sessionListDrawerWidthRef.current = wideSessionNav.drawerWidth;');
-    expect(source).toContain('width={paneLayout.persistent && !sessionListDrawerOverlayMounted ? paneLayout.sidebarWidth : sessionListDrawerWidthRef.current}');
+    expect(layout).toContain('width={paneLayout.sidebarWidth}');
+    expect(source).toContain('width={sessionListDrawerWidthRef.current}');
     // 选任务失败路径:校验先于关闭动画——先关再弹 Alert 会让焦点归还抢走弹窗焦点。
     expect(source).toContain("Alert.alert(t('devices.list.error.sessionDeviceNotFound'));\n      return;\n    }\n    // 不派发 NativeStack REPLACE");
   });

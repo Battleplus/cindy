@@ -24,8 +24,12 @@ import {
   createBotGroupChatService,
   resolveGroupMentions,
   rotateResponders,
+  settleBotGroupLaneTerminal,
   type BotGroupChatServiceDeps,
+  type BotGroupLaneTerminal,
 } from '../botGroupChatService.js';
+import { createProviderGroupHeldWorkerTerminals } from '../../provider-group/heldWorkerTerminals.js';
+import { AutoResumeBookkeeping } from '../autoResumeBookkeeping.js';
 import {
   buildPlanDecisionPrompt,
   buildPlanStepBrief,
@@ -33,7 +37,7 @@ import {
   type PlanDecision,
   type PlanDecisionInput,
 } from '../botGroupDivision.js';
-import type { BotGroupDetail } from '../../../shared/botGroupChat.js';
+import type { BotGroupAttachment, BotGroupDetail } from '../../../shared/botGroupChat.js';
 
 function createDatabase(): Database.Database {
   const sqlite = new Database(':memory:');
@@ -94,6 +98,7 @@ function createDatabase(): Database.Database {
       client_id TEXT,
       plan_id TEXT,
       files_json TEXT NOT NULL DEFAULT '[]',
+      attachments_json TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL,
       UNIQUE (group_id, sequence)
     );
@@ -108,7 +113,8 @@ function createDatabase(): Database.Database {
       work_dir TEXT,
       branch TEXT,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      attachments_json TEXT NOT NULL DEFAULT '[]'
     );
     CREATE TABLE bot_group_plan_steps (
       plan_id TEXT NOT NULL REFERENCES bot_group_plans(id) ON DELETE CASCADE,
@@ -133,7 +139,7 @@ type Script = (botId: string, prompt: string, callIndex: number) => string | nul
 
 interface Harness {
   service: ReturnType<typeof createBotGroupChatService>;
-  dispatches: Array<{ botId: string; clientId: string; prompt: string; sessionId: string }>;
+  dispatches: Array<{ botId: string; clientId: string; prompt: string; sessionId: string; attachments: string[] }>;
   lanes: Array<Parameters<BotGroupChatServiceDeps['ensureLane']>[0]>;
   abortLane: ReturnType<typeof vi.fn>;
   events: Array<{ groupId: string; change: string }>;
@@ -159,7 +165,13 @@ function createHarness(
     dispatch: async (params) => {
       const botId = params.targetSessionId.replace(/^(lane|plan)-/, '');
       const index = dispatches.length;
-      dispatches.push({ botId, clientId: params.clientId, prompt: params.message, sessionId: params.targetSessionId });
+      dispatches.push({
+        botId,
+        clientId: params.clientId,
+        prompt: params.message,
+        sessionId: params.targetSessionId,
+        attachments: (params.attachments ?? []).map((attachment) => attachment.name),
+      });
       await params.onAccepted();
       const reply = script(botId, params.message, index);
       if (reply !== null) {
@@ -225,6 +237,64 @@ describe('botGroupChatService', () => {
     ]);
   });
 
+  // #6671 / bot-group-chat §4.3–4.4 (unit): a held done-only turn can have
+  // streamed text still queued for persistence. Existing tests covered the
+  // ordinary event path, not release/handback through the real recovery stores.
+  // Read the actual group result so an early empty DB read cannot silently eat it.
+  it.each(['group', 'generic'] as const)('keeps a streamed reply pending until persistence when %s recovery releases it', async recovery => {
+    let written = false;
+    let finishWrite!: () => void;
+    const writing = new Promise<void>(resolve => { finishWrite = () => { written = true; resolve(); }; });
+    const drain = vi.fn(() => writing);
+    const readReplyText = vi.fn(async () => written ? '落库后的实际回复' : null);
+    const harness = createHarness((_bot, _prompt, index) => index === 0 ? null : 'NO_REPLY', { readReplyText });
+    const groupId = await createGroup(harness);
+    await harness.service.sendMessage({ groupId, text: '继续讨论', mentions: { all: true, botIds: [] }, clientId: 'source-input' });
+    await vi.waitFor(() => expect(harness.dispatches).toHaveLength(3));
+    const call = harness.dispatches[0]!;
+    let settlement: Promise<boolean> | undefined;
+    const deliver = (terminal: BotGroupLaneTerminal) => {
+      settlement = settleBotGroupLaneTerminal(harness.service, terminal, drain);
+    };
+    const held = createProviderGroupHeldWorkerTerminals<BotGroupLaneTerminal>({
+      ownerKey: () => 'account', deliver: (_sessionId, terminal) => deliver(terminal),
+    });
+    const book = new AutoResumeBookkeeping({
+      persistSuppressedError: vi.fn(), markOutcome: vi.fn(),
+      rollbackGuardPendingResume: vi.fn(), abandonTakeover: vi.fn(),
+      finalizeBotGroupSuppressedTerminal: deliver,
+    });
+    held.stash(call.sessionId, 3, {
+      sessionId: call.sessionId, activeInputClientId: call.clientId,
+      outcome: 'done', resultText: '', resultMessageClientId: 'queued-reply',
+    });
+    try {
+      if (recovery === 'generic') {
+        book.stashSuppressedError(call.sessionId, { reason: 'upstream-overload' });
+        book.stashBotGroupSuppressedTerminal(call.sessionId, held.takeForRecovery(call.sessionId, 3)!);
+        book.surfaceSuppressedError(call.sessionId);
+        book.surfaceSuppressedError(call.sessionId);
+      }
+      held.release(call.sessionId, 3);
+      held.release(call.sessionId, 3);
+      await Promise.resolve();
+      expect(readReplyText.mock.calls.length).toBe(0);
+      const waiting = await harness.service.getGroup(groupId);
+      expect(waiting.ok && waiting.group.speakingBotIds).toContain(call.botId);
+      finishWrite();
+      await settlement;
+      const group = await waitForIdle(harness, groupId);
+      expect(drain).toHaveBeenCalledOnce();
+      expect(readReplyText).toHaveBeenCalledExactlyOnceWith(call.sessionId, 'queued-reply');
+      expect(group.messages.filter(message => message.authorKind === 'bot').map(message => message.content))
+        .toEqual(['落库后的实际回复']);
+    } finally {
+      finishWrite();
+      await settlement;
+      await waitForIdle(harness, groupId);
+    }
+  });
+
   it('in sequential mode lets every member answer in turn, rotates the next circle, and ends when a circle is silent', async () => {
     const replies: Record<string, string[]> = {
       mimi: ['先定个大框架', 'NO_REPLY'],
@@ -282,6 +352,14 @@ describe('botGroupChatService', () => {
       });
     }
     const group = await waitForIdle(harness, groupId);
+    expect(group.lastReplyAt).toBe(Math.max(...group.messages.filter(m => m.authorKind === 'bot' && (m.kind === 'message' || m.kind === 'plan')).map(m => m.createdAt)));
+    // Incoming times are the Bots' messages, oldest first, without the owner's own or notices.
+    const incoming = group.messages.filter(m => m.authorKind === 'bot' && (m.kind === 'message' || m.kind === 'plan'))
+      .sort((a, b) => a.sequence - b.sequence).map(m => new Date(m.createdAt).toISOString());
+    expect(incoming.length).toBeGreaterThan(0);
+    expect(group.incomingMessageTimes).toEqual(incoming);
+    const listed = await harness.service.listGroups();
+    expect(listed.ok && listed.groups.find(g => g.id === groupId)?.incomingMessageTimes).toEqual(incoming);
     // Second circle takes turns and sees the whole first circle.
     expect(harness.dispatches.slice(3).map((call) => call.botId)).toEqual(['xiaoman', 'abu', 'mimi']);
     expect(harness.dispatches[3]!.prompt).toContain('咪咪的看法');
@@ -386,6 +464,37 @@ describe('botGroupChatService', () => {
       .toEqual([['member-failed', '咪咪']]);
   });
 
+  it('preserves a safe dispatch failure category for a local-only group', async () => {
+    const harness = createHarness(() => null, {
+      dispatch: async () => ({ ok: false, errorCode: 'INTERNAL', message: 'authentication_failed private credential' }),
+    });
+    const groupId = await createGroup(harness, ['mimi', 'abu']);
+    await harness.service.sendMessage({ groupId, text: '@咪咪 hello', mentions: { all: false, botIds: ['mimi'] }, clientId: 'rejected-input' });
+    const group = await waitForIdle(harness, groupId);
+    expect(group.messages.filter(message => message.kind === 'notice')).toEqual([
+      expect.objectContaining({ noticeCode: 'member-failed', runtimeFailureCode: 'AUTH_REQUIRED' }),
+    ]);
+    expect(JSON.stringify(group.messages)).not.toContain('private credential');
+  });
+
+  it.each([
+    ['NO_MODEL', 'MODEL_UNAVAILABLE'],
+    ['MEMBER_UNAVAILABLE', undefined],
+  ] as const)('preserves the preparation reason %s for a local group without dispatching', async (errorCode, failureCode) => {
+    const harness = createHarness(() => null, {
+      ensureLane: async () => ({ ok: false, errorCode, message: 'private preparation details' }),
+    });
+    const groupId = await createGroup(harness, ['mimi', 'abu']);
+    await harness.service.sendMessage({ groupId, text: '@咪咪 hello', mentions: { all: false, botIds: ['mimi'] }, clientId: 'no-lane' });
+    const group = await waitForIdle(harness, groupId);
+    expect(harness.dispatches).toEqual([]);
+    expect(group.round.speakers).toEqual([]);
+    expect(group.messages.filter(message => message.kind === 'notice')).toEqual([
+      expect.objectContaining({ noticeCode: 'member-unavailable', runtimeFailureCode: failureCode }),
+    ]);
+    expect(JSON.stringify(group.messages)).not.toContain('private preparation details');
+  });
+
   it('a round superseded while a member prepares never dispatches and never steals the new waiter', async () => {
     let releaseSync!: () => void;
     const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
@@ -441,6 +550,7 @@ describe('botGroupChatService', () => {
     expect(harness.abortLane).toHaveBeenCalledWith('lane-mimi');
     expect(group.messages.filter((m) => m.kind === 'notice').map((m) => [m.noticeCode, m.authorName]))
       .toEqual([['member-timeout', '咪咪']]);
+    expect(group.messages.find((m) => m.kind === 'notice')?.runtimeFailureCode).toBe('RUNTIME_TIMEOUT');
     expect(harness.dispatches.map((call) => call.botId)).toEqual(['mimi', 'xiaoman', 'abu']);
   });
 
@@ -606,6 +716,13 @@ describe('botGroupChatService 分工', () => {
     const plan = await proposePlan(harness, groupId);
     const group = await detailOf(harness, groupId);
 
+    // The plan card is the newest incoming item: the read position seeded from lastReplyAt
+    // covers it, and the unread list counts it (bot-group-chat.md §5 未读).
+    const planMessage = group.messages.filter(m => m.authorKind === 'bot').sort((a, b) => b.sequence - a.sequence)[0]!;
+    expect(planMessage.kind).toBe('plan');
+    expect(group.lastReplyAt).toBe(planMessage.createdAt);
+    expect(group.incomingMessageTimes?.at(-1)).toBe(new Date(planMessage.createdAt).toISOString());
+
     expect(decidePlan).toHaveBeenCalledTimes(1);
     expect(decidePlan.mock.calls[0]![0]).toMatchObject({
       mode: 'auto',
@@ -696,6 +813,40 @@ describe('botGroupChatService 分工', () => {
       .toEqual({ text: '帮我给官网做一个介绍页' });
   });
 
+  it('preserves the timeout category when a local plan step times out', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const harness = createHarness(() => null, { decidePlan: async () => THREE_STEPS, workDir: fakeWorkDir(), stepTurnTimeoutMs: 1_000 });
+    const groupId = await createGroup(harness);
+    const plan = await proposePlan(harness, groupId);
+    await harness.service.startPlan({ groupId, planId: plan.id });
+    await vi.waitFor(() => expect(harness.dispatches.at(-1)?.sessionId).toBe('plan-mimi'));
+    await vi.advanceTimersByTimeAsync(1_100);
+    const group = await waitForIdle(harness, groupId);
+    expect(harness.abortLane).toHaveBeenCalledWith('plan-mimi');
+    expect(openPlan(group).steps[0].status).toBe('failed');
+    expect(group.messages.find((message) => message.kind === 'notice' && message.planId === plan.id))
+      .toMatchObject({ noticeCode: 'member-timeout', runtimeFailureCode: 'RUNTIME_TIMEOUT', content: '' });
+  });
+
+  it.each([
+    ['NO_MODEL', 'MODEL_UNAVAILABLE'],
+    ['MEMBER_UNAVAILABLE', undefined],
+  ] as const)('preserves the preparation reason %s for a local plan without dispatching', async (errorCode, failureCode) => {
+    const harness = createHarness(() => null, { decidePlan: async () => THREE_STEPS, workDir: fakeWorkDir(),
+      ensureLane: async () => ({ ok: false, errorCode, message: 'private preparation details' }),
+    });
+    const groupId = await createGroup(harness);
+    const plan = await proposePlan(harness, groupId);
+    await harness.service.startPlan({ groupId, planId: plan.id });
+    const group = await waitForIdle(harness, groupId);
+    expect(harness.dispatches).toEqual([]);
+    expect(openPlan(group).status).toBe('waiting');
+    expect(openPlan(group).steps[0].status).toBe('failed');
+    expect(group.messages.find(message => message.kind === 'notice' && message.planId === plan.id))
+      .toMatchObject({ noticeCode: 'member-unavailable', runtimeFailureCode: failureCode, content: '' });
+    expect(JSON.stringify(group.messages)).not.toContain('private preparation details');
+  });
+
   it('runs the steps one at a time in the plan work directory and stops after each', async () => {
     const replies: Record<string, string> = { mimi: '策划做完了', xiaoman: '设计好了', abu: '写好了' };
     const workDir = fakeWorkDir();
@@ -753,6 +904,36 @@ describe('botGroupChatService 分工', () => {
     expect(lanePrompt.prompt).toContain('not in your own workspace');
   });
 
+  it('reports every settled step so phones can be told', async () => {
+    const onStepSettled = vi.fn();
+    let fail = true;
+    const harness = createHarness((botId) => (botId === 'xiaoman' && fail ? null : '好了'), {
+      decidePlan: async () => ({ needsPlan: true, steps: [{ botId: 'mimi', task: '策划' }, { botId: 'xiaoman', task: '设计' }] }),
+      workDir: fakeWorkDir(),
+      onStepSettled,
+    });
+    const groupId = await createGroup(harness);
+    const plan = await proposePlan(harness, groupId);
+    await harness.service.startPlan({ groupId, planId: plan.id });
+    await waitForIdle(harness, groupId);
+    await harness.service.continuePlan({ groupId, planId: plan.id });
+    await vi.waitFor(() => expect(harness.dispatches.at(-1)!.botId).toBe('xiaoman'));
+    const call = harness.dispatches.at(-1)!;
+    await harness.service.settleLaneTurn({ sessionId: call.sessionId, activeInputClientId: call.clientId, outcome: 'error', resultText: '' });
+    await waitForIdle(harness, groupId);
+    fail = false;
+    await harness.service.retryPlan({ groupId, planId: plan.id });
+    await waitForIdle(harness, groupId);
+    expect(onStepSettled.mock.calls.map(([event]) => [event.botName, event.task, event.outcome, event.planDone])).toEqual([
+      ['咪咪', '策划', 'done', false],
+      ['小满', '设计', 'failed', false],
+      ['小满', '设计', 'done', true],
+    ]);
+    expect(onStepSettled.mock.calls[0]![0]).toMatchObject({ groupId, groupName: '周末出游', planId: plan.id, position: 0 });
+    // The whole group, so the push can apply the phone's member-visibility rule.
+    expect([...onStepSettled.mock.calls[0]![0].memberBotIds].sort()).toEqual(['abu', 'mimi', 'xiaoman']);
+  });
+
   it('a plain message after a step asks the same Bot to redo it, and later steps read the new hand-off', async () => {
     const replies: Record<string, string[]> = { mimi: ['第一版', '第二版'], xiaoman: ['设计好了'] };
     const harness = createHarness((botId) => replies[botId]!.shift() ?? 'x', { decidePlan: async () => THREE_STEPS, workDir: fakeWorkDir() });
@@ -797,7 +978,7 @@ describe('botGroupChatService 分工', () => {
       .toEqual(['加上英文版了']);
   });
 
-  it('checks 「@所有人」 and mention-only groups too; only naming a Bot skips the check', async () => {
+  it('checks 「@所有人」 but leaves unaddressed messages idle in mention-only groups', async () => {
     const decidePlan = vi.fn(async (_input: PlanDecisionInput) => ({ needsPlan: false }) as PlanDecision);
     const harness = createHarness(() => 'NO_REPLY', { decidePlan });
     const groupId = await createGroup(harness);
@@ -808,8 +989,11 @@ describe('botGroupChatService 分工', () => {
     await harness.service.updateGroup({ groupId, replyMode: 'mentioned' });
     await harness.service.sendMessage({ groupId, text: '帮我做个海报', mentions: NONE, clientId: 'quiet' });
     await waitForIdle(harness, groupId);
-    expect(decidePlan).toHaveBeenCalledTimes(2);
+    expect(decidePlan).toHaveBeenCalledTimes(1);
     expect(harness.dispatches).toHaveLength(3);
+    await harness.service.sendMessage({ groupId, text: '帮我做个海报', mentions: NONE, clientId: 'explicit', division: true });
+    await waitForIdle(harness, groupId);
+    expect(decidePlan).toHaveBeenCalledTimes(2);
   });
 
   it('an explicit request whose chosen members all became unavailable says so', async () => {
@@ -979,7 +1163,7 @@ describe('botGroupChatService 分工', () => {
     const harness = createHarness(() => '好了', { decidePlan: async () => THREE_STEPS, workDir: fakeWorkDir() });
     const groupId = await createGroup(harness);
     h.sqlite!.exec(`
-      INSERT INTO bot_group_plans VALUES ('p-old', '${groupId}', 'running', '做个页面', 'mimi', '咪咪', 0, '/w', NULL, 1, 1);
+      INSERT INTO bot_group_plans VALUES ('p-old', '${groupId}', 'running', '做个页面', 'mimi', '咪咪', 0, '/w', NULL, 1, 1, '[]');
       INSERT INTO bot_group_plan_steps (plan_id, position, bot_id, bot_name, task, status) VALUES
         ('p-old', 0, 'mimi', '咪咪', '策划', 'running'), ('p-old', 1, 'abu', '阿布', '写代码', 'pending');
     `);
@@ -1025,7 +1209,7 @@ describe('分工 plan transactions', () => {
     h.sqlite = createDatabase();
     h.sqlite.exec(`
       INSERT INTO bot_groups (id, name, created_at, updated_at) VALUES ('g1', '官网', 1, 1);
-      INSERT INTO bot_group_plans VALUES ('p-run', 'g1', 'stopped', '做页面', 'mimi', '咪咪', 0, '/w', NULL, 1, 1);
+      INSERT INTO bot_group_plans VALUES ('p-run', 'g1', 'stopped', '做页面', 'mimi', '咪咪', 0, '/w', NULL, 1, 1, '[]');
       INSERT INTO bot_group_plan_steps (plan_id, position, bot_id, bot_name, task, status) VALUES ('p-run', 0, 'mimi', '咪咪', '策划', 'running');
     `);
   });
@@ -1112,5 +1296,234 @@ describe('分工 decision and step brief', () => {
     expect(brief).toContain('did not finish');
     expect(brief).not.toContain('never push');
     expect(brief.match(/<\/untrusted-data>/g)).toHaveLength(4);
+  });
+});
+
+/** Stands in for the attachment store: images get a media address, files keep their path. */
+function fakeAttachments() {
+  const commit = vi.fn();
+  const discard = vi.fn(async () => undefined);
+  const prepare = vi.fn(async (input: { attachments: readonly unknown[] }) => ({
+    ok: true as const,
+    attachments: input.attachments.map((value): BotGroupAttachment => {
+      const { id, name } = value as { id: string; name: string };
+      const image = name.endsWith('.png');
+      return {
+        id,
+        name,
+        category: image ? 'image' : 'file',
+        mimeType: image ? 'image/png' : 'application/pdf',
+        size: 1,
+        url: image ? `cindy-media://blobs/${'a'.repeat(64)}.png` : null,
+        path: image ? null : `/files/${name}`,
+      };
+    }),
+    commit,
+    discard,
+  }));
+  return { prepare, commit, discard };
+}
+
+const attach = (...names: string[]) =>
+  names.map((name) => ({ id: `att-${name}`, name, path: `/files/${name}`, category: 'file', mimeType: 'application/pdf' }));
+
+describe('botGroupChatService attachments', () => {
+  beforeEach(() => {
+    h.sqlite = createDatabase();
+  });
+
+  afterEach(() => {
+    h.sqlite?.close();
+  });
+
+  it('keeps attachments with the message and hands them once to every member', async () => {
+    const store = fakeAttachments();
+    const harness = createHarness(() => '看到了', { prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+    const sent = await harness.service.sendMessage({
+      groupId, text: '看看这个', mentions: NONE, clientId: 'c1', attachments: attach('photo.png', '需求.pdf'),
+    });
+    expect(sent.ok).toBe(true);
+    const group = await waitForIdle(harness, groupId);
+
+    expect(group.messages[0]).toMatchObject({ content: '看看这个', attachments: [{ name: 'photo.png', category: 'image' }, { name: '需求.pdf', path: '/files/需求.pdf' }] });
+    expect(store.commit).toHaveBeenCalledOnce();
+    expect(store.discard).not.toHaveBeenCalled();
+    const first = new Map<string, (typeof harness.dispatches)[number]>();
+    for (const call of harness.dispatches) if (!first.has(call.botId)) first.set(call.botId, call);
+    expect([...first.keys()].sort()).toEqual(['abu', 'mimi', 'xiaoman']);
+    for (const call of first.values()) {
+      expect(call.attachments).toEqual(['photo.png', '需求.pdf']);
+      expect(call.prompt).toContain('Attachments listed with a message come with this turn.');
+    }
+    // A member's later turns in the round deliver only what it has not seen.
+    const later = harness.dispatches.filter((call) => !Array.from(first.values()).includes(call));
+    for (const call of later) expect(call.attachments).toEqual([]);
+  });
+
+  it('posts an attachment-only message and refuses what it cannot keep', async () => {
+    const store = fakeAttachments();
+    const harness = createHarness(() => 'NO_REPLY', { prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+
+    expect(await harness.service.sendMessage({ groupId, text: '', mentions: NONE, clientId: 'c1', attachments: attach('photo.png') }))
+      .toMatchObject({ ok: true });
+    expect(await harness.service.sendMessage({ groupId, text: '  ', mentions: NONE, clientId: 'c2' }))
+      .toMatchObject({ ok: false, errorCode: 'INVALID_PARAMS' });
+    const tooMany = Array.from({ length: 21 }, (_, index) => `f${index}.pdf`);
+    expect(await harness.service.sendMessage({ groupId, text: 'x', mentions: NONE, clientId: 'c3', attachments: attach(...tooMany) }))
+      .toMatchObject({ ok: false, errorCode: 'INVALID_PARAMS' });
+    expect(await harness.service.sendMessage({ groupId, text: 'x', mentions: NONE, clientId: 'c4', attachments: 'nope' }))
+      .toMatchObject({ ok: false, errorCode: 'INVALID_PARAMS' });
+    expect(store.prepare).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports why attachments were refused, and refuses them where nothing can keep them', async () => {
+    const refused = createHarness(() => 'x', {
+      prepareAttachments: async () => ({ ok: false, errorCode: 'INVALID_PARAMS', message: 'FILE_PEER_DENIED' }),
+    });
+    const other = await createGroup(refused);
+    expect(await refused.service.sendMessage({ groupId: other, text: 'x', mentions: NONE, clientId: 'c1', attachments: attach('a.pdf') }))
+      .toMatchObject({ ok: false, message: 'FILE_PEER_DENIED' });
+    expect((await detailOf(refused, other)).messages).toHaveLength(0);
+    h.sqlite?.close();
+    h.sqlite = createDatabase();
+    const unsupported = createHarness(() => 'x');
+    const third = await createGroup(unsupported);
+    expect(await unsupported.service.sendMessage({ groupId: third, text: 'x', mentions: NONE, clientId: 'c1', attachments: attach('a.pdf') }))
+      .toMatchObject({ ok: false, errorCode: 'INVALID_PARAMS' });
+  });
+
+  it('never stores a resend again and undoes a batch that was not posted', async () => {
+    const store = fakeAttachments();
+    const harness = createHarness(() => 'NO_REPLY', { prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+    const first = await harness.service.sendMessage({ groupId, text: 'x', mentions: NONE, clientId: 'same', attachments: attach('a.pdf') });
+    const again = await harness.service.sendMessage({ groupId, text: 'x', mentions: NONE, clientId: 'same', attachments: attach('a.pdf') });
+    expect(again).toEqual(first);
+    expect(store.prepare).toHaveBeenCalledTimes(1);
+
+    expect(await harness.service.sendMessage({ groupId: 'missing', text: 'x', mentions: NONE, clientId: 'c9', attachments: attach('b.pdf') }))
+      .toMatchObject({ ok: false, errorCode: 'NOT_FOUND' });
+    expect(store.discard).toHaveBeenCalledOnce();
+    expect(store.commit).toHaveBeenCalledOnce();
+  });
+
+  it('deleting the group releases its attachment references in the same transaction, and only those', async () => {
+    const harness = createHarness(() => 'x');
+    const groupId = await createGroup(harness);
+    h.sqlite!.exec(`
+      CREATE TABLE media_refs (id TEXT PRIMARY KEY, hash TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_id TEXT NOT NULL);
+      INSERT INTO media_refs VALUES
+        ('r1', 'h1', 'bot-group-attachment', '${groupId}'),
+        ('r2', 'h1', 'session-attachment', 'lane-mimi'),
+        ('r3', 'h2', 'bot-group-attachment', 'another-group');
+    `);
+    expect(await harness.service.deleteGroup(groupId)).toEqual({ ok: true });
+    expect(h.sqlite!.prepare('SELECT id FROM media_refs ORDER BY id').all()).toEqual([{ id: 'r2' }, { id: 'r3' }]);
+  });
+
+  it('undoes a batch whose account changed or whose send broke before it was posted', async () => {
+    const store = fakeAttachments();
+    let switched = false;
+    const harness = createHarness(() => 'x', {
+      prepareAttachments: async (input) => {
+        const result = await store.prepare(input);
+        switched = true;
+        return result;
+      },
+      captureOwnerScope: () => ({ owner: 'a' }) as never,
+      isOwnerScopeCurrent: () => !switched,
+    });
+    const groupId = await createGroup(harness);
+    expect(await harness.service.sendMessage({ groupId, text: 'x', mentions: NONE, clientId: 'c1', attachments: attach('a.pdf') }))
+      .toMatchObject({ ok: false });
+    expect(store.discard).toHaveBeenCalledTimes(1);
+    expect(store.commit).not.toHaveBeenCalled();
+
+    switched = false;
+    const broken = fakeAttachments();
+    h.sqlite?.close();
+    h.sqlite = createDatabase();
+    const other = createHarness(() => 'x', { prepareAttachments: broken.prepare });
+    const otherGroup = await createGroup(other);
+    h.sqlite!.exec('DROP TABLE bot_group_members');
+    await expect(other.service.sendMessage({ groupId: otherGroup, text: 'x', mentions: NONE, clientId: 'c2', attachments: attach('b.pdf') }))
+      .rejects.toThrow();
+    expect(broken.discard).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands over the attachments of unseen messages left out of the prompt, newest first when too many', async () => {
+    const store = fakeAttachments();
+    const harness = createHarness(() => '收到', { prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+    await harness.service.updateGroup({ groupId, replyMode: 'mentioned' });
+    for (let index = 0; index < 45; index += 1) {
+      await harness.service.sendMessage({ groupId, text: `第${index}条`, mentions: NONE, clientId: `m${index}`, attachments: attach(`f${index}.pdf`) });
+    }
+    expect(harness.dispatches).toHaveLength(0);
+    await harness.service.sendMessage({ groupId, text: '@咪咪 都看看', mentions: { all: false, botIds: ['mimi'] }, clientId: 'ask' });
+    await waitForIdle(harness, groupId);
+    const turn = harness.dispatches[0]!;
+    expect(turn.attachments).toEqual(Array.from({ length: 40 }, (_, index) => `f${index + 5}.pdf`));
+    expect(turn.prompt).toContain('The omitted earlier messages carried these attachments');
+    expect(turn.prompt).toContain('f15.pdf');
+    expect(turn.prompt).not.toContain('f4.pdf');
+    expect(turn.prompt).toContain('(5 older attachments are not included');
+  });
+
+  it('keeps what the user added to a step that then failed for its retry', async () => {
+    const store = fakeAttachments();
+    let first = true;
+    const harness = createHarness((botId) => {
+      if (botId === 'mimi' && first) {
+        first = false;
+        return null;
+      }
+      return '好了';
+    }, { decidePlan: async () => THREE_STEPS, workDir: fakeWorkDir(), prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+    const plan = await proposePlan(harness, groupId);
+    await harness.service.startPlan({ groupId, planId: plan.id });
+    await vi.waitFor(() => expect(harness.dispatches.at(-1)?.botId).toBe('mimi'));
+    const running = harness.dispatches.at(-1)!;
+    await harness.service.sendMessage({ groupId, text: '参考这份', mentions: NONE, clientId: 'note', attachments: attach('参考.pdf') });
+    await harness.service.settleLaneTurn({ sessionId: running.sessionId, activeInputClientId: running.clientId, outcome: 'error', resultText: '' });
+    let group = await waitForIdle(harness, groupId);
+    expect(openPlan(group).steps[0]!.status).toBe('failed');
+
+    await harness.service.retryPlan({ groupId, planId: plan.id });
+    group = await waitForIdle(harness, groupId);
+    const retry = harness.dispatches.at(-1)!;
+    expect(retry).toMatchObject({ botId: 'mimi', attachments: ['参考.pdf'] });
+    expect(retry.prompt).toContain('参考这份');
+    expect(openPlan(group).steps[0]!.status).toBe('done');
+  });
+
+  it('gives every 分工 step the request attachments, and a redo only the new ones', async () => {
+    const store = fakeAttachments();
+    const decidePlan = vi.fn(async (_input: PlanDecisionInput) => THREE_STEPS);
+    const harness = createHarness(() => '做好了', { decidePlan, workDir: fakeWorkDir(), prepareAttachments: store.prepare });
+    const groupId = await createGroup(harness);
+    await harness.service.sendMessage({ groupId, text: '照这个做介绍页', mentions: NONE, clientId: 'req', attachments: attach('需求.pdf') });
+    const plan = openPlan(await waitForIdle(harness, groupId));
+    expect(decidePlan.mock.calls[0]![0].requestAttachments).toEqual(['需求.pdf']);
+
+    await harness.service.startPlan({ groupId, planId: plan.id });
+    await waitForIdle(harness, groupId);
+    const step1 = harness.dispatches.at(-1)!;
+    expect(step1).toMatchObject({ botId: 'mimi', attachments: ['需求.pdf'] });
+    expect(step1.prompt).toContain('they come with this message');
+
+    await harness.service.sendMessage({ groupId, text: '参考这张', mentions: NONE, clientId: 'redo', attachments: attach('草图.png') });
+    await waitForIdle(harness, groupId);
+    const redo = harness.dispatches.at(-1)!;
+    expect(redo).toMatchObject({ botId: 'mimi', attachments: ['草图.png'] });
+    expect(redo.prompt).toContain('they came with your first message for this step');
+    expect(redo.prompt).toContain('With these attachments');
+
+    await harness.service.continuePlan({ groupId, planId: plan.id });
+    await waitForIdle(harness, groupId);
+    expect(harness.dispatches.at(-1)).toMatchObject({ botId: 'xiaoman', attachments: ['需求.pdf'] });
   });
 });

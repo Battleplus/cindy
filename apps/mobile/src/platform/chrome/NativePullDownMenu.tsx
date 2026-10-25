@@ -1,5 +1,6 @@
 import { MenuView, type MenuAction } from "@react-native-menu/menu";
 import { cloneElement, isValidElement, type ReactNode } from "react";
+import type { LucideIcon } from "lucide-react-native";
 import {
   NativeModules,
   Platform,
@@ -16,6 +17,8 @@ export type NativePullDownAction = {
   displayInline?: boolean;
   id: string;
   image?: MenuAction["image"];
+  /** 与 iOS image 对应的跨平台菜单图标。 */
+  icon?: LucideIcon;
   keepPresented?: boolean;
   preferredElementSize?: "small" | "medium" | "large";
   state?: "on" | "off" | "mixed";
@@ -28,7 +31,7 @@ let nativePullDownAvailable: boolean | null = null;
 
 /**
  * 是否用「贴着触发控件弹出」的菜单:iOS 在包里编进 MenuView 时用系统 UIMenu(没冷更前
- * 自动退回调用方的自绘面板);Android 始终用 Cindy 自绘的 AnchoredPullDownMenu。
+ * 自动退回调用方的自绘面板);Android 用 Compose DropdownMenu 的平台实现。
  */
 export function usesNativePullDownMenu(): boolean {
   if (Platform.OS === "android") return true;
@@ -101,8 +104,8 @@ function childDisabled(children: ReactNode): boolean {
 }
 
 /**
- * 收起时完全是调用方原来的按钮/标题;iOS 点开是系统 UIMenu 下拉,Android 是 Cindy 自绘
- * 的同交互菜单(AnchoredPullDownMenu)。iOS 尚未编进 MenuView 的包只渲染 children,
+ * 收起时完全是调用方原来的按钮/标题;iOS 点开是系统 UIMenu 下拉,Android 是 Material
+ * 下拉菜单(AnchoredPullDownMenu.android)。iOS 尚未编进 MenuView 的包只渲染 children,
  * 由调用方继续走自绘面板。
  */
 export function NativePullDownMenu({
@@ -112,6 +115,7 @@ export function NativePullDownMenu({
   disabled = false,
   longPress = false,
   onAction,
+  onPress,
   style,
   testID,
 }: {
@@ -123,6 +127,11 @@ export function NativePullDownMenu({
   disabled?: boolean;
   longPress?: boolean;
   onAction(id: string): void;
+  /**
+   * longPress 时的短按动作。Android 触发器接管整块触摸，子元素的点按收不到，必须经这里转发；
+   * iOS 系统菜单只拦长按，短按仍交给子元素，这里不重复调用。
+   */
+  onPress?(): void;
   /**
    * 菜单外层在父布局里的样式。外层替代子元素成为父布局的直接子节点,子元素原本
    * 依赖父布局的样式(如 flex: 1 占满标题区)要同时交给这里。
@@ -146,6 +155,7 @@ export function NativePullDownMenu({
         actions={actions}
         longPress={longPress}
         onAction={onAction}
+        onPress={onPress}
         style={style}
         testID={testID}
       >

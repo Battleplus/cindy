@@ -195,18 +195,39 @@ describe('createMobileLocalAttachmentUploadController', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('reclaims an upload arriving after the total deadline without publishing it', async () => {
+  it('does not apply the total deadline while a large upload is transferring', async () => {
     vi.useFakeTimers();
     try {
       const gate = gatedUpload();
-      const { deps, uploaded, discarded } = makeDeps({ upload: gate.upload });
+      const { deps, uploaded, failed } = makeDeps({ upload: gate.upload });
       const controller = createMobileLocalAttachmentUploadController(deps);
       controller.enqueue([candidate('a.jpg')], { token: 't' });
+      // 传输层自己按无进度判超时;这里跨过多个 180 秒窗口仍在上传。
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(gate.inFlight()).toEqual(['a.jpg']);
+      expect(failed).toEqual([]);
+      gate.release('a.jpg');
+      expect(await controller.waitForIdle()).toEqual({ failedCount: 0 });
+      expect(uploaded).toHaveLength(1);
+      controller.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('re-arms the deadline after upload and reclaims the attachment when delivery never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const gate = gatedUpload();
+      const { deps, discarded, failed } = makeDeps({
+        upload: gate.upload,
+        onUploaded: () => new Promise<void>(() => {}),
+      });
+      const controller = createMobileLocalAttachmentUploadController(deps);
+      controller.enqueue([candidate('a.jpg')], { token: 't' });
+      await vi.advanceTimersByTimeAsync(600_000);
+      gate.release('a.jpg');
       await vi.advanceTimersByTimeAsync(180_000);
       expect(await controller.waitForIdle()).toEqual({ failedCount: 1 });
-      gate.release('a.jpg');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(uploaded).toEqual([]);
+      expect(failed).toHaveLength(1);
       expect(discarded).toEqual([attachmentFor('a.jpg')]);
       controller.dispose();
     } finally { vi.useRealTimers(); }
@@ -247,6 +268,59 @@ describe('createMobileLocalAttachmentUploadController', () => {
     // (发送后气泡的本地缩略兜底用它)。
     expect(uploaded[0]?.candidate.uri).toBe('file:///tmp/a.jpg');
     expect(uploaded[0]?.uploadedUri).toBe('file:///tmp/downsampled.jpg');
+  });
+
+  // Regression: the picker returns a tiny thumbnail before resolving the original.
+  // Existing tests only checked onUploaded; unit coverage must observe the preview
+  // while preprocessing/PUT are still pending, and after failure recycles that file.
+  it('upgrades the pending preview before upload and drops recycled originals on retry', async () => {
+    const gate = gatedUpload();
+    let finishResolve!: (value: { uri: string }) => void;
+    let finishPreprocess!: (value: { uri: string; name: string; size: number }) => void;
+    const cleaned: string[] = [];
+    const { deps, pendingSnapshots } = makeDeps({
+      upload: gate.upload,
+      preprocess: () => new Promise((resolve) => { finishPreprocess = resolve; }),
+    });
+    const controller = createMobileLocalAttachmentUploadController(deps);
+    const latest = () => pendingSnapshots.at(-1)![0]!;
+    controller.enqueue([{
+      ...candidate('photo.jpg'),
+      uri: 'data:image/jpeg;base64,tiny-thumbnail',
+      resolve: () => new Promise((resolve) => { finishResolve = resolve; }),
+      cleanupLocalUris: async (uris) => { cleaned.push(...uris); },
+    }], { token: 't' });
+    const initial = latest();
+    try {
+      await flush();
+      expect(latest().previewUri).toBe(initial.previewUri);
+      finishResolve({ uri: 'file:///original.jpg' });
+      await flush();
+      expect(latest().previewUri).toBe('file:///original.jpg');
+      expect(latest().localId).toBe(initial.localId);
+      expect(gate.inFlight()).toEqual([]);
+      finishPreprocess({ uri: 'file:///encoded.jpg', name: 'photo.jpg', size: 500_000 });
+      await flush();
+      expect(gate.inFlight()).toEqual(['photo.jpg']);
+      expect(latest().previewUri).toBe('file:///original.jpg');
+      gate.fail('photo.jpg');
+      await controller.waitForIdle();
+      expect(cleaned).toContain('file:///original.jpg');
+      expect(latest()).toMatchObject({ previewUri: initial.previewUri, failed: true });
+      controller.retry(initial.localId, { token: 't2' });
+      await flush();
+      expect(latest().previewUri).toBe(initial.previewUri);
+      finishResolve({ uri: 'file:///retry-original.jpg' });
+      await flush();
+      expect(latest().previewUri).toBe('file:///retry-original.jpg');
+      finishPreprocess({ uri: 'file:///retry-encoded.jpg', name: 'photo.jpg', size: 500_000 });
+      await flush();
+      gate.release('photo.jpg');
+      expect(await controller.waitForIdle()).toEqual({ failedCount: 0 });
+    } finally {
+      controller.dispose();
+      finishPreprocess?.({ uri: 'file:///cleanup.jpg', name: 'photo.jpg', size: 500_000 });
+    }
   });
 
   it('resolve 型任务:onUploaded 回传就位后的 candidate,保留来源与 composer 代际', async () => {
