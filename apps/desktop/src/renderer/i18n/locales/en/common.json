@@ -12665,6 +12665,19 @@
     }
   },
   "ccAgent": {
+    "contextWindowBudget": {
+      "menuTitle": "Task context window",
+      "triggerLabel": "Task context window, currently {{window}}",
+      "menuHint": "Affects this task only. Applies from the next message.",
+      "optionDefault": "Model default",
+      "optionPercent": "{{percent}}%",
+      "inputPrice": "input {{price}}/M",
+      "remoteUnsupported": "The controlled device does not support changing this task's context window",
+      "remoteTightenOnly": "The controlled device ceiling is unavailable, so only smaller tiers are offered here.",
+      "readOnlyHint": "Read-only task: you can review the tiers and price bands, but not change them.",
+      "shrinkWarning": "{{used}} already in use — a smaller window compacts or rolls over first.",
+      "saveFailed": "Failed to save the context window tier"
+    },
     "agentStatus": {
       "readingMemory": "Reading memory…",
       "savingMemory": "Saving memory…",
@@ -13212,7 +13225,7 @@
         "unarchiveAll": "Restore all",
         "openInExplorer": "Open in file manager",
         "newInDirectory": "New session in this directory",
-        "copyDeepLink": "Copy deep link",
+        "copyDeepLink": "Copy Project Link",
         "syncCodex": "Sync Codex sessions for this project",
         "syncCodexDone": "Codex sync complete: {{inserted}} linked, {{updated}} updated",
         "syncCodexAlreadyLinked": "Codex sessions for this project are already linked",
@@ -13221,7 +13234,7 @@
         "search": "Search sessions in this project"
       },
       "deepLink": {
-        "copied": "Deep link copied",
+        "copied": "Link copied",
         "copyFailed": "Copy failed, please copy manually",
         "projectNotFound": "Project not found — it may have been archived or doesn't exist on this device"
       },

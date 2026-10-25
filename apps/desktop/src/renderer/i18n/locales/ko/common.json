@@ -12611,6 +12611,19 @@
     }
   },
   "ccAgent": {
+    "contextWindowBudget": {
+      "menuTitle": "이 작업의 컨텍스트 창",
+      "triggerLabel": "작업 컨텍스트 창, 현재 {{window}}",
+      "menuHint": "이 작업에만 적용됩니다. 다음 메시지부터 적용됩니다.",
+      "optionDefault": "모델 기본값",
+      "optionPercent": "{{percent}}%",
+      "inputPrice": "입력 {{price}}/M",
+      "remoteUnsupported": "피제어 기기 버전에서는 이 작업의 컨텍스트 창을 변경할 수 없습니다",
+      "remoteTightenOnly": "피제어 기기 상한을 읽을 수 없어 축소 방향만 제공합니다.",
+      "readOnlyHint": "읽기 전용 작업입니다. 단계와 요금 구간은 볼 수 있지만 변경할 수는 없습니다.",
+      "shrinkWarning": "현재 {{used}} 사용 중 — 더 작은 창은 먼저 압축하거나 새 창으로 전환합니다.",
+      "saveFailed": "컨텍스트 창 저장에 실패했습니다"
+    },
     "agentStatus": {
       "readingMemory": "기억을 읽고 있어요…",
       "savingMemory": "기억을 저장하고 있어요…",
@@ -13163,11 +13176,11 @@
         "unarchiveAll": "모두 보관 해제",
         "openInExplorer": "파일 관리자에서 열기",
         "newInDirectory": "이 디렉터리에서 새 세션",
-        "copyDeepLink": "딥 링크 복사",
+        "copyDeepLink": "프로젝트 링크 복사",
         "search": "이 프로젝트에서 세션 검색"
       },
       "deepLink": {
-        "copied": "딥 링크가 복사되었습니다",
+        "copied": "링크를 복사했습니다",
         "copyFailed": "복사에 실패했습니다. 수동으로 복사해주세요",
         "projectNotFound": "해당 프로젝트를 찾을 수 없습니다. 보관되었거나 이 기기에 없을 수 있습니다"
       },
