@@ -8,7 +8,7 @@ import { registerFilePeerIpc } from './device-link/filePeer';
 import { registerTaskMigrationIpc } from './task-migration/service';
 import { registerLoginItemIpc } from './login-item-ipc.js';
 import { registerMenubarIpc } from './menubar/ipc.js';
-import { initMenubarService, refreshMenubarLocalization, stopMenubarService } from './menubar/service.js';
+import { initMenubarService, refreshMenubarControlState, refreshMenubarLocalization, stopMenubarService } from './menubar/service.js';
 import {
   createLatestSourceVersionReader,
   sourceChannel,
@@ -848,7 +848,8 @@ import {
   resetImDefaultSettingsChannel,
   writeImDefaultSettingsPatch,
 } from './im/defaultSettingsStore.js';
-import { readImDefaultSettingsFingerprint } from './im/defaultSessionSettings.js';
+import { readImDefaultSettingsFingerprint, projectImDefaultSettings } from './im/defaultSessionSettings.js';
+import { usesAutomaticImModel } from '../shared/imAutomaticModel.js';
 import { fingerprintImDefaultSettings } from './im/shared/channelDefaultRoute.js';
 import { IM_DEFAULT_SETTINGS } from '../shared/imDefaultSettings.js';
 import { assertOwnerScopeSettledForWrite } from './im/ownerScopedStorage.js';
@@ -7529,7 +7530,7 @@ const registerIpcHandlers = () => {
     'fs:resolve-path',
     async (
       _event: Electron.IpcMainInvokeEvent,
-      params: { href: string; workingDir: string },
+      params: { href: string; workingDir: string; refresh?: boolean },
     ): Promise<{
       status: 'unique' | 'multiple' | 'none';
       candidates: string[];
@@ -7538,6 +7539,7 @@ const registerIpcHandlers = () => {
       try {
         return await resolveWorkspacePathCached(params.href, params.workingDir, {
           isPathAllowed,
+          refresh: params.refresh === true,
         });
       } catch (err) {
         console.error('[fs:resolve-path] failed:', err);
@@ -9924,6 +9926,7 @@ app.on('ready', async () => {
   // 设备互联(跨设备远程控制):登录后连 relay,登出即断;开关与设备列表 IPC 一并注册
   let updateRelaunchRemoteBusy = false;
   initDeviceLinkService({
+    onControlledStateChanged: refreshMenubarControlState,
     onUpdateRelaunchBusyChanged: (busy) => {
       const transition = decideUpdateRelaunchBusyTransition(updateRelaunchRemoteBusy, busy);
       updateRelaunchRemoteBusy = transition.nextBusy;
@@ -10479,10 +10482,17 @@ function memorySettingsWire() {
   };
 }
 
-function imDefaultSettingsWire(channel?: ImDefaultSettingsChannel) {
+async function imDefaultSettingsWire(channel?: ImDefaultSettingsChannel) {
+  const ownerGeneration = getActiveAppSession().generation;
   const state = readImDefaultSettingsState(channel);
+  const automaticModel = usesAutomaticImModel(state.value);
+  const value = await projectImDefaultSettings(state.value, channel);
+  if (isAppSessionBoundaryPending() || getActiveAppSession().generation !== ownerGeneration) {
+    throwIpcError('INTERNAL', 'IM settings owner changed; retry loading settings');
+  }
   return {
-    ...state.value,
+    ...value,
+    automaticModel,
     isCustomized: state.isCustomized,
     customizedKeys: state.customizedKeys,
     defaults: state.defaults,
