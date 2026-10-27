@@ -1387,7 +1387,7 @@ export function createBotDelegationService(deps: BotDelegationServiceDeps) {
         // A group lane is a live requester only for the task it started (bot-group-chat.md §10);
         // the lane is never woken by this service, its group gets the messages instead.
         // A private-chat topic gets the results of the tasks started in it (cindy-bots-runtime.md).
-        && (parent.role === 'canonical' || parent.role === 'thread' || parent.role === 'delegation' || parent.role === 'group')
+        && (parent.role === 'canonical' || parent.role === 'thread' || parent.role === 'routine' || parent.role === 'delegation' || parent.role === 'group')
       );
     };
     if (parentSessionId && (await liveRequesterTask(parentSessionId))) return parentSessionId;
@@ -1602,7 +1602,7 @@ export function createBotDelegationService(deps: BotDelegationServiceDeps) {
       || link.sessionSource !== 'bot'
       || link.profileStatus !== 'active'
       || link.linkArchivedAt !== null
-      || !['canonical', 'thread', 'delegation', 'group'].includes(link.role)
+      || !['canonical', 'thread', 'routine', 'delegation', 'group'].includes(link.role)
     ) return null;
     // Delegating full independent work is an owner action, not a guest tool grant.
     const group = link.role === 'group' && !ownerUi
@@ -2810,7 +2810,7 @@ export function createBotDelegationService(deps: BotDelegationServiceDeps) {
       || caller.sessionSource !== 'bot'
       || (caller.sessionStatus !== 'active' && caller.sessionStatus !== 'archived')
       || caller.profileStatus === 'deleting'
-      || !['canonical', 'history', 'thread', 'delegation', 'group'].includes(caller.role)) {
+      || !['canonical', 'history', 'thread', 'routine', 'delegation', 'group'].includes(caller.role)) {
       return { ok: false, errorCode: 'NOT_A_BOT_SESSION', message: '当前任务不属于任何伙伴' };
     }
     const db = getDbClient().drizzle;

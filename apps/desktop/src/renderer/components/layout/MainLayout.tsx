@@ -719,6 +719,7 @@ export function MainLayout() {
         | { type: 'chat-invite'; token: string }
         | { type: 'chat-invite-malformed' }
         | { type: 'provider-share-join'; link: string }
+        | { type: 'plugin'; pluginId: string }
         | { type: 'settings'; tab: 'voice-input' | 'providers' | 'billing' | 'remote-control'; connect?: string; intent?: 'topup' },
     ) => {
       if (payload.type === 'chat-message') {
@@ -742,6 +743,10 @@ export function MainLayout() {
       }
       if (payload.type === 'shared-task-join') {
         setSharedTaskInvitation({ link: buildSharedTaskInvitationLink(payload.invitation, payload.server), id: ++invitationSequence.current });
+        return;
+      }
+      if (payload.type === 'plugin') {
+        navigate(`/plugins?market=${encodeURIComponent(payload.pluginId)}`);
         return;
       }
       if (payload.type === 'session') {
@@ -804,11 +809,11 @@ export function MainLayout() {
         void pullChatInvitations();
         return;
       }
-      if (payload.type !== 'provider-import' && payload.type !== 'shared-task-join' && payload.type !== 'provider-share-join') {
+      if (payload.type !== 'provider-import' && payload.type !== 'shared-task-join' && payload.type !== 'provider-share-join' && payload.type !== 'plugin') {
         handleDeepLinkPayload(payload);
         return;
       }
-      // Main retains imports through login. Both this wake-up and the mount pull
+      // Main retains these intents through login. Both this wake-up and the mount pull
       // use the same atomic take, so either ordering navigates only once.
       void pullChatInvitations();
     });
@@ -1851,7 +1856,12 @@ export function MainLayout() {
           {/* 面板稳态宽度由 LayoutRoot 输出 CSS 百分比/clamp，BrowserWindow live resize
               不再逐像素回灌 React；设置页接管时非 chat 面板统一歇业。 */}
           <TabGroupHostProvider value={tabGroupHost}>
-            <LayoutRoot suppressNonChatPanels={isSettingsRoute} />
+            <LayoutRoot
+              suppressNonChatPanels={isSettingsRoute}
+              rightTabsCollapsed={
+                !rightSidebarMounted || isRightSidebarCollapsed || rightSidebarForceCollapsed
+              }
+            />
           </TabGroupHostProvider>
         </BuiltinPanelBridgeProvider>
         {/* 拖面板换位(B3 转正;M3 起 mac 同步开闸——mac 顶栏全部保留窗口拖拽,

@@ -679,6 +679,23 @@ describe('production Session event pipeline', () => {
     } finally { close(); await h.dispose(); }
   });
 
+  it('shows the accepted owner reply during a quiet run without changing scheduler attribution', async () => {
+    const h = harness();
+    const close = beginQuietScheduledOutput('check', 'owner-steer-run');
+    const origin = { kind: 'scheduler' as const, scheduleId: 'check', scheduleName: 'Check', runId: 'owner-steer-run' };
+    const ownerAuthored = vi.fn(() => false);
+    Object.assign(h.deps.agentInputCoordinatorHolder, { isActiveInputOwnerAuthored: ownerAuthored });
+    try {
+      h.emit(event('text', { text: 'Background preamble' }, { turnOrigin: origin }));
+      expect(effects.fn('onAssistantTextEvent')).not.toHaveBeenCalled();
+      ownerAuthored.mockReturnValue(true);
+      h.emit(event('text', { text: 'Here is the progress', isFinal: true }, { turnOrigin: origin }));
+      expect(effects.fn('onAssistantTextEvent')).toHaveBeenCalledOnce();
+      expect(JSON.stringify(h.deps.broadcastToAllWindows.mock.calls)).toContain('owner-steer-run');
+      expect(origin.kind).toBe('scheduler');
+    } finally { close(); await h.dispose(); }
+  });
+
   it('keeps redacted terminal fields redacted for quiet scheduler output', async () => {
     const h = harness();
     const close = beginQuietScheduledOutput('check', 'redaction-run');
@@ -1555,7 +1572,11 @@ describe('provider turn observer on real Session.send', () => {
     } finally { unsubscribe(); dispose(); await h.dispose(); }
   });
 
-  it('announces a harness wake-up as a provider-wake channel turn before its first event', async () => {
+  it.each([
+    [undefined, 'provider-wake-local'],
+    [{ kind: 'user' as const, surface: 'im' as const }, 'provider-wake'],
+    [{ kind: 'scheduler' as const, scheduleId: 'hook:slack', surface: 'im' as const }, 'provider-wake'],
+  ])('inherits the dispatched origin %j when announcing a harness wake-up', async (origin, expectedSource) => {
     const pushed: Array<AgentEvent | null> = [];
     let wake: (() => void) | null = null;
     let running = false;
@@ -1592,12 +1613,12 @@ describe('provider turn observer on real Session.send', () => {
     });
     const off = session.onEvent((value) => order.push(value.type));
     try {
-      await session.send('typed on desktop');
+      await session.send('launch background work', { origin });
       await emit(event('text', { text: 'launched agents' }));
       await emit(event('done'));
       await emit(event('text', { text: 'agent result' }));
       await emit(event('done'));
-      expect(order).toEqual(['starting:none', 'text', 'done', 'starting:provider-wake', 'text', 'done']);
+      expect(order).toEqual(['starting:none', 'text', 'done', `starting:${expectedSource}`, 'text', 'done']);
     } finally { off(); unsubscribe(); dispose(); await session.close(); }
   });
 

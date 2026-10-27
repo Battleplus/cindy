@@ -682,6 +682,15 @@ async function stopCurrentClient(opts: StopOptions): Promise<void> {
 async function announceLifecycle(phase: 'online' | 'offline'): Promise<void> {
   const log = getLog();
 
+  // A shared-profile preview owns only its local socket, not the bot's presence.
+  // Do not create an offline-history warning or persist a user preference here.
+  if (getScope().shouldAnnounceLifecycle?.() === false) {
+    log.info(
+      `[feishu/wsClient] announceLifecycle ${phase}: suppressed for secondary instance`,
+    );
+    return;
+  }
+
   const owner = ownerGuard.firstAllowed();
   if (!owner) {
     log.info(`[feishu/wsClient] announceLifecycle ${phase}: no owner whitelisted, skip`);
