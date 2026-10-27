@@ -594,6 +594,39 @@ describe('device-link 远程交互往返 — permission', () => {
     expect(makerChatStore.getSnapshot(s).pendingPermission?.submitting).toBeFalsy();
   });
 
+  it('提交中的队首被后到的并行请求顶替后，A 的失败回执不会把它拉回队首', async () => {
+    const s = openRemoteSession();
+    let rejectReceipt!: (error: Error) => void;
+    host.invoke.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectReceipt = reject; }));
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'superseded-head-a', toolName: 'Read',
+      input: { file_path: '/a.txt' },
+    });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('superseded-head-a');
+
+    // 用户对 A 作答、回执尚未落地：A 处于 submitting。
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.submitting).toBe(true);
+
+    // 并行请求 B 这时到达：按既有语义顶替 A 成为队首（用户对 A 的回执竞赛已输），
+    // 但队列不会留下已作答的 A —— 否则用户会再次看到自己刚回答过的卡片。
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'superseding-b', toolName: 'Read',
+      input: { file_path: '/b.txt' },
+    });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('superseding-b');
+    expect(makerChatStore.getSnapshot(s).pendingPermissionQueue.map((i) => i.requestId)).toEqual([]);
+
+    // A 的回执随后失败：不能把已经顶替掉的 A 重新拉回队首、把 B 挤下去。
+    rejectReceipt(new Error('receipt lost'));
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('superseding-b');
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.submitting).toBeFalsy();
+  });
+
   it('排队中的权限保留 IM 来源说明与自动审批故障原因', async () => {
     const s = openRemoteSession();
     host.hostInteraction(s, {

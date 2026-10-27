@@ -6834,33 +6834,23 @@ export function handleStreamEvent(
       }
       // A newer request supersedes a card whose decision is in flight: that
       // receipt race is already lost, so the newest authoritative request takes
-      // the head (upstream semantics — a failure snapshot must not resurrect it).
+      // the head. The superseded card is not requeued — it was already answered,
+      // and anything the Host still holds surface again through the pending
+      // interaction snapshot read below the failed receipt.
       if (state.pendingPermission?.submitting) {
         return { ...state, pendingPermission: permission };
       }
       // FIFO: an actionable card keeps the head; parallel requests queue behind.
-      // A fresh head is built from the incoming request (incl. sourceDescription);
-      // an existing head is preserved as-is (keeps its submitting/submissionFailed).
+      // A fresh head is the incoming request itself (identical field set, incl.
+      // sourceDescription / autoReviewReason), an existing head is kept as-is.
+      // NOTE: the `(state.pendingPermission?.requestId === data.requestId)
+      // ? { submitting, submissionFailed }` reset that upstream carries here is
+      // dead code under this branch — the duplicate guard above already returned
+      // for that requestId, and this expression only evaluates when
+      // `pendingPermission` is nullish — so it is not carried over.
       return {
         ...state,
-        pendingPermission: state.pendingPermission ?? {
-          requestId: data.requestId,
-          toolName: data.toolName,
-          input: data.input,
-          title: data.title,
-          displayName: data.displayName,
-          description: data.description,
-          sourceDescription: data.sourceDescription,
-          suggestions: data.suggestions,
-          autoReviewUnavailable: data.autoReviewUnavailable === true,
-          autoReviewReason: data.autoReviewReason,
-          ...(state.pendingPermission?.requestId === data.requestId
-            ? {
-                submitting: state.pendingPermission.submitting,
-                submissionFailed: state.pendingPermission.submissionFailed,
-              }
-            : {}),
-        },
+        pendingPermission: state.pendingPermission ?? permission,
         pendingPermissionQueue: state.pendingPermission
           ? [...state.pendingPermissionQueue, permission]
           : state.pendingPermissionQueue,
