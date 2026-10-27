@@ -108,6 +108,14 @@ App 完成未读与提醒统一由 `renderer/hooks/useSessionRunningStatus.ts` �
 | **工具循环与输出上限终态的渠道文案** | `im/shared/turnRetryNotice.ts`（`terminalErrorText`） | `reason=tool_use_loop_detected` 的终态事件统一按受限 `toolLoop` 生成渠道可读说明；`reason=output-limit` 共用「回复可能不完整，可发送下一条消息继续」提示；个人侧 `turnRunner` 与官方侧 `hook-control/turnObserver` 都复用这份映射，原始 `loopHint` / `missing_required_field` 等内部分类只留在本地错误上下文，不外发。 |
 | **Auto 审阅的引用证据**（用户本条回复／引用的消息与附件数） | 投影与上限：`packages/maker-shared/src/autoReviewIntent.ts` 的 `projectAutoReviewUserReferences`；两侧映射：`im/shared/autoReviewReferences.ts` | 两侧都把宿主盖章的引用事实放进 `MAIN_OWNED_SEND_CONTEXT.autoReviewReferences`，由 maker-core 挂到当前消息的审阅意图上，审阅器以独立低信任块呈现，不算用户原话、不构成授权。**数据来源各不相同**：个人只取 adapter 的 `prepareAgentTurnText` 实际交给模型的回复投影（`replyContext`；飞书被注入扫描拦下时就是占位，模型没看到的回复审阅器也看不到），附件数取本条附件（`im/shared/turnRunner.ts`，纯图引用为「[图片]」占位）；官方由 `hook-control/dispatcher.ts` 在展示截短（只留最早 20 条）之前从服务端原始 `source.threadContext` 取回复目标（触发消息带 `replyToMessageId` 时按它找父消息、找不到不猜，否则取排除当前请求后的最后一条），连同实际送达附件数交给 `hook-control/session-runner.ts`。服务端在被引消息没有文字时不下发 threadContext、且附件不区分自带与引用，所以官方纯图引用只剩「本条带 N 张图」 |
 
+官方成功终稿的客户端发布有 **120 秒交接期限**（2026-10-27）：从 `publishFinal`
+开始计时，包含在途进度、终稿分段与过程消息清理。期限内沿用共享发送判据；超时关闭
+该轮载体、取消退避，返回 `clientFinal.complete=false`，完整正文经既有 `turn.end`
+出箱交回服务端，释放同任务队列。不会截短 `retry_after` 后继续由旧载体重发，也不重新
+调用模型；实际送达仍取决于服务端与 Telegram 状态。个人 bot 没有服务端出箱，不套用
+此期限。实现与回归：`hook-control/telegramTurnCarrier.ts`、
+`__tests__/telegramTurnCarrier.test.ts`、`__tests__/dispatcher.test.ts`。
+
 ### 放在共享目录、但**只有一侧消费**的
 
 | 东西 | 实际情况 |
@@ -174,6 +182,15 @@ App 完成未读与提醒统一由 `renderer/hooks/useSessionRunningStatus.ts` �
 `acquirePendingAgentSwitchForImSend` 的切换流程；官方 hook 先应用选择，再读取任务
 meta 和绑定观察器，发送完成即释放锁。跟随切换与手动选择共用发送锁；跟随切换保持任务的权限档与 Fast。回归见 `hook-control/__tests__/session-runner.test.ts`。
 桌面 IM 默认配置与目录偏好统一使用标准模型选择器，一次保存 Harness、来源、模型和思考强度；不额外展示独立 Harness 控件，不展示无法保存的 Fast。两侧的配置归属与权限规则保持各自既有契约。
+2026-10-26：官方与个人机器人未单独选模时共用 `shared/imAutomaticModel.ts`，复用普通新任务
+的出厂默认组合与可用目录回退，不跟随输入框的最近选择。设置页显示「自动选择」和当前解析
+出的实际模型；手动固定的旧模型继续保留。目录更新后，仍跟随默认的任务在下一条消息重算，
+手动改过的任务不受影响。「恢复自动选择」不重置权限。两侧独立的配置归属、目录覆盖与权限
+策略保持不变；自动模式没有可用来源时明确失败，不再回落到写死的旧型号。
+自动候选遵守执行电脑的模型显示偏好。官方目录选择远程电脑而未固定模型时，使用那台电脑
+允许远程调用的可见目录；本机继承模型先解析，再判断残留来源。设置页自动模型随目录更新，
+迟到读取不覆盖手动保存。回归见 `remoteProviderRoute.test.ts`、`session-runner.test.ts` 与
+`ImDefaultSettingsSection.test.tsx`。
 两侧的成功提示、帮助与命令菜单都必须按这个真实结果称为「新任务」，不得沿用旧的
 「新对话／清掉上下文」说法。
 官方 bot 通过 `session-new-v1` 双向能力协商执行立即创建，滚动升级时旧 Desktop 才退回旧的
@@ -299,6 +316,7 @@ hook 侧既有的逐轮 `[渠道说明]`，两者措辞不同但都向模型说�
 | 2i | **群内回复触发与任务归属两边各写一套** | 官方 bot 的服务端正本用 `TelegramMessageRoute.botAuthored === true` 区分“消息与任务有关”和“消息由 Cindy 发出、可通过回复召唤”：回复曾触发任务的普通用户消息不会误触发，明确 `@cindyapp_bot` 仍召唤当前发言者自己的 Cindy；回复同一 principal 的 Cindy 输出可续用其历史群 lane，回复其他 principal 的 Cindy 输出只带引用上下文，任务归当前发言者，不继承原任务的 principal、设备、会话或权限。普通群与 forum topic 都适用；`/session`、interaction、取消和 reaction 继续严格校验 owner。个人 bot 则在 `packages/lizi-im/src/telegram/inbound.ts` 的 `detectGroupTrigger` 独立用 `reply_to_message.from.id === botId` 判定回复触发，且采用本地单 owner 模型；两侧没有共享代码或数据，不能因为当前触发语义相近就跳过双路核对。**纯 @（只发一句 `@bot`、没有正文）两侧同口径都算召唤**：剥离召唤标记后 `userText`/事件正文保持空串，召唤及附件投递情况作为独立事实进入模型，不回填裸 `@` 或虚构请求。个人侧通过 `invoked` 保留纯召唤，即使随附媒体下载失败、超限或不支持也继续处理；仅有不可用媒体且没有召唤、引用或正文时仍直接提示。个人侧提及判据只认平台实体——`mention` 按 username、`text_mention` 按 user id，@ 在句中、句尾都触发；显示名召唤是唯一的字面匹配兜底 | 本客户端改动统一个人 bot 入站事实及 Hook 原文存档；官方 bot 的输入组装需配套版本更新，不能把客户端实现完成视为官方已上线。两侧保持同语义，仍各自维护触发与归属判据；以后修改群回复行为必须同时核对两条路径 |
 | 2j | **入站音视频与「先发媒体、再单独 @」：个人 bot 已补齐，官方待核** | 个人：`packages/lizi-im/src/telegram/inbound.ts` 的 `collectMedia` 把 video / video_note / voice / audio 及 `video/*`、`audio/*` 文档经 `host.media.cacheMedia` 存入 cindy-media 媒体总仓（可回收暂存，消息落库时转为附件引用；不写冻结的 `cc-agent/telegram-media`），以 file block（可读路径）交给模型，Agent 自行抽帧或转写；总仓不收的格式或 host 未提供 `cacheMedia` 时标 video / audio 不支持；Bot API 只能下载 20MB 以内，超出标 `oversize`，均作为未提供原因告知模型。群里先发媒体、再单独 @bot 时，`TelegramIM` 用收到时记下的 file_id（内存池，200 条 / 24 小时，重启清空，受保护群不入池；不随轮次出池，已受理轮次由群窗口游标防重复，同一轮已随附件送达的相册成员与被引消息排除）补下载本轮群上下文实际纳入那些消息的附件（`groupWindowCore` 的 `messageIds`），名额与飞书群上下文同口径（图片 6、文件 4，最新优先，先占名额再下载），全响应（ambient）轮次不补，经 `contextAttachments` 只进模型消息、不落库（总仓内保持可回收缓存），`<group_chat_attachments>` 块写明已提供与未提供的原因。官方：服务端入站对音视频与群历史媒体的处理**未核** PDF 等非媒体文件经 `host.files` 暂存后移入按账号隔离的 `im-attachments/telegram/sessions/<任务ID>/`（随任务删除清理），与飞书、Discord、企业微信同一实现，不再写 `cc-agent/telegram-media`。| 待核官方侧；若服务端仍丢弃音视频，按同一语义跨仓补齐 |
 | 2k | **全响应（ambient）消息先经辅助模型判「该不该插话」：个人 bot 有、官方没有** | 个人：`im/shared/messageHandler.ts` 在 ack 与提前落库**之前**调 adapter 的 `ambientTurnGate`，Telegram 适配器把群窗口前缀（只读不 commit）、发言人行、被引消息与机器人身份（设置页人格 / 伙伴名字 + 简介）交给 `im/shared/ambientReplyJudge.ts`，走共享辅助模型链（与伙伴群聊分工判定同一条，单候选 5 秒 / 总预算 8 秒，只答 REPLY / SKIP）。SKIP 的消息不落库、不起轮次、游标不动（下次真正开口时仍是背景）；REPLY / 判不出来（没有辅助模型、超时、输出不合规）照旧起完整轮次，主模型仍可 NO_REPLY，所以第 2b / 2f 行的哨兵与失败收口语义不变。官方：服务端在 `controller.ts` 打 ambient 标后直接下发整轮，没有前置判定 | 待判：官方侧要省同样的钱得在服务端接同类判定；在那之前登记为缺口。个人侧判定器失败一律放行，不得把「判不出来」当 SKIP |
+| 2l | **富答案出站：个人已投影，官方待核（#6884）** | 个人 `im/shared/turnRunner.ts` 在普通轮次与后台转播的统一出站层复用 `richAnswerText`，把 `cindy-ui` 转为可读文本，覆盖流式卡片、文本终稿、建卡失败后的文本补发及错误收尾。流式投影为空时等待后续内容，组件终稿仍无可读内容时用本地化提示，绝不回退协议原文；历史保留原始组件。回归见 `turnRunnerSendOutcome.test.ts`、`turnRunnerThreadRouting.test.ts`、`messagePersistBroadcaster.test.ts` | 官方 hook 是独立架构，本次未改，其富答案出站能力待单独核验，不计为两侧已同源 |
 | 3 | **终稿必达只有官方有** | 官方侧终稿先落盘、失败重试到送达或有界放弃（`xindong/cindy-server#348`）。个人 bot 的 `streamingText.finalize` 是进程内尽力而为，桌面进程挂掉那条终稿就没了。**两侧的「有界」各有一条明确边界、且不在同一层**：官方路径经桌面账本 `hook-control/requestLedger.ts`，客户端侧的投递时效是 `HOOK_TERMINAL_DELIVERY_TTL_MS ≈ 24h`，**规则无条件**——过线的终稿一律不再发出，不论是谁在要。覆盖的出口：持久出箱 `listPending`、ACK 退避重发、离线内存缓冲、ACK 缓冲的两个消费分支（`onConnected` 入口一次性清扫，含能力降级回落），以及 **server 显式重投**——那一支只回放 `task.ack` 后返回，不发终稿、也不把记录改回 `pending`。（重投一度有过 `origin='server-request'` 豁免，后被删除：它在持久记录里没有位置，每条路径都要手工传播，连续三轮 review 各找出一条漏掉的。）server 侧只丢掉一份它自己也已放弃发布的终稿——服务端 `OUTBOX_MAX_ATTEMPTS × OUTBOX_MAX_DELAY_MS ≈ 24h` 的发布放弃线与客户端刻意取同一个数，而结果总比请求更晚，所以它索取一份过线结果时自身 outbox 早已过放弃点；X 侧入口还另有 `x-hook-server` 的 `onMention` 陈旧守卫。**个人 bot 不经过这个账本**，既没有落盘也没有这条时效，它的边界就是「进程活着就尽力，挂了就没了」。官方协商 `telegram-final-ops-v1` 由桌面端发布终稿后**仍走这本账**：发布前先把不带 `clientFinal` 的 `turn.end` 写进出箱，崩溃重放时服务端删掉已落地的客户端终稿段并自己重发，所以官方这条保障不降级 | 待判：个人侧是否需要等价保障，还是接受「桌面挂了本来就没人在跑」。**注意两侧要判的不是同一件事**：官方已定「超过 24h 的终稿不再主动补发」，个人待定的是「要不要先落盘」 |
 | 4 | 受保护群内容的隐私边界 | 个人侧已做（出站回流 fail-closed，任一分片带保护标即整条不回流）。官方侧是否等价**待核** | 待核 |
 | 5 | 相册失败逐张回落 | 两侧都有实现，判据是否等价**待核** | 待核 |

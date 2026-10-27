@@ -1,4 +1,7 @@
+import { reportTaskDelivery } from '../bot-autonomy/hub.js';
 import { todoForCaller } from '../maker-ipc/botTodoAccess.js';
+import { getDeviceId } from '../authManager.js';
+import { buildHistorySessionDeepLink } from '../deepLink.js';
 import { activeCompanionCloud } from '../companion-cloud/runtime.js';
 import { TodoError, queryTodoItems, type TodoListQuery, type TodoPatch, type preflightTodoEvents } from '@cindy/maker-shared/teammate-todo';
 import { t } from '../i18n.js';
@@ -793,6 +796,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         getSessionRuntime: wrap((service, params) => service.getSessionRuntime(params)),
         setSessionRuntime: wrap((service, params) => service.setSessionRuntime(params)),
       },
+      taskDelivery: { report: reportTaskDelivery },
       setCurrentSessionTitle: async ({ sessionId, title }) => {
         if (!tryGetDbClient()) {
           return { ok: false, errorCode: 'HOST_NOT_READY', message: 'localDb not ready' };
@@ -1152,6 +1156,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         authorizePath: (request) => authorizeDesktopSessionPath(request, deps.getLiveSessionGrantState),
       }),
       history: {
+        sessionUrl: (sessionId) => buildHistorySessionDeepLink(sessionId, getDeviceId()),
         remote: deps.historyRemote,
         resolveSessionScope: async ({ callerSessionId, callerMemoryScopeKey }) => {
           try {

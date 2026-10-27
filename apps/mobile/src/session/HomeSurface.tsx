@@ -1,3 +1,4 @@
+import { deviceDisplayName } from '@/device-link/deviceName';
 import { MountOnFirstOpen } from './MountOnFirstOpen';
 import { getMobileAuthOwner, isMobileAuthOwnerCurrent } from '@/auth/authOwnerGeneration';
 import { TaskTagDots } from '@/session/TaskTags';
@@ -173,7 +174,6 @@ import {
 import { ConversationSearchFilterSheet } from '@/session/ConversationSearchFilterSheet';
 import {
   conversationSearchAllowsLocalWrites,
-  conversationSearchCompanionParams,
   conversationSearchOriginsFromDeviceModels,
   listConversationSearchProjects,
   shouldReplaceListWithSearchResults,
@@ -2382,10 +2382,9 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
       pathname: '/sessions/[sessionId]',
       params: {
         deviceId,
-        deviceName: session.deviceLinkDeviceName ?? deviceId,
+        deviceName: deviceDisplayName(deviceId, session.deviceLinkDeviceName),
         sessionId: session.id,
         ...(focusClientId ? { focusClientId } : {}),
-        ...conversationSearchCompanionParams(item),
       },
     } as const;
     rememberTask(href);
@@ -2399,7 +2398,7 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
   const openNewSession = useCallback((project?: MobileHomeProjectGroup, suggestion?: RemoteTaskSuggestionId, explicitDeviceId?: string, origin?: ComposerMorphOrigin) => {
     const { primaryDevice, newSessionDeviceOptions, selectedDeviceId } = newSessionTargetRef.current;
     const deviceId = project?.deviceId ?? explicitDeviceId ?? primaryDevice?.deviceId;
-    const deviceName = project?.deviceName ?? newSessionDeviceOptions.find((device) => device.deviceId === deviceId)?.name ?? primaryDevice?.label ?? deviceId ?? '';
+    const deviceName = deviceDisplayName(deviceId ?? '', project?.deviceName ?? newSessionDeviceOptions.find((device) => device.deviceId === deviceId)?.name ?? primaryDevice?.label);
     if (!deviceId) {
       setError(t('devices.list.error.noDevice'));
       return;
@@ -2732,7 +2731,7 @@ function HomeScreenContent({ active = true, width, newSessionInSystemBar = false
       pathname: '/devices/[deviceId]',
       params: {
         deviceId,
-        name: session.deviceLinkDeviceName ?? deviceId,
+        name: deviceDisplayName(deviceId, session.deviceLinkDeviceName),
         automationGroupKey: group.baseKey,
         automationName: group.title,
         ...(workingDir ? { automationWorkingDir: workingDir } : {}),
@@ -3969,7 +3968,7 @@ function ProjectRow({
     // fields here so registering a drag never copies all project task data.
     const { key: projectKey, sessionCount } = project;
     return Gesture.Pan()
-      .activateAfterLongPress(380)
+      .activateAfterLongPress(600)
       .activeOffsetY([-8, 8])
       .failOffsetX([-12, 12])
       .onStart((event) => {
