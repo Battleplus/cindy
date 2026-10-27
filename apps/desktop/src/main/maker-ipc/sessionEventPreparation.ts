@@ -1,6 +1,6 @@
 import { taskResultClientIdForInput } from '../../shared/botCollaboration.js';
 import { readChannelToolScope } from '../im/shared/channelToolScope.js';
-import { isQuietScheduledOutput } from '../scheduler-host/silent-output.js';
+import { isQuietScheduledOutput, revealScheduledOutput } from '../scheduler-host/silent-output.js';
 import { captureTurnUsageContext, type TurnUsageContext } from './turnUsageContext.js';
 import type { BotCompactRuntimeRefreshCoordinator } from './botCompactRuntimeRefresh.js';
 import type {
@@ -120,7 +120,7 @@ export interface PrepareSessionEventDeps {
   readonly agentInputCoordinatorHolder: Pick<
     AgentInputCoordinator,
     'onTurnEvent' | 'noteSuppressedTerminalError' | 'getActiveInputClientId' | 'getActiveInputClientIds' | 'getAcceptedInputProvenance' | 'isActiveTaskCoordination'
-  > | null;
+  > & Partial<Pick<AgentInputCoordinator, 'isActiveInputOwnerAuthored'>> | null;
   readonly handleSilentStopTurnEnd: (
     session: Session,
     doneAt: number,
@@ -183,6 +183,10 @@ export function prepareSessionEvent(
         text: t('settings.piPackages.failure.runtimeRetirementFailed'),
       },
     };
+  }
+  if (event.turnScope !== 'background'
+    && deps.agentInputCoordinatorHolder?.isActiveInputOwnerAuthored?.(session.id, event.sessionTurnGeneration)) {
+    revealScheduledOutput(event.turnOrigin);
   }
   const taskCoordination = event.turnScope !== 'background'
     && (deps.agentInputCoordinatorHolder?.isActiveTaskCoordination?.(session.id, event.sessionTurnGeneration) ?? false);

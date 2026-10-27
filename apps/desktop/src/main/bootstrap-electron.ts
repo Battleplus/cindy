@@ -978,6 +978,7 @@ import {
 } from './maker-ipc/usage.js';
 import { prewarmModelPricing } from './usage/modelPricing.js';
 import { registerMakerBinaryVersionIpc } from './maker-ipc/binary-version.js';
+import { startBinaryBackgroundUpdates } from './agent-binaries/background-update.js';
 import { registerCrossAgentConvertIpc } from './cross-agent-convert/ipc.js';
 import { registerFileBrowserIpc } from './file-browser/index.js';
 import { disposeHtmlPreviews } from './file-browser/html-preview-ipc.js';
@@ -1154,6 +1155,7 @@ import { getGhostSetupInteractionBridge } from './cindy-brain/ghostSetupInteract
 import { registerPluginMarketIpc, syncDefaultMarketPlugins, refreshForegroundMarketPlugins } from './plugin-market/registerIpc.js';
 import { getPluginMarketService } from './plugin-market/service.js';
 import { StableOwnerPostCommitStep } from './stableOwnerPostCommit.js';
+import { registerPluginContributionsIpc } from './plugin-contributions/registerIpc.js';
 import { registerPluginPublisherIpc } from './plugin-publisher/registerIpc.js';
 import { findCindyFileInArgv } from './cindy-brain/argv.js';
 import { handleIncomingCindyFile } from './cindy-brain/openFileInstall.js';
@@ -1177,7 +1179,7 @@ import {
 } from './scheduler-host/index.js';
 import { configureRoutineHost } from './routines/service.js';
 import { configureBotAutonomyHost, initBotAutonomy } from './bot-autonomy/service.js';
-import { getBotRemoteResourceSource } from './localDb/ipc/bots.js';
+import { getBotRemoteResourceSource, ensureBotRoutineLaneSession } from './localDb/ipc/bots.js';
 import {
   registerScheduleHandlers,
   attachSchedulerEventListeners,
@@ -1235,6 +1237,10 @@ async function waitForCurrentAccountProviderModelsReady(): Promise<void> {
 configureRoutineHost({
   assertImportedAutomationReady: ensureImportedAutomationReady, prepareImportedAutomation, finishImportedAutomation, recoverImports: recoverCompanionImports,
   getBot: getBotRemoteResourceSource,
+  ensureRoutineSession: ensureBotRoutineLaneSession,
+  closeRoutineSession: async (sessionId) => {
+    await getMakerIfReady()?.closeSession(sessionId);
+  },
   getScheduler: getSchedulerIfInitialized,
   getScheduleStorage,
 });
@@ -2554,6 +2560,7 @@ setRemotePluginManagementServices({
 registerGhostIpc();
 registerPluginMarketIpc();
 registerPluginPublisherIpc();
+registerPluginContributionsIpc();
 setAppSessionCommitBoundaryHook(() => {
   cancelLocalAgentConfirmations();
   // 进行中的 Claude Code 登录属于旧 owner:结束 CLI 子进程,不让它在新 owner 下完成。
@@ -6677,6 +6684,7 @@ const registerIpcHandlers = () => {
 
     // 必装 binary 都 ready,现在才能安全构造 Maker 单例并挂 maker:* / 相关 IPC。
     await registerMakerIpcsAfterSplash();
+    startBinaryBackgroundUpdates();
 
     return {
       claudeCode: { status: 'passed' as const, path: claudeRes.path },

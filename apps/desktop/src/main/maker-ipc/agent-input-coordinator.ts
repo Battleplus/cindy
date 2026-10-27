@@ -301,7 +301,7 @@ export interface AgentInputSendOpts {
     origin?: AgentInputQueuedMessage['origin'];
     shouldBroadcast?: () => boolean;
     onPersisting?: () => void;
-    onPersisted?: () => void | Promise<void>;
+    onPersisted?: (signal?: AbortSignal) => void | Promise<void>;
     onPersistFailed?: () => void;
   };
 }
@@ -531,6 +531,7 @@ export interface AgentInputCoordinatorDeps {
   beforeDispatchUserTurn?: (
     sessionId: string,
     item: AgentInputQueuedMessage,
+    signal?: AbortSignal,
   ) => void | Promise<void>;
   /**
    * Called when a user row crossed the persistence boundary but never reached
@@ -1350,12 +1351,21 @@ export class AgentInputCoordinator {
       retrySourceClientId: item.retrySourceClientId ?? item.supersedesUserClientId };
   }
 
+  /** Account-scoped tools may not borrow the Host identity from plugin or shared guest input. */
+  isActiveInputAccountScoped(sessionId: string): boolean {
+    const item = this.states.get(sessionId)?.activeTurn?.item;
+    return !!item && !item.sourcePlugin && !item.sharedTaskAuthor;
+  }
+
   /**
    * Owner-only Host actions (app update) require the active input itself to be text
    * this account's user typed on Desktop or a same-account remote device. Automation,
    * other tasks, Orca, plugins, shared-task guests and automatic resumes never qualify.
    */
-  isActiveInputOwnerAuthored(sessionId: string): boolean {
+  isActiveInputOwnerAuthored(sessionId: string, vendorGeneration?: number): boolean {
+    const active = this.states.get(sessionId)?.activeTurn;
+    if (vendorGeneration !== undefined && active?.vendorTurnGeneration != null
+      && vendorGeneration !== active.vendorTurnGeneration) return false;
     return this.activeInputHasOwnerAuthor(sessionId, false);
   }
 
@@ -5160,7 +5170,7 @@ export class AgentInputCoordinator {
               active.persisting = true;
             }
           },
-          onPersisted: async () => {
+          onPersisted: async (signal) => {
             // The DB row already owns any staged attachment references. This
             // callback intentionally runs before generation checks: a clear
             // or Stop may win the pre-vendor race after persistence, but it
@@ -5176,7 +5186,7 @@ export class AgentInputCoordinator {
               // 已送达的消息二次恢复(issue #761)。
               this.maybePersistQueueSnapshot(sessionId);
             }
-            await this.deps.beforeDispatchUserTurn?.(sessionId, head);
+            await this.deps.beforeDispatchUserTurn?.(sessionId, head, signal ?? this.getInputAbortSignal(sessionId, active.generation));
             if (!this.isActiveTurnCurrent(sessionId, active)) {
               throw new Error(
                 '[SEND_CANCELLED_BEFORE_DISPATCH] User turn was cancelled before vendor dispatch',

@@ -444,7 +444,7 @@ export const botSessionLinks = sqliteTable(
     profileVersion: integer('profile_version').notNull().default(1),
     // TS-only enum (SQLite `text`, no CHECK): `channel` = 伙伴接管的个人 IM 群 / 话题专线；
     // `thread` = 主人私聊里的话题（route_key = dm-thread:<根消息 Session>:<根消息 clientId>）。
-    role: text('role', { enum: ['canonical', 'history', 'delegation', 'group', 'channel', 'thread'] }).notNull(),
+    role: text('role', { enum: ['canonical', 'history', 'delegation', 'group', 'channel', 'thread', 'routine'] }).notNull(),
     routeKey: text('route_key'),
     createdAt: integer('created_at').notNull(),
     archivedAt: integer('archived_at'),
@@ -1445,6 +1445,8 @@ export const schedules = sqliteTable(
     agentKind: text('agent_kind', { enum: ['claude-code', 'codex', 'pi'] }).notNull(),
     /** NULL preserves legacy bound-task Harness inheritance. */
     modelAgentKind: text('model_agent_kind', { enum: ['claude-code', 'codex', 'pi'] }),
+    /** NULL inherits a bound task; empty string explicitly selects the automation host. */
+    modelAgentDeviceId: text('model_agent_device_id'),
     model: text('model'),
     /**
      * 显式选定的供应商(来源)id。NULL = 回落该 agent 原生默认来源(no-break,
