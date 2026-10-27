@@ -5,7 +5,7 @@ import History from '@tiptap/extension-history';
 import Paragraph from '@tiptap/extension-paragraph';
 import Text from '@tiptap/extension-text';
 import { EditorContent, useEditor } from '@tiptap/react';
-import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { act, cleanup, createEvent, fireEvent, render, waitFor } from '@testing-library/react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -459,5 +459,71 @@ describe('composer quote remove control', () => {
     });
     fireEvent.click(button);
     await waitFor(() => expect(countComposerQuotes(editor)).toBe(1));
+  });
+
+  it('keeps the 24px hit target inside the composer scroll clip by never extending upward', async () => {
+    const { container } = await renderQuoteHarness();
+    const button = container.querySelector<HTMLElement>('[data-composer-quote] button');
+    expect(button).not.toBeNull();
+
+    // DESIGN.md §5 要求命中区 ≥24×24，且不得改变可见几何（右上角 14px 圆）。
+    // 四周各外扩 5px 时命中框顶部会伸到 .ProseMirror 的 overflow 裁剪边界之外，
+    // 首行最上面约 5px 实际点不到；改成左右各 5px、向上 0、向下 10px 后，
+    // 命中框顶边与可见圆顶边齐平，永远落在裁剪范围内。
+    expect(button?.className).toContain('after:-inset-x-[5px]');
+    expect(button?.className).toContain('after:top-0');
+    expect(button?.className).toContain('after:bottom-[-10px]');
+    // 对称外扩是这次要修掉的写法，回归时会重新出现。
+    expect(button?.className).not.toContain('after:inset-[-5px]');
+  });
+
+  it('does not inherit the quote node native drag, so a drag from the button cannot swallow the click', async () => {
+    const { editor, container } = await renderQuoteHarness();
+    const button = await waitFor(() => {
+      const element = container.querySelector<HTMLElement>('[data-composer-quote] button');
+      if (!element) throw new Error('Remove control was not rendered');
+      return element;
+    });
+
+    // 按钮自身不能是原生拖拽源：按住 X 拖动时不能就地启动引用拖拽，否则
+    // 拖拽会吞掉随后的 click。这是 HTML 规范里「向上找最近的 draggable
+    // 祖先」算法的正规拦截点，jsdom 可观测。
+    expect(button.draggable).toBe(false);
+
+    // onDragStart 兜底：dragstart 被 preventDefault 且不再冒泡到引用节点，
+    // ProseMirror 不会把它当成引用节点的拖拽接管。
+    // 用 createEvent + fireEvent 拿到原始事件对象，才能观察 defaultPrevented。
+    // （不断言「不冒泡到 [data-composer-quote]」：React 17+ 把监听挂在根容器上，
+    // 祖先上的原生监听器一定先于 React 的合成事件处理收到该事件，这个断言
+    // 测不到 stopPropagation；stopPropagation 挡的是 ProseMirror / ChatInput
+    // 的 React 侧处理，不在本测试的观测范围内。）
+    const dragStart = createEvent.dragStart(button, {
+      dataTransfer: new TestDataTransfer(),
+    });
+    fireEvent(button, dragStart);
+    expect(dragStart.defaultPrevented).toBe(true);
+
+    // 拖拽被拦住后，按钮仍能正常删除。
+    fireEvent.click(button);
+    await waitFor(() => expect(countComposerQuotes(editor)).toBe(1));
+  });
+
+  it('turns the inherited -webkit-user-drag back off for the remove button', () => {
+    // cssstyle(jsdom 的 CSS 实现)不认识带前缀的 -webkit-user-drag，DOM 上
+    // 观测不到该声明，所以照 globalsSource 的既有做法直接校验样式表源码。
+    // 两件事都必须成立：
+    // ① 按钮带 data-quote-remove，才能被下面的覆盖规则选中；
+    // ② 该规则的优先级必须高于把整棵子树恢复成 element 的那条（0-2-0），
+    //    否则 Chromium 仍会从按钮起手拖动整颗引用。
+    const removeRule = /\.ProseMirror \[data-composer-quote\] button\[data-quote-remove\]\s*\{[^}]*-webkit-user-drag:\s*none;/;
+    expect(removeRule.test(globalsSource)).toBe(true);
+  });
+
+  it('tags the remove button so the -webkit-user-drag override can select it', async () => {
+    const { container } = await renderQuoteHarness();
+    const button = container.querySelector('[data-composer-quote] button');
+    expect(button).not.toBeNull();
+    // 没有这个属性，globals.css 里针对性关闭 element drag 的规则不会命中。
+    expect(button?.hasAttribute('data-quote-remove')).toBe(true);
   });
 });

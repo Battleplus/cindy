@@ -72,6 +72,18 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
         <button
           type="button"
           aria-label={removeLabel}
+          // 引用节点本身是原生拖拽源，globals.css 又对它的整棵子树恢复
+          // `-webkit-user-drag: element`。删除按钮在子树内，若不加处理，按下
+          // X 后移动超过原生拖拽阈值时 Chromium 会就地启动引用拖拽（mousedown
+          // 的 stopPropagation 只挡冒泡、不取消默认拖拽），进而取消随后的
+          // click，表现为「按住 X 稍微一拖就删不掉」。这里同时做三件事：
+          // ① draggable={false} 让按钮自身不是拖拽源（HTML 规范里向上找最近
+          //    draggable 祖先的算法会在此命中 false 并停止，不再取到外层引用）；
+          // ② onDragStart 兜底阻止任何仍从按钮起手的拖拽；
+          // ③ data-quote-remove 供 globals.css 关掉继承来的
+          //    -webkit-user-drag: element（属性选择器比子树规则更具体，能覆盖）。
+          draggable={false}
+          data-quote-remove=""
           className={cn(
             'absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center',
             'rounded-full bg-[var(--surface-chip-alt)] text-[var(--text-tertiary)]',
@@ -79,15 +91,29 @@ function ComposerQuoteNodeView({ node, selected, editor, getPos }: NodeViewProps
             'hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]',
             'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--focus-ring)]',
             // 点击目标 ≥24×24(DESIGN.md §5:hit-testing 与可见几何是独立职责,
-            // 命中区可扩大但不得改变可见几何)。透明 ::after 把命中框扩展到
-            // 14px 可见圆四周各 5px,视觉保持 10px 图标 + 14px 圆不变。
-            'after:absolute after:inset-[-5px] after:rounded-full after:content-[""]',
+            // 命中区可扩大但不得改变可见几何)。左右各外扩 5px 得到 24px 宽；
+            // 向上**不扩**，改为向下扩满 10px 得到 24px 高。
+            // 原因：composer 的 .ProseMirror 是 overflow-y-auto 的滚动容器，
+            // 首行的引用胶囊几乎贴着裁剪上边界。原先四周各扩 5px 时，命中框
+            // 顶部会伸到裁剪边界之外，首行最上面约 5px 实际点不到，按钮看着
+            // 有 24px 目标却有一半落空。改成只向内/向下扩后，命中框顶边与
+            // 可见圆顶边齐平，永远不会越过裁剪边界；可见几何仍是右上角
+            // 14px 圆 + 10px 图标，未受影响。
+            'after:absolute after:-inset-x-[5px] after:top-0 after:bottom-[-10px]',
+            'after:rounded-full after:content-[""]',
           )}
           onClick={(e) => {
             e.stopPropagation();
             handleRemove();
           }}
           onMouseDown={(e) => e.stopPropagation()}
+          onDragStart={(e) => {
+            // 兜底：任何仍从按钮起手的原生拖拽都取消，否则拖拽会吞掉随后的
+            // click，按钮看起来「点了没反应」。stopPropagation 防止 ProseMirror
+            // 的 nodeViews 把它当成引用节点的拖拽来处理。
+            e.preventDefault();
+            e.stopPropagation();
+          }}
           onKeyDown={(e) => {
             // 真实 button 的原生键盘激活会再触发一次 click，这里显式处理并
             // preventDefault 防止重复删除；stopPropagation 阻止 Enter/Space
