@@ -209,10 +209,17 @@ function emptyProjection(sessionId: string) {
   };
 }
 
-const flush = () => new Promise((r) => setTimeout(r, 0));
-// 等待超过 permissionResponseInFlight 的防重窗口(500ms),模拟用户读完下一张卡后
-// 才做下一次批准;guard 未释放时第二次响应会被当作同一手势的重复输入挡下。
-const waitPastPermissionGuardWindow = () => new Promise((r) => setTimeout(r, 560));
+// 单测里的宏任务刷新。fake timers 生效时改为推进 0ms（真实 setTimeout 在那
+// 种模式下永不回调），否则退回真实 setTimeout(0)，这样同一份测试代码在两种
+// 计时模式下都能用。
+const flush = async () => {
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+  else await new Promise((r) => setTimeout(r, 0));
+};
+// permissionResponseInFlight 的防重窗口是 500ms，跨过它才能把「读完第二张卡
+// 再批」当成一次新的用户手势而不是双击。用 fake timers 推进真实时间是不必
+// 要的：engine 的 test-hygiene 门不允许单测里出现 ≥100ms 的真实等待。
+const PERMISSION_GUARD_ADVANCE_MS = 560;
 
 // Execute the hook's real edit callback with the real store and transport,
 // without mounting unrelated hook effects or starting Electron.
@@ -259,6 +266,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // 用例里开了 fake timers 的（防重 guard 窗口那几条）必须在这里兜底还原，
+  // 否则一次失败就会把假时钟泄漏给后面的用例。
+  vi.useRealTimers();
   makerChatStore.__teardownGlobalListeners();
   resetRemoteDataOwnerPushFence();
   remoteProjectsStore.clear();
@@ -327,6 +337,7 @@ describe('device-link 远程交互往返 — permission', () => {
   });
 
   it('同一会话并行 permission 按 FIFO 展示和回传,不会丢掉先到的请求', async () => {
+    vi.useFakeTimers();
     const s = openRemoteSession();
     host.hostInteraction(s, {
       kind: 'permission',
@@ -351,7 +362,7 @@ describe('device-link 远程交互往返 — permission', () => {
 
     // 这是两次独立的用户手势(读完第二张卡再批):必须等防重窗口结束,
     // 否则第二次响应会被当作双击重复输入挡下。
-    await waitPastPermissionGuardWindow();
+    await vi.advanceTimersByTimeAsync(PERMISSION_GUARD_ADVANCE_MS);
     makerChatStore.respondToPermission(s, { behavior: 'allow' });
     await flush();
     expect(host.resolved.map((item) => item.requestId)).toEqual([
@@ -387,6 +398,7 @@ describe('device-link 远程交互往返 — permission', () => {
   });
 
   it('双击第二击在 IPC 已 settle 后到达也不能误批推广后的新卡', async () => {
+    vi.useFakeTimers();
     const s = openRemoteSession();
     host.hostInteraction(s, {
       kind: 'permission',
@@ -414,7 +426,7 @@ describe('device-link 远程交互往返 — permission', () => {
     expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('async-double-second');
 
     // 防重窗口结束后,用户对新卡的正常批准仍可进行。
-    await waitPastPermissionGuardWindow();
+    await vi.advanceTimersByTimeAsync(PERMISSION_GUARD_ADVANCE_MS);
     makerChatStore.respondToPermission(s, { behavior: 'allow' });
     await flush();
     expect(host.resolved.map((item) => item.requestId)).toEqual([
@@ -425,6 +437,7 @@ describe('device-link 远程交互往返 — permission', () => {
   });
 
   it('dismissal 重新武装防重 guard:窗口内 A 的迟到输入不误批 B,窗口结束后 B 可正常响应', async () => {
+    vi.useFakeTimers();
     const s = openRemoteSession();
     host.hostInteraction(s, {
       kind: 'permission',
@@ -458,7 +471,7 @@ describe('device-link 远程交互往返 — permission', () => {
     expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('dismiss-guard-b');
 
     // 窗口结束后:用户对 B 的真实响应送达(不等旧 RPC ~30s 超时)。
-    await waitPastPermissionGuardWindow();
+    await vi.advanceTimersByTimeAsync(PERMISSION_GUARD_ADVANCE_MS);
     makerChatStore.respondToPermission(s, { behavior: 'allow' });
     await flush();
     expect(host.resolved.map((item) => item.requestId)).toEqual([
@@ -510,6 +523,7 @@ describe('device-link 远程交互往返 — permission', () => {
   });
 
   it('reconnect snapshot A-B rearm guard: A delayed input does not approve B, then B actionable', async () => {
+    vi.useFakeTimers();
     const s = openRemoteSession();
     host.hostInteraction(s, {
       kind: 'permission',
@@ -543,7 +557,7 @@ describe('device-link 远程交互往返 — permission', () => {
     expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('reconnect-guard-b');
 
     // After the window, B's real response is delivered.
-    await waitPastPermissionGuardWindow();
+    await vi.advanceTimersByTimeAsync(PERMISSION_GUARD_ADVANCE_MS);
     makerChatStore.respondToPermission(s, { behavior: 'allow' });
     await flush();
     expect(host.resolved.map((item) => item.requestId)).toEqual([
