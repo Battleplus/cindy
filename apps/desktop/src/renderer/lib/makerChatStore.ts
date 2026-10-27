@@ -6817,9 +6817,16 @@ export function handleStreamEvent(
         title: data.title,
         displayName: data.displayName,
         description: data.description,
+        // 入队的对象也要带上 IM 来源说明与自动审批故障原因：卡片被晋升成队首或
+        // 重连重建时会直接读这两个字段，入队时丢掉的话，第二条来自 IM 且
+        // autoReviewUnavailable 的权限就只能显示通用故障文案，来源群与触发消息
+        // 一并丢失。
+        sourceDescription: data.sourceDescription,
         suggestions: data.suggestions,
         autoReviewUnavailable: data.autoReviewUnavailable === true,
-      };      if (
+        autoReviewReason: data.autoReviewReason,
+      };
+      if (
         state.pendingPermission?.requestId === permission.requestId ||
         state.pendingPermissionQueue.some((item) => item.requestId === permission.requestId)
       ) {
@@ -17572,6 +17579,11 @@ function respondToPermission(
   // Any other session guard entry also blocks (cross-request duplicate input).
   if (permissionResponseInFlight.has(sessionId) &&
       permissionResponseInFlight.get(sessionId) !== requestId) return;
+  // 写提交态前先拒绝已过期的 requestId：A 被另一控制端 dismiss、store 已把队首
+  // 推进到 B 时，旧 A 的 DOM 或硬件 effect 仍可能带着 capturedRequestId=A 走到
+  // 这里。少了这一道，会把当前 B 标成 submitting 并向 Host 发 A 的身份，随后
+  // 对账路径因队首不匹配直接返回，B 卡在 submitting 里既答不了也退不出去。
+  if (!hasCurrentCard()) return;
   bumpInteractionReconcileEpoch(sessionId);
 
   // Receipt protocol: keep the card on screen with submitting=true until the
@@ -17632,8 +17644,19 @@ function respondToPermission(
         return;
       }
       if (receipt?.accepted === false) {
+        // A 已被其它控制端解决或超时，Host 因此不收 A 的回执。此时 A、B 都已排队
+        // 时不能只把队首置空：轻量 UI 只读取 pendingPermission，把 B 留在
+        // pendingPermissionQueue 里会让它永远隐藏，用户看着「没有待处理权限」却
+        // 仍被输入门禁挡着。accepted=false 同样是队列推进点，把 B 提上来。
         bumpInteractionReconcileEpoch(sessionId);
-        setState(sessionId, (s) => ({ ...s, pendingPermission: null }));
+        setState(sessionId, (s) => {
+          const [nextPermission = null, ...remainingPermissions] = s.pendingPermissionQueue;
+          return {
+            ...s,
+            pendingPermission: nextPermission,
+            pendingPermissionQueue: remainingPermissions,
+          };
+        });
         toast.warning(i18n.t('newChat.permissionPrompt.requestEnded'));
         armPermissionResponseGuard(sessionId, requestId);
         return;

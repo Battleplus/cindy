@@ -568,6 +568,93 @@ describe('device-link 远程交互往返 — permission', () => {
   });
 });
 
+  it('accepted=false 时同样推进权限队列，不把 B 留在隐藏队列里', async () => {
+    const s = openRemoteSession();
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'reject-guard-a', toolName: 'Read',
+      input: { file_path: '/a.txt' },
+    });
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'reject-guard-b', toolName: 'Read',
+      input: { file_path: '/b.txt' },
+    });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('reject-guard-a');
+    expect(makerChatStore.getSnapshot(s).pendingPermissionQueue.map((i) => i.requestId))
+      .toEqual(['reject-guard-b']);
+
+    // Host 认为 A 已被别的控制端解决或已超时，因此不收 A 的回执。
+    host.invoke.mockResolvedValueOnce({ accepted: false });
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+
+    // B 必须被提上来：轻量 UI 只读 pendingPermission，把它留在队列里会永远隐藏。
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('reject-guard-b');
+    expect(makerChatStore.getSnapshot(s).pendingPermissionQueue).toEqual([]);
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.submitting).toBeFalsy();
+  });
+
+  it('排队中的权限保留 IM 来源说明与自动审批故障原因', async () => {
+    const s = openRemoteSession();
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'im-src-a', toolName: 'Read',
+      input: { file_path: '/a.txt' },
+      metadata: {
+        imSourceDescription: '飞书群 · 机器人研发',
+        autoReviewUnavailable: true, autoReviewReason: '群内无法自动审批',
+      },
+    });
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'im-src-b', toolName: 'Read',
+      input: { file_path: '/b.txt' },
+      metadata: {
+        imSourceDescription: '飞书群 · 机器人研发',
+        autoReviewUnavailable: true, autoReviewReason: '群内无法自动审批',
+      },
+    });
+    await flush();
+    const queued = makerChatStore.getSnapshot(s).pendingPermissionQueue[0];
+    expect(queued?.requestId).toBe('im-src-b');
+    // 入队时丢掉这两个字段，晋升成队首后就只剩通用故障文案。
+    expect(queued?.sourceDescription).toBe('飞书群 · 机器人研发');
+    expect(queued?.autoReviewReason).toBe('群内无法自动审批');
+
+    // 晋升后仍必须带着来源说明。
+    makerChatStore.respondToPermission(s, { behavior: 'allow' });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('im-src-b');
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.sourceDescription)
+      .toBe('飞书群 · 机器人研发');
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.autoReviewReason)
+      .toBe('群内无法自动审批');
+  });
+
+  it('过期的 requestId 不会把当前卡片写进提交态', async () => {
+    const s = openRemoteSession();
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'stale-guard-a', toolName: 'Read',
+      input: { file_path: '/a.txt' },
+    });
+    host.hostInteraction(s, {
+      kind: 'permission', requestId: 'stale-guard-b', toolName: 'Read',
+      input: { file_path: '/b.txt' },
+    });
+    await flush();
+    // A 被另一控制端解决，store 把队首推进到 B。
+    host.hostDismiss(s, 'stale-guard-a', 'resolved', { behavior: 'allow' });
+    await flush();
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('stale-guard-b');
+
+    // 旧 A 的 DOM / 硬件 effect 带着 capturedRequestId=A 迟到。
+    makerChatStore.respondToPermission(s, { behavior: 'allow' }, 'stale-guard-a');
+    await flush();
+
+    // B 不能被 A 的迟到手势钉在 submitting 上，A 的身份也不能借 B 的卡片发出去。
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.requestId).toBe('stale-guard-b');
+    expect(makerChatStore.getSnapshot(s).pendingPermission?.submitting).toBeFalsy();
+    expect(host.resolved.some((item) => item.requestId === 'stale-guard-a')).toBe(false);
+  });
+
 describe('device-link 远程交互往返 — plan_review', () => {
   it('shared guest edits stay in memory and approval sends the edited plan to the host', async () => {
     const peer = sharedTaskHostPeer('plan-share', 'host');
