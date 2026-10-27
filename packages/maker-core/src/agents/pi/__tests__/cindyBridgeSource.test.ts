@@ -2801,4 +2801,55 @@ it('reports an unknown MCP server as UNKNOWN_SERVER even when a tool name is sup
   const ok = list({ server: 'demo', tool: 'alpha' });
   expect(ok).toMatchObject({ ok: true });
   expect(ok.tools).toHaveLength(1);
+
+  // 只查 server 不带 tool（旧顺序下本就命中 UNKNOWN_SERVER）：前移后行为不变。
+  const serverOnly = list({ server: 'ghost' });
+  expect(serverOnly).toMatchObject({ ok: false, errorCode: 'UNKNOWN_SERVER', requested: 'ghost' });
+  expect(serverOnly).not.toHaveProperty('availableTools');
+
+  // 只带 tool 不带 server：仍回 SERVER_REQUIRED，不能被新的 server 判定抢走。
+  const toolOnly = list({ tool: 'alpha' });
+  expect(toolOnly).toMatchObject({ ok: false, errorCode: 'SERVER_REQUIRED' });
+  expect(toolOnly.availableServers).toContain('demo');
+});
+
+// #7136 review：server 存在性必须按「已注册工具的归属集合」判定，不能按
+// list(serverName) 过滤后的工具数。记忆门面开启时 list() 会隐去 cindy_memory 的
+// 全部工具，工具数恒为 0；若按工具数判定，一个真实存在的 server 会被误报成
+// UNKNOWN_SERVER，同时让 listResult 里 cindy_memory 的门面特判变成不可达分支。
+it('keeps the memory-facade cindy_memory server on its existing UNKNOWN_TOOL contract', () => {
+  const source = CINDY_BRIDGE_EXTENSION_SOURCE;
+  const compiled = ts.transpileModule(
+    source.slice(source.indexOf('const CINDY_MCP_LIST_TOOLS'), source.indexOf('async function connectServer'))
+      + '\n(globalThis as any).Gateway = CindyMcpGateway;',
+    { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const context: Record<string, any> = {
+    createHash,
+    recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
+    mcpContentToPi: (content: unknown) => content,
+  };
+  runInNewContext(compiled, context);
+  const client = { request: async () => ({ content: [] }) };
+  const gateway = new context.Gateway();
+  gateway.add('demo', client, [{ name: 'alpha' }]);
+  gateway.add('cindy_memory', client, [{ name: 'call_tool' }]);
+  // 门面开启：cindy_memory 是已注册 server，只是被 list() 隐藏。
+  gateway.register({ on: () => {}, registerTool: () => {} }, { botMemoryFacade: true });
+  const list = (params: unknown) => gateway.listResult(params).details as Record<string, any>;
+
+  expect(gateway.list('cindy_memory')).toEqual([]);
+
+  // 带 tool 查询：仍走门面特判 → UNKNOWN_TOOL，而不是 UNKNOWN_SERVER。
+  const facade = list({ server: 'cindy_memory', tool: 'call_tool' });
+  expect(facade).toMatchObject({ ok: false, errorCode: 'UNKNOWN_TOOL' });
+  expect(facade.requested).toEqual({ server: 'cindy_memory', tool: 'call_tool' });
+  expect(facade).not.toHaveProperty('availableServers');
+
+  // 未注册的 server 依然是 UNKNOWN_SERVER：门面不能顺带放宽这条判定。
+  const unknown = list({ server: 'ghost', tool: 'call_tool' });
+  expect(unknown).toMatchObject({ ok: false, errorCode: 'UNKNOWN_SERVER', requested: 'ghost' });
+
+  // 门面下 cindy_memory 不在可用 server 列里，但其它 server 照常列出。
+  expect(gateway.availableServers()).toEqual(['demo']);
 });
