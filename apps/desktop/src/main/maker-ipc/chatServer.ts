@@ -44,7 +44,7 @@ import { UI_ACTION_TRIGGER_PREFIX } from '../../shared/interruptedTurn.js';
 import { untrustedJsonBlock } from '../../shared/untrustedPrompt.js';
 import {
   BOT_GROUP_ATTACHMENTS_MAX, BOT_GROUP_CLIENT_ID, isBotGroupNoReplyText,
-  isBotGroupRuntimeFailureCode, type BotGroupRuntimeFailureCode,
+  type BotGroupRuntimeFailureCode,
   readImportedBotGroupRuntimeFailureCode,
   readBotGroupExecutionFailure, type BotGroupExecutionFailureView,
   buildBotGroupThreadShareCard, botGroupThreadShareOperationId, readBotGroupThreadShareCard,
@@ -56,7 +56,7 @@ import {
 import type { BotGroupChatService, BotGroupChatServiceDeps, BotGroupLaneTerminal, BotGroupTaskPostInput, BotGroupTaskPostResult } from './botGroupChatService.js';
 import { readPersistedReplyText } from './botGroupChatService.js';
 import { botGroupRuntimeFailureCode, botGroupRuntimeFailureDetail } from './botGroupRuntimeFailure.js';
-import { chatGroupMemberName as memberName, chatGroupOwnerName, botGroupExecutionFailureBatches } from '@cindy/maker-shared/botGroupPresentation';
+import { chatGroupMemberName as memberName, chatGroupOwnerName, botGroupExecutionFailureBatches, latestBotGroupMessage } from '@cindy/maker-shared/botGroupPresentation';
 import { createThreadProjection, isShareableThreadReply, threadPreviewAttachments, threadPreviewText } from './chatServerThreads.js';
 import { companionSnapshot, registerCompanionHomes } from '../companion-cloud/homes.js';
 import { startCompanionCloud, type CompanionCloudRuntime } from '../companion-cloud/runtime.js';
@@ -1602,7 +1602,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     if (reads) for (const view of [...messages, ...(messageUpdates ?? [])]) if (!view.threadRootId && (view.replyCount ?? 0) > 0) view.threadUnread = threadUnread(view.id, s.messages, reads);
     const threadList = reads && !direct ? threadSummaries(roomId, s, page, reads) : undefined;
     messages.sort((a, b) => a.sequence - b.sequence);
-    const last = s.messages[0];
+    const last = latestBotGroupMessage(s.messages);
     const lastView = last ? messageView(last, s.members, ownerMembers) : null;
     // The sidebar never resolves shares: it names the sharer and never quotes the card's text.
     const lastIsShare = !!last && !!readBotGroupThreadShareCard(last);
@@ -1872,7 +1872,8 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       const cachedCode = failureCodes.get(`${failure.executionId}:${failure.epoch}`);
       return [{ ...failure, botId: localBot(failure.botId)?.id ?? failure.botId,
         botName: member ? memberName(member, members) : actors.find(actor => actor.id === failure.botId)?.name ?? '',
-        code: !isBotGroupRuntimeFailureCode((row as Record<string, unknown>).failure_code) && cachedCode ? cachedCode : failure.code }];
+        // Older servers may normalize a newly introduced category to RUNTIME_ERROR.
+        code: failure.code === 'RUNTIME_ERROR' && cachedCode ? cachedCode : failure.code }];
     });
   }
   /** One execution gets one immutable terminal result, regardless of which boundary ends it. */
@@ -2133,7 +2134,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
           ...(run.plan?.kind === 'talk' ? { talkPlanId: run.plan.id }
             : run.plan ? { plan: { planId: run.plan.id, workDir: run.workspace?.workDir ?? '', sessionId: run.workspace?.ownerSessionId ?? undefined } } : {}),
           ...(threadRootId ? { threadRootId } : {}) });
-        if (!lane.ok) throw new Error(lane.errorCode);
+        if (!lane.ok) throw new Error(botGroupRuntimeFailureCode({ code: lane.errorCode, message: lane.message }));
         run.sessionId = lane.sessionId;
         run.releaseToolAuthority = registerGroupToolAuthority(lane.sessionId, {
           botId: bot.id, mode: execution.access_mode,
@@ -2720,6 +2721,11 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       const route = type === 'update' || type === 'archive' ? '' : type === 'member' ? '/members' : type === 'botAccess' ? '/bot-access' : `/${type}`;
       const asManager = type === 'update' || type === 'archive' || type === 'transfer' || (type === 'member' && !['leave', 'invite'].includes(action.action));
       const s = await groupSnapshot(target);
+      if (action.type === 'transfer') {
+        const recipient = s.members.find(member => member.id === action.actorId && member.state === 'joined');
+        if (!recipient) throw new Error('MEMBER_NOT_FOUND');
+        if (recipient.kind !== 'human') throw new Error('HUMAN_OWNER_REQUIRED');
+      }
       const actorId = asManager ? managementActor(s) : undefined;
       await api(`/conversations/${target}${route}`, type === 'update' || type === 'archive' ? 'PATCH' : 'POST', {
         operationId: randomUUID(), ...payload, ...(type === 'archive' ? { archived: action.archived } : {}),

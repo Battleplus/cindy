@@ -65,6 +65,35 @@ function withUiLanguageNote(content: string): string {
 function withUiLanguageUserMessage(content: string): { type: 'user'; content: string } {
   return { type: 'user', content: withUiLanguageNote(content) };
 }
+
+describe('local application task takeover', () => {
+  // #7631 review P0. Runtime tests do not cover the ordinary send transaction.
+  // Minimal regression (unit): a live external Session must be retired before
+  // selecting the send target; failed handoff must never dispatch Cindy input.
+  it.each([false, true])('does not reuse the external runtime (handoff fails=%s)', async (fails) => {
+    const { deps, session } = createDeps();
+    const replacement = createSession();
+    let live: typeof session | undefined = session;
+    deps.getSession = () => live;
+    deps.bootstrapSession = vi.fn(async () => {
+      live = replacement;
+      return { session: replacement, didInjectOrcaInstructions: false, didInjectProjectContext: false };
+    });
+    deps.prepareExternalInput = async () => {
+      if (fails) throw new Error('handoff unavailable');
+      live = undefined;
+    };
+    const send = createMakerSendTransaction(deps).sendToAgentAccepted(
+      'session-1', 'private Cindy input', { id: 'session-1', agentKind: 'codex', workingDir: '/repo' },
+    );
+    if (fails) await expect(send).rejects.toThrow('handoff unavailable');
+    else {
+      await send;
+      expect(replacement.send).toHaveBeenCalledOnce();
+    }
+    expect(session.send).not.toHaveBeenCalled();
+  });
+});
 describe('MCP App next-turn context', () => {
   it('keeps ordinary user intent when validating App context without a replacement intent', async () => {
     const assertCurrent = vi.fn(async () => {});
@@ -3551,6 +3580,34 @@ describe('session-agent-switch handoff injection', () => {
     expect(stored?.agentMeta?.autoReviewUserText).toBe(` ${request}`);
     expect(restoreAutoReviewUserIntent([{ clientId: queued.clientId, role: 'user', content,
       agentMeta: stored!.agentMeta as Record<string, unknown> }])).toBe(request);
+  });
+
+  // #7424 / unit: the trusted queue and accepted transaction must persist the exact pasted owner request.
+  // Adjacent reference tests did not cover paste ranges; the minimal old failure stamps '' for text + ranges.
+  it.each([false, true])('preserves pasted authorization through queue and persistence (deviceLink=%s)', async deviceLink => {
+    const text = '允许本地修改和测试，但不要 push、不要发布。';
+    const content = { text, pastedTextRanges: [{ start: 0, end: text.length }] };
+    const queued = stampTrustedDesktopQueuedOrigin({ clientId: 'pasted-request', text,
+      persistedContent: content, files: [],
+    } as unknown as AgentInputQueuedMessage, deviceLink);
+    expect(queued.autoReviewUserText).toBe(text);
+    const { deps, session } = createDeps();
+    await createMakerSendTransaction(deps).sendToAgentAccepted('session-1', text, undefined, {
+      [AUTO_REVIEW_SOURCE_CONTENT]: queued.autoReviewUserText,
+      persistUserMessage: { clientId: queued.clientId, content, delivery: 'turn' },
+    });
+    expect(vi.mocked(session.send).mock.lastCall?.[1]?.[AUTO_REVIEW_USER_INTENT]).toBe(text);
+    expect(vi.mocked(deps.createDbMessage).mock.lastCall?.[1].agentMeta?.autoReviewUserText).toBe(text);
+  });
+
+  it.each([false, true])('rejects pasted authorization when persisted and wire text diverge (deviceLink=%s)', deviceLink => {
+    const persisted = { text: '允许 push。', pastedTextRanges: [{ start: 0, end: 6 }] };
+    for (const persistedContent of [persisted, JSON.stringify(persisted)]) {
+      const queued = stampTrustedDesktopQueuedOrigin({ clientId: 'pasted-mismatch', text: '不要 push。',
+        persistedContent, files: [],
+      } as unknown as AgentInputQueuedMessage, deviceLink);
+      expect(queued.autoReviewUserText).toBe('');
+    }
   });
 
   // unit: a forwarded quote must survive persistence without becoming permission.

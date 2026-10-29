@@ -338,7 +338,9 @@
       "doneUnread": "완료·읽지 않음",
       "running": "실행 중",
       "close": "닫기",
-      "cancelRename": "이름 변경 취소"
+      "cancelRename": "이름 변경 취소",
+      "createdBy": "{{name}}이(가) 생성",
+      "ownedBy": "{{name}} 소속"
     },
     "accounts": {
       "title": "계정 전환",
@@ -415,7 +417,11 @@
       },
       "summaryNone": "없음",
       "summarySeparator": ", ",
-      "filterEmptyCopy": "표시 설정의 필터에서 조정하거나 재설정할 수 있습니다."
+      "filterEmptyCopy": "표시 설정의 필터에서 조정하거나 재설정할 수 있습니다.",
+      "filterTeammatesHeading": "파트너",
+      "filterAnySource": "전체",
+      "filterHideAllTeammates": "모두 숨기기",
+      "filterSelectedTeammates": "{{count}}명 선택"
     },
     "search": {
       "placeholder": "제목 또는 내용 검색…",
@@ -867,6 +873,10 @@
     "checkPrompt": "연결된 메일, 메시지 등에서 내가 처리해야 할 새 일이 있는지 확인하고, 있으면 할 일에 추가해 줘.",
     "dailyCheck": "매일 확인",
     "dailyCheckMeta": "평일 9:00, 새 할 일이 없으면 알리지 않습니다",
+    "recentTasks": "최근 세션",
+    "unread": "읽지 않은 결과",
+    "stopDailyCheck": "매일 확인 중지",
+    "openFailed": "링크를 열 수 없습니다",
     "dailyCheckFailed": "저장하지 못했습니다. 다시 시도하세요",
     "loadFailed": "할 일을 불러오지 못했습니다",
     "outputs": "결과물",

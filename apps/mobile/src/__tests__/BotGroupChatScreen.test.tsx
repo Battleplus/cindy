@@ -496,13 +496,47 @@ describe('group timeline', () => {
     expect(all('botGroup.message.bot')).toHaveLength(0);
   });
 
-  it.each(BOT_GROUP_RUNTIME_FAILURE_CODES)('renders the runtime reason and recovery advice on mobile: %s', async runtimeFailureCode => {
+  // #6835: unit screen entry must prioritize the limit over the lane-unavailable fallback.
+  it.each(['REMOTE_DEVICE_LIMIT', 'REMOTE_TOTAL_LIMIT'] as const)('renders lane failure %s on mobile', async runtimeFailureCode => {
+    await render(group({ messages: [message('failure', 1, { kind: 'notice', authorKind: 'system',
+      authorName: 'Bot', noticeCode: 'member-unavailable', runtimeFailureCode })] }));
+    const text = all('botGroup.notice')[0]?.textContent;
+    expect(text).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.summary(name=Bot)`);
+    expect(text).not.toContain('groupChat.notice.memberUnavailable');
+  });
+
+  // Unit: the real group/thread renderer must keep long failure guidance collapsed.
+  // The previous matrix only checked concatenated text, missing the oversized notice reported by the user.
+  it.each(BOT_GROUP_RUNTIME_FAILURE_CODES)('discloses guidance without retrying a failed reply: %s', async runtimeFailureCode => {
     await render(group({ messages: [message('failure', 1, { kind: 'notice', authorKind: 'system',
       authorName: 'Bot', noticeCode: 'member-failed', runtimeFailureCode })] }));
     const text = all('botGroup.notice')[0]?.textContent;
-    expect(text).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}(name=Bot)`);
-    expect(text).toContain('groupChat.notice.runtimeFailureSetupHint');
+    expect(text).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.summary(name=Bot)`);
+    expect(text).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.advice`);
+    expect(text).not.toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.details`);
+    expect(text).not.toContain('groupChat.notice.runtimeFailureSetupHint');
     expect(text).not.toContain('groupChat.notice.memberFailed');
+    const toggle = [...all('botGroup.notice')[0]!.querySelectorAll('button')]
+      .find(button => button.textContent === 'session.tail.showErrorDetails')!;
+    expect(toggle).toBeTruthy();
+    await act(async () => toggle.click());
+    expect(all('botGroup.notice')[0]?.textContent).toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.details`);
+    expect(h.chat.act).not.toHaveBeenCalled();
+    await act(async () => toggle.click());
+    expect(all('botGroup.notice')[0]?.textContent).not.toContain(`groupChat.notice.runtimeFailure.${runtimeFailureCode}.details`);
+  });
+
+  // #7769: model-switch advice must retain its computer location after disclosure.
+  it.each(['AUTH_REQUIRED', 'RATE_LIMITED', 'UPSTREAM_OVERLOADED', 'RUNTIME_TIMEOUT'] as const)(
+    'keeps computer setup guidance inside thread details: %s', async runtimeFailureCode => {
+    await render(group({ messages: [message('failure', 1, { kind: 'notice', authorKind: 'system',
+      authorName: 'Bot', noticeCode: 'member-failed', runtimeFailureCode })] }), 'ready', 'thread-root');
+    const notice = all('botGroup.notice')[0]!;
+    expect(notice.textContent).not.toContain('groupChat.notice.runtimeFailureSetupHint');
+    const toggle = [...notice.querySelectorAll('button')].find(button => button.textContent === 'session.tail.showErrorDetails')!;
+    await act(async () => toggle.click());
+    expect(notice.textContent).toContain('groupChat.notice.runtimeFailureSetupHint');
+    expect(h.chat.act).not.toHaveBeenCalled();
   });
 
   it('renders messages, notices, round ends and plan ends like the desktop timeline', async () => {
