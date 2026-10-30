@@ -257,6 +257,24 @@ describe('PiRpcProcess close semantics (bridge-disconnect vs explicit close)', (
     });
   });
 
+  // 测试价值
+  // - 生产入口与结果：PiRpcProcess.request；超限 get_tree 必须立即返回可诊断失败，释放调用方等待。
+  // - Bug／缺口：#7997；超限帧保护现有测试只覆盖 get_entries，没有覆盖完整会话树读取。
+  // - 最小失败输入：单个 pending get_tree 收到 transport oversized-frame 通知。
+  // - tier／实测耗时：unit；本文件单独运行耗时见 PR 描述。
+  it('fails a pending get_tree immediately when the transport drops an oversized frame', async () => {
+    const { transport, emitOversized, drain } = makeFakeTransport();
+    const { proc } = makeProc({ transport });
+    const pending = proc.request({ type: 'get_tree' });
+    drain();
+    emitOversized();
+    await expect(pending).resolves.toMatchObject({
+      success: false,
+      command: 'get_tree',
+      error: PI_RPC_OVERSIZED_FRAME_ERROR,
+    });
+  });
+
   it('does not fail a lone pending steer when an oversized event frame is dropped', async () => {
     const { transport, emitLine, emitOversized, drain } = makeFakeTransport();
     const { proc } = makeProc({ transport });
