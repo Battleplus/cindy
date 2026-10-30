@@ -6,6 +6,18 @@ const members = [
 ];
 const base = { name: 'Design review', members, messages: 0, sidebar: true };
 const QUEUE_CROWD = ['Aster', 'Nova', 'Mira', 'Orin', 'Pax', 'Quill', 'Rhea'].map((name, i) => ({ botId: 'abcdefg'[i], name }));
+/** Nine members across three accounts, as in a real cross-account group (owner request 2026-10-26). */
+const CROWD = [
+  { botId: 'a', name: 'Aster', ownerName: 'Ada', isOwned: false, actorKind: 'bot' },
+  { botId: 'b', name: 'Nova', ownerName: 'Leo', isOwned: false, actorKind: 'bot' },
+  { botId: 'c', name: 'Leo', actorKind: 'human', isOwned: false },
+  { botId: 'd', name: 'Mira', ownerName: 'Ada', isOwned: false, actorKind: 'bot' },
+  { botId: 'e', name: 'Orin', ownerName: 'Kai', isOwned: false, actorKind: 'bot' },
+  { botId: 'f', name: 'Quill', actorKind: 'bot', isOwned: true },
+  { botId: 'g', name: 'Ada', actorKind: 'human', isOwned: false },
+  { botId: 'h', name: 'Kai', actorKind: 'human', isOwned: false },
+  { botId: 'i', name: 'Rhea', ownerName: 'Ada', isOwned: false, actorKind: 'bot' },
+];
 const LONG_DEVICE = 'Mac Studio · A very long device name for layout verification';
 
 /** Migrated from check-group-control-layout.mjs (remote-control notice above the composer). */
@@ -19,8 +31,26 @@ export default {
   viewport: { width: 1280, height: 800 },
   real: 'BotGroupChatView (timeline, composer, send button, header registration), ControlledBanner, ContentHeader shell, Markdown, theme, fonts and translations',
   notCovered:
-    'Sending, round control, real device-link control and revocation, pending interactions, plans and attachments; the bubbles case shows a task snapshot, not a live task; the sidebar is an empty frame',
+    'Real IPC/network sending (send-status controls host receipts), round control, real device-link control and revocation, pending interactions, plans and attachments; the bubbles case shows a task snapshot, not a live task; the sidebar is an empty frame',
   cases: {
+    'send-status': {
+      about: 'Mac send flicker regression: real composer/outbox/timeline, controlled slow receipt; row geometry stays stable and failed sends remain retryable',
+      data: { ...base, messages: 40, sendStatus: true },
+    },
+    'remote-limits': {
+      about: '#6835: lane-unavailable notices show device and total task limits with recovery advice',
+      viewport: { width: 720, height: 700 },
+      data: { ...base, sidebar: false, remoteLimits: true },
+    },
+    'work-thinking': { about: 'Actual group work status, scenario data: thinking', data: { ...base, messages: 2, workState: 'thinking' } },
+    'work-tools': { about: 'Actual group work status, scenario data: command execution', data: { ...base, messages: 2, workState: 'testing' } },
+    'work-reading': { about: 'Actual group work status, scenario data: file reading', data: { ...base, messages: 2, workState: 'reading-file' } },
+    'work-waiting': { about: 'Actual group work status, scenario data: needs confirmation', data: { ...base, messages: 2, workState: 'waiting' } },
+    'work-stopping': { about: 'Actual group work status, scenario data: stop requested', data: { ...base, messages: 2, workState: 'stopping' } },
+    'work-unknown': { about: 'Remote work with no readable task: generic activity, no invented thinking', data: { ...base, messages: 2, workState: 'unknown' } },
+    'work-remote': { about: 'Authenticated remote target projection, scenario data (not a live device-link run)', data: { ...base, messages: 2, workState: 'testing', workRemote: true } },
+    'work-parallel': { about: 'Two concurrent execution rows, separate task entries and one group stop', data: { ...base, messages: 2, workState: 'testing', workParallel: true } },
+    'work-parallel-stopping': { about: 'Last execution is stopping while the first still runs: the group stop control remains available', data: { ...base, messages: 2, workState: 'testing', workParallel: true, workLastStopping: true } },
     'body-answer': {
       about: '#6550: component body is readable; literal punctuation and surrounding Markdown are retained',
       viewport: { width: 720, height: 700 },
@@ -38,6 +68,11 @@ export default {
       controller: LONG_DEVICE,
     },
     multiline: { about: 'Eight-line draft pushes the composer up', data: base, lines: 8 },
+    crowded: {
+      about: 'Nine members from three accounts: the header names the group and a member count, not every member',
+      viewport: { width: 800, height: 600 },
+      data: { ...base, members: CROWD, bubbles: true },
+    },
     'no-sidebar': { about: 'Collapsed sidebar layout', data: { ...base, sidebar: false } },
     bubbles: {
       about: 'Teammate bubbles: quote, corner reaction, thread entry, task card, long text at the width cap; hover shows the toolbar beside the bubble',
@@ -96,12 +131,90 @@ export default {
   },
   async check(page, ui) {
     const definition = this.cases[ui.case];
+    if (ui.case === 'send-status') {
+      // Renderer integration: jsdom's send tests cannot measure the 600ms layout jump.
+      const input = page.locator('textarea');
+      const outbox = page.getByTestId('bot-group-outbox');
+      const content = 'A message awaiting its receipt';
+      const row = page.locator('[data-bot-group-message-id]').filter({ hasText: content });
+      const geometry = () => row.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const scroller = document.querySelector('[data-testid="bot-group-timeline"]');
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scrollTop: scroller.scrollTop };
+      });
+      const receipt = (result) => page.evaluate((detail) => window.dispatchEvent(new CustomEvent('fixture-send-receipt', { detail })), result);
+      await input.fill(content);
+      await input.press('Enter');
+      await outbox.waitFor();
+      const pending = await geometry();
+      await ui.capture('pending');
+      await outbox.getByRole('status').waitFor({ state: 'attached' });
+      const slow = await geometry();
+      await ui.capture('slow');
+      await receipt('ok');
+      await outbox.waitFor({ state: 'detached' });
+      const sent = await geometry();
+      await ui.capture('sent');
+      console.log('SEND_STATUS_GEOMETRY', JSON.stringify({ pending, slow, sent }));
+      assert.deepEqual(slow, pending, 'slow-send feedback must not move the row or scroll position');
+      assert.deepEqual(sent, pending, 'receipt must not move the row or scroll position');
+      assert.equal(await row.count(), 1, 'receipt preserves one message');
+
+      await input.fill('Failure remains actionable');
+      await input.press('Enter');
+      await outbox.waitFor();
+      await input.fill('Keep this new draft');
+      await receipt('failed');
+      await outbox.getByRole('alert').waitFor();
+      await ui.capture('failed');
+      assert.equal(await outbox.getByRole('button', { name: await ui.t('bots.groupChat.outbox.edit'), exact: true }).isEnabled(), true);
+      await outbox.getByRole('button', { name: await ui.t('bots.retry'), exact: true }).click();
+      await outbox.getByRole('alert').waitFor({ state: 'detached' });
+      await receipt('ok');
+      await outbox.waitFor({ state: 'detached' });
+      assert.equal(await input.inputValue(), 'Keep this new draft');
+      return;
+    }
+    if (ui.case === 'remote-limits') {
+      const timeline = page.getByTestId('bot-group-timeline');
+      for (const [i, code] of ['REMOTE_DEVICE_LIMIT', 'REMOTE_TOTAL_LIMIT'].entries()) {
+        const expected = (await ui.t(`bots.groupChat.notice.runtimeFailure.${code}`)).replace('{{name}}', members[i].name);
+        assert.ok((await timeline.innerText()).includes(expected));
+      }
+      return;
+    }
+    if (definition.data.workState) {
+      const state = definition.data.workState;
+      await ui.emit('sessionActivity', [{ sessionId: 'fixture-work', phase: 'running',
+        workingPhase: ['thinking', 'reading-file', 'testing'].includes(state) ? state : 'processing',
+        compactDetail: state === 'testing' ? '检查私聊与群聊的回归结果' : state === 'reading-file' ? '核对群聊状态与任务入口' : '',
+        startedAtMs: Date.now() - 83_000, lastActivityAtMs: Date.now(), attention: false,
+        gracefulStopState: state === 'stopping' ? 'requested' : 'none', source: 'live' }]);
+      await page.getByTestId('bot-group-progress').first().waitFor();
+      if (ui.case === 'work-parallel-stopping') {
+        const stop = page.getByRole('button', { name: await ui.t('bots.groupChat.progress.stop'), exact: true });
+        assert.equal(await stop.count(), 1);
+        assert.equal(await stop.isEnabled(), true, 'another running execution must remain stoppable');
+      }
+      await ui.capture('work');
+      return;
+    }
     if (ui.case === 'body-answer') {
       const timeline = page.getByTestId('bot-group-timeline');
       assert.ok((await timeline.innerText()).includes('保留 <name>、*literal* 和 & 符号'));
       assert.ok((await timeline.innerText()).includes('以上是本轮结论。'));
       assert.equal(await timeline.getByText('重点', { exact: true }).count(), 1);
       assert.ok(!(await timeline.innerText()).includes('"op":"create"'));
+      const text = await timeline.innerText();
+      assert.ok(text.includes('图片说明保留') && text.includes('图片标题保留'));
+      assert.ok(text.includes('🖼'), 'an undescribed image has a neutral placeholder');
+      assert.ok(!text.includes('cindy-media://') && !text.includes('/private/tmp/fixture-image.png'));
+      for (const kind of ['image', 'video', 'audio']) {
+        const url = `https://example.test/public-${kind}`;
+        const link = timeline.getByRole('link', { name: url, exact: true });
+        assert.equal(await link.count(), 1, 'public media keep an actionable web link');
+        assert.equal(await link.getAttribute('href'), url);
+      }
       return;
     }
     const input = page.locator('textarea');

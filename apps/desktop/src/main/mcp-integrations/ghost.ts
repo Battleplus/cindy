@@ -1,3 +1,5 @@
+import * as community from '../plugin-contributions/host.js';
+import { contributionOwnerKey, assertContributionOwner, getPreparedContribution } from '../plugin-contributions/prepared.js';
 import { createPluginMarketAgentTools } from '../plugin-market/agentTools.js';
 import type { GhostInstallConsentPrompt } from '../cindy-brain/ghostInstallConsent.js';
 import {
@@ -468,6 +470,8 @@ async function packForgeSource(
  * ──────────────────────────────────────────────────────────────────────── */
 
 export interface GhostGrantLiveSessionState {
+  /** Rechecks account-owned input and the current helper surface. */
+  contributionAccountAllowed?: (acceptedOperation?: boolean) => Promise<boolean>;
   permissionMode: PermissionMode | null;
   remoteHostId: string | null;
   /** Includes the captured permission/Plan generations and forbids active or unknown Plan. */
@@ -1668,6 +1672,24 @@ const ghostVisibilityDeps = {
   isDisabledForWorkdir: isGhostDisabledForWorkdir,
 };
 
+/**
+ * 「我的浏览器」由哪个插件提供(宿主正在经它的扩展承接页面控制)。该插件声明的
+ * pageControlReplaces 工具与手册此时对 Agent 隐藏:操作用户浏览器只留 Browser Use
+ * 一套。未接线或桥接未运行时返回 null,插件工具照常可用。
+ */
+/** 返回承接页面控制的插件实例标识(installedGhostStoragePart)。 */
+let pageControlGhostProvider: () => string | null = () => null;
+export function setPageControlGhostProvider(provider: () => string | null): void {
+  pageControlGhostProvider = provider;
+}
+function pageControlHidden(ghost: InstalledGhost): { tools: Set<string>; manual: Set<string> } | null {
+  const replaces = ghost.manifest.browserExtension?.pageControlReplaces;
+  if (!replaces || pageControlGhostProvider() !== installedGhostStoragePart(ghost)) return null;
+  return { tools: new Set(replaces.tools), manual: new Set(replaces.manual ?? []) };
+}
+const PAGE_CONTROL_TOOL_MESSAGE =
+  '这个插件工具已由 Cindy 的 browser 工具取代:读取或操作用户自己的浏览器,请用 cindy_browser 的 browser 工具,浏览器目标选「我的浏览器」(user-browser)。';
+
 function ghostRecall(ghost: InstalledGhost): string | undefined {
   return ghost.manifest.whenToUse ?? ghost.manifest.description;
 }
@@ -1690,6 +1712,7 @@ export function getGhostRosterPrompt({ workingDir }: { workingDir?: string }): s
 
 function toCindyGhostInfo(ghost: InstalledGhost): CindyGhostInfo {
   const recall = ghostRecall(ghost);
+  const hidden = pageControlHidden(ghost);
   let setup: CindyGhostInfo['setup'];
   try {
     setup = getGhostSetupAssessment(installedGhostStoragePart(ghost));
@@ -1709,14 +1732,16 @@ function toCindyGhostInfo(ghost: InstalledGhost): CindyGhostInfo {
     ...(recall ? { recall } : {}),
     ...(ghost.manifest.manual
       ? {
-          manual: ghost.manifest.manual.items.map(({ name, description }) => ({
-            name,
-            description,
-          })),
+          manual: ghost.manifest.manual.items
+            .filter(({ name }) => !hidden?.manual.has(name))
+            .map(({ name, description }) => ({
+              name,
+              description,
+            })),
         }
       : {}),
     ...(setup ? { setup } : {}),
-    tools: (ghost.manifest.tools ?? []).map((tool) => ({
+    tools: (ghost.manifest.tools ?? []).filter((tool) => !hidden?.tools.has(tool.name)).map((tool) => ({
       name: tool.name,
       description: tool.description,
       ...(tool.parameters ? { parameters: tool.parameters } : {}),
@@ -1788,11 +1813,99 @@ export function getCindyGhostsMcpDeps(
       return { assertCurrent, release: () => undefined, consentPrompt: installConsentPrompt() };
     },
   });
+  const contributionAuthority = async (write: boolean) => {
+    const context = resolveSessionContext();
+    const owner = contributionOwnerKey();
+    const live = context?.sessionId && context.sessionInstanceId
+      ? hostDeps.getLiveSessionGrantState?.(context.sessionId, context.sessionInstanceId) : null;
+    const assert = async (acceptedOperation = false) => {
+      assertContributionOwner(owner);
+      if (!live || await live.contributionAccountAllowed?.(acceptedOperation) !== true || (write && (live.isCurrent?.() !== true || !live.permissionMode || workdirWriteVerdict(live.permissionMode, false) === 'deny'))) {
+        throwIpcError('PERMISSION_DENIED', 'Community contributions require a current account task; shared-task guests cannot borrow the Host account');
+      }
+      assertContributionOwner(owner);
+    };
+    await assert();
+    return { context: context!, assert: () => assert(), assertAccepted: () => assert(true) };
+  };
   return {
     ...(marketTools ? {
       searchMarket: (query: string) => marketTools.search(query),
       installMarket: (request: { pluginId: string; releaseId: string }, signal?: AbortSignal) => marketTools.install(request, signal),
     } : {}),
+    async communityContribution(input) {
+      try {
+        const authority = await contributionAuthority(['prepare', 'submit', 'cancel', 'cancel-review'].includes(input.action));
+        let result: unknown;
+        if (input.action === 'prepare') {
+          const resolved = resolveInstalledGhost(getGhostManager().list(), input.ghostId, input.namespace);
+          if (resolved.status !== 'unique') return { ok: false, errorCode: resolved.status === 'ambiguous' ? 'GHOST_AMBIGUOUS' : 'GHOST_NOT_FOUND' };
+          result = await community.prepareContribution(installedGhostStoragePart(resolved.ghost), 'ai');
+        } else if (input.action === 'submit' || input.action === 'cancel-review') {
+          const cancelTarget = input.action === 'cancel-review' ? await community.myPluginReviewTarget(input.pluginId, input.release.releaseId) : null;
+          if (input.action === 'cancel-review' && (!cancelTarget || cancelTarget.release.sha256 !== input.release.sha256 || cancelTarget.release.revision !== input.release.revision)) throwIpcError('CONTRIBUTION_REVISION_STALE', 'Refresh this version before cancelling its review');
+          if (input.action === 'cancel-review' && cancelTarget && ['approved', 'rejected', 'cancelled'].includes(cancelTarget.release.reviewStatus ?? '')) {
+            await authority.assert();
+            return { ok: true, result: cancelTarget.release };
+          }
+          const toolName = input.action === 'cancel-review' ? 'ghost_cancel_plugin_review' : 'ghost_contribution_submit';
+          const prepared = input.action === 'cancel-review' && cancelTarget ? { preparedId: cancelTarget.release.releaseId, ghostId: input.pluginId, version: cancelTarget.release.version, sha256: cancelTarget.release.sha256, name: cancelTarget.name, description: t('settings.ghosts.contribution.cancelReviewDescription').replaceAll('{{version}}', cancelTarget.release.version) } : input.action === 'submit' ? getPreparedContribution(input.id).summary : undefined;
+          if (!prepared) throwIpcError('PRECONDITION_FAILED', 'Contribution preparation is unavailable');
+          const context = authority.context;
+          const live = hostDeps.getLiveSessionGrantState!(context.sessionId!, context.sessionInstanceId!);
+          let allowed = live?.permissionMode === 'bypassPermissions';
+          if (!allowed && live?.permissionMode === 'auto' && live.reviewAction) {
+            const decision = await live.reviewAction(toolAutoReviewAction(toolName, {
+              prepared_id: prepared.preparedId, ghost_id: prepared.ghostId, version: prepared.version, sha256: prepared.sha256, public: true,
+            }));
+            await authority.assert();
+            if (decision.verdict === 'block') return {
+              ok: false,
+              errorCode: 'PERMISSION_DENIED',
+              message: decision.reason ?? 'Automatic review denied this action; no publishing or cancellation request was sent.',
+            };
+            allowed = decision.verdict === 'allow';
+          }
+          if (!allowed) {
+            if (!hostDeps.requestHostPermission) throwIpcError('PRECONDITION_FAILED', 'Contribution confirmation is unavailable');
+            const decision = await hostDeps.requestHostPermission(context.sessionId!, context.sessionInstanceId!, {
+              kind: 'permission', requestId: randomUUID(), toolName,
+              input: { prepared_id: prepared.preparedId, ghost_id: prepared.ghostId, version: prepared.version, sha256: prepared.sha256 },
+              title: t(input.action === 'cancel-review' ? 'settings.ghosts.contribution.cancelReview' : 'settings.ghosts.contribution.confirmSubmit'),
+              description: [
+                input.action === 'cancel-review' ? '' : t('settings.ghosts.contribution.confirmPublic'),
+                `${prepared.name} · ${prepared.version}`,
+                prepared.description,
+                ...('releaseNotes' in prepared && typeof prepared.releaseNotes === 'string' && prepared.releaseNotes.trim()
+                  ? [t('settings.ghosts.contribution.releaseNotes'), prepared.releaseNotes] : []),
+                input.action === 'cancel-review' ? '' : t('settings.ghosts.contribution.versionConsumedHint'),
+              ].filter(Boolean).join('\n'),
+              metadata: { hostOwnedConfirmation: 'plugin_contribution' },
+            }, AbortSignal.timeout(10 * 60_000));
+            allowed = decision?.kind === 'permission' && decision.behavior === 'allow';
+          }
+          await authority.assert();
+          if (!allowed) return { ok: false, errorCode: 'MUTATION_CANCELLED' };
+          result = input.action === 'cancel-review' ? await community.cancelPluginReview(input.pluginId, input.release, authority.assert) : await community.submitContribution(input.id, authority.assertAccepted);
+        } else if (input.action === 'status') result = await community.contributionTransferStatus(input.id);
+        else if (input.action === 'cancel') result = community.cancelContribution(input.id);
+        else if (input.action === 'list') result = await community.listMyPlugins({ query: input.query ?? '', filter: input.filter ?? 'all', cursor: input.cursor });
+        else if (input.action === 'submission') result = await community.myPluginSubmission(input.pluginId, input.submissionId);
+        else if (input.action === 'detail') result = await community.myPluginDetail(input.pluginId, input.cursor);
+        await authority.assert();
+        return { ok: true, result };
+      } catch (error) {
+        try { community.mapContributionError(error); } catch (safe) {
+          return {
+            ok: false,
+            errorCode: isIpcError(safe) ? safe.code : 'INTERNAL',
+            message: isIpcError(safe) && safe.code !== 'INTERNAL'
+              ? safe.message
+              : 'Community contribution action could not complete; query the original operation before retrying.',
+          };
+        }
+      }
+    },
     connectAccount: async (target, signal) => {
       const context = resolveSessionContext();
       const sessionId = ghostSetupInteractionSessionId(context);
@@ -1995,6 +2108,10 @@ export function getCindyGhostsMcpDeps(
           message: '该插件未声明可供读取的手册;不要重试,改用其它方式完成。',
         };
       }
+      const hiddenManual = pageControlHidden(visibility.ghost)?.manual;
+      if (hiddenManual?.size && hiddenManual.has(String(manualPath ?? '').split('/')[0])) {
+        return { ok: false, manual: [], content: '', errorCode: 'GHOST_NOT_FOUND', message: PAGE_CONTROL_TOOL_MESSAGE };
+      }
       return readInstalledGhostManual(visibility.ghost, manualPath);
     },
     async callGhostTool({
@@ -2044,6 +2161,9 @@ export function getCindyGhostsMcpDeps(
       // Runtime setup gate: the shared visibility check above runs before any
       // durable attachment grant, directory ticket, sandbox, card call, or dispatch.
       // grant_only never dispatches and intentionally ignores its tool field.
+      if (!grantOnly && pageControlHidden(target)?.tools.has(tool)) {
+        return { ok: false, errorCode: 'TOOL_NOT_FOUND', message: PAGE_CONTROL_TOOL_MESSAGE };
+      }
       if (
         !grantOnly &&
         !(target.manifest.tools ?? []).some((candidate) => candidate.name === tool)
@@ -2203,6 +2323,7 @@ export function getCindyGhostsMcpDeps(
           },
         };
       }
+      const callId = randomUUID();
       const attachmentUrls = [...new Set(attachments ?? [])];
       if (attachmentUrls.length > 0) {
         const grant = await grantAttachmentUrls({
@@ -2244,6 +2365,7 @@ export function getCindyGhostsMcpDeps(
         if (dirConfirm.isCurrent) handoffChecks.push(dirConfirm.isCurrent);
         if (handoffExpired()) return handoffDenied;
         const deposited = getDirDepositVault().deposit({
+          callId,
           ghostId: installedGhostStoragePart(target),
           dirAbs: dirConfirm.userGranted ? dirConfirm.approvedRealPath : dir,
           workdirAbs: sessionWorkdir,
@@ -2381,7 +2503,6 @@ export function getCindyGhostsMcpDeps(
       // 中可 card-update)→ finalize(问"这单供过卡吗",开晚到宽限窗)→
       // 真供过卡才把 xdt_card_id 注入 result(mcpServer 提升到顶层,renderer
       // 据此配对取卡;没供过 = 结果零变化,模型永远看不到内部 UUID)。
-      const callId = randomUUID();
       const cardService = getGhostCardService();
       const callSessionContext = resolveSessionContext();
       cardService.registerCall(callId, {

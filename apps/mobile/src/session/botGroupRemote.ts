@@ -205,6 +205,15 @@ function parseAttachment(value: unknown): BotGroupAttachment | null {
   };
 }
 
+function parseMaskAttribution(value: unknown): BotGroupMessageView['maskAttribution'] {
+  const record = recordOf(value), self = recordOf(record?.self), companion = recordOf(record?.companion);
+  if (!id(record?.sourceMessageId) || !id(self?.id) || !id(companion?.id)
+    || typeof self?.name !== 'string' || typeof companion?.name !== 'string') return undefined;
+  return { sourceMessageId: id(record?.sourceMessageId)!,
+    self: { id: id(self.id)!, name: self.name, avatarUrl: text(self.avatarUrl, 4096) },
+    companion: { id: id(companion.id)!, name: companion.name, avatarUrl: text(companion.avatarUrl, 4096) } };
+}
+
 function parseMessage(value: unknown): BotGroupMessageView | null {
   const record = recordOf(value);
   const messageId = id(record?.id);
@@ -227,6 +236,7 @@ function parseMessage(value: unknown): BotGroupMessageView | null {
     ...(typeof record.serverSequence === 'string' && /^\d{1,30}$/.test(record.serverSequence) ? { serverSequence: record.serverSequence } : {}),
     kind,
     authorKind,
+    maskAttribution: parseMaskAttribution(record.maskAttribution),
     ...(typeof record.isSelf === 'boolean' ? { isSelf: record.isSelf } : {}),
     ...(optionalId(record.threadRootId) ? { threadRootId: optionalId(record.threadRootId) } : {}),
     authorBotId: optionalId(record.authorBotId),
@@ -316,6 +326,11 @@ function parseRound(value: unknown): BotGroupRoundView {
         botId,
         sessionId: optionalId(speaker.sessionId),
         activity: enumOf(speaker.activity, SPEAKER_ACTIVITIES) ?? 'reply',
+        ...(id(speaker.executionId) ? { executionId: id(speaker.executionId)! } : {}),
+        ...(typeof speaker.startedAt === 'number' && Number.isFinite(speaker.startedAt) ? { startedAt: speaker.startedAt } : {}),
+        ...(speaker.stopping === true ? { stopping: true } : {}),
+        ...(['queued', 'running', 'needs_input', 'stopping'].includes(String(speaker.executionStatus))
+          ? { executionStatus: speaker.executionStatus as BotGroupSpeaker['executionStatus'] } : {}),
       }];
     })
     : [];
@@ -380,6 +395,7 @@ export function parseBotGroupChatData(value: unknown): BotGroupRemoteChatData | 
     supportsMemberRemoval: record.supportsMemberRemoval === true,
     supportsSettingsManagement: record.supportsSettingsManagement === true,
     supportsReadReceipts: record.supportsReadReceipts === true,
+    supportsPersonalMask: record.supportsPersonalMask === true,
     replyMode: record.replyMode === 'mentioned' ? 'mentioned' : 'all',
     speakingMode: record.speakingMode === 'sequential' ? 'sequential' : 'auto',
     members,

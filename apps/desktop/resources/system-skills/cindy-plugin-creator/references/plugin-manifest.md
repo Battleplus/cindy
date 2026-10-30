@@ -15,6 +15,7 @@
     "ko": "locales/ko.json"
   },
   "version": "1.0.0",
+  "releaseNotes": "新增图片编辑工具。", // 可选；更新说明要求见 §7.3
   "minCindyVersion": "1.2.3", // 示例；v3 必填:本插件实际依赖的首个 Cindy 正式版本(SemVer)
   "entry": "main.js",          // 电子脑入口(kind 字段已无需填写:插件只有芯片一种形态,缺省即 chip;写了也只认 "chip")
   "launch": "on-demand",       // 可选:电子脑启动模式。on-demand(缺省)=被需要才拉起;resident=唤醒即常驻(详情页会如实标注"常驻运行",绝大多数插件不需要,仅订阅型/需秒响应的场景用)
@@ -157,9 +158,9 @@ node secretBindings key、setup kv key——都不能使用 `__proto__`、`const
 
 v3 直接用顶层字段声明插件贡献项与自主 Host 能力，不再有 `slots`。带详单的字段是 `tools`、`cindy`、
 `agent`、`panel`、`mainView`、`taskView`、`card`、`subscribe`、`network`、`node`、`preview`、
-`skill`；布尔能力写成字面量 `true`：`notify`、`badge`、`confirm`、`fs`、
+`browserExtension`、`skill`；布尔能力写成字面量 `true`：`notify`、`badge`、`confirm`、`fs`、
 `library`、`deviceSync`、`sessionContext`、`pick`、`workspace`。不用的字段直接省略。
-`deviceSync` 的声明与调用约定见 [§4.10.2 同账号电脑间的插件资料同步](plugin-files-and-library.md#4102-同账号电脑间的插件资料同步)。
+`deviceSync` 的声明与调用约定见 [§4.10.2 资料同步](plugin-files-and-library.md#4102-同账号电脑间的插件资料同步)。
 邮件插件声明 `mail: true`，调用 Cindy 内置 `cindyMail.register(adapter)`
 （version 1），不生成卡片 HTML、不打包公共流程；纯邮件插件不需要 `card`。
 阅读邮件可声明 `mailReader:{tool,hosts}`，工具接收 `{url}` 并返回 MailMessage，默认只读。

@@ -1,4 +1,5 @@
 import { fastModeFromStorage, fastModeToStorage } from '@cindy/maker-shared';
+import { extractToolResultDiagnostics } from '@cindy/maker-shared/tool-result-compaction';
 import { runPluginUsageTransaction } from './pluginUsageTx.js';
 import { runTaskTagsTransaction } from './taskTagsTx.js';
 import { recordMediaSpend } from './mediaSpendTx.js';
@@ -15,6 +16,7 @@ import { inferBotTemplatePresetId } from '../../../../shared/botTemplatePreset.j
 import type Database from 'better-sqlite3';
 
 import type { DbTxName, SessionsSetTerminalStatusResult } from '../../client/tx/types.js';
+import { runChatCacheTransaction, type ChatCacheTransaction } from './chatCacheTx.js';
 import { computeForkSourceMessagesDigest, type ForkSourceMessage } from '../../forkRecoverySnapshot.js';
 import { normalizeWorkingDirForStorage } from '../../../../shared/workingDir.js';
 import { capImportedToolResultContent } from '../../../../shared/toolResultPersistCap.js';
@@ -70,6 +72,8 @@ function dispatchTransaction(db: Database.Database, args: unknown): unknown {
   const txArgs = payload.args;
 
   switch (name) {
+    case 'chatCache.execute':
+      return runChatCacheTransaction(db, txArgs as ChatCacheTransaction);
     case 'usage.recordMediaSpend':
       return recordMediaSpend(db, txArgs as import('../../client/tx/types.js').MediaSpendArgs);
     case 'authorization.readProjection':
@@ -184,6 +188,8 @@ function dispatchTransaction(db: Database.Database, args: unknown): unknown {
       return botsPersistSessionPermission(db, txArgs);
     case 'bots.createGroupLane':
       return botsCreateGroupLane(db, txArgs as BotGroupsCreateLaneArgs);
+    case 'bots.createRoutineLane':
+      return botsCreateChannelLane(db, txArgs as BotsCreateChannelLaneArgs, 'routine');
     case 'bots.createChannelLane':
       return botsCreateChannelLane(db, txArgs as BotsCreateChannelLaneArgs);
     case 'bots.createThreadLane':
@@ -320,16 +326,24 @@ function projectAliasesReplaceIdentity(
   })();
 }
 
+/** Main → worker internal flag: absent keeps the original behavior. */
+function expectOptionalFlag(value: unknown, name: string): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw invalidArgs(`${name} must be a boolean`);
+  return value;
+}
+
 function botsCreateProfile(db: Database.Database, args: unknown): void {
   const p = asRecord(args, 'bots.createProfile args');
   const id = expectString(p.id, 'id');
   const now = expectNumber(p.now, 'now');
+  const allowDuplicateName = expectOptionalFlag(p.allowDuplicateName, 'allowDuplicateName');
   db.transaction(() => {
     const config = JSON.parse(expectString(p.capabilitiesJson, 'capabilitiesJson'));
     const rows = db.prepare(`SELECT p.id, p.display_name AS name, v.capabilities_json AS config, v.identity_source AS identity
       FROM bot_profiles p JOIN bot_profile_versions v ON v.bot_id = p.id AND v.version = p.current_version
       WHERE p.status != 'archived'`).all() as Array<{ id: string; name: string; config: string; identity: string }>;
-    if (rows.some(row => normalizeBotName(row.name) === normalizeBotName(expectString(p.displayName, 'displayName'))) ||
+    if ((!allowDuplicateName && rows.some(row => normalizeBotName(row.name) === normalizeBotName(expectString(p.displayName, 'displayName')))) ||
         (config.templateId === 'cindy' && rows.some(row => JSON.parse(row.config).templateId === 'cindy' || inferBotTemplatePresetId(row.identity) === 'cindy'))) {
       throw Object.assign(new Error('A matching companion already exists'), { code: 'ALREADY_EXISTS' });
     }
@@ -365,6 +379,7 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
   const id = expectString(p.id, 'id');
   const expectedVersion = expectNumber(p.expectedCurrentVersion, 'expectedCurrentVersion');
   const now = expectNumber(p.now, 'now');
+  const allowDuplicateName = expectOptionalFlag(p.allowDuplicateName, 'allowDuplicateName');
   const avatarRef = p.botAvatarRef === undefined
     ? null
     : asRecord(p.botAvatarRef, 'botAvatarRef');
@@ -390,7 +405,7 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
     if (p.expectedAvatar !== undefined && current.avatar !== expectString(p.expectedAvatar, 'expectedAvatar')) {
       throw Object.assign(new Error('Teammate avatar changed during update'), { code: 'PRECONDITION_FAILED' });
     }
-    if (p.displayName !== undefined && normalizeBotName(expectString(p.displayName, 'displayName')) !== normalizeBotName(current.displayName)) {
+    if (!allowDuplicateName && p.displayName !== undefined && normalizeBotName(expectString(p.displayName, 'displayName')) !== normalizeBotName(current.displayName)) {
       const name = normalizeBotName(expectString(p.displayName, 'displayName'));
       const others = db.prepare("SELECT display_name AS name FROM bot_profiles WHERE id != ? AND status != 'archived'").all(id) as Array<{ name: string }>;
       if (others.some(row => normalizeBotName(row.name) === name)) throw Object.assign(new Error('A companion with this name already exists'), { code: 'ALREADY_EXISTS' });
@@ -423,11 +438,11 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
     if (permissionMode !== undefined && !['ask', 'auto', 'bypassPermissions'].includes(permissionMode)) {
       throw new Error('Invalid canonical permission mode');
     }
-    const latest = editsContent || permissionMode !== undefined
+    const latest = editsContent || permissionMode !== undefined || p.clearScheduledModelBaseline === true
       ? db.prepare('SELECT capabilities_json AS json, identity_source AS identity FROM bot_profile_versions WHERE bot_id = ? AND version = ?')
         .get(id, expectedVersion) as { json: string; identity: string } | undefined
       : undefined;
-    if ((editsContent || permissionMode !== undefined) && !latest) {
+    if ((editsContent || permissionMode !== undefined || p.clearScheduledModelBaseline === true) && !latest) {
       throw Object.assign(new Error('Bot profile version missing'), { code: 'PRECONDITION_FAILED' });
     }
     const latestConfig = latest ? asRecord(JSON.parse(latest.json), 'capabilities') : undefined;
@@ -443,7 +458,10 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
       else delete nextConfig.permissions;
     }
     // A same-value settings edit can become a real change while waiting to commit.
-    const changed = editsContent || (permission !== undefined && latestConfig?.permissions !== permission);
+    // Reaccepting the same saved model is a durable selection event too. Give
+    // it a version so cold sends can distinguish it from a legacy restore.
+    const changed = editsContent || p.clearScheduledModelBaseline === true
+      || (permission !== undefined && latestConfig?.permissions !== permission);
     const nextVersion = changed ? expectedVersion + 1 : expectedVersion;
     if (changed) {
       fields.push('current_version = ?');
@@ -477,7 +495,7 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
           agent_kind AS agentKind, model, provider_id AS providerId, effort, fast_mode AS fastMode
           FROM sessions WHERE id IN
           (SELECT session_id FROM bot_session_links WHERE bot_id = ?
-            AND role IN ('canonical', 'group', 'channel', 'thread') AND archived_at IS NULL)`)
+            AND role IN ('canonical', 'group', 'channel', 'thread', 'routine') AND archived_at IS NULL)`)
           .all(id) as Array<{ id: string; baseline: string | null; agentKind: string; model: string;
             providerId: string | null; effort: string; fastMode: number | string }>;
 
@@ -499,7 +517,7 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
       // their next runtime bootstrap. Route/worker links remain pinned to their
       // creation version.
       db.prepare(`UPDATE bot_session_links SET profile_version = ?
-        WHERE bot_id = ? AND role IN ('canonical', 'group', 'channel', 'thread') AND archived_at IS NULL`)
+        WHERE bot_id = ? AND role IN ('canonical', 'group', 'channel', 'thread', 'routine') AND archived_at IS NULL`)
         .run(nextVersion, id);
     }
     if (permissionMode !== undefined) {
@@ -507,7 +525,7 @@ function botsUpdateProfile(db: Database.Database, args: unknown): { currentVersi
       // Group and IM channel lanes run under the same permission profile as the
       // Bot's canonical Chat (per-turn group policies still apply on top).
       db.prepare(`UPDATE sessions SET permission_mode = ? WHERE id IN
-        (SELECT session_id FROM bot_session_links WHERE bot_id = ? AND role IN ('canonical', 'group', 'channel', 'thread') AND archived_at IS NULL)`)
+        (SELECT session_id FROM bot_session_links WHERE bot_id = ? AND role IN ('canonical', 'group', 'channel', 'thread', 'routine') AND archived_at IS NULL)`)
         .run(mode, id);
     }
     return { currentVersion: nextVersion };
@@ -875,11 +893,11 @@ function botsCreateGroupLane(db: Database.Database, args: BotGroupsCreateLaneArg
  * of creating a second. Unlike group lanes there is no member table: the
  * connection binding (owner-scoped setting) is the authority, checked by Main.
  */
-function botsCreateChannelLane(db: Database.Database, args: BotsCreateChannelLaneArgs): BotGroupsCreateLaneResult {
+function botsCreateChannelLane(db: Database.Database, args: BotsCreateChannelLaneArgs, role: 'channel' | 'routine' = 'channel'): BotGroupsCreateLaneResult {
   const p = asRecord(args, 'bots.createChannelLane args');
   const botId = expectString(p.botId, 'botId');
   const routeKey = expectString(p.routeKey, 'routeKey');
-  if (!routeKey.startsWith('im:')) throw new Error('Channel lane route key must start with im:');
+  if (!routeKey.startsWith(role === 'routine' ? 'routine:' : 'im:')) throw new Error('Invalid companion lane route key');
   const s = asRecord(p.session, 'session');
   const sessionId = expectString(s.id, 'session.id');
   const createdAt = expectNumber(s.createdAt, 'session.createdAt');
@@ -892,15 +910,15 @@ function botsCreateChannelLane(db: Database.Database, args: BotsCreateChannelLan
     }
     const existing = db.prepare(`SELECT l.session_id AS sessionId FROM bot_session_links l
       INNER JOIN sessions s ON s.id = l.session_id
-      WHERE l.bot_id = ? AND l.role = 'channel' AND l.route_key = ? AND l.archived_at IS NULL
+      WHERE l.bot_id = ? AND l.role = ? AND l.route_key = ? AND l.archived_at IS NULL
         AND s.source = 'bot' AND s.status = 'active'
-      LIMIT 1`).get(botId, routeKey) as { sessionId: string } | undefined;
+      LIMIT 1`).get(botId, role, routeKey) as { sessionId: string } | undefined;
     if (existing) return { sessionId: existing.sessionId, created: false };
     insertBotSession(db, s);
     db.prepare(`INSERT INTO bot_session_links
       (id, bot_id, session_id, profile_version, role, route_key, created_at, archived_at)
-      VALUES (?, ?, ?, ?, 'channel', ?, ?, NULL)`)
-      .run(`${botId}:${sessionId}`, botId, sessionId, profile.version, routeKey, createdAt);
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`)
+      .run(`${botId}:${sessionId}`, botId, sessionId, profile.version, role, routeKey, createdAt);
     const permission = botsReconcileLanePermission(db, { sessionId });
     return { sessionId, created: true,
       ...(permission.canonicalSessionId ? { permissionRepairCanonicalSessionId: permission.canonicalSessionId } : {}) };
@@ -1294,7 +1312,7 @@ function botsPersistSessionPermission(
       return { updated: true };
     }
     const link = db.prepare(`SELECT bot_id AS botId FROM bot_session_links
-      WHERE session_id = ? AND role IN ('canonical', 'channel', 'group', 'thread')
+      WHERE session_id = ? AND role IN ('canonical', 'channel', 'group', 'thread', 'routine')
         AND archived_at IS NULL`).get(sessionId) as { botId: string } | undefined;
     if (link) {
       const profile = db.prepare('SELECT current_version AS version FROM bot_profiles WHERE id = ?')
@@ -1326,7 +1344,7 @@ function botsPersistSessionPermission(
     if (link) {
       db.prepare(`UPDATE sessions SET permission_mode = ?, updated_at = ? WHERE source = 'bot' AND status = 'active' AND id IN
         (SELECT session_id FROM bot_session_links WHERE bot_id = ?
-          AND role IN ('canonical', 'group', 'channel', 'thread') AND archived_at IS NULL)`)
+          AND role IN ('canonical', 'group', 'channel', 'thread', 'routine') AND archived_at IS NULL)`)
         .run(mode, Date.now(), link.botId);
     } else {
       db.prepare('UPDATE sessions SET permission_mode = ?, updated_at = ? WHERE id = ?')
@@ -1345,7 +1363,7 @@ function botsReconcileLanePermission(db: Database.Database, args: unknown): { mo
       JOIN sessions s ON s.id = l.session_id
       JOIN bot_profiles p ON p.id = l.bot_id
       LEFT JOIN bot_profile_versions v ON v.bot_id = p.id AND v.version = p.current_version
-      WHERE l.session_id = ? AND l.role IN ('canonical', 'channel', 'group', 'thread') AND l.archived_at IS NULL
+      WHERE l.session_id = ? AND l.role IN ('canonical', 'channel', 'group', 'thread', 'routine') AND l.archived_at IS NULL
         AND s.source = 'bot' AND s.status = 'active' AND p.status = 'active'`).get(sessionId) as
       { json: string | null; botId: string; role: string; previousMode: string } | undefined;
     if (!row) return { mode: null, changed: false };
@@ -1363,7 +1381,7 @@ function botsReconcileLanePermission(db: Database.Database, args: unknown): { mo
     if (canonical && ['ask', 'auto', 'bypassPermissions'].includes(canonical.mode)) {
       const permission = canonical.mode === 'bypassPermissions' ? 'trusted' : canonical.mode;
       const staleLane = db.prepare(`SELECT 1 FROM bot_session_links l JOIN sessions s ON s.id = l.session_id
-        WHERE l.bot_id = ? AND l.role IN ('channel', 'group', 'thread') AND l.archived_at IS NULL
+        WHERE l.bot_id = ? AND l.role IN ('channel', 'group', 'thread', 'routine') AND l.archived_at IS NULL
           AND s.source = 'bot' AND s.status = 'active' AND s.permission_mode != ? LIMIT 1`)
         .get(row.botId, canonical.mode);
       if (config.permissions !== permission || staleLane) {
@@ -2316,6 +2334,8 @@ function sessionsSetStatus(db: Database.Database, args: unknown): Array<{
   }>;
 }
 
+const TASK_LIST_BOT_LANE_SQL = "SELECT 1 FROM bot_session_links WHERE session_id = ? AND role IN ('routine', 'channel') LIMIT 1";
+
 /** Atomically persist a terminal task status and its local-close fence. */
 function sessionsSetTerminalStatus(db: Database.Database, args: unknown): SessionsSetTerminalStatusResult {
   const payload = asRecord(args, 'sessions.setTerminalStatus args');
@@ -2327,7 +2347,8 @@ function sessionsSetTerminalStatus(db: Database.Database, args: unknown): Sessio
       | { id: string; status: string; source: string } | undefined;
     if (!existing) throw Object.assign(new Error('Session not found: ' + sessionId), { code: 'NOT_FOUND' });
     if (existing.status === 'deleted') throw Object.assign(new Error('Deleted session cannot change status: ' + sessionId), { code: 'PRECONDITION_FAILED' });
-    if (existing.source === 'bot') throw Object.assign(new Error('Bot sessions must use Bot lifecycle: ' + sessionId), { code: 'PRECONDITION_FAILED' });
+    // Routine/channel lanes are listed with ordinary tasks and follow their lifecycle.
+    if (existing.source === 'bot' && !db.prepare(TASK_LIST_BOT_LANE_SQL).get(sessionId)) throw Object.assign(new Error('Bot sessions must use Bot lifecycle: ' + sessionId), { code: 'PRECONDITION_FAILED' });
     const now = Date.now();
     if (status === 'archived' || status === 'deleted') db.prepare(CLOSE_SHARED_TASKS_FOR_SESSION_SQL).run(now, sessionId);
     const updated = db.prepare(
@@ -2369,6 +2390,12 @@ function compactSessionToolResults(
   const sessionId = expectString(payload.sessionId, 'sessionId');
   const now = expectNumber(payload.now, 'now');
 
+  // Runtime-only function; no persisted schema/trigger depends on it.
+  db.function('tool_result_diagnostics', { deterministic: true }, (content: unknown) => {
+    const diagnostics = extractToolResultDiagnostics(content);
+    return diagnostics ? JSON.stringify(diagnostics) : null;
+  });
+
   const selectSession = db.prepare(`
     SELECT id
       FROM sessions
@@ -2377,7 +2404,7 @@ function compactSessionToolResults(
      LIMIT 1
   `);
   // Archived/deleted tool results are intentionally treated uniformly. Ordinary
-  // rows only pay for the fixed-prefix check. JSON validation runs solely for
+  // rows only pay for the fixed-prefix check when selecting candidates. JSON validation runs solely for
   // the tiny set of rows that look like our marker, preventing an unrelated
   // tool result with the same prefix from being skipped forever.
   const uncompactedContentPredicate = `
@@ -2403,12 +2430,12 @@ function compactSessionToolResults(
   `);
   const compactMessages = db.prepare(`
     UPDATE messages
-       SET content = json_object(
+       SET content = json_patch(json_object(
          'type', 'tool_result_compacted',
          'version', 1,
          'originalBytes', octet_length(content),
          'compactedAt', ?
-       )
+       ), json_object('diagnostics', json(tool_result_diagnostics(content))))
      WHERE session_id = ?
        AND role = 'tool_result'
        AND (${uncompactedContentPredicate}) = 1
@@ -2509,19 +2536,13 @@ function imRotateSession(
   })();
 }
 
-function codexImportMessages(db: Database.Database, args: unknown): { changed: number } {
+function codexImportMessages(db: Database.Database, args: unknown): { changed: number; hiddenClientIds?: string[]; updatedLocalIds?: string[] } {
   const payload = asRecord(args, 'codex.importMessages args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
   const importClientIdPrefix = expectString(payload.importClientIdPrefix, 'importClientIdPrefix');
   const sdkSessionId = expectString(payload.sdkSessionId, 'sdkSessionId');
   const model = expectString(payload.model, 'model');
   const rows = expectArray(payload.rows, 'rows');
-  const existing = readExistingMessageFingerprints(db, sessionId, importClientIdPrefix);
-  const existingImportedClientIds = readExistingImportedClientIds(
-    db,
-    sessionId,
-    importClientIdPrefix,
-  );
   const upsert = db.prepare(`
     INSERT INTO messages
       (id, client_id, session_id, role, content, tool_use_id, agent_meta, created_at, rewind_at)
@@ -2543,6 +2564,33 @@ function codexImportMessages(db: Database.Database, args: unknown): { changed: n
       )
   `);
   const transaction = db.transaction(() => {
+    const existing = readExistingMessageFingerprints(db, sessionId, importClientIdPrefix);
+    const importedRows = new Map((db.prepare(`
+      SELECT client_id AS clientId, role, content, created_at AS createdAt, rewind_at AS rewindAt
+      FROM messages WHERE session_id = ? AND client_id LIKE ?
+    `).all(sessionId, `${importClientIdPrefix}%`) as Array<{
+      clientId: string; role: string; content: string; createdAt: number; rewindAt: number | null;
+    }>).map((row) => [row.clientId, row]));
+    const consumed = new Set<string>();
+    const hiddenClientIds: string[] = [];
+    const updatedLocalIds: string[] = [];
+    // Text fallback must not match an earlier turn that happened to say the
+    // same thing. Include external user turns as well as Cindy's local rows.
+    const userTimes = existing.filter((row) => row.role === 'user').map((row) => row.createdAt);
+    for (const row of importedRows.values()) {
+      if (row.role !== 'user') continue;
+      const lineNo = Number(row.clientId.slice(importClientIdPrefix.length));
+      if (Number.isInteger(lineNo) && lineNo >= 0) userTimes.push(row.createdAt - lineNo);
+    }
+    for (const value of rows) {
+      const row = asRecord(value, 'codex row');
+      if (row.role === 'user') userTimes.push(expectNumber(row.sourceCreatedAt ?? row.createdAt, 'row.createdAt'));
+    }
+    const hideDuplicate = db.prepare(`UPDATE messages SET rewind_at = ?
+      WHERE session_id = ? AND client_id = ? AND role = 'assistant' AND rewind_at IS NULL`);
+    const enrichLocal = db.prepare(`UPDATE messages SET content = ?, agent_meta = ?
+      WHERE session_id = ? AND id = ? AND role = 'assistant' AND rewind_at IS NULL
+      AND (content IS NOT ? OR agent_meta IS NOT ?)`);
     let changed = 0;
     for (const rawRow of rows) {
       const row = asRecord(rawRow, 'codex row');
@@ -2550,11 +2598,38 @@ function codexImportMessages(db: Database.Database, args: unknown): { changed: n
       const role = expectString(row.role, 'row.role') as 'user' | 'assistant';
       const text = expectString(row.text, 'row.text');
       const createdAt = expectNumber(row.createdAt, 'row.createdAt');
+      const sourceCreatedAt = row.sourceCreatedAt == null ? createdAt : expectNumber(row.sourceCreatedAt, 'row.sourceCreatedAt');
       const clientId = `${importClientIdPrefix}${lineNo}`;
-      if (
-        !existingImportedClientIds.has(clientId) &&
-        isLikelyLocalDuplicate(existing, { role, text, createdAt })
-      ) {
+      const phase = row.phase === 'commentary' || row.phase === 'final_answer' ? row.phase : undefined;
+      const agentMessageId = typeof row.agentMessageId === 'string' && row.agentMessageId ? row.agentMessageId : undefined;
+      const previous = importedRows.get(clientId);
+      // Deleted/rewound rows never become visible again. Their local match is
+      // still consumed so a second, legitimate identical item is not swallowed.
+      const duplicate = findLocalDuplicate(existing, { role, text, createdAt: sourceCreatedAt, phase, agentMessageId, sdkSessionId }, consumed, userTimes);
+      if (duplicate) consumed.add(duplicate.id);
+      if (previous && (previous.role === 'message_tombstone' || previous.rewindAt !== null)) continue;
+      if (duplicate && (!previous || role === 'assistant' && normalizeStoredMessageText(previous.content) === text)) {
+        if (role === 'assistant') {
+          // Keep the stable live row and its usage/fork metadata. Only append a
+          // recognized citation tail; never replace ordinary prose with rollout.
+          const tail = !duplicate.memoryTail ? memoryCitationTail(text) : '';
+          if (tail || phase && !duplicate.meta.assistantPhase || agentMessageId && !duplicate.meta.agentMessageId) {
+            const content = JSON.stringify(duplicate.text + tail);
+            const meta = JSON.stringify({ ...duplicate.meta,
+              ...(phase && !duplicate.meta.assistantPhase ? { assistantPhase: phase } : {}),
+              ...(agentMessageId && !duplicate.meta.agentMessageId ? { agentMessageId, sdkSessionId } : {}),
+            });
+            const updated = enrichLocal.run(content, meta, sessionId, duplicate.id, content, meta).changes;
+            changed += updated;
+            if (updated > 0) updatedLocalIds.push(duplicate.id);
+          }
+          // Soft-hide only verified import copies; preserve their original data.
+          if (previous) {
+            const hidden = hideDuplicate.run(Date.now(), sessionId, clientId).changes;
+            changed += hidden;
+            if (hidden > 0) hiddenClientIds.push(clientId);
+          }
+        }
         continue;
       }
       changed += upsert.run({
@@ -2563,14 +2638,18 @@ function codexImportMessages(db: Database.Database, args: unknown): { changed: n
         sessionId,
         role,
         content: stringifyImportedContent(role, row.content),
-        agentMeta: JSON.stringify({ sdkSessionId, model }),
+        agentMeta: JSON.stringify({ sdkSessionId, model,
+          ...(phase ? { assistantPhase: phase } : {}),
+          ...(agentMessageId ? { agentMessageId } : {}),
+        }),
         createdAt,
       }).changes;
     }
     if (changed > 0) invalidateSessionListProjection(db, sessionId);
-    return changed;
+    return { changed, ...(hiddenClientIds.length > 0 ? { hiddenClientIds } : {}),
+      ...(updatedLocalIds.length > 0 ? { updatedLocalIds } : {}) };
   });
-  return { changed: transaction() as number };
+  return transaction();
 }
 
 function claudeImportMessages(db: Database.Database, args: unknown): { changed: number } {
@@ -2661,6 +2740,16 @@ function rewindCommit(db: Database.Database, args: unknown): void {
     payload.expectedClearedAt === undefined || payload.expectedClearedAt === null
       ? null
       : expectNumber(payload.expectedClearedAt, 'expectedClearedAt');
+  const nativeContextReset = payload.nativeContextReset === undefined
+    ? null
+    : (() => {
+        const reset = asRecord(payload.nativeContextReset, 'nativeContextReset');
+        return {
+          markerId: expectString(reset.markerId, 'nativeContextReset.markerId'),
+          markerClientId: expectString(reset.markerClientId, 'nativeContextReset.markerClientId'),
+          markerContent: expectString(reset.markerContent, 'nativeContextReset.markerContent'),
+        };
+      })();
   const rows = db
     .prepare(
       `SELECT id, client_id, role, created_at, agent_meta, tool_use_id
@@ -2760,7 +2849,25 @@ function rewindCommit(db: Database.Database, args: unknown): void {
       // work from the branch the user explicitly withdrew.
       rewindParentlessSubagentTail.run(now, sessionId, targetCreatedAt);
     }
-    if (sdkSessionId) {
+    if (nativeContextReset) {
+      db.prepare(
+        `UPDATE sessions
+           SET user_send_at = ?, updated_at = ?, context_tokens = 0, context_window = 0,
+               codex_plan_json = NULL, sdk_session_id = NULL,
+               list_preview = NULL, list_preview_role = NULL, list_message_count = NULL
+         WHERE id = ?`,
+      ).run(now, now, sessionId);
+      db.prepare(
+        "INSERT INTO messages (id, client_id, session_id, role, content, created_at, rewind_at) VALUES (?, ?, ?, 'context_rebuild', ?, ?, ?)",
+      ).run(
+        nativeContextReset.markerId,
+        nativeContextReset.markerClientId,
+        sessionId,
+        nativeContextReset.markerContent,
+        now,
+        now,
+      );
+    } else if (sdkSessionId) {
       db.prepare(
         `UPDATE sessions
            SET user_send_at = ?, updated_at = ?, context_tokens = 0, context_window = 0,
@@ -3790,69 +3897,82 @@ function orcaReleaseWorkerCreationReservation(db: Database.Database, args: unkno
   );
 }
 
-function readExistingImportedClientIds(
-  db: Database.Database,
-  sessionId: string,
-  importClientIdPrefix: string,
-): Set<string> {
-  const rows = db.prepare(`
-    SELECT client_id AS clientId
-    FROM messages
-    WHERE session_id = ? AND client_id LIKE ?
-  `).all(sessionId, `${importClientIdPrefix}%`) as Array<{ clientId: string }>;
-  return new Set(rows.map((row) => row.clientId));
-}
-
 interface MessageFingerprint {
   role: 'user' | 'assistant';
   /** 原文指纹(仅换行归一 + trim),普通消息只用它精确比较。 */
   plain: string;
   /**
    * citation 规范形指纹(有损:标记→路径、去反引号、折叠空白)。只在 canon 比较
-   * 门放行时参与(见 isLikelyLocalDuplicate),避免「仅 Markdown 格式不同」的两条
+   * 门放行时参与(见 findLocalDuplicate),避免「仅 Markdown 格式不同」的两条
    * 正常回复被误判成重复(review 反馈)。
    */
   canonical?: string;
   /** 原文是否含原始标记字面量——canon 比较的门:至少一侧为真才启用有损比较。 */
   hasMarker: boolean;
   createdAt: number;
+  memoryTail: string;
+}
+
+interface LocalMessageFingerprint extends MessageFingerprint {
+  id: string;
+  text: string;
+  meta: Record<string, unknown>;
 }
 
 function readExistingMessageFingerprints(
   db: Database.Database,
   sessionId: string,
   importClientIdPrefix: string,
-): MessageFingerprint[] {
+): LocalMessageFingerprint[] {
+  // Rewound local rows still suppress their retained rollout copies. Enrichment
+  // below only writes visible rows, so matching never changes a rewind record.
   const rows = db.prepare(`
-    SELECT role, content, created_at AS createdAt
+    SELECT id, role, content, agent_meta AS agentMeta, created_at AS createdAt
     FROM messages
     WHERE session_id = ?
       AND role IN ('user', 'assistant')
       AND client_id NOT LIKE ?
   `).all(sessionId, `${importClientIdPrefix}%`) as Array<{
     role: string;
+    id: string;
     content: string;
+    agentMeta: string | null;
     createdAt: number;
   }>;
-  const out: MessageFingerprint[] = [];
+  const out: LocalMessageFingerprint[] = [];
   for (const row of rows) {
     if (row.role !== 'user' && row.role !== 'assistant') continue;
     const text = normalizeStoredMessageText(row.content);
     if (!text) continue;
-    out.push(messageFingerprint(row.role, text, row.createdAt));
+    let meta: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(row.agentMeta ?? '{}');
+      if (isRecord(parsed)) meta = parsed;
+    } catch { /* Legacy rows may have no usable metadata. */ }
+    out.push({ ...messageFingerprint(row.role, text, row.createdAt), id: row.id, text, meta });
   }
   return out;
 }
 
-function isLikelyLocalDuplicate(
-  existing: MessageFingerprint[],
-  row: { role: 'user' | 'assistant'; text: string; createdAt: number },
-): boolean {
+function findLocalDuplicate(
+  existing: LocalMessageFingerprint[],
+  row: { role: 'user' | 'assistant'; text: string; createdAt: number; phase?: string; agentMessageId?: string; sdkSessionId: string },
+  consumed: Set<string>,
+  userTimes: number[],
+): LocalMessageFingerprint | undefined {
   const next = messageFingerprint(row.role, row.text, row.createdAt);
-  return existing.some(
+  const candidates = existing.filter(
     (prev) =>
+      !consumed.has(prev.id) &&
       prev.role === next.role &&
-      Math.abs(prev.createdAt - next.createdAt) <= LOCAL_DUPLICATE_WINDOW_MS &&
+      (!row.phase || !prev.meta.assistantPhase || row.phase === prev.meta.assistantPhase) &&
+      (!prev.meta.sdkSessionId || prev.meta.sdkSessionId === row.sdkSessionId) &&
+      (!row.agentMessageId || !prev.meta.agentMessageId || row.agentMessageId === prev.meta.agentMessageId) &&
+      ((row.agentMessageId && row.agentMessageId === prev.meta.agentMessageId)
+        || Math.abs(prev.createdAt - next.createdAt) <= LOCAL_DUPLICATE_WINDOW_MS
+          && (row.role !== 'assistant' || !userTimes.some((time) => time > Math.min(prev.createdAt, next.createdAt)
+            && time <= Math.max(prev.createdAt, next.createdAt)))) &&
+      (!prev.memoryTail || !next.memoryTail || prev.memoryTail === next.memoryTail) &&
       // 普通消息:原文精确比较。canon 有损比较只在「至少一侧含原始标记字面量」时
       // 启用——即升级前的旧标记行 vs 已归一化的导入行;两条都不含标记的正常回复
       // (如 `Use \`foo\`` vs `Use foo`)绝不走有损比较(review 反馈)。
@@ -3862,6 +3982,33 @@ function isLikelyLocalDuplicate(
           (prev.hasMarker || next.hasMarker) &&
           prev.canonical === next.canonical)),
   );
+  // Ambiguous repeated prose is not proof of identity. Exact native item IDs
+  // take precedence; legacy fallback must have one unclaimed local candidate.
+  const exact = candidates.filter((candidate) => row.agentMessageId && candidate.meta.agentMessageId === row.agentMessageId);
+  return exact.length === 1 ? exact[0] : candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/** Only a complete terminal memory citation is metadata, never a prose substring or code example. */
+function memoryCitationTail(text: string): string {
+  const open = text.lastIndexOf('<oai-mem-citation>');
+  if (open <= 0) return '';
+  const body = text.slice(0, open);
+  if (!body.trim()) return '';
+  let fence: { char: string; length: number } | undefined;
+  for (const line of body.split(/\r?\n/)) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!match) continue;
+    const marker = match[1]!;
+    if (fence) {
+      if (marker[0] === fence.char && marker.length >= fence.length && !match[2]!.trim()) fence = undefined;
+    } else if (marker[0] !== '`' || !match[2]!.includes('`')) {
+      fence = { char: marker[0]!, length: marker.length };
+    }
+  }
+  if (fence) return '';
+  const tail = text.slice(open);
+  if (!/^<oai-mem-citation>\s*<citation_entries>[\s\S]+?<\/citation_entries>\s*(?:<rollout_ids>[\s\S]*?<\/rollout_ids>\s*)?<\/oai-mem-citation>\s*$/.test(tail)) return '';
+  return text.slice(body.trimEnd().length);
 }
 
 function messageFingerprint(
@@ -3872,13 +4019,15 @@ function messageFingerprint(
   // 升级前落库的旧行仍带原始 `:codex-file-citation{...}` 标记,导入侧新文本已
   // 归一化(标记换成 code span,截断残尾则被整段剥掉——此时是**不含任何标记/
   // 反引号的纯文本**)。因此 assistant 一律算出规范形候选指纹,是否参与比较由
-  // isLikelyLocalDuplicate 的标记门决定(review 反馈:残尾行的规范形是纯文本,
+  // findLocalDuplicate 的标记门决定(review 反馈:残尾行的规范形是纯文本,
   // 导入侧若不给纯文本算规范形就永远配不上)。只影响比较,不改落库内容。
-  const plain = normalizeFingerprintText(text);
+  const memoryTail = role === 'assistant' ? memoryCitationTail(text) : '';
+  const body = memoryTail ? text.slice(0, -memoryTail.length) : text;
+  const plain = normalizeFingerprintText(body);
   const hasMarker = role === 'assistant' && text.includes(CODEX_CITATION_OPEN);
   const canonical =
-    role === 'assistant' ? normalizeFingerprintText(canonicalizeCodexCitations(text)) : undefined;
-  return { role, plain, ...(canonical !== undefined ? { canonical } : {}), hasMarker, createdAt };
+    role === 'assistant' ? normalizeFingerprintText(canonicalizeCodexCitations(body)) : undefined;
+  return { role, plain, ...(canonical !== undefined ? { canonical } : {}), hasMarker, createdAt, memoryTail };
 }
 
 // 指纹专用规范形——与展示形(maker-core finalizeCodexCitationText)**刻意不同**:

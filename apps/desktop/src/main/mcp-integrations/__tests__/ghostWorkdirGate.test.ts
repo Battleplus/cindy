@@ -25,6 +25,8 @@ import type {
 import { t } from '../../i18n';
 import { Session } from '@cindy/maker-core';
 import { resolveGhostFsSessionSnapshot } from '../../maker-ipc/ghostFsSessionSnapshot';
+import { createIpcError } from '../../../shared/ipc-errors';
+import { installedGhostStoragePart } from '../../../shared/pluginIdentity';
 import type { CindyGhostsHostDeps } from '../ghost';
 import type { GhostInstallConsentPrompt } from '../../cindy-brain/ghostInstallConsent';
 import type { InstalledGhost, GhostSetupAssessment } from '../../../shared/ghost';
@@ -258,8 +260,22 @@ vi.mock('../ghostAttachmentResolve.js', () => ({
   resolveGhostAttachmentUrl: resolveGhostAttachmentUrlMock,
 }));
 
-const { authorizeDesktopSessionPath, getCindyGhostsMcpDeps, getGhostRosterPrompt } = await import('../ghost');
+const communityReadMock = vi.fn();
+const communitySubmitMock = vi.fn();
+const communityPreparedMock = vi.fn();
+vi.mock('../../plugin-contributions/host.js', () => ({
+  listMyPlugins: (...args: unknown[]) => communityReadMock(...args),
+  submitContribution: (...args: unknown[]) => communitySubmitMock(...args),
+  mapContributionError: (error: unknown) => { throw error; },
+}));
+vi.mock('../../plugin-contributions/prepared.js', () => ({
+  contributionOwnerKey: () => 'test-owner', assertContributionOwner: vi.fn(),
+  getPreparedContribution: (...args: unknown[]) => communityPreparedMock(...args),
+}));
+
+const { authorizeDesktopSessionPath, getCindyGhostsMcpDeps, getGhostRosterPrompt, setPageControlGhostProvider } = await import('../ghost');
 const { createCindyGhostsMcpServer, handleGhostList, handleGhostInfo, handleGhostCall, handleGhostManual } = await import('cindy-tools');
+const chatAttachments = await import('../../cindy-media/chatAttachments');
 const { setGhostDisabledForWorkdir, listDisabledGhostIdsForWorkdir, isGhostDisabledForWorkdir } =
   await import('../../cindy-brain/ghostWorkdirPrefs');
 import type { LiziMcpSessionContext } from '@cindy/mcps';
@@ -2225,6 +2241,32 @@ describe('session-context 宿主铸造', () => {
 });
 
 describe('Cindy media 本机路径揭示', () => {
+  // 2026-10-30: generated images must stay metadata-only until the Agent elects to
+  // read a local path. Existing cases cover path approval, not request/poll output.
+  // Unit: one completed image through the real Host entry must keep its URL and
+  // task reference without adding model images or automatic-preview diagnostics.
+  it.each(['request', 'poll'] as const)('%s returns image metadata without automatic inspection', async (action) => {
+    const generated = {
+      ok: true,
+      status: 'completed',
+      xdt_image_urls: [`cindy-media://blobs/${'a'.repeat(64)}.png`],
+    };
+    callCindyMediaMock.mockResolvedValueOnce(generated);
+    const commit = vi.spyOn(chatAttachments, 'commitMessageMediaRefs')
+      .mockResolvedValueOnce({ committed: 1, skipped: 0, failed: 0 });
+    try {
+      const result = await makeDeps('codex', 'generated-image').callMedia?.(
+        action === 'request'
+          ? { action, invocationId: 'generated', body: {} }
+          : { action, invocationId: 'generated' },
+      );
+      expect(result).toEqual(generated);
+      expect(commit).toHaveBeenCalledWith({ sessionId: 'generated-image', role: 'tool', content: generated });
+    } finally {
+      commit.mockRestore();
+    }
+  });
+
   it('只在用户点击允许后把已解析路径返回给 Agent', async () => {
     const url = `cindy-media://blobs/${'a'.repeat(64)}.png`;
     callCindyMediaMock.mockResolvedValue({
@@ -3546,5 +3588,179 @@ describe('market install live authority', () => {
     const controller = new AbortController(); controller.abort();
     expect(await deps.installMarket!({ pluginId: 'p1', releaseId: 'r1' }, controller.signal)).toMatchObject({ ok: false, errorCode: 'PERMISSION_DENIED' });
     expect(market.detail).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('personal contribution account surface', () => {
+  beforeEach(() => {
+    communityReadMock.mockReset();
+    communitySubmitMock.mockReset();
+    communityPreparedMock.mockReset();
+    communityPreparedMock.mockReturnValue({ summary: {
+      preparedId: 'prepared-1', ghostId: 'hello', name: 'Hello', description: 'Current installed plugin',
+      version: '1.0.0', sha256: 'a'.repeat(64), releaseNotes: 'Complete release changes.\nIncludes all fixes.',
+    } });
+    communitySubmitMock.mockReturnValue({ localId: 'prepared-1', phase: 'preparing' });
+  });
+
+  it('blocks an account read when the live helper surface is restricted', async () => {
+    communityReadMock.mockReset();
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => false });
+    const result = await makeDeps().communityContribution!({ action: 'list' });
+    expect(result).toMatchObject({ ok: false, errorCode: 'PERMISSION_DENIED' });
+    expect(communityReadMock).not.toHaveBeenCalled();
+  });
+
+  it('discards personal results if the helper surface becomes restricted during the read', async () => {
+    let allowed = true;
+    communityReadMock.mockImplementationOnce(async () => { allowed = false; return { privateReason: 'private author record' }; });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => allowed });
+    const result = await makeDeps().communityContribution!({ action: 'list' });
+    expect(result).toMatchObject({ ok: false, errorCode: 'PERMISSION_DENIED' });
+    expect(JSON.stringify(result)).not.toContain('private author record');
+  });
+
+  it('allows an ordinary current account task to read its own records', async () => {
+    communityReadMock.mockResolvedValueOnce({ plugins: [] });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => true });
+    await expect(makeDeps().communityContribution!({ action: 'list' })).resolves.toEqual({ ok: true, result: { plugins: [] } });
+  });
+
+  it('returns a known publishing precondition so the author can fix the original package', async () => {
+    const error = createIpcError('PRECONDITION_FAILED', 'This version is already submitted; install a new version before publishing.');
+    communityPreparedMock.mockImplementationOnce(() => { throw error; });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => true });
+    await expect(makeDeps().communityContribution!({ action: 'submit', id: 'prepared-1' }))
+      .resolves.toEqual({ ok: false, errorCode: 'PRECONDITION_FAILED', message: error.message });
+    expect(communitySubmitMock).not.toHaveBeenCalled();
+  });
+
+  it.each([new Error('private-transport-token'), createIpcError('INTERNAL', 'private-transport-token')])('does not expose unexpected publishing failures (%#)', async (error) => {
+    communityPreparedMock.mockImplementationOnce(() => { throw error; });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => true });
+    const result = await makeDeps().communityContribution!({ action: 'submit', id: 'prepared-1' });
+    expect(result).toMatchObject({ ok: false, errorCode: 'INTERNAL' });
+    expect(JSON.stringify(result)).not.toContain('private-transport-token');
+    expect(communitySubmitMock).not.toHaveBeenCalled();
+  });
+
+  it('submits the fixed preparation in Full Access without an extra confirmation', async () => {
+    const permission = vi.fn();
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => true });
+    const deps = makeDeps('pi', 'author', 'author-instance', {}, undefined, permission);
+    await expect(deps.communityContribution!({ action: 'submit', id: 'prepared-1' })).resolves.toMatchObject({ ok: true });
+    expect(communityPreparedMock).toHaveBeenCalledWith('prepared-1');
+    expect(communitySubmitMock).toHaveBeenCalledExactlyOnceWith('prepared-1', expect.any(Function));
+    expect(permission).not.toHaveBeenCalled();
+  });
+
+  it('keeps accepted background submission alive after normal input completion but rechecks its scope', async () => {
+    let active = true, writable = true, allowed = true;
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'bypassPermissions', remoteHostId: null,
+      isCurrent: () => writable, contributionAccountAllowed: async (accepted = false) => allowed && (active || accepted) });
+    const deps = makeDeps('pi', 'author', 'author-instance');
+    await expect(deps.communityContribution!({ action: 'submit', id: 'prepared-1' })).resolves.toMatchObject({ ok: true });
+    const check = communitySubmitMock.mock.calls[0][1] as () => Promise<void>;
+    active = false;
+    await expect(check()).resolves.toBeUndefined();
+    await expect(deps.communityContribution!({ action: 'list' })).resolves.toMatchObject({ ok: false, errorCode: 'PERMISSION_DENIED' });
+    writable = false;
+    await expect(check()).rejects.toThrow('PERMISSION_DENIED');
+    writable = true; allowed = false;
+    await expect(check()).rejects.toThrow('PERMISSION_DENIED');
+  });
+
+  it.each(['allow', 'block'] as const)('honors Auto %s for the exact public bytes', async (verdict) => {
+    const permission = vi.fn();
+    const reviewAction = vi.fn<(action: { description: string }) => Promise<{ verdict: typeof verdict; reason: string }>>()
+      .mockResolvedValue({ verdict, reason: 'Public publishing is outside the approved scope.' });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'auto', remoteHostId: null, reviewAction,
+      isCurrent: () => true, contributionAccountAllowed: async () => true });
+    const result = await makeDeps('codex', 'author', 'author-instance', {}, undefined, permission)
+      .communityContribution!({ action: 'submit', id: 'prepared-1' });
+    expect(JSON.parse(reviewAction.mock.calls[0]![0].description)).toMatchObject({
+      toolName: 'ghost_contribution_submit', input: {
+        prepared_id: 'prepared-1', ghost_id: 'hello', version: '1.0.0', sha256: 'a'.repeat(64), public: true,
+      },
+    });
+    expect(result).toMatchObject(verdict === 'allow' ? { ok: true } : {
+      ok: false,
+      errorCode: 'PERMISSION_DENIED',
+      message: 'Public publishing is outside the approved scope.',
+    });
+    expect(communitySubmitMock).toHaveBeenCalledTimes(verdict === 'allow' ? 1 : 0);
+    expect(permission).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('rechecks the account surface after Ask confirmation (restricted=%s)', async (restrict) => {
+    let allowed = true;
+    const permission = vi.fn(async () => {
+      allowed = !restrict;
+      return { kind: 'permission' as const, behavior: 'allow' as const };
+    });
+    liveGrantStateMock.mockReturnValue({ permissionMode: 'ask', remoteHostId: null,
+      isCurrent: () => true, contributionAccountAllowed: async () => allowed });
+    const result = await makeDeps('pi', 'author', 'author-instance', {}, undefined, permission)
+      .communityContribution!({ action: 'submit', id: 'prepared-1' });
+    expect(permission).toHaveBeenCalledWith('author', 'author-instance', expect.objectContaining({
+      toolName: 'ghost_contribution_submit', metadata: { hostOwnedConfirmation: 'plugin_contribution' },
+      input: { prepared_id: 'prepared-1', ghost_id: 'hello', version: '1.0.0', sha256: 'a'.repeat(64) },
+      description: expect.stringContaining('Complete release changes.\nIncludes all fixes.'),
+    }), expect.any(AbortSignal));
+    expect(permission).toHaveBeenCalledWith('author', 'author-instance', expect.objectContaining({
+      description: expect.stringContaining('Once a submission is accepted for review, its version number cannot be reused'),
+    }), expect.any(AbortSignal));
+    expect(result).toMatchObject(restrict ? { ok: false, errorCode: 'PERMISSION_DENIED' } : { ok: true });
+    expect(communitySubmitMock).toHaveBeenCalledTimes(restrict ? 0 : 1);
+  });
+});
+
+describe('「我的浏览器」取代插件自有页面工具', () => {
+  function pageControlGhost(): unknown {
+    return chipGhost('my-browser', ['tool'], {
+      tools: [
+        { name: 'browser_read', description: 'read' },
+        { name: 'browser_act', description: 'act' },
+        { name: 'browser_policy', description: 'policy' },
+      ],
+      manual: { items: [{ dir: 'manual/browser', name: 'browser', description: 'browser manual' }] },
+      browserExtension: {
+        protocol: 'cindy-browser-extension/3',
+        extensionIds: ['a'.repeat(32)],
+        pageControl: true,
+        pageControlReplaces: { tools: ['browser_read', 'browser_act'], manual: ['browser'] },
+      },
+    });
+  }
+  afterEach(() => setPageControlGhostProvider(() => null));
+
+  it('宿主经该插件提供页面控制时,只隐藏被取代的工具与手册;调用被引导到 browser 工具', async () => {
+    listMock.mockReturnValue([pageControlGhost()]);
+    setPageControlGhostProvider(() => installedGhostStoragePart(pageControlGhost() as InstalledGhost));
+    const deps = makeDeps();
+    const [ghost] = await deps.listAwakeGhosts();
+    expect(ghost.tools.map((tool) => tool.name)).toEqual(['browser_policy']);
+    expect(ghost.manual ?? []).toEqual([]);
+    const refused = await deps.callGhostTool({ ghostId: 'my-browser', tool: 'browser_read', args: {} });
+    expect(refused).toMatchObject({ ok: false, errorCode: 'TOOL_NOT_FOUND', message: expect.stringContaining('user-browser') });
+    await expect(deps.readGhostManual({ ghostId: 'my-browser', path: 'browser/MANUAL.md' })).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringContaining('browser 工具'),
+    });
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it('桥接未运行(没有页面控制)时插件工具照常可见', async () => {
+    listMock.mockReturnValue([pageControlGhost()]);
+    const [ghost] = await makeDeps().listAwakeGhosts();
+    expect(ghost.tools.map((tool) => tool.name)).toEqual(['browser_read', 'browser_act', 'browser_policy']);
+    expect(ghost.manual?.map((item) => item.name)).toEqual(['browser']);
   });
 });

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   setLimit: vi.fn(async () => {}),
   reset: vi.fn(async () => {}),
   target: vi.fn(),
+  imageTarget: vi.fn(),
+  imageSet: vi.fn(async () => {}),
   limit: null as number | null,
 }));
 vi.mock('react-i18next', () => ({
@@ -28,6 +30,12 @@ vi.mock('@/hooks/useModelContextLimit', () => ({
       setLimit: mocks.setLimit,
       reset: mocks.reset,
     };
+  },
+}));
+vi.mock('@/hooks/useModelImageInputOverride', () => ({
+  useModelImageInputOverride: (target: unknown) => {
+    mocks.imageTarget(target);
+    return { value: null, mixed: false, loading: false, error: false, setValue: mocks.imageSet };
   },
 }));
 vi.mock('@/state/modelVisibilityPrefs', () => ({
@@ -133,7 +141,10 @@ describe('model advanced editor', () => {
   });
 
   it.each(['generate', 'edit', 'default'] as const)('saves image capability %s only on the explicit Images connection', async (value) => {
-    const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+    const update = vi.fn(async (...args: unknown[]) => {
+      void args;
+      return { ok: true };
+    });
     const previous = window.electronAPI;
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
     const source = { ...buildUserProvider({ id: 'relay', name: 'Relay', auth: { method: 'apiKey' }, runtimes: {
@@ -170,7 +181,10 @@ describe('model advanced editor', () => {
     } finally { Object.defineProperty(window, 'electronAPI', { configurable: true, value: previous }); }
   });
   it.each(['generate', 'edit', 'default'] as const)('saves video capability %s only on the explicit video connection', async (value) => {
-    const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+    const update = vi.fn(async (...args: unknown[]) => {
+      void args;
+      return { ok: true };
+    });
     const previous = window.electronAPI;
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
     const source = { ...buildUserProvider({ id: 'relay', name: 'Relay', auth: { method: 'apiKey' }, runtimes: {
@@ -220,11 +234,11 @@ describe('model advanced editor', () => {
       render(<ModelAdvancedDrawer provider={source} row={{ id: primary.id, name: primary.name, avail: ['pi'], byAgent: { pi: primary } }} open onOpenChange={vi.fn()} pricePresentationOf={() => null} onDisable={vi.fn()} disabled={false} paymentRequired={false} />);
       const input = screen.getByRole('textbox', { name: 'settings.providers.models.advanced.contextLimitAria' });
       await waitFor(() => expect(window.electronAPI.maker.llamaCppStatus).toHaveBeenCalled());
-      fireEvent.change(input, { target: { value: '64' } });
+      fireEvent.change(input, { target: { value: '64K' } });
       expect(input.getAttribute('aria-invalid')).toBe('true');
       fireEvent.blur(input);
       expect(mocks.setLimit).not.toHaveBeenCalled();
-      fireEvent.change(input, { target: { value: '32' } });
+      fireEvent.change(input, { target: { value: '32K' } });
       fireEvent.blur(input);
       expect(mocks.setLimit).toHaveBeenLastCalledWith(32000);
     } finally { cleanup(); Object.defineProperty(window, 'electronAPI', { configurable: true, value: previous }); }
@@ -269,7 +283,10 @@ describe('model advanced editor', () => {
   });
 
   it('saves protocol selection to the selected engine and model without writing derived model limits', async () => {
-    const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+    const update = vi.fn(async (...args: unknown[]) => {
+      void args;
+      return { ok: true };
+    });
     const previous = window.electronAPI;
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
     const source = { ...buildUserProvider({ id: 'fixture', name: 'Fixture', runtimes: {
@@ -292,7 +309,10 @@ describe('model advanced editor', () => {
 
   // V6 selection is a user intent, not a copy of today's resolved route/limits.
   it.each(['auto', 'moonshot-kimi-code-openai-responses'])('persists Kimi interface %s without locking catalog defaults', async (interfaceId) => {
-    const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+    const update = vi.fn(async (...args: unknown[]) => {
+      void args;
+      return { ok: true };
+    });
     const previous = window.electronAPI;
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
     const source = { ...buildUserProvider({ id: 'kimi-user', name: 'Kimi', runtimes: {
@@ -311,7 +331,10 @@ describe('model advanced editor', () => {
   });
 
   it('saves Google selection with its matching wire and official endpoint', async () => {
-    const update = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
+    const update = vi.fn(async (...args: unknown[]) => {
+      void args;
+      return { ok: true };
+    });
     const previous = window.electronAPI;
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: { maker: { updateCustomProvider: update } } });
     const source = { ...buildUserProvider({ id: 'fixture', name: 'Fixture', runtimes: {
@@ -336,21 +359,21 @@ describe('model advanced editor', () => {
     mocks.limit = 1_000;
     draw();
     const input = screen.getByRole('textbox') as HTMLInputElement;
-    expect(input.value).toBe('1');
+    expect(input.value).toBe('1000');
     expect(input.hasAttribute('aria-invalid')).toBe(false);
     fireEvent.blur(input);
     expect(mocks.setLimit).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: '2' } });
+    fireEvent.change(input, { target: { value: '2K' } });
     fireEvent.blur(input);
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(mocks.setLimit).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: '99' } });
+    fireEvent.change(input, { target: { value: '99K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: '100' } });
+    fireEvent.change(input, { target: { value: '100K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenLastCalledWith(100_000);
-    fireEvent.change(input, { target: { value: '1' } });
+    fireEvent.change(input, { target: { value: '1K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledTimes(1);
   });
@@ -358,10 +381,10 @@ describe('model advanced editor', () => {
   it.each(['cindy-local-ollama', 'ollama', 'cindy-local-lmstudio'])('keeps %s editable at 1K even when the catalog advertises a large window', (id) => {
     render(drawer(model, model.defaultEffort, model.efforts, { ...provider, id, source: 'user' }));
     const input = screen.getByRole('textbox');
-    fireEvent.change(input, { target: { value: '4' } });
+    fireEvent.change(input, { target: { value: '4K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenLastCalledWith(4_000);
-    fireEvent.change(input, { target: { value: '1' } });
+    fireEvent.change(input, { target: { value: '1K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenLastCalledWith(1_000);
   });
@@ -370,10 +393,10 @@ describe('model advanced editor', () => {
     draw({ ...model, contextWindow: window, contextWindowMax: window });
     const input = screen.getByRole('textbox');
     const floor = Math.floor(window / 1000);
-    fireEvent.change(input, { target: { value: String(floor - 1) } });
+    fireEvent.change(input, { target: { value: `${floor - 1}K` } });
     fireEvent.blur(input);
     expect(mocks.setLimit).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: String(floor) } });
+    fireEvent.change(input, { target: { value: `${floor}K` } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledWith(floor * 1000);
   });
@@ -429,8 +452,8 @@ describe('model advanced editor', () => {
     const input = screen.getByRole('textbox', {
       name: 'settings.providers.models.advanced.contextLimitAria',
     });
-    expect((input as HTMLInputElement).value).toBe('272');
-    fireEvent.change(input, { target: { value: '500' } });
+    expect((input as HTMLInputElement).value).toBe('272000');
+    fireEvent.change(input, { target: { value: '500K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledWith(500_000);
     fireEvent.change(input, { target: { value: '1.5' } });
@@ -459,7 +482,7 @@ describe('model advanced editor', () => {
       />,
     );
     const input = screen.getByRole('textbox');
-    fireEvent.change(input, { target: { value: '1000' } });
+    fireEvent.change(input, { target: { value: '1000K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledWith(1_000_000);
     expect(screen.getByText('1,050,000')).toBeTruthy();
@@ -480,7 +503,7 @@ describe('model advanced editor', () => {
       />,
     );
     const input = screen.getByRole('textbox');
-    fireEvent.change(input, { target: { value: '1000' } });
+    fireEvent.change(input, { target: { value: '1000K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledWith(1_000_000);
     expect(screen.getAllByText('272K').length).toBeGreaterThan(0);
@@ -510,20 +533,20 @@ describe('model advanced editor', () => {
     expect(screen.getByText(/^Messages/)).toBeTruthy();
     expect(screen.getByText(/^Responses/)).toBeTruthy();
     expect(screen.getByText(/^Chat Completions/)).toBeTruthy();
-    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('1048');
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('1048576');
   });
 
-  it('shows whole K without rewriting the exact catalog value on untouched blur', () => {
+  it('shows exact tokens without rewriting the catalog value on untouched blur', () => {
     draw({ ...model, contextWindow: 1_048_576, contextWindowMax: 1_048_576 });
     const input = screen.getByRole('textbox') as HTMLInputElement;
-    expect(input.value).toBe('1048');
+    expect(input.value).toBe('1048576');
     expect(
       screen.getByText('settings.providers.models.advanced.contextLimitRoute 1,048,576'),
     ).toBeTruthy();
     fireEvent.focus(input);
     fireEvent.blur(input);
     expect(mocks.setLimit).not.toHaveBeenCalled();
-    fireEvent.change(input, { target: { value: '1000' } });
+    fireEvent.change(input, { target: { value: '1000K' } });
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledWith(1_000_000);
   });
@@ -590,7 +613,7 @@ describe('model advanced editor', () => {
     mocks.limit = 1_048_900;
     draw({ ...model, contextWindow: 1_048_576, contextWindowMax: 1_048_576 });
     const input = screen.getByRole('textbox') as HTMLInputElement;
-    expect(input.value).toBe('1048');
+    expect(input.value).toBe('1048900');
     expect(
       screen.getByText('settings.providers.models.advanced.contextLimitOverWindow'),
     ).toBeTruthy();
@@ -657,11 +680,11 @@ describe('model advanced editor', () => {
 
   it('refreshes defaults and controls in an open drawer when the catalog changes', () => {
     const { rerender } = draw();
-    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('272');
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('272000');
     rerender(
       drawer({ ...model, contextWindow: 700_000, efforts: ['high', 'max'], defaultEffort: 'max' }),
     );
-    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('700');
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('700000');
     expect(screen.queryByRole('radio', { name: 'effortLevels.low' })).toBeNull();
     expect(
       screen.getByRole('radio', { name: 'effortLevels.max' }).getAttribute('aria-checked'),
@@ -673,7 +696,7 @@ describe('model advanced editor', () => {
     const input = screen.getByRole('textbox', {
       name: 'settings.providers.models.advanced.contextLimitAria',
     });
-    fireEvent.change(input, { target: { value: '1200' } });
+    fireEvent.change(input, { target: { value: '1200K' } });
     expect(
       screen.getByText('settings.providers.models.advanced.contextLimitOverWindow'),
     ).toBeTruthy();
@@ -683,6 +706,14 @@ describe('model advanced editor', () => {
     fireEvent.blur(input);
     expect(mocks.setLimit).toHaveBeenCalledTimes(1);
     expect(input.getAttribute('aria-invalid')).toBe('true');
+  });
+
+  it('keeps the saved primary effort when another harness has a different default', () => {
+    vi.mocked(getProviderModelEffort).mockImplementation((agent) => agent === 'codex' ? 'max' : undefined);
+    draw({ ...model, efforts: ['low', 'high', 'max'], defaultEffort: 'low' }, 'low');
+
+    expect(screen.getByRole('radio', { name: 'effortLevels.max' }).getAttribute('aria-checked'))
+      .toBe('true');
   });
 
   it('retains a mixed saved selection without showing per-engine default labels', () => {
@@ -769,7 +800,7 @@ it('limits context and effort reads, writes and resets to the chat runtime', () 
   fireEvent.click(screen.getByRole('button', { name: 'settings.providers.models.advanced.restoreDefault' }));
   expect(clearProviderModelEffort).toHaveBeenCalledExactlyOnceWith('codex', 'private', 'shared');
   const input = screen.getByRole('textbox');
-  fireEvent.change(input, { target: { value: '128' } });
+  fireEvent.change(input, { target: { value: '128K' } });
   fireEvent.blur(input);
   expect(mocks.setLimit).toHaveBeenCalledWith(128_000);
   expect(mocks.target).toHaveBeenLastCalledWith(expect.objectContaining({ agent: 'codex', relatedTargets: [] }));
@@ -785,6 +816,32 @@ it('keeps enterprise reference prices read-only in the model drawer', () => {
   expect(
     screen.queryByRole('button', { name: 'settings.providers.models.priceOverride.menu' }),
   ).toBeNull();
+});
+
+// Component contract (unit): the real drawer names the charge, independently of its token unit.
+// Existing cases only name directions; one image quote and mixed/uncategorized variants cover fallback.
+it.each([
+  { components: ['image'], label: 'newChat.modelSelector.displayPricing.roles.image.output', prefixes: [] },
+  { components: ['image', 'image'], label: 'newChat.modelSelector.displayPricing.roles.image.output', prefixes: [] },
+  { components: [undefined], label: 'settings.providers.models.advanced.price.output', prefixes: [] },
+  { components: ['future_kind'], label: 'settings.providers.models.advanced.price.output', prefixes: [] },
+  { components: ['text', 'image'], label: 'settings.providers.models.advanced.price.output', prefixes: ['text', 'image'] },
+  { components: ['image', undefined], label: 'settings.providers.models.advanced.price.output', prefixes: ['image'] },
+])('labels primary quotes without inferring a category: $components', ({ components, label, prefixes }) => {
+  draw({ ...model, currency: 'CNY', displayPricing: {
+    items: [{ label: 'Custom fee', price: 1, unit: 'request', quantity: 1 }],
+    summary: { output: components.map((component, index) => ({
+      price: 840 + index, unit: 'token', quantity: 1000000, tier: index === 0 ? 'HD' : '4K', component,
+    })) },
+  } });
+  const row = screen.getByText(label).parentElement!;
+  expect(row.textContent).toContain('¥840');
+  expect(row.textContent).toContain('HD');
+  expect(row.textContent).not.toContain('future_kind');
+  for (const component of ['text', 'image', 'audio', 'video']) {
+    const prefix = `newChat.modelSelector.displayPricing.components.${component}`;
+    expect(row.textContent?.includes(prefix)).toBe(prefixes.includes(component));
+  }
 });
 
 // Unit contract: drawer summary must show translated roles while retaining supplier conditions below.
@@ -806,7 +863,7 @@ it.each([{ hasSummary: true, withNotes: true }, { hasSummary: true, withNotes: f
   }
   const input = screen.getByText('settings.providers.models.advanced.price.input').parentElement!;
   expect(input.textContent).toContain('¥0.016');
-  expect(input.textContent).toContain(' · ');
+  expect(input.textContent).not.toContain(' · ');
   expect(input.textContent).toContain('¥112');
   expect(input.querySelector('s')?.textContent).toBe('¥0.02');
   const output = screen.getByText('settings.providers.models.advanced.price.output').parentElement!;
@@ -877,4 +934,33 @@ it('retains the chat discount inferred from standard and effective prices', () =
   expect(screen.getByText('settings.providers.models.advanced.discount').parentElement?.textContent).toContain('↓40%');
   const outputRow = screen.getByText('settings.providers.models.advanced.price.output').parentElement!;
   expect(outputRow.nextElementSibling).toBe(screen.getByText('settings.providers.models.advanced.discount').parentElement);
+});
+
+// Unit: real editor commits normalized tokens, preserving precision and rejecting fractional tokens.
+it.each([['1000000', 1_000_000], ['1M', 1_000_000], ['1.5m', 1_500_000], ['100万', 1_000_000], ['100萬', 1_000_000], ['262144', 262_144], ['1.000001M', 1_000_001], ['262.144K', 262_144]])('accepts context %s as %s tokens', (value, tokens) => {
+  draw();
+  const input = screen.getByRole('textbox');
+  fireEvent.change(input, { target: { value } }); fireEvent.blur(input);
+  expect(mocks.setLimit).toHaveBeenLastCalledWith(tokens);
+});
+// Review #7836: the bare-number rejection does not exercise unit precision.
+// Unit tier: the real editor must show invalid input and never persist fractional tokens.
+// Use the local-runtime 1K floor so the 1.0001K case cannot pass on the 100K guard alone.
+it.each(['1.0001K', '1.0000001M', '1.00001万'])('rejects context %s that converts to fractional tokens', (value) => {
+  render(drawer(model, model.defaultEffort, model.efforts, { ...provider, id: 'ollama', source: 'user' }));
+  const input = screen.getByRole('textbox');
+  fireEvent.change(input, { target: { value } });
+  expect(input.getAttribute('aria-invalid')).toBe('true');
+  expect(screen.getByText('settings.providers.models.advanced.contextInvalid')).toBeTruthy();
+  fireEvent.blur(input);
+  expect(mocks.setLimit).not.toHaveBeenCalled();
+});
+it('does not label an unverified working default as the upstream capacity', () => {
+  draw({ ...model, contextWindow: 200_000, contextWindowMax: undefined, contextWindowVerified: false });
+  const input = screen.getByRole('textbox');
+  fireEvent.change(input, { target: { value: '1M' } });
+  expect(screen.queryByText('settings.providers.models.advanced.contextLimitOverWindow')).toBeNull();
+  expect(screen.getByText('settings.providers.models.advanced.catalogMissing')).toBeTruthy();
+  fireEvent.blur(input);
+  expect(mocks.setLimit).toHaveBeenLastCalledWith(1_000_000);
 });

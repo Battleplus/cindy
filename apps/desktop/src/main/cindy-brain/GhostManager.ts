@@ -270,6 +270,9 @@ function cloneParsedGhostPackage(parsed: ParsedGhostPackage): ParsedGhostPackage
 }
 
 export interface GhostManagerOptions {
+  /** Read-only source projections. Does not affect running, installation, or publishing ACL. */
+  sourcesForInstance?: (record: PluginInstanceRecord, receipt: PluginInstanceReceiptFact | null | undefined) =>
+    Pick<InstalledGhost, 'publishingSource'>;
   /** 意识仓库根目录(生产:userData/cindy-brain;测试:os.tmpdir 下临时目录)。 */
   getRootDir: () => string;
   /** Host 批准状态根；必须位于插件安装根之外。 */
@@ -917,9 +920,48 @@ export class GhostManager {
     return this.instanceRegistryService.recordForAddress(id);
   }
 
+  /** Author management must not turn an unreadable installation scan into "not installed". */
+  assertContributionReadAvailable(ghostId?: string): void {
+    this.ensureCurrentOwnerContextSync();
+    const registry = this.instanceRegistryStore().read();
+    if (registry.kind !== 'ok' && registry.kind !== 'missing') {
+      throw new Error('plugin instance registry is ' + registry.kind);
+    }
+    if (registry.kind === 'ok' && Object.values(registry.registry.instances).some((record) =>
+      record.active && (!ghostId || record.ghostId === ghostId) &&
+      this.hasPendingMutationJournal(record.contentRelId))) {
+      throw new Error('plugin installation is changing');
+    }
+    const entries = this.listContentEntries();
+    if (!this.isInstallationScanComplete()) throw new Error('plugin installation state is unavailable');
+    for (const { relId, dir } of entries) {
+      const identity = parsePluginInstallRelId(relId);
+      if (!identity || (ghostId && identity.ghostId !== ghostId)) continue;
+      if (this.hasPendingMutationJournal(relId)) throw new Error('plugin installation is changing');
+      const approval = this.readApproval(relId);
+      if (approval.state === 'invalid') throw new Error('plugin approval evidence is unavailable');
+      if (approval.state === 'approved') continue;
+      // list() may skip an unreadable legacy manifest. Do not interpret that
+      // omitted entry as proof that the user's corresponding plugin is absent.
+      try {
+        const manifestPath = resolveGhostContentPathSync(dir, GHOST_MANIFEST_FILE, {
+          expect: 'file', label: 'installed manifest',
+        });
+        const bytes = readBoundedFileNoFollowSync(manifestPath, MAX_GHOST_MANIFEST_BYTES);
+        const parsed = bytes && parseInstalledGhostManifest(JSON.parse(bytes.toString('utf8')));
+        if (!parsed || !parsed.ok || parsed.manifest.id !== identity.ghostId) {
+          throw new Error('invalid manifest');
+        }
+      } catch {
+        throw new Error('plugin manifest evidence is unavailable');
+      }
+    }
+  }
+
 
   private instanceProjection(relId: string, ghostId: string): {
     instanceKey?: string;
+    publishingSource?: InstalledGhost['publishingSource'];
     namespace?: string | null;
     namespaceState?: PluginInstanceRecord['namespaceState'];
   } {
@@ -929,6 +971,7 @@ export class GhostManager {
     if (!record || record.ghostId !== ghostId) return {};
     return {
       instanceKey: record.instanceKey,
+      ...this.options.sourcesForInstance?.(record, this.receiptFact(relId)),
       namespaceState: record.namespaceState,
       ...(record.namespaceState === 'confirmed' || record.namespaceState === 'unconfirmed'
         ? { namespace: record.namespace } : {}),
@@ -2949,6 +2992,7 @@ export class GhostManager {
           approval: { state: 'approved', revision: receipt.revision },
           ...(receipt.taskCapabilityApproved === true ? { taskCapabilityApproved: true as const } : {}),
           ...(receipt.targetCapabilityApproved === true ? { targetCapabilityApproved: true as const } : {}),
+          ...(receipt.delegationCapabilityApproved === true ? { delegationCapabilityApproved: true as const } : {}),
           trust: receipt.trust,
           ...(!retired && receipt.manifest.skill?.items.length
             ? {
@@ -3139,7 +3183,7 @@ export class GhostManager {
   }
 
   /** Called only after Host permission UI confirms this exact installed revision. */
-  async approveTaskCapability(id: string, revision: string, isCurrent: () => boolean, capability: 'tasks' | 'targets' = 'tasks'): Promise<boolean> {
+  async approveTaskCapability(id: string, revision: string, isCurrent: () => boolean, capability: 'tasks' | 'targets' | 'delegation' = 'tasks'): Promise<boolean> {
     return this.runExclusiveMutation(async () => {
       const relId = this.approvalRelIdFor(id);
       if (!relId) return false;
@@ -3147,8 +3191,9 @@ export class GhostManager {
       if (!isCurrent() || approval.state !== 'approved' || approval.receipt.revision !== revision ||
           approval.receipt.manifest.agent?.tasks !== true ||
           (capability === 'targets' && (approval.receipt.manifest.agent.targets !== true || approval.receipt.taskCapabilityApproved !== true)) ||
+          (capability === 'delegation' && (approval.receipt.manifest.agent.delegation !== true || approval.receipt.manifest.agent.targets !== true || approval.receipt.targetCapabilityApproved !== true || approval.receipt.taskCapabilityApproved !== true)) ||
           !findInstalledGhostByInstanceId(this.list(), id)?.enabled) return false;
-      const field = capability === 'targets' ? 'targetCapabilityApproved' : 'taskCapabilityApproved';
+      const field = capability === 'delegation' ? 'delegationCapabilityApproved' : capability === 'targets' ? 'targetCapabilityApproved' : 'taskCapabilityApproved';
       if (approval.receipt[field] !== true) {
         const expired = new Error('Task capability approval owner changed');
         try {
@@ -3834,6 +3879,7 @@ export class GhostManager {
     opts?: {
       taskCapabilityApproved?: true;
       targetCapabilityApproved?: true;
+      delegationCapabilityApproved?: true;
       initiallyEnabled?: boolean;
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
@@ -3859,6 +3905,7 @@ export class GhostManager {
     opts?: {
       taskCapabilityApproved?: true;
       targetCapabilityApproved?: true;
+      delegationCapabilityApproved?: true;
       initiallyEnabled?: boolean;
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
@@ -4032,6 +4079,7 @@ export class GhostManager {
           enabled: initiallyEnabled,
           ...(opts?.taskCapabilityApproved === true && approvedManifest.agent?.tasks === true ? {taskCapabilityApproved:true as const} : {}),
           ...(opts?.targetCapabilityApproved === true && approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true ? {targetCapabilityApproved:true as const} : {}),
+          ...(opts?.delegationCapabilityApproved === true && approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true && approvedManifest.agent.delegation === true ? {delegationCapabilityApproved:true as const} : {}),
           trust,
           // 指纹取自包投影而不是刚发布的 finalDir:发布后被换的字节应当在快照
           // 对账时被拒,而不是被首读钉成批准基线(P0-8)。
@@ -4155,6 +4203,7 @@ export class GhostManager {
     opts: {
       taskCapabilityApproved?: true;
       targetCapabilityApproved?: true;
+      delegationCapabilityApproved?: true;
       expectedInstalledApproval: string;
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
@@ -4177,6 +4226,7 @@ export class GhostManager {
     opts: {
       taskCapabilityApproved?: true;
       targetCapabilityApproved?: true;
+      delegationCapabilityApproved?: true;
       expectedInstalledApproval: string;
       expectedPackageSha256?: string;
       trustOverride?: GhostHostTrustOverride;
@@ -4453,6 +4503,8 @@ export class GhostManager {
           approvedManifest.agent?.tasks === true ? { taskCapabilityApproved: true as const } : {}),
         ...((opts.targetCapabilityApproved === true || (archiveId === undefined && approvalResult.state === 'approved' && approvalResult.receipt.targetCapabilityApproved === true)) &&
           approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true ? { targetCapabilityApproved: true as const } : {}),
+        ...((opts.delegationCapabilityApproved === true || (archiveId === undefined && approvalResult.state === 'approved' && approvalResult.receipt.delegationCapabilityApproved === true)) &&
+          approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true && approvedManifest.agent.delegation === true ? { delegationCapabilityApproved: true as const } : {}),
         trust,
         // 同 install:指纹取自包投影,发布后的目录漂移在快照对账时 fail closed(P0-8)。
         skillContentSha256: await this.hashSkillContentFromPackage(
@@ -4864,6 +4916,8 @@ export class GhostManager {
           approvedManifest.agent?.tasks === true ? { taskCapabilityApproved: true as const } : {}),
         ...(current.state === 'approved' && current.receipt.targetCapabilityApproved === true &&
           approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true ? { targetCapabilityApproved: true as const } : {}),
+        ...(current.state === 'approved' && current.receipt.delegationCapabilityApproved === true &&
+          approvedManifest.agent?.tasks === true && approvedManifest.agent.targets === true && approvedManifest.agent.delegation === true ? { delegationCapabilityApproved: true as const } : {}),
         ...(iconDataUrl !== undefined ? { iconDataUrl } : {}),
         namespace: null,
       }),

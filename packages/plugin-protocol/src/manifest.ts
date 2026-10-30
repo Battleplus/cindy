@@ -233,6 +233,8 @@ export interface GhostAgentNeeds {
   tasks?: boolean;
   /** 查询项目、任务、伙伴并投递消息;必须同时声明 tasks,需独立批准。 */
   targets?: boolean;
+  /** Independently approved, scoped Auto delegation to an existing companion. */
+  delegation?: boolean;
   /** 后台隐藏任务;必须与 `tasks: true` 同时声明。 */
   hiddenTasks?: boolean;
   schedule?: boolean;
@@ -898,6 +900,8 @@ export interface GhostManifest {
   name: string;
   /** 版本字符串(不强制 semver,仅展示用)。 */
   version: string;
+  /** 本版本相对上一实际发布包的完整更新说明；旧包可省略。纯文本。 */
+  releaseNotes?: string;
   /**
    * 安装此 Release 所需的最低 Cindy 客户端版本。缺省表示不限制客户端版本；
    * 声明时必须是合法 SemVer，客户端与 Plugin Server 使用同一比较语义。
@@ -958,7 +962,7 @@ export interface GhostManifest {
    * 页用它避免抖动)。须与 settingsHtml 成对声明。
    */
   settingsHeight?: number;
-  /** 是否显示宿主「模型与任务」默认配置卡；缺省或 true 显示，false 仅隐藏卡片。 */
+  /** 本插件是否使用宿主默认配置卡；缺省/true 启用，false 隐藏且不读取该插件的卡片配置。 */
   showTaskPreferences?: boolean;
   /** 仅 schemaVersion 2 存在的兼容声明。 */
   slots?: LegacyGhostSlot[];
@@ -1195,6 +1199,7 @@ const GHOST_MANIFEST_KNOWN_TOP_LEVEL_FIELDS = new Set([
   'id',
   'name',
   'version',
+  'releaseNotes',
   'minCindyVersion',
   'author',
   'locales',
@@ -1410,6 +1415,9 @@ export function validateGhostManifest(value: unknown): ManifestValidation {
     raw.version.length > 32
   ) {
     return { ok: false, reason: 'version 必须是 1–32 字符的非空字符串' };
+  }
+  if (raw.releaseNotes !== undefined && typeof raw.releaseNotes !== 'string') {
+    return { ok: false, reason: 'releaseNotes 必须是纯文本字符串' };
   }
   if (
     raw.minCindyVersion !== undefined &&
@@ -3071,10 +3079,16 @@ export function validateGhostManifest(value: unknown): ManifestValidation {
         return { ok: false, reason: 'agent.targets: true 需要同时声明 agent.tasks: true' };
       }
     }
+    if (agentRaw.delegation !== undefined) {
+      if (typeof agentRaw.delegation !== 'boolean') return { ok: false, reason: 'agent.delegation must be boolean' };
+      if (agentRaw.delegation === true && (agentRaw.tasks !== true || agentRaw.targets !== true)) {
+        return { ok: false, reason: 'agent.delegation requires agent.tasks and agent.targets' };
+      }
+    }
     if (agentRaw.schedule !== undefined && typeof agentRaw.schedule !== 'boolean') {
       return { ok: false, reason: 'agent.schedule 必须是布尔值' };
     }
-    if (agentRaw.background !== true && agentRaw.errand !== true && agentRaw.schedule !== true && agentRaw.tasks !== true && Object.keys(unknownDeclarationFields(agentRaw, ['background', 'errand', 'schedule', 'tasks', 'hiddenTasks', 'targets'])).length === 0) {
+    if (agentRaw.background !== true && agentRaw.errand !== true && agentRaw.schedule !== true && agentRaw.tasks !== true && Object.keys(unknownDeclarationFields(agentRaw, ['background', 'errand', 'schedule', 'tasks', 'hiddenTasks', 'targets', 'delegation'])).length === 0) {
       return {
         ok: false,
         reason:
@@ -3082,11 +3096,12 @@ export function validateGhostManifest(value: unknown): ManifestValidation {
       };
     }
     agent = {
-      ...unknownDeclarationFields(agentRaw, ['background', 'errand', 'schedule', 'tasks', 'hiddenTasks', 'targets']),
+      ...unknownDeclarationFields(agentRaw, ['background', 'errand', 'schedule', 'tasks', 'hiddenTasks', 'targets', 'delegation']),
       ...(agentRaw.background === true ? { background: true } : {}),
       ...(agentRaw.errand === true ? { errand: true } : {}),
       ...(agentRaw.tasks === true ? { tasks: true } : {}),
       ...(agentRaw.tasks === true && agentRaw.targets === true ? { targets: true } : {}),
+      ...(agentRaw.tasks === true && agentRaw.targets === true && agentRaw.delegation === true ? { delegation: true } : {}),
       ...(agentRaw.tasks === true && agentRaw.hiddenTasks === true ? { hiddenTasks: true } : {}),
       ...(agentRaw.schedule === true ? { schedule: true } : {}),
     };
@@ -3853,6 +3868,7 @@ export function validateGhostManifest(value: unknown): ManifestValidation {
       id: raw.id,
       name: raw.name,
       version: raw.version,
+      ...(raw.releaseNotes !== undefined ? { releaseNotes: raw.releaseNotes as string } : {}),
       ...(raw.minCindyVersion !== undefined
         ? { minCindyVersion: raw.minCindyVersion as string }
         : {}),

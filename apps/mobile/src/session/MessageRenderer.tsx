@@ -9,13 +9,18 @@ import { McpAppCard } from './McpAppCard';
 import { RichContentContext } from './richContentContext';
 import { RichContentRuntime } from './richContentRuntime';
 import { MessageListVisibility, MessageListVisibilityContext, useMessageListItemVisible } from './messageListVisibility';
+import { MessageContentLongPressContext } from './messageContentLongPress';
 import { CompanionLearningFooter } from './CompanionLearningFooter';
 import { CompanionTaskResultCard } from './CompanionTaskResultCard';
 import { botTaskResultKey, readBotTaskResults } from '@cindy/maker-shared/botCollaboration';
+import type { ErrorDiagnosisSource } from './errorDiagnosisPrompt';
 import { AgentErrorDetails } from './AgentErrorDetails';
 import { ErrorNotice } from '@/components/ErrorNotice';
 import { FileTypeIcon } from '@/components/FileTypeIcon';
+import { CompanionThreadSummary, type CompanionThreads } from './CompanionThreads';
 import { CompanionMessageActions } from './CompanionMessageActions';
+import { compactMessageBubble, messageBubbleBase, userMessageBubble } from './messageBubbleStyles';
+import { MarkdownCodeCopyButton } from './MarkdownCodeCopyButton';
 import { BotGroupQuote } from './BotGroupQuote';
 import { companionReplyQuoteDisplay, companionReplyQuoteFor } from './companionReplyQuote';
 import type { ChatReplyQuote } from '@cindy/maker-shared/chat-reply-quote';
@@ -97,7 +102,6 @@ import {
   type TextStyle,
   type ViewStyle,
 } from 'react-native';
-import { UITextView } from 'react-native-uitextview';
 import {
   LegendList,
   useRecyclingState,
@@ -129,11 +133,9 @@ import { buildMobileMessageMenu, type MobileMessageMenuActionId } from '@/sessio
 import { isShareableMessage } from '@/session/shareSelectionStore';
 import {
   ShareMessageCheckbox,
-  useCancelShareSelectionRowTap,
   MessageBodyText,
 } from '@/session/ShareMessageCheckbox';
 import { SentInlineAtomBody } from '@/session/SentInlineAtomBody';
-import { selectableTextVerticalOffset } from '@/session/selectableTextAlignment';
 import {
   composerDocumentFromSerializedMessage,
   type ComposerDocument,
@@ -143,17 +145,13 @@ import {
   sentInlineTokensDisplayText,
   type SentInlineToken,
 } from '@/session/sentMessageAtoms';
-import {
-  selectionQuoteMenuLabel,
-  SelectionQuoteContext,
-  handleSelectionQuoteMenuAction,
-} from '@/session/selectionQuote';
-import { SelectionMenuText } from '@/session/SelectionMenuText';
+import { SelectionQuoteContext } from '@/session/selectionQuote';
+import { MarkdownSelectableText, MarkdownSelectableSpan } from './MarkdownSelectableText';
 import {
   MOBILE_COMPOSER_CONTROL_SIZE,
   MOBILE_COMPOSER_VOICE_ANCHOR_RIGHT,
 } from '@/session/MobileComposerInputRow';
-import { MAX_FONT_SIZE_MULTIPLIER, Text } from '@/components/AppText';
+import { Text } from '@/components/AppText';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type {
   NormalizedAttachment,
@@ -473,7 +471,10 @@ const MOBILE_MESSAGE_DRAW_DISTANCE = 800;
 const FOLDABLE_HEADER_HIT_SLOP = { bottom: 10, left: 4, right: 4, top: 10 };
 
 function mobileMessageListItemType(item: MobileMessageRenderItem): MobileMessageRenderItem['type'] {
-  return item.type;
+  // A confirmed local send keeps the same logical row as its optimistic bubble.
+  // Reusing the message pool preserves the measured height while the item data
+  // changes from pending_send to the persisted message.
+  return item.type === 'pending_send' ? 'message' : item.type;
 }
 
 function resolveMobileMessageHistoryAnchorOffset(
@@ -524,115 +525,6 @@ const stylesStatic = StyleSheet.create({
   },
 });
 
-/**
- * 消息正文可选中文本块的双端实现:
- * - iOS:RN 官方 Text 底层是 UILabel,selectable 只有「长按拷贝整块」、没有系统选择手柄
- *   (部分选择做不到,facebook/react-native#13938)。换用 react-native-uitextview
- *   (Bluesky 开源,真 UITextView):长按出系统手柄、支持块内部分选择,嵌套 span 样式与 onPress 保留。
- * - Android:RN Text selectable 本身就有系统选择手柄,维持 AppText(带全局字体缩放限幅)。
- * 选中高亮双端都刻意**不**覆写 selectionColor,交给系统:iOS UITextView 本就用系统高亮;
- * Android 不传则回落 Activity 主题的 textColorHighlight(accent 色 ~26% 透明度的半透明
- * tint),选区可见性与选中文字可读性天然兼得。历史教训(#1427):曾逐 view 覆写不透明
- * token —— surfaceChip 近白,浅色主题选区与底色仅 1.04:1,选了看不见;换 inputCaret 纯蓝,
- * 选中文字对比度跌到 2.6:1,看得见但读不了 —— 不透明覆写两头都讨不到好。props 类型
- * Omit 掉 selectionColor 挡编译期,messageSelectionHighlight.test.ts 锁文件级不再覆写。
- */
-type MarkdownSelectableTextProps = Omit<ComponentProps<typeof Text>, 'selectionColor'> & {
-  /**
-   * iOS 是否使用可部分选中的 UITextView。普通任务的超长展开正文回退 RN Text:
-   * UITextView 在折叠→展开时骤增为超高复用视图会偶发只留下巨高空白容器。
-   */
-  allowIosUITextView?: boolean;
-  /** Decorated table cells must stay on the row grid, including their borders. */
-  adjustVerticalAlignment?: boolean;
-  /** Include larger inline headings when aligning a combined text run. */
-  alignmentTextStyles?: readonly StyleProp<TextStyle>[];
-};
-
-function MarkdownSelectableText({
-  allowIosUITextView = true,
-  adjustVerticalAlignment = true,
-  alignmentTextStyles,
-  selectable,
-  ...rest
-}: MarkdownSelectableTextProps) {
-  // chat-text-quote:宿主(MessageRenderer)启用采集时,给 iOS UITextView 传
-  // menuActionLabel(系统选择菜单里插入「添加到对话」项,iOS 16+)并挂
-  // onTextLayout(缓存逐行渲染文本)+ onMenuAction(菜单点按时按选区偏移切
-  // 文本提交)。context 为 null(宿主未启用 / 非会话场景)时零开销走原路径。
-  const quoteCtx = useContext(SelectionQuoteContext);
-  const renderedLinesRef = useRef<readonly string[]>([]);
-  const { fontScale } = useWindowDimensions();
-  if (selectable && allowIosUITextView && Platform.OS === 'ios') {
-    const typography = [rest.style, ...(alignmentTextStyles ?? [])]
-      .map((style) => StyleSheet.flatten(style) ?? {});
-    const top = selectableTextVerticalOffset(typography, rest.allowFontScaling === false ? 1 : fontScale);
-    // Position only the selectable root. RN Text already centers its leading;
-    // shifting the bubble itself would also shift pending/Android text and chips.
-    const alignedStyle: StyleProp<TextStyle> = adjustVerticalAlignment ? [rest.style, { top }] : rest.style;
-    if (!quoteCtx) {
-      return (
-        <UITextView
-          maxFontSizeMultiplier={MAX_FONT_SIZE_MULTIPLIER}
-          selectable
-          uiTextView
-          {...rest}
-          style={alignedStyle}
-        />
-      );
-    }
-    return (
-      <UITextView
-        maxFontSizeMultiplier={MAX_FONT_SIZE_MULTIPLIER}
-        selectable
-        uiTextView
-        {...rest}
-        style={alignedStyle}
-        onTextLayout={(e) => {
-          // uitextview 自定义 spec 的 lines 是 string[](RN 核心 Text 是对象数组),
-          // 双形态防御:确保缓存的是纯字符串行。
-          const rawLines = e.nativeEvent.lines as unknown as readonly (string | { text: string })[];
-          renderedLinesRef.current = rawLines.map((line) => (typeof line === 'string' ? line : line.text));
-          rest.onTextLayout?.(e);
-        }}
-        // menuActionLabel / onMenuAction 是 uitextview patch 的扩展 prop,不在
-        // RN Text props 里,组件内部私有附加(经 {...rest} 透传到原生组件)。
-        {...{
-          menuActionLabel: selectionQuoteMenuLabel(),
-          sideChatMenuActionLabel: quoteCtx.askInSideChat ? i18n.t('session.sideChat.title') : '',
-          onMenuAction: (event: { nativeEvent: { target: number; start: number; end: number } }) => {
-            handleSelectionQuoteMenuAction(event, renderedLinesRef.current, quoteCtx);
-          },
-          onSideChatMenuAction: (event: { nativeEvent: { target: number; start: number; end: number } }) => {
-            handleSelectionQuoteMenuAction(event, renderedLinesRef.current, quoteCtx, 'side-chat');
-          },
-        }}
-      />
-    );
-  }
-  return <SelectionMenuText selectable={selectable} {...rest} />;
-}
-
-/**
- * iOS 可选中块里的嵌套 span:必须也是 UITextView(经库内祖先上下文渲染为原生 child),
- * 混入 RN Text 会破坏原生文本树。仅由 renderInline 在「块可选中且 iOS」时使用。
- */
-function MarkdownSelectableSpan(props: ComponentProps<typeof Text>) {
-  const cancelShareSelectionRowTap = useCancelShareSelectionRowTap();
-  const handlePress = props.onPress
-    ? (event: GestureResponderEvent) => {
-      cancelShareSelectionRowTap?.();
-      props.onPress?.(event);
-    }
-    : undefined;
-  return (
-    <UITextView
-      maxFontSizeMultiplier={MAX_FONT_SIZE_MULTIPLIER}
-      {...props}
-      onPress={handlePress}
-    />
-  );
-}
 
 function isTextRunContinuationGroup(group: MobileMarkdownBlockGroup): boolean {
   return group.type === 'text_run' && group.textRunContinuation === true;
@@ -675,6 +567,7 @@ interface MessageActions {
   onRetryImageDelivery?: (imageId: string) => Promise<void>;
   companion?: boolean;
   companionQuoteActions?: CompanionQuoteActions;
+  companionThreads?: CompanionThreads;
   onCompanionReadThrough?: (at: number) => void;
   onOpenCompanionSettings?: (page: 'memory' | 'capabilities') => void;
   companionWorkingLabel?: string | null;
@@ -692,6 +585,7 @@ interface MessageActions {
   /** Insert this message's anchored link as an atom in the active composer. */
   onAddMessageToComposer?: (clientId: string) => void;
   onSideChatMessage?: (text: string) => void;
+  onDiagnoseError?: (error: ErrorDiagnosisSource) => void;
   /**
    * chat-text-quote:选中消息文字 → 系统选择菜单「添加到对话」项的采集回调
    * (会话页写入 chatQuoteStore)。未传时选区采集整体关闭(context 为 null,
@@ -752,6 +646,8 @@ interface MessageActions {
 export function MessageRenderer({
   companion = false,
   companionQuote,
+  companionThreads,
+  conversationHeader,
   companionWorkingLabel,
   onOpenCompanionSettings,
   companionAvatar,
@@ -766,6 +662,7 @@ export function MessageRenderer({
   onCopyMessageLink,
   onAddMessageToComposer,
   onSideChatMessage,
+  onDiagnoseError,
   onForkMessage,
   onDeleteMessage,
   onLoadEarlier,
@@ -816,6 +713,8 @@ export function MessageRenderer({
   companion?: boolean;
   /** Companion private chats only; ordinary tasks keep their existing message actions. */
   companionQuote?: CompanionQuoteOptions;
+  companionThreads?: CompanionThreads;
+  conversationHeader?: ReactNode;
   onOpenCompanionSettings?: (page: 'memory' | 'capabilities') => void;
   companionWorkingLabel?: string | null;
   companionAvatar?: ReactNode;
@@ -1823,6 +1722,7 @@ export function MessageRenderer({
   const actions: MessageActions & { firstUserMessageClientId?: string } = useMemo(() => ({
     companion,
     companionQuoteActions,
+    companionThreads,
     companionWorkingLabel,
   onOpenCompanionSettings,
     companionAvatar,
@@ -1832,6 +1732,7 @@ export function MessageRenderer({
     remoteDeviceId,
     onAddMessageToComposer,
     onSideChatMessage,
+    onDiagnoseError,
     onCopyMessageLink,
     onForkMessage,
     onDeleteMessage,
@@ -1866,6 +1767,7 @@ export function MessageRenderer({
   }), [
     companion,
     companionQuoteActions,
+    companionThreads,
     companionWorkingLabel,
   onOpenCompanionSettings,
     companionAvatar,
@@ -1884,6 +1786,7 @@ export function MessageRenderer({
     onCopyMessageLink,
     onAddMessageToComposer,
     onSideChatMessage,
+    onDiagnoseError,
     onDeleteMessage,
     onForkMessage,
     onOpenForkOrigin,
@@ -2869,7 +2772,7 @@ export function MessageRenderer({
         // 内容形态下会与布局结算互相触发,形成无限 onScroll 风暴把 JS 线程打满——表现为
         // 冷开会话消息区空白、无 loading、返回键无响应,只能杀 App(2026-07 模拟器逐项
         // 二分实锤,3.3.2 / 3.3.3 均复现)。
-        alignItemsAtEnd
+        alignItemsAtEnd={!conversationHeader}
         maintainScrollAtEnd={false}
         // iOS uses LegendList/RN's atomic data/size anchoring while reading history. Android history
         // prepends temporarily disable the whole prop because RN exposes one native switch: leaving
@@ -2879,6 +2782,7 @@ export function MessageRenderer({
           : { data: anchorVisibleRowsOnDataChange, size: true }}
         contentContainerStyle={[
           styles.messages,
+          conversationHeader ? styles.messagesWithRoot : undefined,
           { paddingBottom: bottomPadding, paddingTop: topPadding },
           viewportLayout.wideViewport && styles.messagesWide,
           viewportLayout.wideViewport && { maxWidth: viewportLayout.contentMaxWidth },
@@ -2886,8 +2790,9 @@ export function MessageRenderer({
         ListEmptyComponent={syncingWhileEmpty
           ? <SyncingMessages />
           : <EmptyMessages testID={emptyTestID} copy={emptyMessage} />}
-        ListHeaderComponent={
-          loadEarlierAction.visible ? (
+        ListHeaderComponent={<>
+          {conversationHeader}
+          {loadEarlierAction.visible ? (
             <MessageListActionButton
               accessibilityLabel={loadEarlierAction.accessibilityLabel}
               disabled={loadEarlierAction.disabled}
@@ -2897,8 +2802,8 @@ export function MessageRenderer({
             >
               <Text style={styles.loadEarlierText}>{loadEarlierAction.label}</Text>
             </MessageListActionButton>
-          ) : null
-        }
+          ) : null}
+        </>}
         ListFooterComponent={queueFooter ? <>{queueFooter}</> : null}
         onLayout={handleListLayout}
         onMetricsChange={handleListMetricsChange}
@@ -3563,7 +3468,7 @@ function MessageBubble({
   // 操作行只挂在每轮收尾正文、且该行确实是一条发言(判据见
   // mobileMessageShowsActionBar):中间句不再逐条带复制/分叉/时间,系统边界卡整行
   // 不挂。分享态只保留与导出图片一致的消息内容,不显示操作图标、时间或费用。
-  // 流式回复不挂操作行或状态占位；任务运行状态由底部状态栏展示。
+  // 流式回复不显示操作，但保留最终操作行的占位，收尾时不把正在看的正文推走。
   const showCompletedActionBar = !shareSelectionActive && mobileMessageShowsActionBar({
     hasSystemCard: !!item.message.systemCardType,
     isStreamingAssistant,
@@ -3684,7 +3589,14 @@ function MessageBubble({
     hasTurnCost: !!turnCost || !!turnTokens,
     isStreaming: isStreamingAssistant,
   }), [canCopy, canFork, isStreamingAssistant, isUser, messageMenu.length, relativeTime, turnCost, turnTokens]);
-  const hasActions = actionBar.items.length > 0 || canShare;
+  const threadEligible = actions.companion && actions.companionThreads && clientId && !isStreamingAssistant
+    && !!companionReplyQuoteFor(item.message);
+  const hasActions = actionBar.items.length > 0 || canShare || !!threadEligible;
+  const reserveActionSlot = !shareSelectionActive
+    && !actions.companion
+    && isStreamingAssistant
+    && !item.message.systemCardType
+    && !hasActions;
   const actionBusy = !!clientId && actions.busyClientId === clientId;
   const forkBusy = actionBusy && actions.busyAction === 'fork';
   const disabled = !!actions.busyClientId;
@@ -3940,6 +3852,7 @@ function MessageBubble({
             renderText={(text, index) => (
               <View key={`text:${index}`} style={styles.sentInlineTextChunk}>
                 <MarkdownBody
+                  codeCopyEnabled={!shareSelectionActive}
                   layout={contentLayout}
                   markdownImageCacheKey={item.message.key}
                   onOpenPayload={actions.onOpenPayload}
@@ -3955,6 +3868,7 @@ function MessageBubble({
           />
         ) : (
           <MarkdownBody
+            codeCopyEnabled={!shareSelectionActive}
             renderRichAnswers={item.message.kind === 'assistant'}
             richStateKey={item.message.source.clientId ?? item.message.key}
             allowIosUITextView={!shouldCollapseLongMessage || actions.companion === true}
@@ -4086,9 +4000,15 @@ function MessageBubble({
       ) : null}
       {item.message.role === 'error' ? (
         <ErrorNotice message={displayBubbleBody}>
-          {item.message.rawError ? <AgentErrorDetails key={item.message.key} message={item.message.rawError} /> : null}
+          {item.message.rawError ? <AgentErrorDetails key={item.message.key} message={item.message.rawError}
+            onDiagnose={actions.onDiagnoseError ? () => actions.onDiagnoseError!({
+              message: displayBubbleBody, details: item.message.rawError!,
+            }) : undefined} /> : null}
         </ErrorNotice>
       ) : bubbleShown ? bubble : null}
+      {threadEligible && actions.companionThreads ? <View style={styles.companionThreadSummary}>
+        <CompanionThreadSummary message={item.message} topics={actions.companionThreads} />
+      </View> : null}
       {actions.companion && item.message.kind === 'assistant' && item.message.body.trim() ? (
         <CompanionLearningFooter receipts={item.message.source.agentMeta?.botLearning}
           onOpenSettings={actions.onOpenCompanionSettings} />
@@ -4115,6 +4035,7 @@ function MessageBubble({
       {hasActions && actions.companion ? <CompanionMessageActions user={isUser} copied={copyState === 'copied'} copying={copyState === 'copying'} disabled={disabled}
         onCopy={canCopy ? copyMessage : undefined}
         actions={[
+          ...(threadEligible ? [{ id: 'thread', title: t(actions.companionThreads?.threads.has(clientId) ? 'groupChat.thread.open' : 'groupChat.thread.create'), image: 'bubble.left.and.bubble.right', disabled: actions.companionThreads?.busy }] : []),
           ...(canCopy ? [{ id: 'copy', title: copyActionLabel(copyState), image: 'doc.on.doc', disabled: copyState === 'copying' }] : []),
           ...(canShare ? [{ id: 'share', title: t('session.shareImage.shareMessage'), image: 'square.and.arrow.up' }] : []),
           // Desktop's teammate action bar omits fork and per-turn cost/tokens: the Bot owns its one timeline.
@@ -4124,19 +4045,21 @@ function MessageBubble({
         onAction={id => {
           // Reply quotes what can be quoted; other rows (errors, system cards) keep inserting their link.
           const quote = id === 'add-to-chat' && companionQuote ? companionReplyQuoteFor(item.message) : null;
-          if (quote) companionQuote?.onQuote(quote);
+          if (id === 'thread') actions.companionThreads?.open(item.message);
+          else if (quote) companionQuote?.onQuote(quote);
           else if (id === 'copy') selectControlAction(id);
           else if (id === 'share') actions.onEnterShareSelection?.(clientId);
           else if (messageMenu.some(item => item.id === id)) selectMenuAction(id as MobileMessageMenuActionId);
-        }} /> : hasActions ? (
+        }} /> : hasActions || reserveActionSlot ? (
         <View
           style={[
             styles.messageActionBar,
+            reserveActionSlot && styles.messageActionSlot,
             actionBar.align === 'right' ? styles.userMessageActionBar : styles.agentMessageActionBar,
           ]}
-          testID="message.actionBar"
+          testID={hasActions ? 'message.actionBar' : 'message.actionSlot'}
         >
-          {actionBar.items.map((id) => {
+          {hasActions ? actionBar.items.map((id) => {
             if (id === 'time') return timeText;
             if (id === 'cost') return costText;
             if (id === 'more') {
@@ -4188,8 +4111,8 @@ function MessageBubble({
               );
             }
             return null;
-          })}
-          {canShare && !actionBar.items.includes('copy') ? (
+          }) : null}
+          {hasActions && canShare && !actionBar.items.includes('copy') ? (
             <MessageShareButton
               buttonSize={actionBar.buttonSize}
               iconSize={actionBar.iconSize}
@@ -4853,11 +4776,11 @@ function WorkGroupCard({
   const lineMode = lines !== undefined;
   const deferredRef = useRef(item.deferred);
   deferredRef.current = item.deferred;
-  useLayoutEffect(() => {
-    const current = deferredRef.current;
-    current?.setVisible?.(expanded, isStreaming && !lineMode);
-    return () => current?.setVisible?.(false, false);
-  }, [item.deferred?.owner, item.deferred?.key, expanded, isStreaming, lineMode]);
+  // The read tail regroups this item, so its own isStreaming must not drive the read.
+  useLayoutEffect(
+    () => deferredRef.current?.setVisible?.(expanded, true),
+    [item.deferred?.owner, item.deferred?.key, item.deferred?.livePreview, expanded],
+  );
   const layout = useMemo(() => buildMessageHierarchyLayout({
     screenWidth: actions.screenWidth,
     summaryCount: header.summaryCount,
@@ -5148,10 +5071,7 @@ function SubagentCard({
   const styles = useThemedStyles(makeStyles);
   const [expanded, toggleExpanded] = useFoldableExpandedState(item.key, false);
   const deferred = item.deferred;
-  useEffect(() => {
-    deferred?.setVisible?.(expanded, false);
-    return () => deferred?.setVisible?.(false, false);
-  }, [deferred?.owner, deferred?.key, expanded]);
+  useEffect(() => deferred?.setVisible?.(expanded, false), [deferred?.owner, deferred?.key, expanded]);
   const title = item.header.subagentType
     ? t('message.renderer.subagentTyped', { type: item.header.subagentType })
     : t('message.renderer.subagent');
@@ -5475,10 +5395,10 @@ function MobileAgentSwitchCard({ data }: { data?: Record<string, unknown> }) {
               <Text style={styles.agentSwitchModel} numberOfLines={1}>{toModel}</Text>
             </>
           ) : null}
-          {resumed ? (
+          {resumed || data?.nativeHistory === 'fallback' ? (
             <>
               <Text style={styles.agentSwitchDot}>·</Text>
-              <Text style={styles.agentSwitchPillText} numberOfLines={1}>{t('message.renderer.sessionResumedPill')}</Text>
+              <Text style={styles.agentSwitchPillText} numberOfLines={1}>{t(data?.nativeHistory === 'fallback' ? 'message.renderer.sessionFallbackPill' : 'message.renderer.sessionResumedPill')}</Text>
             </>
           ) : null}
           {handoff ? (
@@ -5783,6 +5703,7 @@ function CompanionCardMarkdown({ text, actions, messageKey }: { text: string; ac
 // 不跳转界面;整条复制走操作条按钮。选择按块进行(原生 Text 能力边界,跨段选择做不到)。
 function MarkdownBodyBase({
   allowIosUITextView = true,
+  codeCopyEnabled = true,
   boundTextRuns = false,
   markdownImageCacheKey,
   layout,
@@ -5811,6 +5732,8 @@ function MarkdownBodyBase({
    * 气泡(长代码围栏横向裁切 + 纵向巨高空白)。
    */
   pinContentWidth?: boolean;
+  /** 分享图片选择态关闭块级操作,避免把按钮带进导出内容。 */
+  codeCopyEnabled?: boolean;
   /** 完成态消息为 true:各块 Text 开原生选中(含内嵌图片 View 的块除外,Android 上有风险)。 */
   selectable?: boolean;
   /** 消息流式中:文件 chip 层跳过远端验证。 */
@@ -6062,14 +5985,17 @@ function MarkdownBodyBase({
     if (block.type === 'code') {
       // 围栏代码在气泡内换行,不用横向 ScrollView:后者在展开长用户消息时
       // 会按未折行内容报出超高,气泡巨幅空白并把每行裁在右侧圆角外。
+      const showCodeCopyButton = codeCopyEnabled && block.text.trim().length > 0;
       return (
         <View key={block.key} style={styles.markdownCodeFrame}>
+          {showCodeCopyButton ? <MarkdownCodeCopyButton text={block.text} /> : null}
           <View
             style={[
               styles.markdownCodeContent,
               {
                 paddingHorizontal: layout.codePaddingHorizontal,
-                paddingVertical: layout.codePaddingVertical,
+                paddingBottom: layout.codePaddingVertical,
+                paddingTop: showCodeCopyButton ? 0 : layout.codePaddingVertical,
               },
             ]}
           >
@@ -6208,7 +6134,7 @@ function MarkdownBodyBase({
         {renderInlines(block.inlines, singleBlockSpanFor(inlinesSelectable(block.inlines)))}
       </MarkdownSelectableText>
     );
-  }, [allowIosUITextView, boundTextRuns, contentWidth, inlinesSelectable, layout, onOpenPayload, pinSettledWidth, renderInlines, selectable, settledTextStyle, spanFor, styles, t]);
+  }, [allowIosUITextView, boundTextRuns, codeCopyEnabled, contentWidth, inlinesSelectable, layout, onOpenPayload, pinSettledWidth, renderInlines, selectable, settledTextStyle, spanFor, styles, t]);
   return (
     <View
       collapsable={false}
@@ -6324,6 +6250,7 @@ function LinkPathChipSpan({
   return (
     <ChatPathChipSpan
       candidate={candidate}
+      explicitLink={!bare}
       chipStyle={
         codeStyled
           ? [baseStyle, styles.markdownInlineCode, underlineDecoration(styles, baseStyle, styles.markdownPathChip)]
@@ -6628,6 +6555,8 @@ export function AttachmentStrip({
   layout,
   onOpen,
   onOpenFile,
+  onImageError,
+  imageReloadKeys,
   onResolveRemoteMedia,
   usePreviewState = useRecyclingState,
 }: {
@@ -6640,6 +6569,10 @@ export function AttachmentStrip({
   onOpen?: (payload: MessagePayload) => void;
   /** Index within this strip's file chips, for callers that resolve files by ID on tap. */
   onOpenFile?: (index: number) => void;
+  /** Index within this strip's images, for owners that refresh short-lived authorization. */
+  onImageError?: (index: number) => void;
+  /** Reset only the failed image when authorization returns the same URL. */
+  imageReloadKeys?: readonly number[];
   onResolveRemoteMedia?: ResolveRemoteMediaFn;
   usePreviewState?: MediaPreviewStateHook;
 }) {
@@ -6660,13 +6593,14 @@ export function AttachmentStrip({
           兜底命中时替换成 file:// 直接渲染(payload 同源替换,点开查看器同图)。 */}
       {imageAttachments.map((item, index) => (
         <MediaPreview
-          key={`${item.kind}:${item.uri ?? item.name}:${index}`}
+          key={`${item.kind}:${item.uri ?? item.name}:${index}:${imageReloadKeys?.[index] ?? 0}`}
           label={item.name}
           layout={layout}
           media={{ kind: 'image', url: item.uri ?? '', previewable: item.previewable }}
           localPreview={clientId ? getImagePreview?.(clientId, index, item.name, undefined, item.sha256, item.uri) : undefined}
           onOpen={onOpen ? () => onOpen(buildAttachmentPayload(applySentAttachmentThumbOverlay(item))) : undefined}
           onResolveRemoteMedia={onResolveRemoteMedia}
+          onImageError={onImageError ? () => onImageError(index) : undefined}
           variant="attachment"
           usePreviewState={usePreviewState}
         />
@@ -6855,6 +6789,7 @@ function MediaPreview({
   label,
   onOpen,
   onResolveRemoteMedia,
+  onImageError,
   variant = 'card',
   presentationOnly = false,
   localPreview,
@@ -6865,6 +6800,7 @@ function MediaPreview({
   label: string;
   onOpen?: () => void;
   onResolveRemoteMedia?: ResolveRemoteMediaFn;
+  onImageError?: () => void;
   variant?: 'card' | 'attachment';
   presentationOnly?: boolean;
   localPreview?: SentMessageImagePreview;
@@ -6932,6 +6868,7 @@ function MediaPreview({
   const handleImageError = useCallback(() => {
     if (media.previewable) {
       setResolveState({ status: 'error' });
+      onImageError?.();
       return;
     }
     if (imageRetryUsedRef.current) {
@@ -6940,7 +6877,7 @@ function MediaPreview({
     }
     imageRetryUsedRef.current = true;
     resolveThumbnail(true);
-  }, [media.previewable, resolveThumbnail]);
+  }, [media.previewable, onImageError, resolveThumbnail]);
 
   // Measure with the same decoder that displays the image: RN getSize cannot
   // decode SVG. Reuse the decoded dimensions without a second image request.
@@ -7242,6 +7179,7 @@ function MessageContentOpenButton({
 }) {
   const styles = useThemedStyles(makeStyles);
   const interactionDisabled = disabled || !onPress;
+  const onLongPress = useContext(MessageContentLongPressContext);
   if (presentationOnly) return <View style={style} testID={testID}>{children}</View>;
   return (
     <Pressable
@@ -7250,6 +7188,8 @@ function MessageContentOpenButton({
       accessibilityState={{ disabled: interactionDisabled }}
       disabled={interactionDisabled}
       onPress={interactionDisabled ? undefined : onPress}
+      onLongPress={interactionDisabled ? undefined : onLongPress}
+      delayLongPress={350}
       style={({ pressed }) => [
         style,
         pressed && styles.pressed,
@@ -7432,7 +7372,7 @@ function MessagePayloadModal({
             testID="message.payloadMermaidDiagram"
             zoomable
           />
-          <View style={[styles.payloadFloatingActions, { top: modalSafeArea.paddingTop }]}>
+          <View style={[styles.payloadFloatingActions, { top: modalSafeArea.paddingTop, right: safeAreaInsets.right + spacing.lg }]}>
             {imageAnnotation ? (
               <PayloadHeaderActionButton
                 accessibilityLabel={t('message.renderer.annotateSendToChat')}
@@ -7486,6 +7426,9 @@ function MessagePayloadModal({
           styles.payloadModal,
           {
             paddingBottom: modalSafeArea.paddingBottom,
+            // Landscape side insets hold the notch or a vertical system bar (Duo).
+            paddingLeft: safeAreaInsets.left,
+            paddingRight: safeAreaInsets.right,
             paddingTop: modalSafeArea.paddingTop,
           },
         ]}
@@ -8725,6 +8668,7 @@ function headingSizeStyle(
 const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   messageFrame: { flex: 1, minHeight: 0 },
   messageList: { flex: 1 },
+  messagesWithRoot: { justifyContent: 'flex-start' },
   messages: {
     flexGrow: 1,
     // Anchor a short conversation to the bottom (just above the composer) like a normal chat,
@@ -8792,23 +8736,15 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     flexShrink: 1,
     maxWidth: '100%',
   },
+  companionThreadSummary: { maxWidth: '100%', marginTop: -2 },
   userMessageItem: {
     alignItems: 'flex-end',
   },
   agentMessageItem: {
     alignItems: 'stretch',
   },
-  bubble: {
-    borderRadius: radius.container,
-    borderWidth: StyleSheet.hairlineWidth,
-    gap: spacing.xs,
-    padding: spacing.md,
-  },
-  bubbleCompact: {
-    gap: 6,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-  },
+  bubble: messageBubbleBase,
+  bubbleCompact: compactMessageBubble,
   bubbleRich: {
     gap: spacing.sm,
   },
@@ -8827,14 +8763,7 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     marginTop: spacing.sm,
     textAlign: 'center',
   },
-  userBubble: {
-    alignSelf: 'flex-end',
-    backgroundColor: colors.surfaceElevated,
-    borderColor: colors.border,
-    maxWidth: '86%',
-    minWidth: 0,
-    overflow: 'hidden',
-  },
+  userBubble: userMessageBubble(colors),
   agentBubble: {
     alignSelf: 'stretch',
     backgroundColor: colors.surface,
@@ -9398,6 +9327,9 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     gap: 2,
     marginTop: 0,
   },
+  // Keep the row occupied while a reply streams so completion controls can appear
+  // without changing the message's measured height in the middle of a turn.
+  messageActionSlot: { minHeight: MESSAGE_CONTROL_TOUCH_SIZE },
   userMessageActionBar: { justifyContent: 'flex-end' },
   agentMessageActionBar: { justifyContent: 'flex-start' },
   messageIconAction: {
@@ -9713,7 +9645,6 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
     flexDirection: 'row',
     gap: spacing.sm,
     position: 'absolute',
-    right: spacing.lg,
   },
   // 浮动按钮需要实底色,否则悬在图表线条上看不清。
   payloadFloatingButton: {

@@ -18,6 +18,41 @@ function parsePayload(result: unknown): Record<string, unknown> {
 }
 
 describe("cindy_helper MCP server", () => {
+  // Discovery used to describe auth as Grok-only and omit the handoff schema.
+  // Unit: a fresh client must discover the required window/purpose arguments
+  // before its first call, without using an invalid call to obtain the schema.
+  it('discovers input handoff and its required arguments before starting it', async () => {
+    const start = vi.fn(async () => ({ ok: true as const, requestId: 'handoff-1' }));
+    const server = createXdtHelperMcpServer({ inputHandoff: { start } }, {
+      agentKind: 'codex', workingDir: '/repo', sessionId: 'current-task',
+      getSessionContext: () => ({
+        agentKind: 'codex', workingDir: '/repo', sessionId: 'current-task', sessionInstanceId: 'instance-1',
+      }),
+    });
+    const client = new Client({ name: 'handoff-discovery-test', version: '1' });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    try {
+      const overview = parsePayload(await client.callTool({ name: 'list_tools', arguments: {} }));
+      expect(overview.categories).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'auth', description: expect.stringContaining('二维码') }),
+      ]));
+      const catalog = parsePayload(await client.callTool({ name: 'list_tools', arguments: { category: 'auth' } }));
+      const handoff = (catalog.tools as Array<{ name: string; inputSchema: Record<string, unknown> }>)[0]!;
+      expect(handoff.name).toBe('request_input_handoff');
+      expect(handoff.inputSchema).toMatchObject({
+        required: ['purpose', 'target'],
+        properties: { purpose: { type: 'string' }, target: { type: 'object', properties: { app: { type: 'string' } } } },
+      });
+      expect(parsePayload(await client.callTool({ name: 'call_tool', arguments: {
+        name: handoff.name, args: { purpose: 'Sign in to continue', target: { app: 'Google Chrome' } },
+      } }))).toMatchObject({ ok: true, request_id: 'handoff-1', status: 'pending' });
+      expect(start).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'current-task' }), {
+        purpose: 'Sign in to continue', target: { app: 'Google Chrome' },
+      });
+    } finally { await client.close(); await server.close(); }
+  });
+
   it.each(['default', 'bot-main'] as const)('exposes runtime declarations through the same helper tool for %s', async (surface) => {
     const runtimeCapabilities = vi.fn(async () => ({ ok: true, capabilities: [{ server: 'fixture' }] }));
     const server = createXdtHelperMcpServer({ resolveSurface: async () => surface, runtimeCapabilities }, {
@@ -1300,4 +1335,28 @@ describe("direct Bot MCP tools", () => {
       await server.close();
     }
   });
+});
+
+// Unit: discover and invoke the same local Settings form for all three harnesses.
+it.each(['claude-code', 'codex', 'pi'] as const)('opens MCP Settings through the %s helper and returns only metadata', async agentKind => {
+  const request = vi.fn(async () => ({ status: 'saved' as const, serverId: 'custom_example' }));
+  const context = { agentKind, workingDir: '/repo', sessionId: 'task', sessionInstanceId: 'instance' };
+  const server = createXdtHelperMcpServer({ mcpSetup: request }, { ...context, getSessionContext: () => context });
+  const client = new Client({ name: 'mcp-form-test', version: '1' });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(st), client.connect(ct)]);
+  try {
+    const catalog = parsePayload(await client.callTool({ name: 'list_tools', arguments: { category: 'auth' } }));
+    expect(catalog.tools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'request_mcp_setup' })]));
+    const result = parsePayload(await client.callTool({ name: 'call_tool', arguments: {
+      name: 'request_mcp_setup', args: { name: 'Example', url: 'https://example.test/mcp', transport: 'sse' },
+    } }));
+    expect(result).toEqual({ ok: true, status: 'saved', serverId: 'custom_example' });
+    expect(request).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(context), {
+      name: 'Example', url: 'https://example.test/mcp', transport: 'sse',
+    });
+    request.mockClear();
+    await client.callTool({ name: 'call_tool', arguments: { name: 'request_mcp_setup', args: { url: 'https://example.test/mcp?token=test-invalid-token' } } });
+    expect(request).not.toHaveBeenCalled();
+  } finally { await client.close(); await server.close(); }
 });
