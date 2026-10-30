@@ -105,6 +105,10 @@ export interface CodexImportMessagesArgs {
     text: string;
     content: unknown;
     createdAt: number;
+    /** Rollout timestamp without the line-number ordering offset. */
+    sourceCreatedAt?: number;
+    phase?: 'commentary' | 'final_answer';
+    agentMessageId?: string;
   }>;
 }
 
@@ -147,6 +151,15 @@ export interface RewindCommitArgs {
    * 省略或 null 表示当时会话未被清空。
    */
   expectedClearedAt?: number | null;
+  /**
+   * Claude 目标之前没有可续接的回复：与软删同一事务清掉 sdk_session_id，并追加隐藏
+   * context_rebuild 标记(内容含交接文本)，下次发送开全新原生会话并注入保留下来的历史。
+   */
+  nativeContextReset?: {
+    markerId: string;
+    markerClientId: string;
+    markerContent: string;
+  };
   now: number;
 }
 
@@ -1489,7 +1502,7 @@ export type DbTxResultByName = {
     approximate: number;
   } | null;
   'authorization.readProjection': import('../../autoReviewProjection.js').StoredAutoReviewProjection;
-  'codex.importMessages': { changed: number };
+  'codex.importMessages': { changed: number; hiddenClientIds?: string[]; updatedLocalIds?: string[] };
   'claude.importMessages': { changed: number };
   'rewind.commit': undefined;
   'session.treeRehydrate': { messageCount: number; hiddenClientIds: string[] };
