@@ -65,8 +65,9 @@ describe('sidebar Markdown preview', () => {
 
       const afterFill = parser.mock.calls.length;
       finalizePlainPreview(oldest, 'user');
+      expect(parser.mock.calls.length).toBe(afterFill);
       finalizePlainPreview(recent, 'user');
-      expect(parser.mock.calls.length - afterFill).toBe(1);
+      expect(parser.mock.calls.length).toBe(afterFill + 1);
       expect(afterFill - before).toBe(64);
     } finally {
       parser.mockImplementation(originalParser);
