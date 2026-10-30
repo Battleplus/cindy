@@ -164,7 +164,7 @@ export function finalizePlainPreview(
   const cacheable = text.length <= PREVIEW_CACHE_MAX_ENTRY_CHARS;
   const hashed = text.length > PREVIEW_CONTENT_BOUND_CHARS;
   const key = !cacheable ? null : hashed
-    ? `${roleKey}:${text.length}:${createHash('sha256').update(text).digest('base64url')}`
+    ? `${roleKey}:hashed:${text.length}:${createHash('sha256').update(text).digest('base64url')}`
     : `${roleKey}:${text}`;
   if (key !== null) {
     const cached = plainPreviewCache.get(key);
