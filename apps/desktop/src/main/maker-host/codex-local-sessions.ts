@@ -1261,6 +1261,10 @@ function originalCodexRolloutName(file: string): string {
   return path.basename(file).replace(/^(?:rollout-cindy-(?:adopted|empty-recovery|synthetic)(?:-\d+)?-)+/, '');
 }
 
+function uncompressedCodexRolloutName(file: string): string {
+  return originalCodexRolloutName(file).replace(/\.zst$/, '');
+}
+
 function nativeRolloutIdentity(file: string): { threadId: string; rolloutId: string } | undefined {
   const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
   const match = originalCodexRolloutName(file).match(new RegExp(`^rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-(${uuid})(?:_(${uuid}))?\\.jsonl(?:\\.zst)?$`, 'i'));
@@ -1273,7 +1277,12 @@ function isZstdRollout(file: string): boolean {
 
 function createRolloutReadStream(file: string): Readable {
   const input = createReadStream(file);
-  return isZstdRollout(file) ? input.pipe(createZstdDecompress()) : input;
+  if (!isZstdRollout(file)) return input;
+  const decompressor = createZstdDecompress();
+  input.on('error', error => decompressor.destroy(error));
+  decompressor.on('close', () => input.destroy());
+  input.pipe(decompressor);
+  return decompressor;
 }
 
 class RolloutByteCursor {
@@ -1441,7 +1450,7 @@ async function ensureCodexHistoryAncestors(threadId: string, rolloutPath: string
       }
       const homes = (await Promise.all(candidates.filter(home => !samePath(home, targetHome)).map(async home => {
         for (const file of files(home)) {
-          if (path.basename(file) !== originalCodexRolloutName(rolloutPath)
+          if (uncompressedCodexRolloutName(file) !== uncompressedCodexRolloutName(rolloutPath)
             || !readPrivateNonEmptyRolloutSnapshot(home, file)) continue;
           if (await readFirstLineAsync(file) === rootLine) return home;
         }
@@ -1454,12 +1463,13 @@ async function ensureCodexHistoryAncestors(threadId: string, rolloutPath: string
   };
   if (verifyExternalSource) await source();
   const find = (home: string, id: string) => {
-    const matches = files(home).filter(file => nativeRolloutIdentity(file)?.rolloutId === id.toLowerCase())
-      .sort((a, b) => Number(path.basename(a) !== originalCodexRolloutName(a)) - Number(path.basename(b) !== originalCodexRolloutName(b)));
-    if (matches.some(file => !sameRegularFileIdentity(file, matches[0]!))) {
+    const matches = files(home).filter(file => nativeRolloutIdentity(file)?.rolloutId === id.toLowerCase());
+    const plain = matches.filter(file => !isZstdRollout(file));
+    const preferred = plain.length > 0 ? plain : matches;
+    if (preferred.some(file => !sameRegularFileIdentity(file, preferred[0]!))) {
       throw resumePreparationBlocked(threadId, 'ambiguous paginated history ancestor');
     }
-    return matches[0];
+    return preferred[0];
   };
   const seen = new Set([rootIdentity.rolloutId]);
   const plan: Array<{ sourcePath?: string; localAlias?: string; destination: string; snapshot: NonEmptyRolloutSnapshot }> = [];

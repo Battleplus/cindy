@@ -1625,6 +1625,19 @@ describe('paginated Codex rollout adoption (#7436)', () => {
     expect(await prepareExternalCodexSessionForResume(threadId)).toBe(prepared);
   });
 
+  it('prefers a plaintext ancestor when the same rollout also exists as .jsonl.zst', async () => {
+    const f = ancestorHistory(true);
+    const plainParent = f.parent.replace(/\.zst$/, '');
+    fs.writeFileSync(plainParent, f.parentContents);
+    const dbPath = createStateDb(path.join(targetUserData, 'codex-home'));
+    insertThread(dbPath, threadId, f.sourceChild, { updatedAt: 2000 });
+
+    await expect(prepareExternalCodexSessionForResume(threadId)).resolves.toBeTruthy();
+
+    const importedParent = path.join(targetUserData, 'codex-home', 'archived_sessions', path.basename(plainParent));
+    expect(fs.readFileSync(importedParent, 'utf8')).toBe(f.parentContents);
+  });
+
   it.each(['missing', 'truncated', 'cycle', 'conflict'] as const)(
     'blocks %s ancestry without replacing the selected history or index', async fault => {
       const f = ancestorHistory();
