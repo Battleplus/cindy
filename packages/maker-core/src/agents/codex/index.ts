@@ -47,8 +47,8 @@ import { readAccountRateLimitsWithRefresh } from './app-server/account-rate-limi
 import {
   BaseAgent,
   LOCAL_AGENT_CLIENT,
+  AUTO_REVIEW_SOURCE_CONTENT,
   INHERITED_CAPABILITY_SELECTION,
-  MAIN_OWNED_SEND_CONTEXT,
   PINNED_SKILL_INVOCATION,
   CodexResumePreparationBlockedError,
   OneShotError,
@@ -6624,7 +6624,7 @@ assertRouteCurrent();
     const toTurnInput = async (
       content: UserMessage['content'],
       pinnedSkill?: PinnedSkillInvocation,
-      mainOwnedRawText?: string,
+      sourceContent?: UserMessage['content'],
     ): Promise<UserInput[]> => {
       if (reviewMode) {
         if (pinnedSkill) {
@@ -6643,7 +6643,7 @@ assertRouteCurrent();
       }
 
       const slash = parseLeadingSlashToken(
-        (pinnedSkill && typeof mainOwnedRawText === 'string' ? mainOwnedRawText : content).trim(),
+        (pinnedSkill && typeof sourceContent === 'string' ? sourceContent : content).trim(),
       );
       if (pinnedSkill) {
         const normalizedSlashName = slash?.name.toLowerCase();
@@ -13219,7 +13219,7 @@ assertRouteCurrent();
           turnInput = await toTurnInput(
             withLibraryNativeReadContext(message.content, mutableLibraryRoot, mutableExtraDirs),
             sendOpts?.[PINNED_SKILL_INVOCATION],
-            sendOpts?.[MAIN_OWNED_SEND_CONTEXT]?.rawChannelText,
+            sendOpts?.[AUTO_REVIEW_SOURCE_CONTENT],
           );
         } catch (e) {
           isTurnStartPending = false;

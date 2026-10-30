@@ -8293,7 +8293,7 @@ describe('CodexAgent MCP thread context hooks', () => {
       },
       {
         [PINNED_SKILL_INVOCATION]: { name: 'learn', path: pinnedPath },
-        [MAIN_OWNED_SEND_CONTEXT]: { origin: { kind: 'desktop' }, rawChannelText: '/learn release flow' },
+        [AUTO_REVIEW_SOURCE_CONTENT]: '/learn release flow',
       },
     );
 
@@ -8321,10 +8321,7 @@ describe('CodexAgent MCP thread context hooks', () => {
       { type: 'user', content: 'Please read this note: /learn release flow' },
       {
         [PINNED_SKILL_INVOCATION]: { name: 'learn', path: '/cindy/system-skills/v10/learn/SKILL.md' },
-        [MAIN_OWNED_SEND_CONTEXT]: {
-          origin: { kind: 'desktop' },
-          rawChannelText: 'Please read this note: /learn release flow',
-        },
+        [AUTO_REVIEW_SOURCE_CONTENT]: 'Please read this note: /learn release flow',
       },
     )).rejects.toThrow('The pinned Skill does not match the dispatched command');
 
