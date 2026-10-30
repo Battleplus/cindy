@@ -28,6 +28,15 @@ describe('sidebar Markdown preview', () => {
     expect(sessionToCamel(row).preview).toBe('Cache regression');
   });
 
+  it('reuses previews larger than the cache key bound across task list refreshes', () => {
+    const text = `**Large preview** ${'repeated markdown [link](https://example.com) '.repeat(120)}`;
+    const before = vi.mocked(markdownPreviewText).mock.calls.length;
+    const first = finalizePlainPreview(text, 'assistant');
+    const second = finalizePlainPreview(text, 'assistant');
+    expect(second).toBe(first);
+    expect(vi.mocked(markdownPreviewText).mock.calls.length - before).toBe(1);
+  });
+
   const markdown =
     '[PR #3943](https://github.com/makecindy/cindy/pull/3943) 已合并，CI 无失败、review 已通过。';
   const plain = 'PR #3943 已合并，CI 无失败、review 已通过。';
