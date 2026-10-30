@@ -48,6 +48,7 @@ import {
   BaseAgent,
   LOCAL_AGENT_CLIENT,
   INHERITED_CAPABILITY_SELECTION,
+  MAIN_OWNED_SEND_CONTEXT,
   PINNED_SKILL_INVOCATION,
   CodexResumePreparationBlockedError,
   OneShotError,
@@ -6623,6 +6624,7 @@ assertRouteCurrent();
     const toTurnInput = async (
       content: UserMessage['content'],
       pinnedSkill?: PinnedSkillInvocation,
+      mainOwnedRawText?: string,
     ): Promise<UserInput[]> => {
       if (reviewMode) {
         if (pinnedSkill) {
@@ -6640,7 +6642,9 @@ assertRouteCurrent();
         return toAppServerInput(content, opts.workingDir);
       }
 
-      const slash = parseLeadingSlashToken(content.trim());
+      const slash = parseLeadingSlashToken(
+        (pinnedSkill && typeof mainOwnedRawText === 'string' ? mainOwnedRawText : content).trim(),
+      );
       if (pinnedSkill) {
         const normalizedSlashName = slash?.name.toLowerCase();
         const normalizedSkillName = pinnedSkill.name.toLowerCase();
@@ -13215,6 +13219,7 @@ assertRouteCurrent();
           turnInput = await toTurnInput(
             withLibraryNativeReadContext(message.content, mutableLibraryRoot, mutableExtraDirs),
             sendOpts?.[PINNED_SKILL_INVOCATION],
+            sendOpts?.[MAIN_OWNED_SEND_CONTEXT]?.rawChannelText,
           );
         } catch (e) {
           isTurnStartPending = false;
