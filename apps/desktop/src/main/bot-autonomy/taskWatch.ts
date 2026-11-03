@@ -59,7 +59,7 @@ const USER_SOURCES = new Set(['desktop', 'feishu', 'slack', 'telegram', 'x', 'di
  * 伙伴的历史 / 私聊话题 / 群 / IM 渠道专线不是「任务」，不进表。主任务（canonical）进表：总调度是另一个伙伴时要能
  * 发现它坏了；但它永远不是主任务所属伙伴自己的事件对象（见 followerFor），也不进它自己的工作台。
  */
-const BOT_LANE_ROLES = new Set(['history', 'thread', 'group', 'channel']);
+const BOT_LANE_ROLES = new Set(['history', 'thread', 'group', 'channel', 'routine']);
 
 export interface LocalSessionMeta {
   id: string;
@@ -96,7 +96,8 @@ function sameOwnership(a: OwnershipSnapshot, b: OwnershipSnapshot): boolean {
   for (const [id, bot] of a.bots) {
     const other = b.bots.get(id);
     if (!other || bot.status !== other.status || bot.allowSchedulerFollow !== other.allowSchedulerFollow
-      || !!bot.shadowed !== !!other.shadowed || (bot.canonicalSessionId ?? null) !== (other.canonicalSessionId ?? null)) return false;
+      || !!bot.shadowed !== !!other.shadowed || !!bot.followOff !== !!other.followOff
+      || (bot.canonicalSessionId ?? null) !== (other.canonicalSessionId ?? null)) return false;
   }
   for (const [id, creator] of a.creatorBySession) if (b.creatorBySession.get(id) !== creator) return false;
   for (const [id, sessions] of a.responsibleByBot) {
