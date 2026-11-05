@@ -15,11 +15,18 @@ type SourceItem<T extends HistoryMessageSource> = {
 };
 type GroupItem<T extends HistoryMessageSource> = { type: 'group'; summary: HistoryWorkSummary; children?: HistoryViewItem<T>[] };
 
-/** Content-sensitive range revision: outline rows carry a body stamp instead of the body. */
 function historyRowsHash(rows: readonly HistoryMessageSource[]): number {
   let hash = 2166136261;
   for (const row of rows) {
-    const text = JSON.stringify(row);
+    const contentStamp = row.historyContentStamp;
+    // Outline rows already carry a bounded stamp for the hidden body. Hashing
+    // the body again defeats the outline's purpose and is repeated for every
+    // cumulative projection while the reader scans another batch. Keep the
+    // complete-row path for live/full rows, where no stamp is available.
+    const text = typeof contentStamp === 'string' && !row.id.startsWith('history-live:')
+      ? JSON.stringify([row.id, row.clientId, row.role, contentStamp, row.createdAt,
+        row.rowid, row.cacheReceipt, row.toolUseId, row.agentMeta, row.historyArtifacts])
+      : JSON.stringify(row);
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
   }
   return hash >>> 0;
@@ -348,3 +355,4 @@ export function historySubagentScopes(rows: readonly HistoryMessageSource[], roo
   }
   return result;
 }
+

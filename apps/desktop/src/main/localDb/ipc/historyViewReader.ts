@@ -154,8 +154,11 @@ export function createHistoryViewReader<T extends HistoryMessageSource>(deps: Hi
       let cursor = beforeAnchor?.id.startsWith('history-live:') ? undefined : beforeAnchor?.id;
       const chunks: T[][] = [];
       let raw: T[] = [];
+      let live: T[] = [];
       let exhausted = false;
       let items: HistoryViewItem<T>[] = [];
+      let projectedChunkCount = -1;
+      let projectedExhausted = false;
       let scannedRows = 0;
       let scannedBytes = 0;
       const project = (live: T[]) => {
@@ -211,16 +214,23 @@ export function createHistoryViewReader<T extends HistoryMessageSource>(deps: Hi
         exhausted = rows.length < batchSize;
         if (!exhausted && !rows.some(isHistoryPageBoundary)) continue;
         raw = chunks.slice().reverse().flat();
-        const live = liveRows(raw);
+        live = liveRows(raw);
         items = project(live);
+        projectedChunkCount = chunks.length;
+        projectedExhausted = exhausted;
         // Large completed groups can fill the byte-limited page well before
         // twenty items. Continuing to scan then only spends the scan budget.
         if (exhausted || items.length >= HISTORY_VIEW_PAGE_ITEMS
           || Buffer.byteLength(JSON.stringify(items), 'utf8') + 1024 >= HISTORY_VIEW_PAGE_BYTES) break;
       }
-      raw = chunks.slice().reverse().flat();
-      const live = liveRows(raw);
-      items = project(live);
+      // The last scan iteration already projected this exact snapshot in the
+      // common case. Reusing it avoids a second full projection of the same
+      // cumulative history when the page becomes large enough to stop scanning.
+      if (projectedChunkCount !== chunks.length || projectedExhausted !== exhausted) {
+        raw = chunks.slice().reverse().flat();
+        live = liveRows(raw);
+        items = project(live);
+      }
       const safeStarts = historyPageSafeStarts([...raw, ...live]);
       if (outlined) {
         // Select by visible objects before reading any hidden payloads. Every
@@ -438,3 +448,4 @@ export function createHistoryViewReader<T extends HistoryMessageSource>(deps: Hi
     },
   };
 }
+

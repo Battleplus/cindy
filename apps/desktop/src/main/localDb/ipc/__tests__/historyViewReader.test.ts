@@ -42,6 +42,43 @@ describe('host history view', () => {
     expect(details.messages[0].agentMeta).toEqual(source[1].agentMeta);
     expect(details.hasMore).toBe(true);
   });
+
+  // 测试价值
+  // - 生产入口与可观察结果：history reader page 返回的内容、cursor 和 hasMore。
+  // - Bug：#7877 连续打开有长历史的任务时，主进程同步投影消耗 CPU。
+  // - 覆盖缺口：已有测试没有多批 outline 边界下重复投影的长历史。
+  // - 最小输入：8 个 1000 行批次，每批含 user 与已完成答复。
+  // - tier：unit；单独运行本文件 7.38s（Vitest collect 5.91s、tests 947ms、transform 2.19s、prepare 174ms）。
+  it('keeps page content and cursor stable while scanning a long history in outline batches', async () => {
+    const source: HistoryMessageSource[] = [];
+    const outlineRow = (n: number, role?: string) => ({
+      ...row(n, role), historyContentStamp: `${n}:stable-outline-content`,
+    });
+    for (let turn = 0; turn < 8; turn += 1) {
+      const base = turn * 1000;
+      source.push(outlineRow(base, 'user'));
+      source.push(...Array.from({ length: 998 }, (_, index) => outlineRow(base + index + 1)));
+      source.push({ ...outlineRow(base + 999, 'assistant'), content: `Delivered ${turn}`, agentMeta: { turnCompleted: true } });
+    }
+    const base = reader(source);
+    const outline = async (_sid: string, opts: { before?: string; after?: string; limit: number }) =>
+      (await base.list(_sid, opts)).map((message) => ({ ...message }));
+    const api = createHistoryViewReader({
+      list: base.list,
+      outline,
+      hydrate: async (_sid, ids) => source.filter((message) => ids.includes(message.id)),
+      anchor: async (_sid, id) => source.find((message) => message.id === id)!,
+      running: () => false,
+    });
+
+    const page = await api.page('s', undefined, true);
+
+    expect(page.items.flatMap((item) => item.type === 'messages' ? item.messages : [])
+      .filter((message) => message.role === 'assistant').map((message) => message.content))
+      .toEqual(['Delivered 1', 'Delivered 2', 'Delivered 3', 'Delivered 4', 'Delivered 5', 'Delivered 6', 'Delivered 7']);
+    expect(page.nextCursor).toBe('1001');
+    expect(page.hasMore).toBe(true);
+  });
   // 2026-10-25: ordinary simulator plugin calls cost one page item each although
   // Mobile folds them. Exercise real paging and details, not just the classifier.
   it('pages settled plugin work by visible groups and retains every call in details', async () => {
@@ -503,18 +540,26 @@ describe('outline history reads', () => {
   });
 });
 
-it('uses database revisions for stable snapshots and invalidates same-size hidden edits', async () => {
-  const source = [row(0, 'user'), row(1), row(2, 'assistant')];
+it('uses database revisions for stable snapshots and invalidates stamped edits', async () => {
+  const source = [row(0, 'user'), { ...row(1), historyContentStamp: '1:initial' }, row(2, 'assistant')];
   const base = reader(source);
-  let revision = 'first';
   const api = createHistoryViewReader({ list: base.list, outline: base.list,
     hydrate: async (_sid, ids) => source.filter((message) => ids.includes(message.id)),
     anchor: async (_sid, id) => source.find((message) => message.id === id)!,
-    revision: async () => revision, running: () => false });
+    revision: async () => 'stable', running: () => false });
   const initial = await api.page('s', undefined, true);
-  expect(await api.page('s', undefined, true)).toEqual(initial);
-  revision = 'edited';
-  source[1] = { ...source[1], content: 'changed' };
+  const repeated = await api.page('s', undefined, true);
+  expect(repeated).toEqual(initial);
+  const summary = (page: typeof initial) => page.items.flatMap((item) =>
+    item.type === 'work' ? [item.summary.revision] : item.deferred ? [item.deferred.revision] : [],
+  );
+  expect(summary(repeated)).toEqual(summary(initial));
+  const content = String(source[1].content);
+  Object.assign(source[1], { content: `X${content.slice(1)}`, historyContentStamp: '1:edited-content' });
+  expect(await api.page('s', undefined, true)).not.toEqual(initial);
+  Object.assign(source[1], { role: 'system' });
+  expect(await api.page('s', undefined, true)).not.toEqual(initial);
+  Object.assign(source[1], { role: 'thinking', content: 'changed', historyContentStamp: '1:edited-role' });
   expect(await api.page('s', undefined, true)).not.toEqual(initial);
 });
 
@@ -541,3 +586,4 @@ it('invalidates cached subagent membership on a database revision and still reje
   source.length = 0;
   await expect(api.details('s', ref, '3')).rejects.toMatchObject({ code: 'NOT_FOUND' });
 });
+
