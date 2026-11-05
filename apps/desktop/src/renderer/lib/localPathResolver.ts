@@ -776,6 +776,13 @@ export function normalizeMarkdownImageSrc(
   if (!allowPrivilegedLinks) {
     return /^https?:\/\//i.test(src) ? src : undefined;
   }
+  // Older task messages sometimes use xdt-image for a hostless absolute path
+  // (`xdt-image:///C:/...`). The image protocol treats the first path segment
+  // as a cache host, so route this legacy shape through the safe local-file
+  // URL instead. Session and reserved-host xdt-image URLs remain unchanged.
+  if (src.startsWith('xdt-image:///')) {
+    return normalizeXdtFileUrlForRenderer(src.replace(/^xdt-image:/, 'xdt-file:'));
+  }
   if (
     src.startsWith('data:') ||
     src.startsWith('http://') ||
