@@ -437,7 +437,11 @@ describe('authorized file peer source', () => {
   }
   // Unit regression: an authorized path without a MIME was sent as octet-stream,
   // so the mobile player rejected a completely downloaded MP4.
-  it.each([['.mp4', 'video/mp4'], ['.MP4', 'video/mp4'], ['mp4', 'video/mp4'], ['.webm', 'video/webm'], ['.html', 'text/html']])(
+  it.each([
+    ['.mp4', 'video/mp4'], ['.MP4', 'video/mp4'], ['mp4', 'video/mp4'], ['.webm', 'video/webm'],
+    ['.html', 'text/html'], ['.htm', 'text/html'], ['.css', 'text/css'], ['.js', 'text/javascript'],
+    ['.mjs', 'text/javascript'],
+  ])(
     'returns playable direct-file metadata for extension %s', async (uploadExtHint, mimeType) => {
       mock.resolve.mockResolvedValue({ absPath: file, uploadExtHint, maxBytes: 100 });
       const { connection } = await connect();
